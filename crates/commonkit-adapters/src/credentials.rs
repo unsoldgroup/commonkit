@@ -1,0 +1,396 @@
+use std::collections::BTreeMap;
+use std::fmt;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
+
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
+#[cfg(unix)]
+use cap_std::fs::{OpenOptionsExt, Permissions, PermissionsExt};
+
+use serde::{Deserialize, Deserializer, Serialize};
+use thiserror::Error;
+
+/// A portable pointer to credential material. The pointed-to value is never part of this type.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct CredentialReference(String);
+
+impl CredentialReference {
+    pub fn parse(value: impl Into<String>) -> Result<Self, CredentialReferenceError> {
+        let value = value.into();
+        if value.len() > 2048 || value.chars().any(char::is_whitespace) {
+            return Err(CredentialReferenceError::InvalidReference);
+        }
+        let (scheme, opaque) = value
+            .split_once("://")
+            .ok_or(CredentialReferenceError::UnsupportedScheme)?;
+        if opaque.is_empty() || opaque.contains(['?', '#', '\0']) {
+            return Err(CredentialReferenceError::InvalidReference);
+        }
+        match scheme {
+            "env" if valid_env_name(opaque) => {}
+            "file" if valid_absolute_file_path(opaque) => {}
+            "keychain" if valid_keychain_key(opaque) => {}
+            "bws" if valid_opaque_key(opaque) => {}
+            "env" | "file" | "keychain" | "bws" => {
+                return Err(CredentialReferenceError::InvalidReference);
+            }
+            _ => return Err(CredentialReferenceError::UnsupportedScheme),
+        }
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn scheme(&self) -> &str {
+        self.0.split_once("://").expect("validated reference").0
+    }
+
+    pub fn opaque(&self) -> &str {
+        self.0.split_once("://").expect("validated reference").1
+    }
+}
+
+impl fmt::Debug for CredentialReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CredentialReference(<redacted>)")
+    }
+}
+
+impl fmt::Display for CredentialReference {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<credential-reference>")
+    }
+}
+
+impl<'de> Deserialize<'de> for CredentialReference {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+fn valid_env_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|byte| byte == b'_' || byte.is_ascii_uppercase())
+        && bytes.all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn valid_absolute_file_path(value: &str) -> bool {
+    value.starts_with('/')
+        && value
+            .split('/')
+            .all(|component| component != "." && component != "..")
+}
+
+fn valid_keychain_key(value: &str) -> bool {
+    let mut segments = value.split('/');
+    matches!((segments.next(), segments.next(), segments.next()), (Some(service), Some(account), None) if valid_opaque_key(service) && valid_opaque_key(account))
+}
+
+fn valid_opaque_key(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+        && !value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CredentialReferenceError {
+    #[error("unsupported credential reference scheme")]
+    UnsupportedScheme,
+    #[error("invalid credential reference")]
+    InvalidReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialReadiness {
+    Ready,
+    Missing,
+    Unavailable,
+}
+
+/// Read-only preflight. Implementations must only establish availability, never fetch values.
+pub trait CredentialReadinessInspector {
+    fn inspect(&self, reference: &CredentialReference) -> CredentialReadiness;
+}
+
+/// Side-effect-free local probes. Keychain and BWS remain unavailable until a dedicated
+/// provider-specific probe is configured; inspection never invokes either provider.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LocalCredentialReadinessInspector;
+
+impl CredentialReadinessInspector for LocalCredentialReadinessInspector {
+    fn inspect(&self, reference: &CredentialReference) -> CredentialReadiness {
+        match reference.scheme() {
+            "env" => {
+                if std::env::var_os(reference.opaque()).is_some() {
+                    CredentialReadiness::Ready
+                } else {
+                    CredentialReadiness::Missing
+                }
+            }
+            "file" => match std::fs::symlink_metadata(reference.opaque()) {
+                Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                    CredentialReadiness::Ready
+                }
+                Ok(_) => CredentialReadiness::Unavailable,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    CredentialReadiness::Missing
+                }
+                Err(_) => CredentialReadiness::Unavailable,
+            },
+            "keychain" | "bws" => CredentialReadiness::Unavailable,
+            _ => CredentialReadiness::Unavailable,
+        }
+    }
+}
+
+/// Secret bytes have no serialization or cloning surface and redact all formatting.
+pub struct SecretValue(Vec<u8>);
+
+impl SecretValue {
+    pub fn new(bytes: Vec<u8>) -> Result<Self, CredentialResolveError> {
+        if bytes.is_empty() {
+            return Err(CredentialResolveError::EmptyValue);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// This is intentionally named to make the sole permitted exposure point explicit.
+    pub fn expose_for_apply(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for SecretValue {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+impl fmt::Debug for SecretValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SecretValue(<redacted>)")
+    }
+}
+
+impl fmt::Display for SecretValue {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+pub trait CredentialResolver {
+    fn resolve(
+        &mut self,
+        reference: &CredentialReference,
+    ) -> Result<SecretValue, CredentialResolveError>;
+}
+
+pub struct FakeCredentialResolver {
+    values: BTreeMap<CredentialReference, Vec<u8>>,
+}
+
+impl FakeCredentialResolver {
+    pub fn new(values: BTreeMap<CredentialReference, Vec<u8>>) -> Self {
+        Self { values }
+    }
+}
+
+impl CredentialResolver for FakeCredentialResolver {
+    fn resolve(
+        &mut self,
+        reference: &CredentialReference,
+    ) -> Result<SecretValue, CredentialResolveError> {
+        let value = self
+            .values
+            .get(reference)
+            .ok_or(CredentialResolveError::Unavailable)?;
+        SecretValue::new(value.clone())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CredentialResolveError {
+    #[error("credential is unavailable")]
+    Unavailable,
+    #[error("credential provider returned an empty value")]
+    EmptyValue,
+    #[error("credential provider failed")]
+    ProviderFailed,
+    #[error("credential provider returned an invalid response")]
+    InvalidProviderResponse,
+    #[error("credential reference is not supported by this resolver")]
+    UnsupportedReference,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("credential provider command failed")]
+pub struct BwsCommandError;
+
+/// Boundary around the BWS process. Arguments are individual argv entries, never shell text.
+pub trait BwsCommandRunner {
+    fn run(&mut self, args: &[String]) -> Result<Vec<u8>, BwsCommandError>;
+}
+
+pub struct ProcessBwsRunner {
+    executable: PathBuf,
+}
+
+impl ProcessBwsRunner {
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+        }
+    }
+}
+
+impl BwsCommandRunner for ProcessBwsRunner {
+    fn run(&mut self, args: &[String]) -> Result<Vec<u8>, BwsCommandError> {
+        let output = Command::new(&self.executable)
+            .args(args)
+            .output()
+            .map_err(|_| BwsCommandError)?;
+        if !output.status.success() {
+            return Err(BwsCommandError);
+        }
+        Ok(output.stdout)
+    }
+}
+
+pub struct BwsCredentialResolver<R> {
+    runner: R,
+}
+
+impl<R> BwsCredentialResolver<R> {
+    pub fn new(runner: R) -> Self {
+        Self { runner }
+    }
+
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+}
+
+impl<R: BwsCommandRunner> CredentialResolver for BwsCredentialResolver<R> {
+    fn resolve(
+        &mut self,
+        reference: &CredentialReference,
+    ) -> Result<SecretValue, CredentialResolveError> {
+        if reference.scheme() != "bws" {
+            return Err(CredentialResolveError::UnsupportedReference);
+        }
+        let args = vec![
+            "secret".to_string(),
+            "get".to_string(),
+            reference.opaque().to_string(),
+        ];
+        let bytes = self
+            .runner
+            .run(&args)
+            .map_err(|_| CredentialResolveError::ProviderFailed)?;
+        let response: BwsResponse = serde_json::from_slice(&bytes)
+            .map_err(|_| CredentialResolveError::InvalidProviderResponse)?;
+        SecretValue::new(response.value.into_bytes())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BwsResponse {
+    value: String,
+}
+
+/// Capability-rooted storage for credential material that must exist on one target.
+pub struct LocalSensitiveFileStore {
+    root: Dir,
+}
+
+impl LocalSensitiveFileStore {
+    pub fn open(root: &std::path::Path) -> Result<Self, SensitiveFileError> {
+        if !root.is_absolute() || root.parent().is_none() {
+            return Err(SensitiveFileError::UnsafePath);
+        }
+        let metadata = std::fs::symlink_metadata(root).map_err(|_| SensitiveFileError::Io)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(SensitiveFileError::UnsafePath);
+        }
+        #[cfg(unix)]
+        std::fs::set_permissions(root, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+            .map_err(|_| SensitiveFileError::Io)?;
+        let root =
+            Dir::open_ambient_dir(root, ambient_authority()).map_err(|_| SensitiveFileError::Io)?;
+        Ok(Self { root })
+    }
+
+    pub fn write(
+        &self,
+        path: &crate::NormalizedManagedPath,
+        value: &SecretValue,
+    ) -> Result<(), SensitiveFileError> {
+        let components = path.as_str().split('/').collect::<Vec<_>>();
+        let mut parent = PathBuf::new();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            parent.push(component);
+            match self.root.symlink_metadata(&parent) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(SensitiveFileError::UnsafePath);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    self.root
+                        .create_dir(&parent)
+                        .map_err(|_| SensitiveFileError::Io)?;
+                }
+                Err(_) => return Err(SensitiveFileError::Io),
+            }
+            #[cfg(unix)]
+            self.root
+                .set_permissions(&parent, Permissions::from_mode(0o700))
+                .map_err(|_| SensitiveFileError::Io)?;
+        }
+        match self.root.symlink_metadata(path.as_str()) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                return Err(SensitiveFileError::UnsafePath);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(SensitiveFileError::Io),
+        }
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = self
+            .root
+            .open_with(path.as_str(), &options)
+            .map_err(|_| SensitiveFileError::Io)?;
+        #[cfg(unix)]
+        file.set_permissions(Permissions::from_mode(0o600))
+            .map_err(|_| SensitiveFileError::Io)?;
+        file.write_all(value.expose_for_apply())
+            .map_err(|_| SensitiveFileError::Io)?;
+        file.sync_all().map_err(|_| SensitiveFileError::Io)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SensitiveFileError {
+    #[error("unsafe sensitive-file path")]
+    UnsafePath,
+    #[error("sensitive-file operation failed")]
+    Io,
+}

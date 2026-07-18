@@ -3,6 +3,7 @@
 mod apm;
 mod artifacts;
 mod chezmoi;
+mod credentials;
 mod files;
 mod git_sync;
 mod native;
@@ -14,6 +15,13 @@ mod target;
 pub use apm::{ApmProvider, ApmProviderConfig};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
 pub use chezmoi::ChezmoiProvider;
+pub use credentials::{
+    BwsCommandError, BwsCommandRunner, BwsCredentialResolver, CredentialReadiness,
+    CredentialReadinessInspector, CredentialReference, CredentialReferenceError,
+    CredentialResolveError, CredentialResolver, FakeCredentialResolver,
+    LocalCredentialReadinessInspector, LocalSensitiveFileStore, ProcessBwsRunner, SecretValue,
+    SensitiveFileError,
+};
 pub use files::{FileAdapter, FileAdapterError, FileIntent, ManagedRelativePath};
 pub use git_sync::{
     FastForwardPolicy, GitCommandError, GitCommandOutput, GitCommandRunner, GitRepository,

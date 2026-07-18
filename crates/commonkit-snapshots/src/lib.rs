@@ -1,0 +1,429 @@
+//! Snapshot orchestration for mutable databases.
+//!
+//! Portable metadata contains digests and encrypted-object references, never plaintext data.
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
+use std::fmt;
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DatabaseId(String);
+
+impl DatabaseId {
+    pub fn new(value: impl Into<String>) -> Result<Self, SnapshotError> {
+        let value = value.into();
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(SnapshotError::InvalidDatabaseId);
+        }
+        Ok(Self(value))
+    }
+}
+
+impl fmt::Display for DatabaseId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+pub enum Authority {
+    Unassigned,
+    Writer { target: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotCoordinator {
+    database: DatabaseId,
+    authority: Authority,
+    latest_snapshot_digest: Option<String>,
+}
+
+impl SnapshotCoordinator {
+    pub fn new(database: DatabaseId) -> Self {
+        Self {
+            database,
+            authority: Authority::Unassigned,
+            latest_snapshot_digest: None,
+        }
+    }
+
+    pub fn authority(&self) -> &Authority {
+        &self.authority
+    }
+
+    pub fn initialize_writer(&mut self, target: impl Into<String>) -> Result<(), SnapshotError> {
+        match &self.authority {
+            Authority::Unassigned => {
+                self.authority = Authority::Writer {
+                    target: target.into(),
+                };
+                Ok(())
+            }
+            Authority::Writer { target } => {
+                Err(SnapshotError::WriterAlreadyAssigned(target.clone()))
+            }
+        }
+    }
+
+    pub fn record_snapshot_digest(&mut self, digest: impl Into<String>) {
+        self.latest_snapshot_digest = Some(digest.into());
+    }
+
+    pub fn promote(
+        &mut self,
+        candidate: impl Into<String>,
+        current_writer_digest: &str,
+        candidate_digest: &str,
+    ) -> Result<(), SnapshotError> {
+        let latest = self
+            .latest_snapshot_digest
+            .as_deref()
+            .ok_or(SnapshotError::NoSnapshot)?;
+        if current_writer_digest != latest {
+            return Err(SnapshotError::UnsnapshottedWriterChanges);
+        }
+        if candidate_digest != latest {
+            return Err(SnapshotError::CandidateDoesNotMatchSnapshot);
+        }
+        self.authority = Authority::Writer {
+            target: candidate.into(),
+        };
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum SnapshotError {
+    #[error("database id must contain only ASCII letters, digits, '-' or '_'")]
+    InvalidDatabaseId,
+    #[error("authoritative writer is already assigned to {0}")]
+    WriterAlreadyAssigned(String),
+    #[error("snapshot object was not found: {0}")]
+    ObjectNotFound(String),
+    #[error("snapshot ciphertext authentication failed")]
+    AuthenticationFailed,
+    #[error("snapshot content digest does not match its manifest")]
+    IntegrityMismatch,
+    #[error("restored database failed post-swap verification; prior database was restored")]
+    RestoreVerificationFailed,
+    #[error("no snapshot exists for promotion")]
+    NoSnapshot,
+    #[error("authoritative writer has changes newer than the latest snapshot")]
+    UnsnapshottedWriterChanges,
+    #[error("promotion candidate does not match the latest snapshot")]
+    CandidateDoesNotMatchSnapshot,
+    #[error("unsupported snapshot schema or cipher")]
+    UnsupportedSnapshotFormat,
+}
+
+pub trait ConsistentBackup {
+    fn source_format(&self) -> &str;
+    fn export(&self) -> Result<Vec<u8>, SnapshotError>;
+}
+
+pub trait AuthenticatedCipher {
+    fn algorithm(&self) -> &str;
+    fn seal(&self, plaintext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, SnapshotError>;
+    fn open(&self, ciphertext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, SnapshotError>;
+}
+
+pub trait ObjectStore {
+    fn put(&mut self, key: &str, ciphertext: &[u8]) -> Result<(), SnapshotError>;
+    fn get(&self, key: &str) -> Result<Vec<u8>, SnapshotError>;
+}
+
+/// A target stages imported bytes away from the live database, then swaps them atomically.
+pub trait RestoreTarget {
+    type Staged;
+    type Previous;
+
+    fn stage(&mut self, database: &[u8]) -> Result<Self::Staged, SnapshotError>;
+    fn verify_staged(&self, staged: &Self::Staged) -> Result<(), SnapshotError>;
+    fn atomic_swap(&mut self, staged: Self::Staged) -> Result<Self::Previous, SnapshotError>;
+    fn verify_current(&mut self, expected_digest: &str) -> Result<(), SnapshotError>;
+    fn rollback_swap(&mut self, previous: Self::Previous) -> Result<(), SnapshotError>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotManifest {
+    pub schema: String,
+    pub database: DatabaseId,
+    pub source_target: String,
+    pub source_format: String,
+    pub source_digest: String,
+    pub parent_digest: Option<String>,
+    pub content_digest: String,
+    pub object_digest: String,
+    pub cipher: String,
+}
+
+pub struct SnapshotService<'a, C> {
+    cipher: &'a C,
+}
+
+impl<'a, C: AuthenticatedCipher> SnapshotService<'a, C> {
+    pub fn new(cipher: &'a C) -> Self {
+        Self { cipher }
+    }
+
+    pub fn snapshot(
+        &self,
+        database: &DatabaseId,
+        source_target: &str,
+        parent_digest: Option<String>,
+        backup: &impl ConsistentBackup,
+        objects: &mut impl ObjectStore,
+    ) -> Result<SnapshotManifest, SnapshotError> {
+        let plaintext = backup.export()?;
+        let content_digest = sha256(&plaintext);
+        let source_format = backup.source_format().to_owned();
+        let source_digest = content_digest.clone();
+        let cipher = self.cipher.algorithm().to_owned();
+        let associated_data = snapshot_aad(
+            database,
+            source_target,
+            &source_format,
+            &source_digest,
+            parent_digest.as_deref(),
+            &content_digest,
+            &cipher,
+        );
+        let ciphertext = self.cipher.seal(&plaintext, associated_data.as_bytes())?;
+        let object_digest = sha256(&ciphertext);
+        objects.put(&object_digest, &ciphertext)?;
+        Ok(SnapshotManifest {
+            schema: "commonkit.snapshot.v1".into(),
+            database: database.clone(),
+            source_target: source_target.into(),
+            source_format,
+            source_digest,
+            parent_digest,
+            content_digest,
+            object_digest,
+            cipher,
+        })
+    }
+
+    pub fn verify_and_decrypt(
+        &self,
+        manifest: &SnapshotManifest,
+        objects: &impl ObjectStore,
+    ) -> Result<Vec<u8>, SnapshotError> {
+        if manifest.schema != "commonkit.snapshot.v1" || manifest.cipher != self.cipher.algorithm()
+        {
+            return Err(SnapshotError::UnsupportedSnapshotFormat);
+        }
+        let ciphertext = objects.get(&manifest.object_digest)?;
+        if sha256(&ciphertext) != manifest.object_digest {
+            return Err(SnapshotError::IntegrityMismatch);
+        }
+        let associated_data = snapshot_aad(
+            &manifest.database,
+            &manifest.source_target,
+            &manifest.source_format,
+            &manifest.source_digest,
+            manifest.parent_digest.as_deref(),
+            &manifest.content_digest,
+            &manifest.cipher,
+        );
+        let plaintext = self.cipher.open(&ciphertext, associated_data.as_bytes())?;
+        if sha256(&plaintext) != manifest.content_digest {
+            return Err(SnapshotError::IntegrityMismatch);
+        }
+        Ok(plaintext)
+    }
+
+    pub fn restore(
+        &self,
+        manifest: &SnapshotManifest,
+        objects: &impl ObjectStore,
+        target: &mut impl RestoreTarget,
+    ) -> Result<(), SnapshotError> {
+        let plaintext = self.verify_and_decrypt(manifest, objects)?;
+        let staged = target.stage(&plaintext)?;
+        target.verify_staged(&staged)?;
+        let previous = target.atomic_swap(staged)?;
+        if target.verify_current(&manifest.content_digest).is_err() {
+            target.rollback_swap(previous)?;
+            return Err(SnapshotError::RestoreVerificationFailed);
+        }
+        Ok(())
+    }
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn snapshot_aad(
+    database: &DatabaseId,
+    source_target: &str,
+    source_format: &str,
+    source_digest: &str,
+    parent_digest: Option<&str>,
+    content_digest: &str,
+    cipher: &str,
+) -> String {
+    format!(
+        "commonkit.snapshot.v1\0{database}\0{source_target}\0{source_format}\0{source_digest}\0{}\0{content_digest}\0{cipher}",
+        parent_digest.unwrap_or("")
+    )
+}
+
+#[derive(Clone, Debug)]
+pub struct StaticBackup {
+    format: String,
+    bytes: Vec<u8>,
+}
+
+impl StaticBackup {
+    pub fn new(format: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            format: format.into(),
+            bytes,
+        }
+    }
+}
+
+impl ConsistentBackup for StaticBackup {
+    fn source_format(&self) -> &str {
+        &self.format
+    }
+    fn export(&self) -> Result<Vec<u8>, SnapshotError> {
+        Ok(self.bytes.clone())
+    }
+}
+
+#[derive(Default)]
+pub struct InMemoryObjectStore(BTreeMap<String, Vec<u8>>);
+
+impl InMemoryObjectStore {
+    pub fn contains_plaintext(&self, needle: &[u8]) -> bool {
+        self.0
+            .values()
+            .any(|value| value.windows(needle.len()).any(|window| window == needle))
+    }
+}
+
+impl ObjectStore for InMemoryObjectStore {
+    fn put(&mut self, key: &str, ciphertext: &[u8]) -> Result<(), SnapshotError> {
+        self.0
+            .entry(key.into())
+            .or_insert_with(|| ciphertext.to_vec());
+        Ok(())
+    }
+    fn get(&self, key: &str) -> Result<Vec<u8>, SnapshotError> {
+        self.0
+            .get(key)
+            .cloned()
+            .ok_or_else(|| SnapshotError::ObjectNotFound(key.into()))
+    }
+}
+
+/// Deterministic authenticated test cipher. It is intentionally not suitable for production.
+pub struct DeterministicTestCipher([u8; 32]);
+
+impl DeterministicTestCipher {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+}
+
+impl AuthenticatedCipher for DeterministicTestCipher {
+    fn algorithm(&self) -> &str {
+        "INSECURE-TEST-XOR-SHA256"
+    }
+    fn seal(&self, plaintext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+        let body: Vec<_> = plaintext
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ self.0[index % 32])
+            .collect();
+        let mut hash = Sha256::new();
+        hash.update(self.0);
+        hash.update(associated_data);
+        hash.update(&body);
+        let mut result = hash.finalize().to_vec();
+        result.extend(body);
+        Ok(result)
+    }
+    fn open(&self, ciphertext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+        if ciphertext.len() < 32 {
+            return Err(SnapshotError::AuthenticationFailed);
+        }
+        let (tag, body) = ciphertext.split_at(32);
+        let mut hash = Sha256::new();
+        hash.update(self.0);
+        hash.update(associated_data);
+        hash.update(body);
+        if hash.finalize().as_slice() != tag {
+            return Err(SnapshotError::AuthenticationFailed);
+        }
+        Ok(body
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ self.0[index % 32])
+            .collect())
+    }
+}
+
+/// In-memory restore target used to contract-test staging and rollback behavior.
+pub struct InMemoryDatabaseTarget {
+    current: Vec<u8>,
+    swaps: usize,
+    fail_verification: bool,
+}
+
+impl InMemoryDatabaseTarget {
+    pub fn new(current: Vec<u8>) -> Self {
+        Self {
+            current,
+            swaps: 0,
+            fail_verification: false,
+        }
+    }
+    pub fn current(&self) -> &[u8] {
+        &self.current
+    }
+    pub fn swap_count(&self) -> usize {
+        self.swaps
+    }
+    pub fn fail_next_verification(&mut self) {
+        self.fail_verification = true;
+    }
+}
+
+impl RestoreTarget for InMemoryDatabaseTarget {
+    type Staged = Vec<u8>;
+    type Previous = Vec<u8>;
+
+    fn stage(&mut self, database: &[u8]) -> Result<Self::Staged, SnapshotError> {
+        Ok(database.to_vec())
+    }
+    fn verify_staged(&self, _staged: &Self::Staged) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+    fn atomic_swap(&mut self, staged: Self::Staged) -> Result<Self::Previous, SnapshotError> {
+        self.swaps += 1;
+        Ok(std::mem::replace(&mut self.current, staged))
+    }
+    fn verify_current(&mut self, expected_digest: &str) -> Result<(), SnapshotError> {
+        if std::mem::take(&mut self.fail_verification) || sha256(&self.current) != expected_digest {
+            Err(SnapshotError::IntegrityMismatch)
+        } else {
+            Ok(())
+        }
+    }
+    fn rollback_swap(&mut self, previous: Self::Previous) -> Result<(), SnapshotError> {
+        self.current = previous;
+        Ok(())
+    }
+}

@@ -437,6 +437,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "commonkit-snapshots"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_jcs",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
