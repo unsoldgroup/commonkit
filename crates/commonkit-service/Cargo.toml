@@ -19,6 +19,7 @@ commonkit-core = { path = "../commonkit-core" }
 commonkit-platform = { path = "../commonkit-platform" }
 commonkit-reconcile = { path = "../commonkit-reconcile" }
 commonkit-relay = { path = "../commonkit-relay" }
+commonkit-snapshots = { path = "../commonkit-snapshots" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,6 +28,8 @@ thiserror.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 tokio-stream.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
+tempfile = "3"

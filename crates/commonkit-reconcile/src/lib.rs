@@ -530,6 +530,28 @@ impl<'a> Reconciler<'a> {
         self.rollback_from_rolling_back(&mut journal, &applied, adapters)
     }
 
+    /// Explicitly rolls back a previously successful durable run without
+    /// re-resolving provider inputs or secret material.
+    pub fn rollback_succeeded_run(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        validate_plan(plan)?;
+        let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
+        let mut journal = store.load(run_id)?;
+        if journal.receipt().plan_id != plan.id || journal.receipt().target_id != plan.target_id {
+            return Err(ReconcileError::ReceiptPlanMismatch);
+        }
+        if journal.receipt().state != ReceiptState::Succeeded {
+            return Err(ReconcileError::RunAlreadyTerminal(journal.receipt().state));
+        }
+        journal.transition(ReceiptState::RollingBack)?;
+        self.persist(&journal)?;
+        self.rollback_from_rolling_back(&mut journal, &plan.operations, adapters)
+    }
+
     fn recover(
         &self,
         journal: &mut ReceiptJournal,
@@ -852,6 +874,7 @@ fn legal_transition(from: ReceiptState, to: ReceiptState) -> bool {
             ReceiptState::Verifying,
             ReceiptState::Succeeded | ReceiptState::RecoveryRequired
         ) | (ReceiptState::RecoveryRequired, ReceiptState::RollingBack)
+            | (ReceiptState::Succeeded, ReceiptState::RollingBack)
             | (
                 ReceiptState::RollingBack,
                 ReceiptState::RolledBack | ReceiptState::RollbackFailed

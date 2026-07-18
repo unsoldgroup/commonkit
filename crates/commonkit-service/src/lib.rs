@@ -45,6 +45,9 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
+mod production_domains;
+pub use production_domains::{ProductionDomainError, ProductionDomainRegistry};
+
 pub const API_VERSION: &str = "v1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2027,7 +2030,13 @@ impl BoundServer {
             plan_store.clone(), &paths.receipts, &paths.config, paths.state.join("filesystem"),
         ).map_err(|_| ServiceError::UnsafeDiscoveryPath)?
         .with_relay(paths.config.join("relay.json"), paths.state.join("relay"), relay_runtime.clone());
-        let control = ControlPlane::with_plan_store(Arc::new(executor), plan_store);
+        let control = ControlPlane::with_plan_store(Arc::new(executor), plan_store.clone());
+        let production_domains = ProductionDomainRegistry::load_optional(
+            &paths.config.join("headless.json"),
+            plan_store,
+            paths.receipts.clone(),
+        )?;
+        control.set_headless_domains(production_domains.into_headless());
         control.set_scheduler_store(Arc::new(
             SchedulerStore::open(
                 discovery_path
@@ -2233,4 +2242,6 @@ pub enum ServiceError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     PlanStore(#[from] PlanStoreError),
+    #[error(transparent)]
+    ProductionDomains(#[from] ProductionDomainError),
 }
