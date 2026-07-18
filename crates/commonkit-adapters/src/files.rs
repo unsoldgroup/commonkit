@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{ArtifactStore, ContentReference, ContentSensitivity};
+use crate::{FileMode, FilesystemIntent, NormalizedManagedPath, SafeSymlinkTarget};
 
 static REPLACEMENT_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -94,12 +95,45 @@ struct BackupRecord {
     content: Option<ContentReference>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SemanticRecord {
+    operation_id: Sha256Digest,
+    intent: FilesystemIntent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum ResourcePreimage {
+    Absent,
+    File {
+        content: ContentReference,
+        mode: Option<u32>,
+    },
+    Directory {
+        mode: Option<u32>,
+    },
+    Symlink {
+        target: String,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SemanticBackupRecord {
+    operation_id: Sha256Digest,
+    before_digest: Option<Sha256Digest>,
+    preimage: ResourcePreimage,
+}
+
 pub struct FileAdapter {
     id: StableId,
+    target_root: PathBuf,
     target: Dir,
     state: Dir,
     artifacts: ArtifactStore,
     files: BTreeMap<Sha256Digest, ManagedFile>,
+    resources: BTreeMap<Sha256Digest, FilesystemIntent>,
 }
 
 impl FileAdapter {
@@ -111,10 +145,12 @@ impl FileAdapter {
         let artifacts = ArtifactStore::open(state.join("artifacts"))?;
         Ok(Self {
             id: StableId::parse("files").expect("static stable ID"),
+            target_root: target.to_path_buf(),
             target: Dir::open_ambient_dir(target, ambient_authority())?,
             state: Dir::open_ambient_dir(state, ambient_authority())?,
             artifacts,
             files: BTreeMap::new(),
+            resources: BTreeMap::new(),
         })
     }
 
@@ -225,6 +261,237 @@ impl FileAdapter {
         self.files.insert(operation.id.clone(), managed.clone());
         Ok(managed)
     }
+
+    pub fn register_resource(
+        &mut self,
+        id: StableId,
+        intent: FilesystemIntent,
+    ) -> Result<Operation, FileAdapterError> {
+        validate_semantic_intent(&intent)?;
+        if matches!(intent, FilesystemIntent::File { .. }) {
+            return Err(FileAdapterError::UnsupportedResource);
+        }
+        let observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())?;
+        let before_digest = semantic_digest(&observed)?;
+        let expected = match &intent {
+            FilesystemIntent::Symlink {
+                expected_before, ..
+            }
+            | FilesystemIntent::Remove {
+                expected_before, ..
+            } => expected_before,
+            _ => &None,
+        };
+        if expected.is_some() && expected != &before_digest {
+            return Err(FileAdapterError::PreimageMismatch);
+        }
+        let desired = desired_preimage(&intent);
+        let after_digest = semantic_digest(&desired)?;
+        if before_digest == after_digest {
+            return Err(FileAdapterError::NoChange);
+        }
+        let payload_digest =
+            digest_domain_json("commonkit.filesystem-resource-payload.v1", &intent)?;
+        let kind = match (&observed, &intent) {
+            (ResourcePreimage::Absent, FilesystemIntent::Remove { .. }) => {
+                return Err(FileAdapterError::NoChange);
+            }
+            (ResourcePreimage::Absent, _) => OperationKind::Create,
+            (_, FilesystemIntent::Remove { .. }) => OperationKind::Delete,
+            _ => OperationKind::Update,
+        };
+        let path = intent.path().as_str().to_owned();
+        let resource_type = match intent {
+            FilesystemIntent::Directory { .. } => "directory",
+            FilesystemIntent::Symlink { .. } => "symlink",
+            FilesystemIntent::Remove { .. } => "removal",
+            FilesystemIntent::File { .. } => unreachable!(),
+        };
+        let operation = finalize_operation(OperationDraft {
+            adapter_id: self.id.clone(),
+            kind,
+            resource: ResourceRef {
+                resource_type: StableId::parse(resource_type).expect("static ID"),
+                resource_id: id,
+                managed_path: Some(path.clone()),
+            },
+            risk: if matches!(intent, FilesystemIntent::Remove { .. }) {
+                Risk::High
+            } else {
+                Risk::Low
+            },
+            requires_confirmation: true,
+            depends_on: Vec::new(),
+            before_digest,
+            after_digest,
+            payload_digest,
+            summary: format!("materialize {path}"),
+        })?;
+        write_record(
+            &self.state,
+            &operation_record_path(&operation.id),
+            &SemanticRecord {
+                operation_id: operation.id.clone(),
+                intent: intent.clone(),
+            },
+        )?;
+        self.resources.insert(operation.id.clone(), intent);
+        Ok(operation)
+    }
+
+    fn semantic(&mut self, operation: &Operation) -> Result<FilesystemIntent, AdapterFailure> {
+        if let Some(intent) = self.resources.get(&operation.id) {
+            return Ok(intent.clone());
+        }
+        let record: SemanticRecord =
+            read_record(&self.state, &operation_record_path(&operation.id)).map_err(|_| {
+                failure(
+                    "operation_payload_missing",
+                    "durable resource payload is missing or invalid",
+                )
+            })?;
+        validate_semantic_intent(&record.intent).map_err(|_| {
+            failure(
+                "operation_payload_mismatch",
+                "durable resource payload is unsafe",
+            )
+        })?;
+        let digest = digest_domain_json("commonkit.filesystem-resource-payload.v1", &record.intent)
+            .map_err(|_| {
+                failure(
+                    "operation_payload_mismatch",
+                    "durable resource payload cannot be verified",
+                )
+            })?;
+        if record.operation_id != operation.id
+            || digest != operation.payload_digest
+            || operation.resource.managed_path.as_deref() != Some(record.intent.path().as_str())
+        {
+            return Err(failure(
+                "operation_payload_mismatch",
+                "durable resource payload does not match the plan",
+            ));
+        }
+        self.resources
+            .insert(operation.id.clone(), record.intent.clone());
+        Ok(record.intent)
+    }
+
+    fn is_semantic(operation: &Operation) -> bool {
+        matches!(
+            operation.resource.resource_type.as_str(),
+            "directory" | "symlink" | "removal"
+        )
+    }
+}
+
+impl FileAdapter {
+    fn prepare_semantic(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let intent = self.semantic(operation)?;
+        let observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
+            .map_err(|_| failure("inspect_failed", "could not inspect managed resource"))?;
+        let digest = semantic_digest(&observed)
+            .map_err(|_| failure("digest_failed", "could not digest managed resource"))?;
+        if digest != operation.before_digest {
+            return Err(failure(
+                "preimage_changed",
+                "managed resource changed after planning",
+            ));
+        }
+        let durable = persist_preimage(&self.artifacts, observed)
+            .map_err(|_| failure("backup_failed", "could not persist resource preimage"))?;
+        write_record(
+            &self.state,
+            &backup_record_path(&operation.id),
+            &SemanticBackupRecord {
+                operation_id: operation.id.clone(),
+                before_digest: operation.before_digest.clone(),
+                preimage: durable,
+            },
+        )
+        .map_err(|_| failure("backup_failed", "could not persist resource backup record"))
+    }
+
+    fn apply_semantic(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let intent = self.semantic(operation)?;
+        validate_no_symlink_ancestors(&self.target_root, intent.path().as_str())
+            .map_err(|_| failure("unsafe_path", "managed resource has a symlink ancestor"))?;
+        let path = self.target_root.join(intent.path().as_str());
+        apply_intent(&path, &intent)
+            .map_err(|_| failure("apply_failed", "could not materialize managed resource"))
+    }
+
+    fn verify_semantic(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let intent = self.semantic(operation)?;
+        let actual = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
+            .map_err(|_| failure("verify_failed", "could not inspect managed resource"))?;
+        let digest = semantic_digest(&actual)
+            .map_err(|_| failure("verify_failed", "could not digest managed resource"))?;
+        if digest == operation.after_digest {
+            Ok(())
+        } else {
+            Err(failure("verify_mismatch", "managed resource differs"))
+        }
+    }
+
+    fn rollback_semantic(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let intent = self.semantic(operation)?;
+        let backup: SemanticBackupRecord =
+            read_record(&self.state, &backup_record_path(&operation.id)).map_err(|_| {
+                failure(
+                    "rollback_backup_missing",
+                    "resource backup record is missing",
+                )
+            })?;
+        if backup.operation_id != operation.id || backup.before_digest != operation.before_digest {
+            return Err(failure(
+                "rollback_backup_mismatch",
+                "resource backup does not match operation",
+            ));
+        }
+        let preimage = load_preimage(&self.artifacts, backup.preimage).map_err(|_| {
+            failure(
+                "rollback_backup_mismatch",
+                "resource backup artifact is invalid",
+            )
+        })?;
+        if semantic_digest(&preimage).map_err(|_| {
+            failure(
+                "rollback_backup_mismatch",
+                "resource backup cannot be digested",
+            )
+        })? != operation.before_digest
+        {
+            return Err(failure(
+                "rollback_backup_mismatch",
+                "resource backup digest differs",
+            ));
+        }
+        validate_no_symlink_ancestors(&self.target_root, intent.path().as_str())
+            .map_err(|_| failure("unsafe_path", "managed resource has a symlink ancestor"))?;
+        let restore_path = self.target_root.join(intent.path().as_str());
+        if let ResourcePreimage::File { content, mode } = &preimage {
+            remove_entry(&restore_path)
+                .map_err(|_| failure("rollback_failed", "could not clear managed resource"))?;
+            let bytes = self.artifacts.load(content).map_err(|_| {
+                failure(
+                    "rollback_backup_mismatch",
+                    "resource backup artifact is invalid",
+                )
+            })?;
+            if let Some(parent) = restore_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| failure("rollback_failed", "could not create resource parent"))?;
+            }
+            std::fs::write(&restore_path, bytes)
+                .map_err(|_| failure("rollback_failed", "could not restore managed file"))?;
+            set_mode(&restore_path, *mode)
+                .map_err(|_| failure("rollback_failed", "could not restore managed file mode"))?;
+            return Ok(());
+        }
+        restore_preimage(&restore_path, &preimage)
+            .map_err(|_| failure("rollback_failed", "could not restore managed resource"))
+    }
 }
 
 impl Adapter for FileAdapter {
@@ -233,6 +500,9 @@ impl Adapter for FileAdapter {
     }
 
     fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        if Self::is_semantic(operation) {
+            return self.prepare_semantic(operation);
+        }
         let managed = self.managed(operation)?;
         let observed = read_optional(&self.target, managed.path.as_path())
             .map_err(|_| failure("inspect_failed", "could not inspect managed file"))?;
@@ -270,6 +540,9 @@ impl Adapter for FileAdapter {
     }
 
     fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        if Self::is_semantic(operation) {
+            return self.apply_semantic(operation);
+        }
         let managed = self.managed(operation)?;
         let content = self.artifacts.load(&managed.content).map_err(|_| {
             failure(
@@ -282,6 +555,9 @@ impl Adapter for FileAdapter {
     }
 
     fn verify(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        if Self::is_semantic(operation) {
+            return self.verify_semantic(operation);
+        }
         let managed = self.managed(operation)?;
         let actual = read_optional(&self.target, managed.path.as_path())
             .map_err(|_| failure("verify_failed", "could not read managed file"))?
@@ -296,6 +572,9 @@ impl Adapter for FileAdapter {
     }
 
     fn rollback(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        if Self::is_semantic(operation) {
+            return self.rollback_semantic(operation);
+        }
         let managed = self.managed(operation)?;
         let backup: BackupRecord = read_record(&self.state, &backup_record_path(&operation.id))
             .map_err(|_| {
@@ -344,6 +623,225 @@ impl Adapter for FileAdapter {
         }
         .map_err(|_| failure("rollback_failed", "could not restore managed file"))
     }
+}
+
+fn validate_semantic_intent(intent: &FilesystemIntent) -> Result<(), FileAdapterError> {
+    let path = NormalizedManagedPath::parse(intent.path().as_str().to_owned())?;
+    if let FilesystemIntent::Symlink { target, .. } = intent {
+        SafeSymlinkTarget::parse(&path, target.as_str().to_owned())?;
+    }
+    Ok(())
+}
+
+fn desired_preimage(intent: &FilesystemIntent) -> ResourcePreimage {
+    match intent {
+        FilesystemIntent::Directory { mode, .. } => ResourcePreimage::Directory {
+            mode: mode.as_ref().map(FileMode::value),
+        },
+        FilesystemIntent::Symlink { target, .. } => ResourcePreimage::Symlink {
+            target: target.as_str().to_owned(),
+        },
+        FilesystemIntent::Remove { .. } => ResourcePreimage::Absent,
+        FilesystemIntent::File { content, mode, .. } => ResourcePreimage::File {
+            content: content.clone(),
+            mode: mode.as_ref().map(FileMode::value),
+        },
+    }
+}
+
+fn semantic_digest(
+    value: &ResourcePreimage,
+) -> Result<Option<Sha256Digest>, commonkit_contracts::ContractError> {
+    match value {
+        ResourcePreimage::Absent => Ok(None),
+        ResourcePreimage::File { content, mode } => digest_domain_json(
+            "commonkit.filesystem-resource-state.v1",
+            &("file", &content.digest, mode),
+        )
+        .map(Some),
+        ResourcePreimage::Directory { mode } => digest_domain_json(
+            "commonkit.filesystem-resource-state.v1",
+            &("directory", mode),
+        )
+        .map(Some),
+        ResourcePreimage::Symlink { target } => digest_domain_json(
+            "commonkit.filesystem-resource-state.v1",
+            &("symlink", target),
+        )
+        .map(Some),
+    }
+}
+
+fn inspect_resource(
+    directory: &Dir,
+    artifacts: &ArtifactStore,
+    path: &str,
+) -> Result<ResourcePreimage, FileAdapterError> {
+    let path = Path::new(path);
+    let metadata = match directory.symlink_metadata(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ResourcePreimage::Absent);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = directory.read_link(path)?;
+        return Ok(ResourcePreimage::Symlink {
+            target: target.to_string_lossy().into_owned(),
+        });
+    }
+    let mode = portable_mode(&metadata);
+    if metadata.is_dir() {
+        return Ok(ResourcePreimage::Directory { mode });
+    }
+    if metadata.is_file() {
+        let bytes = read_optional(directory, path)?.ok_or(FileAdapterError::MissingStateEntry)?;
+        let content = artifacts.put(&bytes, ContentSensitivity::LocalSensitive)?;
+        return Ok(ResourcePreimage::File { content, mode });
+    }
+    Err(FileAdapterError::UnsupportedResource)
+}
+
+#[cfg(unix)]
+fn portable_mode(metadata: &cap_std::fs::Metadata) -> Option<u32> {
+    use cap_std::fs::MetadataExt;
+    Some(metadata.mode() & 0o7777)
+}
+#[cfg(not(unix))]
+fn portable_mode(_metadata: &cap_std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+fn persist_preimage(
+    artifacts: &ArtifactStore,
+    value: ResourcePreimage,
+) -> Result<ResourcePreimage, FileAdapterError> {
+    if let ResourcePreimage::File { content, .. } = &value {
+        artifacts.load(content)?;
+    }
+    Ok(value)
+}
+fn load_preimage(
+    artifacts: &ArtifactStore,
+    value: ResourcePreimage,
+) -> Result<ResourcePreimage, FileAdapterError> {
+    persist_preimage(artifacts, value)
+}
+
+fn validate_no_symlink_ancestors(root: &Path, relative: &str) -> Result<(), std::io::Error> {
+    let mut current = root.to_path_buf();
+    let components: Vec<_> = Path::new(relative).components().collect();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "symlink ancestor",
+                ));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "non-directory ancestor",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn remove_entry(path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            std::fs::remove_file(path)
+        }
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir(path),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported resource type",
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn apply_intent(path: &Path, intent: &FilesystemIntent) -> Result<(), std::io::Error> {
+    match intent {
+        FilesystemIntent::Directory { mode, .. } => {
+            match std::fs::symlink_metadata(path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => {
+                    remove_entry(path)?;
+                    std::fs::create_dir_all(path)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::create_dir_all(path)?
+                }
+                Err(error) => return Err(error),
+            }
+            set_mode(path, mode.as_ref().map(FileMode::value))
+        }
+        FilesystemIntent::Symlink { target, .. } => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            remove_entry(path)?;
+            create_symlink(target.as_str(), path)
+        }
+        FilesystemIntent::Remove { .. } => remove_entry(path),
+        FilesystemIntent::File { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "semantic file registration is not implemented",
+        )),
+    }
+}
+
+fn restore_preimage(path: &Path, preimage: &ResourcePreimage) -> Result<(), std::io::Error> {
+    remove_entry(path)?;
+    match preimage {
+        ResourcePreimage::Absent => Ok(()),
+        ResourcePreimage::Directory { mode } => {
+            std::fs::create_dir_all(path)?;
+            set_mode(path, *mode)
+        }
+        ResourcePreimage::Symlink { target } => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            create_symlink(target, path)
+        }
+        ResourcePreimage::File { .. } => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "file artifact requires adapter access",
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: Option<u32>) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(mode) = mode {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: Option<u32>) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &str, path: &Path) -> Result<(), std::io::Error> {
+    std::os::unix::fs::symlink(target, path)
+}
+#[cfg(windows)]
+fn create_symlink(target: &str, path: &Path) -> Result<(), std::io::Error> {
+    std::os::windows::fs::symlink_file(target, path)
 }
 
 fn read_optional(directory: &Dir, path: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
@@ -469,6 +967,10 @@ pub enum FileAdapterError {
     MissingStateEntry,
     #[error("durable state entry is not an ordinary file")]
     UnsafeStateEntry,
+    #[error("filesystem resource type is unsupported")]
+    UnsupportedResource,
+    #[error(transparent)]
+    Resource(#[from] crate::ResourceError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
