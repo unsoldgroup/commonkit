@@ -38,3 +38,7 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo fmt --all -- --check
+      - if: runner.os == 'Linux'
+        run: cargo run -p commonkit-contracts --bin generate-schemas -- schemas
+      - if: runner.os == 'Linux'
+        run: git diff --exit-code -- schemas

@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/commonkit-contracts",
+  "crates/commonkit-config",
   "crates/commonkit-core",
 ]
 resolver = "2"
@@ -15,4 +16,8 @@ rust-version = "1.85"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_jcs = "0.2"
+schemars = "1.2"
+sha2 = "0.10"
+regex = "1"
 thiserror = "2"
