@@ -6,6 +6,38 @@ Tested provider contract: APM `0.25.0`, tag commit `d73e6ac3645d2b9c5c813095e2e5
 Supersedes: Agent packaging and broad native-agent compilation portions of `docs/scopes/commonkit-tauri-v1.md` where they conflict with ADR 0005  
 Does not supersede: CommonKit composition, target, policy-floor, reconciliation, credential, relay, snapshot, service, desktop, or platform scope
 
+## Real release verification (2026-07-18)
+
+CommonKit's opt-in compatibility test was exercised with Microsoft's official
+`apm-darwin-arm64.tar.gz` release asset. The archive SHA-256 published by the
+GitHub release and independently verified before extraction is
+`8b46963bf881d1369c1ee30f6099fba54d13379a8860ec190cdcaf50cf4586a9`.
+The binary reports `Agent Package Manager (APM) CLI version 0.25.0 (d73e6ac)`.
+
+Observed behavior relevant to the adapter:
+
+- Frozen install reads the committed lockfile from the disposable project.
+- Compilation may emit Codex context as root `AGENTS.md`; Claude instructions
+  may remain under `.claude/rules/` without a duplicate root `CLAUDE.md`.
+- CI audit performs a cache-only install replay. Its temporary directory must
+  be outside the project tree; APM refuses an in-tree `TMPDIR`.
+- The `.apm/` project tree is a provider input. CommonKit stages it, rejects
+  symlinks, and binds its deterministic tree digest into provider inputs.
+
+After checksum verification, run:
+
+```sh
+COMMONKIT_APM_025_BIN=/absolute/path/to/apm \
+  cargo test -p commonkit-adapters --test apm_provider \
+  real_apm_025_release_materializes_only_in_disposable_staging_when_enabled
+```
+
+The real-binary gate currently covers macOS arm64. Linux arm64/x86_64, macOS
+x86_64, and Windows x86_64 remain release-matrix gates; upstream publishes no
+Windows arm64 asset for 0.25.0. Local-path dependency trees outside the
+committed project `.apm/` tree remain unsupported until supplied as an
+explicit digest-bound source bundle. There is no live-target install fallback.
+
 ## Outcome
 
 CommonKit remains the orchestrator and transactional reconciler for complete developer environments. A version-pinned APM CLI is the preferred provider for portable agent context. APM owns package resolution, locking, package policy, compilation formats, package audit, and package provenance. CommonKit owns target policy and every live-target mutation.

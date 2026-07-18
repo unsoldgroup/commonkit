@@ -235,6 +235,7 @@ pub struct ProviderContext {
 #[derive(Debug, Clone)]
 pub struct ProviderWorkspace {
     staging_root: PathBuf,
+    scratch_root: PathBuf,
 }
 
 impl ProviderWorkspace {
@@ -246,18 +247,40 @@ impl ProviderWorkspace {
         if !staging_root.is_dir() {
             return Err(ProviderContractError::InvalidStagingRoot);
         }
+        let scratch_root = staging_root.with_extension("provider-scratch");
         for root in live_and_protected_roots {
             let root = root.canonicalize()?;
-            if staging_root.starts_with(&root) || root.starts_with(&staging_root) {
+            if staging_root.starts_with(&root)
+                || root.starts_with(&staging_root)
+                || scratch_root.starts_with(&root)
+                || root.starts_with(&scratch_root)
+            {
                 return Err(ProviderContractError::StagingOverlapsLiveRoot);
             }
         }
         set_private_directory(&staging_root)?;
-        Ok(Self { staging_root })
+        match fs::create_dir(&scratch_root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if fs::read_dir(&scratch_root)?.next().is_some() {
+                    return Err(ProviderContractError::InvalidStagingRoot);
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+        set_private_directory(&scratch_root)?;
+        Ok(Self {
+            staging_root,
+            scratch_root,
+        })
     }
 
     pub fn staging_root(&self) -> &Path {
         &self.staging_root
+    }
+
+    pub fn scratch_root(&self) -> &Path {
+        &self.scratch_root
     }
 }
 

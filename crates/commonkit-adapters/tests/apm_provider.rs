@@ -93,11 +93,12 @@ fn pinned_apm_materializes_claude_and_codex_outside_the_live_target() {
         &format!(
             r##"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
-if [ "$1" = "--version" ]; then printf 'apm 0.25.0\n'; exit 0; fi
+if [ "$1" = "--version" ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\n'; exit 0; fi
 if [ "$1" = "compile" ]; then
   mkdir -p .claude .codex
   printf 'claude context\n' > .claude/CLAUDE.md
   printf 'codex context\n' > .codex/AGENTS.md
+  printf 'root codex context\n' > AGENTS.md
 fi
 if [ "$1" = "audit" ]; then printf '{{"ok":true}}\n'; fi
 "##,
@@ -123,7 +124,13 @@ if [ "$1" = "audit" ]; then printf '{{"ok":true}}\n'; fi
         .materialize(&context(), &workspace, &artifacts)
         .unwrap();
     state.verify().unwrap();
-    assert_eq!(state.resources.len(), 2);
+    assert_eq!(state.resources.len(), 3);
+    assert!(
+        state
+            .resources
+            .iter()
+            .any(|resource| resource.intent.path().as_str() == "home/AGENTS.md")
+    );
     assert!(state.resources.iter().all(|resource| {
         resource.provenance.provider_id.as_str() == "apm"
             && resource.provenance.provider_version == "0.25.0"
@@ -168,7 +175,7 @@ fn version_mismatch_is_actionable_and_stops_before_compilation() {
     write_executable(
         &executable,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'apm 0.26.0\\n'\n",
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'Agent Package Manager (APM) CLI version 0.26.0 (fixture)\\n'\n",
             log.display()
         ),
     );
@@ -186,5 +193,117 @@ fn version_mismatch_is_actionable_and_stops_before_compilation() {
     assert!(error.contains("found 0.26.0"), "{error}");
     assert_eq!(fs::read_to_string(log).unwrap(), "--version\n");
 
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn version_check_rejects_incidental_matching_numbers() {
+    let root = fixture("version-format");
+    let executable = root.join("apm");
+    write_executable(&executable, "#!/bin/sh\nprintf 'wrapper build 0.25.0\\n'\n");
+    let provider = configured(&root, executable);
+    let stage = root.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, &[]).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+    let error = provider
+        .materialize(&context(), &workspace, &artifacts)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unrecognized version"), "{error}");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn project_sources_are_digest_bound_and_symlinks_fail_closed() {
+    let root = fixture("sources");
+    let executable = root.join("apm");
+    write_executable(
+        &executable,
+        "#!/bin/sh\nprintf 'Agent Package Manager (APM) CLI version 0.25.0 (test)\\n'\n",
+    );
+    fs::create_dir_all(root.join(".apm/instructions")).unwrap();
+    fs::write(
+        root.join(".apm/instructions/base.instructions.md"),
+        "first\n",
+    )
+    .unwrap();
+    let provider = configured(&root, executable);
+    let first = provider.inspect_inputs(&context()).unwrap();
+    fs::write(
+        root.join(".apm/instructions/base.instructions.md"),
+        "second\n",
+    )
+    .unwrap();
+    let second = provider.inspect_inputs(&context()).unwrap();
+    assert_ne!(first.digest(), second.digest());
+    assert_ne!(
+        first.input_digests["projectSources"],
+        second.input_digests["projectSources"]
+    );
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(
+            "base.instructions.md",
+            root.join(".apm/instructions/linked.md"),
+        )
+        .unwrap();
+        let error = provider.inspect_inputs(&context()).unwrap_err().to_string();
+        assert!(error.contains("symlink"), "{error}");
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn real_apm_025_release_materializes_only_in_disposable_staging_when_enabled() {
+    let Some(executable) = std::env::var_os("COMMONKIT_APM_025_BIN").map(PathBuf::from) else {
+        eprintln!("skipped: set COMMONKIT_APM_025_BIN to the checksum-verified APM 0.25.0 binary");
+        return;
+    };
+    let root = fixture("real-release");
+    fs::create_dir_all(root.join(".apm/instructions")).unwrap();
+    fs::write(root.join("apm.yml"), "name: commonkit-real-spike\nversion: 1.0.0\ntargets: [claude, codex]\nincludes:\n  - .apm/instructions/\ndependencies:\n  apm: []\n  mcp: []\n").unwrap();
+    fs::write(root.join("apm.lock.yaml"), "lockfile_version: '1'\ngenerated_at: '2026-07-18T00:00:00+00:00'\napm_version: 0.25.0\ndependencies: []\ndeployments: []\n").unwrap();
+    fs::write(root.join("apm-policy.yml"), "version: 1\n").unwrap();
+    fs::write(root.join(".apm/instructions/base.instructions.md"), "---\ndescription: CommonKit compatibility fixture\napplyTo: \"**\"\n---\n# Fixture\n\nRemain in staging.\n").unwrap();
+    let live = root.join("live");
+    let stage = root.join("stage");
+    fs::create_dir_all(&live).unwrap();
+    fs::create_dir_all(&stage).unwrap();
+    let provider = ApmProvider::new(ApmProviderConfig {
+        executable,
+        version: ExactProviderVersion::parse("0.25.0").unwrap(),
+        manifest: root.join("apm.yml"),
+        lockfile: root.join("apm.lock.yaml"),
+        policy: root.join("apm-policy.yml"),
+        targets: vec!["claude".into(), "codex".into()],
+        managed_root: NormalizedManagedPath::parse("home").unwrap(),
+    })
+    .unwrap();
+    let workspace = ProviderWorkspace::open(&stage, &[live.clone()]).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+    let state = provider
+        .materialize(&context(), &workspace, &artifacts)
+        .unwrap();
+    state.verify().unwrap();
+    assert!(
+        state
+            .resources
+            .iter()
+            .any(|resource| resource.intent.path().as_str() == "home/AGENTS.md")
+    );
+    assert!(
+        state.resources.iter().any(|resource| resource
+            .intent
+            .path()
+            .as_str()
+            .starts_with("home/.claude/"))
+    );
+    assert_eq!(
+        fs::read_dir(&live).unwrap().count(),
+        0,
+        "APM touched the live target"
+    );
     fs::remove_dir_all(root).unwrap();
 }
