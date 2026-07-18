@@ -88,10 +88,13 @@ test("updater manifest uses Tauri platform keys and signed payloads", async () =
       ["CommonKit.nsis.zip", "windows"],
       ["CommonKit.nsis.zip.sig", "windows-signature"],
     ]) await writeFile(join(root, name), contents);
+    const notes = join(root, "release-notes.md");
+    await writeFile(notes, "Security and reliability improvements.");
     await execFileAsync(process.execPath, [
       new URL("../scripts/assemble-updater-manifest.mjs", import.meta.url).pathname,
       root,
       "v1.2.3",
+      notes,
     ], { env: { ...process.env, COMMONKIT_RELEASE_DOWNLOAD_BASE: "https://releases.example/v1.2.3" } });
     const manifest = JSON.parse(await readFile(join(root, "latest.json"), "utf8"));
     assert.deepEqual(Object.keys(manifest.platforms).sort(), [
@@ -101,6 +104,7 @@ test("updater manifest uses Tauri platform keys and signed payloads", async () =
       "windows-x86_64",
     ]);
     assert.equal(manifest.platforms["darwin-aarch64"].signature, "mac-signature");
+    assert.equal(manifest.notes, "Security and reliability improvements.");
     assert.deepEqual(
       manifest.platforms["darwin-aarch64"],
       manifest.platforms["darwin-x86_64"],
