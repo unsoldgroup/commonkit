@@ -1,5 +1,48 @@
 use commonkit_relay::{DEFAULT_TOOLS_TTL_MS, ManagedBy, RelayConfig, RelayConfigError, RelayMode};
 use serde_json::json;
+use std::process::Command;
+
+#[test]
+fn preserved_node_fixture_has_normalized_rust_parity() {
+    let legacy = serde_json::from_str(include_str!("fixtures/node-legacy-config.json"))
+        .expect("legacy fixture");
+    let expected: RelayConfig =
+        serde_json::from_str(include_str!("fixtures/node-legacy-expected.json"))
+            .expect("expected fixture");
+    assert_eq!(
+        RelayConfig::normalize(legacy).expect("normalized"),
+        expected
+    );
+}
+
+#[test]
+fn live_preserved_node_normalizer_has_semantic_parity() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let module = root.join("packages/mcp-local-relay/dist/src/config.js");
+    if !module.is_file() {
+        return;
+    }
+    let fixture = root.join("crates/commonkit-relay/tests/fixtures/node-legacy-config.json");
+    let script = r#"import {readFile} from 'node:fs/promises'; import {normalizeConfig} from './packages/mcp-local-relay/dist/src/config.js'; const raw=JSON.parse(await readFile(process.argv[1],'utf8')); process.stdout.write(JSON.stringify(normalizeConfig(raw)));"#;
+    let output = Command::new("node")
+        .current_dir(&root)
+        .args([
+            "--input-type=module",
+            "--eval",
+            script,
+            fixture.to_str().expect("fixture path"),
+        ])
+        .output()
+        .expect("run preserved Node normalizer");
+    assert!(output.status.success(), "preserved Node normalizer failed");
+    let node_value = serde_json::from_slice(&output.stdout).expect("Node output");
+    let rust_from_node = RelayConfig::normalize(node_value).expect("normalize Node output");
+    let rust_direct = RelayConfig::normalize(
+        serde_json::from_str(include_str!("fixtures/node-legacy-config.json")).expect("fixture"),
+    )
+    .expect("normalize fixture");
+    assert_eq!(rust_from_node, rust_direct);
+}
 
 #[test]
 fn normalizes_minimal_legacy_config_without_self_upgrade() {

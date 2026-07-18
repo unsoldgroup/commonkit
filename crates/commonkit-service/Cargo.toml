@@ -18,6 +18,7 @@ commonkit-adapters = { path = "../commonkit-adapters" }
 commonkit-core = { path = "../commonkit-core" }
 commonkit-platform = { path = "../commonkit-platform" }
 commonkit-reconcile = { path = "../commonkit-reconcile" }
+commonkit-relay = { path = "../commonkit-relay" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

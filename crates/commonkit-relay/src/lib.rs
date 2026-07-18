@@ -12,10 +12,17 @@ use thiserror::Error;
 use url::Url;
 
 mod runtime;
+mod transaction;
+mod upstream_http;
 pub use runtime::{
     DownstreamRequest, PeerAddress, RelayErrorCode, RelayHealth, RelayRuntime, RuntimeNotification,
     UpstreamError, UpstreamManager,
 };
+pub use transaction::{
+    LegacyRelayError, LegacyRelayReader, RelayAdapter, RelayLifecycleControl, RelayMutationInputs, RelayPlanError,
+    RelayPlanRequest, plan_relay_operation,
+};
+pub use upstream_http::HttpUpstreamManager;
 
 pub const DEFAULT_PORT: u16 = 3764;
 pub const DEFAULT_MCP_PATH: &str = "/mcp";

@@ -61,7 +61,27 @@ enum Command {
     /// Export redacted diagnostics from the local daemon.
     Diagnostics,
     /// Inspect or configure the persistent MCP relay.
-    Relay,
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum RelayCommand {
+    /// Read relay configuration and managed-upstream status.
+    Status,
+    /// Plan reconciliation from a versioned service request document.
+    Reconcile {
+        request: PathBuf,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    /// Request a controlled relay runtime restart.
+    Restart {
+        #[arg(long)]
+        confirmed: bool,
+    },
 }
 
 fn main() {
@@ -131,20 +151,158 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 "confirmation_required: pass --confirmed after reviewing the operation".into(),
             );
         }
-        Command::Sync { confirmed: true }
-        | Command::Apply {
-            confirmed: true, ..
+        Command::Sync { confirmed: true } => print_daemon(daemon_control(
+            "POST",
+            "/control/v1/sync/plan",
+            Some(
+                json!({"confirmed":true,"confirmationId":"cli-sync","idempotencyKey":nonce("sync")}),
+            ),
+            None,
+        )?)?,
+        Command::Apply {
+            plan_id,
+            confirmed: true,
+        } => print_daemon(daemon_control(
+            "POST",
+            &format!("/control/v1/plans/{plan_id}/apply"),
+            Some(json!({"confirmed":true,"confirmationId":"cli-apply"})),
+            Some(nonce("apply")),
+        )?)?,
+        Command::Rollback {
+            run_id,
+            confirmed: true,
+        } => print_daemon(daemon_control(
+            "POST",
+            "/control/v1/rollback",
+            Some(
+                json!({"runId":run_id,"confirmed":true,"confirmationId":"cli-rollback","idempotencyKey":nonce("rollback")}),
+            ),
+            None,
+        )?)?,
+        Command::Verify => print_daemon(daemon_control(
+            "POST",
+            "/control/v1/verify",
+            Some(json!({"targetId":null,"pointer":null})),
+            None,
+        )?)?,
+        Command::Schedule => {
+            print_daemon(daemon_control("GET", "/control/v1/schedule", None, None)?)?
         }
-        | Command::Rollback {
-            confirmed: true, ..
+        Command::Diagnostics => print_daemon(daemon_control(
+            "GET",
+            "/control/v1/diagnostics",
+            None,
+            None,
+        )?)?,
+        Command::Diff => {
+            return Err("plan_required: diff requires an explicit durable plan identifier".into());
         }
-        | Command::Diff
-        | Command::Verify
-        | Command::Schedule
-        | Command::Diagnostics
-        | Command::Relay => {
-            return Err("capability_unavailable: the running CommonKit daemon does not yet expose this command; update or enable the required capability".into());
+        Command::Relay { command } => run_relay(command)?,
+    }
+    Ok(())
+}
+
+fn nonce(prefix: &str) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |value| value.as_nanos());
+    format!("{prefix}-{}-{now}", std::process::id())
+}
+
+fn daemon_control(
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    idempotency_key: Option<String>,
+) -> Result<Value, Box<dyn Error>> {
+    let paths = AppPaths::discover()?;
+    let discovery_bytes = std::fs::read(paths.state.join("daemon.json"))
+        .map_err(|_| "daemon_unavailable: CommonKit daemon discovery is unavailable")?;
+    let discovery: commonkit_service::DaemonDiscovery = serde_json::from_slice(&discovery_bytes)?;
+    let token = commonkit_service::ControlToken::load(&paths.config.join("control.token"))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let url = format!("http://127.0.0.1:{}{path}", discovery.port);
+    let mut request = if method == "GET" {
+        client.get(url)
+    } else {
+        client.post(url)
+    }
+    .bearer_auth(token.expose_for_client());
+    if let Some(key) = idempotency_key {
+        request = request.header("idempotency-key", key);
+    }
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send()?;
+    let status = response.status();
+    let value: Value = response.json()?;
+    if !status.is_success() {
+        let code = value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .unwrap_or("daemon_error");
+        return Err(format!("{code}: CommonKit daemon rejected the request").into());
+    }
+    Ok(value)
+}
+
+fn print_daemon(value: Value) -> Result<(), Box<dyn Error>> {
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn run_relay(command: RelayCommand) -> Result<(), Box<dyn Error>> {
+    let (method, path, body) = match command {
+        RelayCommand::Status => ("GET", "/control/v1/relay", None),
+        RelayCommand::Reconcile {
+            confirmed: false, ..
         }
+        | RelayCommand::Restart { confirmed: false } => {
+            return Err(
+                "confirmation_required: pass --confirmed after reviewing the operation".into(),
+            );
+        }
+        RelayCommand::Reconcile {
+            request,
+            confirmed: true,
+        } => {
+            let mut value: Value = serde_json::from_slice(&std::fs::read(request)?)?;
+            value["confirmed"] = Value::Bool(true);
+            ("POST", "/control/v1/relay/reconcile", Some(value))
+        }
+        RelayCommand::Restart { confirmed: true } => (
+            "POST",
+            "/control/v1/relay/restart",
+            Some(json!({"confirmed": true})),
+        ),
+    };
+    let paths = AppPaths::discover()?;
+    let discovery: commonkit_service::DaemonDiscovery =
+        serde_json::from_slice(&std::fs::read(paths.state.join("daemon.json"))?)?;
+    let token = commonkit_service::ControlToken::load(&paths.config.join("control.token"))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let url = format!("http://127.0.0.1:{}{}", discovery.port, path);
+    let request = if method == "GET" {
+        client.get(url)
+    } else {
+        client.post(url)
+    }
+    .bearer_auth(token.expose_for_client());
+    let response = if let Some(body) = body {
+        request.json(&body).send()?
+    } else {
+        request.send()?
+    };
+    let status = response.status();
+    let value: Value = response.json()?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    if !status.is_success() {
+        return Err(format!("daemon_request_failed: HTTP {}", status.as_u16()).into());
     }
     Ok(())
 }

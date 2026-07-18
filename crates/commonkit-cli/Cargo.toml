@@ -15,4 +15,7 @@ clap.workspace = true
 commonkit-config = { path = "../commonkit-config" }
 commonkit-contracts = { path = "../commonkit-contracts" }
 commonkit-platform = { path = "../commonkit-platform" }
+commonkit-service = { path = "../commonkit-service" }
 serde_json.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+serde.workspace = true

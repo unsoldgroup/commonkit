@@ -144,6 +144,36 @@ pub struct ConsentInput {
     pub idempotency_key: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RelayReconcileInput {
+    pub confirmed: bool,
+    pub confirmation_id: String,
+    pub idempotency_key: String,
+    pub resolved: Value,
+    pub target_identity_digest: String,
+    pub composed_loadout_digest: String,
+    pub provider_inputs_digest: String,
+    pub policy_digest: String,
+    pub ownership_map_digest: String,
+    pub artifact_set_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CredentialReadinessInput {
+    pub references: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduleInput {
+    pub enabled: bool,
+    pub interval_seconds: Option<u64>,
+    pub confirmed: bool,
+    pub confirmation_id: String,
+}
+
 impl ConsentInput {
     pub fn denied() -> Self {
         Self {
@@ -189,6 +219,57 @@ impl CommonKitMcp {
     )]
     pub async fn export_diagnostics(&self) -> Result<CallToolResult, ErrorData> {
         tool_result(self.backend.get("/control/v1/diagnostics").await)
+    }
+
+    #[tool(
+        name = "commonkit_credentials_readiness",
+        description = "Inspect credential-reference availability without resolving or exposing secret values."
+    )]
+    pub async fn credentials_readiness(
+        &self,
+        Parameters(input): Parameters<CredentialReadinessInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/credentials/readiness",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_schedule_status",
+        description = "Read the persistent drift-check schedule without mutation."
+    )]
+    pub async fn schedule_status(&self) -> Result<CallToolResult, ErrorData> {
+        tool_result(self.backend.get("/control/v1/schedule").await)
+    }
+
+    #[tool(
+        name = "commonkit_schedule_update",
+        description = "Enable or disable persistent drift checks at a bounded interval."
+    )]
+    pub async fn schedule_update(
+        &self,
+        Parameters(input): Parameters<ScheduleInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !input.confirmed {
+            return Ok(CallToolResult::structured_error(json!({
+                "code": "confirmation_required",
+                "message": "Explicit user confirmation is required",
+                "retryable": false,
+            })));
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/schedule",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
     }
 
     #[tool(
@@ -241,6 +322,44 @@ impl CommonKitMcp {
             self.backend
                 .post(
                     "/control/v1/verify",
+                    serde_json::to_value(&input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_relay_status",
+        description = "Inspect the persistent MCP relay and its managed upstreams without mutation."
+    )]
+    pub async fn relay_status(&self) -> Result<CallToolResult, ErrorData> {
+        tool_result(self.backend.get("/control/v1/relay").await)
+    }
+
+    #[tool(
+        name = "commonkit_relay_reconcile",
+        description = "Plan reconciliation of portable MCP declarations into the persistent relay. Requires explicit user confirmation."
+    )]
+    pub async fn relay_reconcile(
+        &self,
+        Parameters(input): Parameters<RelayReconcileInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !input.confirmed {
+            return Ok(input_error("confirmation_required", "Explicit user confirmation is required"));
+        }
+        if input.confirmation_id.is_empty() || input.idempotency_key.is_empty() {
+            return Ok(input_error("invalid_input", "Confirmation fields are invalid"));
+        }
+        if serde_json::to_vec(&input).is_ok_and(|bytes| bytes.len() > 512 * 1024) {
+            return Ok(input_error("invalid_input", "Relay request exceeds the safe size"));
+        }
+        if input.resolved.is_null() {
+            return Ok(input_error("invalid_input", "Resolved MCP declarations are required"));
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/relay/reconcile",
                     serde_json::to_value(&input).unwrap_or(Value::Null),
                 )
                 .await,

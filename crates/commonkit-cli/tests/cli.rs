@@ -124,14 +124,14 @@ fn publishes_the_complete_v1_command_surface() {
 }
 
 #[test]
-fn unavailable_commands_fail_with_a_stable_actionable_code() {
+fn headless_commands_contact_the_daemon_and_fail_actionably_when_it_is_absent() {
     let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
         .arg("verify")
         .output()
         .expect("verify");
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).expect("UTF-8");
-    assert!(error.contains("capability_unavailable"));
+    assert!(error.contains("daemon_unavailable"));
     assert!(error.contains("CommonKit daemon"));
 }
 

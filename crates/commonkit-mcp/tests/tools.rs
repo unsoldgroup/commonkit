@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use commonkit_mcp::{
     ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend, ReadInput,
+    RelayReconcileInput,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
@@ -39,11 +40,16 @@ fn publishes_stable_initial_tool_names() {
         [
             "commonkit_apply_plan",
             "commonkit_compose",
+            "commonkit_credentials_readiness",
             "commonkit_explain",
             "commonkit_export_diagnostics",
             "commonkit_get_status",
             "commonkit_plan_sync",
+            "commonkit_relay_reconcile",
+            "commonkit_relay_status",
             "commonkit_rollback",
+            "commonkit_schedule_status",
+            "commonkit_schedule_update",
             "commonkit_snapshot_create",
             "commonkit_snapshot_restore",
             "commonkit_verify",
@@ -100,6 +106,14 @@ async fn every_mutation_tool_requires_consent_before_backend_execution() {
             "confirmation_required"
         );
     }
+    let denied = server.relay_reconcile(Parameters(RelayReconcileInput {
+        confirmed: false,
+        confirmation_id: "not-confirmed".into(), idempotency_key: "not-confirmed".into(),
+        resolved: json!({}), target_identity_digest: String::new(),
+        composed_loadout_digest: String::new(), provider_inputs_digest: String::new(),
+        policy_digest: String::new(), ownership_map_digest: String::new(), artifact_set_digest: String::new(),
+    })).await.expect("relay denial");
+    assert_eq!(denied.structured_content.expect("structured")["code"], "confirmation_required");
     assert!(backend.applies.lock().expect("applies").is_empty());
     assert!(backend.posts.lock().expect("posts").is_empty());
 }

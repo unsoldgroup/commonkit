@@ -18,15 +18,23 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use commonkit_adapters::FileAdapter;
+use commonkit_adapters::{
+    CredentialReadinessInspector, CredentialReference, FileAdapter,
+    LocalCredentialReadinessInspector,
+};
 use commonkit_contracts::{
-    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan, ReceiptState,
-    RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
+    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan, PlanBindings,
+    ReceiptState, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
     assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, build_plan};
 use commonkit_reconcile::{
     Adapter, PlanStore, PlanStoreError, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
+};
+use commonkit_relay::{
+    HttpUpstreamManager, RelayAdapter, RelayLifecycleControl, RelayMutationInputs,
+    RelayPlanRequest, RelayRuntime, ResolvedMcpDeclarations, converge_provider_mcp,
+    plan_relay_operation,
 };
 use futures_util::StreamExt;
 use rand::RngCore;
@@ -99,7 +107,10 @@ pub struct SchedulerConfig {
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        Self { enabled: false, interval_seconds: 900 }
+        Self {
+            enabled: false,
+            interval_seconds: 900,
+        }
     }
 }
 
@@ -111,24 +122,36 @@ impl SchedulerStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SchedulerError> {
         std::fs::create_dir_all(root.as_ref())?;
         make_private_directory(root.as_ref())?;
-        Ok(Self { path: root.as_ref().join("scheduler.json") })
+        Ok(Self {
+            path: root.as_ref().join("scheduler.json"),
+        })
     }
 
     fn load(&self) -> Result<SchedulerConfig, SchedulerError> {
         match std::fs::symlink_metadata(&self.path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(SchedulerError::UnsafeState),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                Err(SchedulerError::UnsafeState)
+            }
             Ok(_) => Ok(serde_json::from_slice(&std::fs::read(&self.path)?)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SchedulerConfig::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(SchedulerConfig::default())
+            }
             Err(error) => Err(error.into()),
         }
     }
 
     fn save(&self, config: SchedulerConfig) -> Result<(), SchedulerError> {
         let bytes = serde_json::to_vec(&config)?;
-        let temporary = self.path.with_extension(format!("{}.tmp", std::process::id()));
+        let temporary = self
+            .path
+            .with_extension(format!("{}.tmp", std::process::id()));
         let mut options = OpenOptions::new();
         options.create_new(true).write(true);
-        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         let result = (|| {
             let mut file = options.open(&temporary)?;
             file.write_all(&bytes)?;
@@ -136,21 +159,28 @@ impl SchedulerStore {
             std::fs::rename(&temporary, &self.path)?;
             Ok::<_, std::io::Error>(())
         })();
-        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
         result.map_err(Into::into)
     }
 }
 
 #[derive(Debug, Error)]
 pub enum SchedulerError {
-    #[error("scheduler state is not a regular file")] UnsafeState,
-    #[error("scheduler interval must be at least one second")] InvalidInterval,
-    #[error(transparent)] Io(#[from] std::io::Error),
-    #[error(transparent)] Json(#[from] serde_json::Error),
+    #[error("scheduler state is not a regular file")]
+    UnsafeState,
+    #[error("scheduler interval must be at least one second")]
+    InvalidInterval,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
 }
 
 fn make_private_directory(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
@@ -179,19 +209,37 @@ impl<C: DriftChecker> DriftScheduler<C> {
     }
 
     pub fn with_store(
-        checker: Arc<C>, status: Arc<RwLock<ServiceStatus>>, events: EventHub, store: SchedulerStore,
+        checker: Arc<C>,
+        status: Arc<RwLock<ServiceStatus>>,
+        events: EventHub,
+        store: SchedulerStore,
     ) -> Result<Self, SchedulerError> {
         let configuration = store.load()?;
-        Ok(Self { checker, status, events, configuration: std::sync::Mutex::new(configuration), store: Some(store), running: AtomicBool::new(false) })
+        Ok(Self {
+            checker,
+            status,
+            events,
+            configuration: std::sync::Mutex::new(configuration),
+            store: Some(store),
+            running: AtomicBool::new(false),
+        })
     }
 
     pub fn configuration(&self) -> SchedulerConfig {
-        *self.configuration.lock().expect("scheduler configuration lock")
+        *self
+            .configuration
+            .lock()
+            .expect("scheduler configuration lock")
     }
 
     pub fn enable(&self, interval: Duration) -> Result<(), SchedulerError> {
-        if interval.as_secs() == 0 { return Err(SchedulerError::InvalidInterval); }
-        self.update_configuration(SchedulerConfig { enabled: true, interval_seconds: interval.as_secs() })
+        if interval.as_secs() == 0 {
+            return Err(SchedulerError::InvalidInterval);
+        }
+        self.update_configuration(SchedulerConfig {
+            enabled: true,
+            interval_seconds: interval.as_secs(),
+        })
     }
 
     pub fn disable(&self) -> Result<(), SchedulerError> {
@@ -201,22 +249,41 @@ impl<C: DriftChecker> DriftScheduler<C> {
     }
 
     fn update_configuration(&self, next: SchedulerConfig) -> Result<(), SchedulerError> {
-        if let Some(store) = &self.store { store.save(next)?; }
-        *self.configuration.lock().expect("scheduler configuration lock") = next;
+        if let Some(store) = &self.store {
+            store.save(next)?;
+        }
+        *self
+            .configuration
+            .lock()
+            .expect("scheduler configuration lock") = next;
         Ok(())
     }
 
     pub async fn check_now(&self) -> DriftResult {
-        self.try_check_now().await.unwrap_or(DriftResult { state: self.status.read().await.state, code: Some("drift_check_in_progress".into()) })
+        self.try_check_now().await.unwrap_or(DriftResult {
+            state: self.status.read().await.state,
+            code: Some("drift_check_in_progress".into()),
+        })
     }
 
     pub async fn try_check_now(&self) -> Option<DriftResult> {
-        if self.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-            self.events.publish("drift.skipped", serde_json::json!({ "code": "overlap_suppressed" }));
+        if self
+            .running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.events.publish(
+                "drift.skipped",
+                serde_json::json!({ "code": "overlap_suppressed" }),
+            );
             return None;
         }
         struct Reset<'a>(&'a AtomicBool);
-        impl Drop for Reset<'_> { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
         let _reset = Reset(&self.running);
         let result = self.checker.check();
         let checked_at = SystemTime::now()
@@ -321,6 +388,68 @@ struct ApiState {
     authority: String,
     events: EventHub,
     control: ControlPlane,
+    relay_runtime: Arc<ManagedRelayRuntime>,
+}
+
+struct ManagedRelayRuntime {
+    token: String,
+    config_path: PathBuf,
+    runtime: std::sync::Mutex<Option<RelayRuntime<HttpUpstreamManager>>>,
+}
+
+impl ManagedRelayRuntime {
+    fn new(token: String, config_path: PathBuf) -> Self {
+        Self {
+            token,
+            config_path,
+            runtime: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+fn default_relay_runtime(token: &ControlToken) -> Arc<ManagedRelayRuntime> {
+    let config_path = commonkit_platform::AppPaths::discover()
+        .map(|paths| paths.config.join("relay.json"))
+        .unwrap_or_else(|_| PathBuf::from("relay.json"));
+    Arc::new(ManagedRelayRuntime::new(
+        token.expose_for_client().into(),
+        config_path,
+    ))
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
+impl RelayLifecycleControl for ManagedRelayRuntime {
+    fn reload(
+        &self,
+        desired: &commonkit_relay::RelayConfig,
+    ) -> Result<(), commonkit_relay::RelayPlanError> {
+        let manager = HttpUpstreamManager::new(Duration::from_secs(30))
+            .map_err(|_| commonkit_relay::RelayPlanError::UnsafeState)?;
+        let runtime = RelayRuntime::new(
+            self.token.clone(),
+            manager,
+            desired.servers.clone(),
+            unix_time_ms() as u64,
+        )
+        .map_err(|_| commonkit_relay::RelayPlanError::UnsafeState)?;
+        *self
+            .runtime
+            .lock()
+            .map_err(|_| commonkit_relay::RelayPlanError::UnsafeState)? = Some(runtime);
+        Ok(())
+    }
+
+    fn restart(&self) -> Result<(), commonkit_relay::RelayPlanError> {
+        let config = commonkit_relay::LegacyRelayReader::read(&self.config_path)
+            .map_err(|_| commonkit_relay::RelayPlanError::UnsafeState)?;
+        self.reload(&config)
+    }
 }
 
 pub fn router(
@@ -353,12 +482,25 @@ pub fn router_with_control(
     events: EventHub,
     control: ControlPlane,
 ) -> Router {
+    let relay_runtime = default_relay_runtime(&token);
+    router_with_control_and_relay(token, status, authority, events, control, relay_runtime)
+}
+
+fn router_with_control_and_relay(
+    token: ControlToken,
+    status: Arc<RwLock<ServiceStatus>>,
+    authority: impl Into<String>,
+    events: EventHub,
+    control: ControlPlane,
+    relay_runtime: Arc<ManagedRelayRuntime>,
+) -> Router {
     let state = ApiState {
         token,
         status,
         authority: authority.into(),
         events,
         control,
+        relay_runtime,
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
@@ -367,14 +509,28 @@ pub fn router_with_control(
         .route("/control/v1/diagnostics", get(get_diagnostics))
         .route("/control/v1/compose", get(capability_unavailable))
         .route("/control/v1/explain", post(capability_unavailable))
-        .route("/control/v1/sync/plan", post(capability_unavailable))
-        .route("/control/v1/verify", post(capability_unavailable))
-        .route("/control/v1/snapshots", post(capability_unavailable))
+        .route("/control/v1/sync/plan", post(sync_plan))
+        .route("/control/v1/verify", post(verify_target))
         .route(
-            "/control/v1/snapshots/restore",
-            post(capability_unavailable),
+            "/control/v1/credentials/readiness",
+            post(credentials_readiness),
         )
-        .route("/control/v1/rollback", post(capability_unavailable))
+        .route("/control/v1/credentials/apply", post(credentials_apply))
+        .route("/control/v1/credentials/verify", post(credentials_verify))
+        .route(
+            "/control/v1/schedule",
+            get(schedule_status).post(update_schedule),
+        )
+        .route("/control/v1/relay", get(get_relay_status))
+        .route("/control/v1/relay/reconcile", post(plan_relay_reconcile))
+        .route("/control/v1/relay/restart", post(restart_relay))
+        .route(
+            "/control/v1/snapshots",
+            get(snapshot_list).post(snapshot_create),
+        )
+        .route("/control/v1/snapshots/restore", post(snapshot_restore))
+        .route("/control/v1/snapshots/promote", post(snapshot_promote))
+        .route("/control/v1/rollback", post(rollback_run))
         .route("/control/v1/plans", post(register_plan))
         .route("/control/v1/plans/{id}", get(get_plan))
         .route("/control/v1/plans/{id}/apply", post(apply_plan))
@@ -600,6 +756,114 @@ impl PlanExecutor for LocalPlanExecutor {
     }
 }
 
+/// Durable executor for relay-only plans. It reconstructs both transaction
+/// artifacts and the live runtime boundary after a process restart.
+pub struct RelayPlanExecutor {
+    plan_store: Arc<PlanStore>,
+    receipt_store: ReceiptStore,
+    live: PathBuf,
+    state: PathBuf,
+    lifecycle: Arc<dyn RelayLifecycleControl>,
+    execution_lock: std::sync::Mutex<()>,
+}
+
+impl RelayPlanExecutor {
+    pub fn open(
+        plan_store: Arc<PlanStore>,
+        receipt_root: impl AsRef<Path>,
+        live: impl AsRef<Path>,
+        state: impl AsRef<Path>,
+        lifecycle: Arc<dyn RelayLifecycleControl>,
+    ) -> Result<Self, LocalExecutionError> {
+        Ok(Self {
+            plan_store,
+            receipt_store: ReceiptStore::open(receipt_root)?,
+            live: live.as_ref().into(),
+            state: state.as_ref().into(),
+            lifecycle,
+            execution_lock: std::sync::Mutex::new(()),
+        })
+    }
+
+    fn adapter(&self) -> Result<RelayAdapter, LocalExecutionError> {
+        Ok(
+            RelayAdapter::open(stable_code("relay"), &self.live, &self.state)?
+                .with_lifecycle(self.lifecycle.clone()),
+        )
+    }
+
+    fn execute_durable(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+    ) -> Result<ReconcileOutcome, LocalExecutionError> {
+        if plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() != "relay")
+        {
+            return Err(LocalExecutionError::PlanMismatch);
+        }
+        let durable = self.plan_store.load(&plan.id)?;
+        if durable != *plan {
+            return Err(LocalExecutionError::PlanMismatch);
+        }
+        let run_id = durable_run_id(&plan.id, confirmation_id)?;
+        let mut adapter: Vec<Box<dyn Adapter>> = vec![Box::new(self.adapter()?)];
+        match self.receipt_store.load(run_id.clone()) {
+            Ok(receipt) => match receipt.receipt().state {
+                ReceiptState::Succeeded => Ok(ReconcileOutcome::Succeeded),
+                ReceiptState::Canceled => Ok(ReconcileOutcome::Canceled),
+                ReceiptState::RolledBack => Ok(ReconcileOutcome::RolledBack),
+                ReceiptState::RollbackFailed => Ok(ReconcileOutcome::RollbackFailed),
+                _ => Ok(Reconciler::with_store(&self.receipt_store).recover_run(
+                    run_id,
+                    &durable,
+                    &mut adapter,
+                )?),
+            },
+            Err(ReceiptError::NotFound(_)) => Ok(Reconciler::with_store(&self.receipt_store)
+                .execute(&durable, run_id, &mut adapter)?),
+            Err(ReceiptError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Reconciler::with_store(&self.receipt_store).execute(
+                    &durable,
+                    run_id,
+                    &mut adapter,
+                )?)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl PlanExecutor for RelayPlanExecutor {
+    fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult {
+        let result = self
+            .execution_lock
+            .lock()
+            .map_err(|_| LocalExecutionError::Lock)
+            .and_then(|_guard| self.execute_durable(plan, confirmation_id));
+        match result {
+            Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
+                status: ApplyStatus::Succeeded,
+                failure_code: None,
+            },
+            Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
+                status: ApplyStatus::RolledBack,
+                failure_code: None,
+            },
+            Ok(ReconcileOutcome::RollbackFailed) => ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("rollback_failed")),
+            },
+            Err(_) => ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("relay_execution_failed")),
+            },
+        }
+    }
+}
+
 fn durable_run_id(
     plan_id: &Sha256Digest,
     confirmation_id: &StableId,
@@ -631,6 +895,8 @@ pub enum LocalExecutionError {
     Reconcile(#[from] commonkit_reconcile::ReconcileError),
     #[error(transparent)]
     Adapter(#[from] commonkit_adapters::FileAdapterError),
+    #[error(transparent)]
+    Relay(#[from] commonkit_relay::RelayPlanError),
 }
 
 impl LocalExecutionError {
@@ -642,6 +908,7 @@ impl LocalExecutionError {
             Self::Receipt(_) => "receipt_invalid",
             Self::Reconcile(_) => "reconcile_failed",
             Self::Adapter(_) => "adapter_unavailable",
+            Self::Relay(_) => "relay_unavailable",
             Self::Contract(_) => "contract_invalid",
         })
     }
@@ -660,6 +927,39 @@ impl PlanExecutor for UnavailableExecutor {
     }
 }
 
+pub trait SyncDomain: Send + Sync + 'static {
+    fn plan(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn rollback(&self, request: Value) -> Result<Value, DomainFailure>;
+}
+
+pub trait CredentialDomain: Send + Sync + 'static {
+    fn apply(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
+}
+
+pub trait SnapshotDomain: Send + Sync + 'static {
+    fn create(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn list(&self) -> Result<Value, DomainFailure>;
+    fn restore(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn promote(&self, request: Value) -> Result<Value, DomainFailure>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainFailure {
+    InvalidRequest,
+    StalePlan,
+    VerificationFailed,
+    OperationFailed,
+}
+
+#[derive(Clone, Default)]
+pub struct HeadlessDomainRegistry {
+    pub sync: Option<Arc<dyn SyncDomain>>,
+    pub credentials: Option<Arc<dyn CredentialDomain>>,
+    pub snapshots: Option<Arc<dyn SnapshotDomain>>,
+}
+
 #[derive(Clone)]
 pub struct ControlPlane {
     inner: Arc<ControlPlaneInner>,
@@ -671,6 +971,8 @@ struct ControlPlaneInner {
     operations: std::sync::RwLock<BTreeMap<Sha256Digest, ApplyOperation>>,
     idempotency: std::sync::Mutex<BTreeMap<String, (Sha256Digest, Sha256Digest)>>,
     executor: Arc<dyn PlanExecutor>,
+    scheduler_store: std::sync::RwLock<Option<Arc<SchedulerStore>>>,
+    domains: std::sync::RwLock<HeadlessDomainRegistry>,
 }
 
 impl ControlPlane {
@@ -682,6 +984,8 @@ impl ControlPlane {
                 operations: std::sync::RwLock::new(BTreeMap::new()),
                 idempotency: std::sync::Mutex::new(BTreeMap::new()),
                 executor,
+                scheduler_store: std::sync::RwLock::new(None),
+                domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
             }),
         }
     }
@@ -694,8 +998,50 @@ impl ControlPlane {
                 operations: std::sync::RwLock::new(BTreeMap::new()),
                 idempotency: std::sync::Mutex::new(BTreeMap::new()),
                 executor,
+                scheduler_store: std::sync::RwLock::new(None),
+                domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
             }),
         }
+    }
+
+    pub fn set_scheduler_store(&self, store: Arc<SchedulerStore>) {
+        *self
+            .inner
+            .scheduler_store
+            .write()
+            .expect("scheduler store lock") = Some(store);
+    }
+
+    pub fn set_headless_domains(&self, domains: HeadlessDomainRegistry) {
+        *self.inner.domains.write().expect("domain registry lock") = domains;
+    }
+
+    pub fn scheduler_configuration(&self) -> Result<SchedulerConfig, SchedulerError> {
+        self.inner
+            .scheduler_store
+            .read()
+            .expect("scheduler store lock")
+            .as_ref()
+            .map_or_else(|| Ok(SchedulerConfig::default()), |store| store.load())
+    }
+
+    pub fn update_scheduler(
+        &self,
+        config: SchedulerConfig,
+    ) -> Result<SchedulerConfig, SchedulerError> {
+        if config.enabled && config.interval_seconds == 0 {
+            return Err(SchedulerError::InvalidInterval);
+        }
+        if let Some(store) = self
+            .inner
+            .scheduler_store
+            .read()
+            .expect("scheduler store lock")
+            .as_ref()
+        {
+            store.save(config)?;
+        }
+        Ok(config)
     }
 
     pub fn register_plan(&self, plan: Plan) -> Result<Plan, ControlError> {
@@ -1002,6 +1348,16 @@ impl ApiError {
             ),
         }
     }
+
+    fn unavailable_code(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code,
+            message: Some(
+                "The required CommonKit domain is not configured; no operation was performed",
+            ),
+        }
+    }
 }
 
 impl From<ControlError> for ApiError {
@@ -1040,6 +1396,375 @@ impl IntoResponse for ApiError {
 
 async fn capability_unavailable() -> ApiError {
     ApiError::unavailable()
+}
+
+fn require_consent(value: &Value) -> Result<(), ApiError> {
+    assert_domain_request_safe(value)?;
+    if value.get("confirmed").and_then(Value::as_bool) != Some(true) {
+        return Err(ApiError::conflict("confirmation_required"));
+    }
+    let confirmation = value
+        .get("confirmationId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ApiError::bad_request("confirmation_id_required"))?;
+    StableId::parse(confirmation).map_err(|_| ApiError::bad_request("invalid_confirmation_id"))?;
+    Ok(())
+}
+
+fn assert_domain_request_safe(value: &Value) -> Result<(), ApiError> {
+    let mut portable = value.clone();
+    if let Some(object) = portable.as_object_mut() {
+        object.remove("confirmationId");
+        object.remove("idempotencyKey");
+    }
+    assert_no_embedded_secrets(&portable)
+        .map_err(|_| ApiError::bad_request("embedded_secret_rejected"))
+}
+
+fn safe_domain_result(result: Result<Value, DomainFailure>) -> Result<Json<Value>, ApiError> {
+    let value = result.map_err(domain_error)?;
+    assert_no_embedded_secrets(&value).map_err(|_| ApiError::internal("unsafe_domain_response"))?;
+    Ok(Json(value))
+}
+
+fn domain_error(error: DomainFailure) -> ApiError {
+    match error {
+        DomainFailure::InvalidRequest => ApiError::bad_request("invalid_domain_request"),
+        DomainFailure::StalePlan => ApiError::conflict("stale_plan"),
+        DomainFailure::VerificationFailed => ApiError::conflict("verification_failed"),
+        DomainFailure::OperationFailed => ApiError::internal("domain_operation_failed"),
+    }
+}
+
+async fn sync_plan(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .sync
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
+    safe_domain_result(domain.plan(request))
+}
+
+async fn verify_target(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    assert_domain_request_safe(&request)?;
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .sync
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
+    safe_domain_result(domain.verify(request))
+}
+
+async fn rollback_run(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .sync
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
+    safe_domain_result(domain.rollback(request))
+}
+
+async fn credentials_apply(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .credentials
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("credential_domain_unconfigured"))?;
+    safe_domain_result(domain.apply(request))
+}
+
+async fn credentials_verify(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    assert_domain_request_safe(&request)?;
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .credentials
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("credential_domain_unconfigured"))?;
+    safe_domain_result(domain.verify(request))
+}
+
+async fn snapshot_create(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .snapshots
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("snapshot_domain_unconfigured"))?;
+    safe_domain_result(domain.create(request))
+}
+
+async fn snapshot_list(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .snapshots
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("snapshot_domain_unconfigured"))?;
+    safe_domain_result(domain.list())
+}
+
+async fn snapshot_restore(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .snapshots
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("snapshot_domain_unconfigured"))?;
+    safe_domain_result(domain.restore(request))
+}
+
+async fn snapshot_promote(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .snapshots
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("snapshot_domain_unconfigured"))?;
+    safe_domain_result(domain.promote(request))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CredentialReadinessRequest {
+    references: Vec<String>,
+}
+
+async fn credentials_readiness(
+    Json(request): Json<CredentialReadinessRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if request.references.len() > 256 {
+        return Err(ApiError::bad_request("too_many_credential_references"));
+    }
+    let inspector = LocalCredentialReadinessInspector;
+    let mut results = Vec::with_capacity(request.references.len());
+    for value in request.references {
+        let reference = CredentialReference::parse(&value)
+            .map_err(|_| ApiError::bad_request("invalid_credential_reference"))?;
+        results.push(
+            serde_json::json!({ "reference": value, "readiness": inspector.inspect(&reference) }),
+        );
+    }
+    Ok(Json(serde_json::json!({ "credentials": results })))
+}
+
+async fn schedule_status(State(state): State<ApiState>) -> Result<Json<SchedulerConfig>, ApiError> {
+    state
+        .control
+        .scheduler_configuration()
+        .map(Json)
+        .map_err(|_| ApiError::internal("scheduler_state_invalid"))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScheduleRequest {
+    enabled: bool,
+    interval_seconds: Option<u64>,
+    confirmed: bool,
+    confirmation_id: StableId,
+}
+
+async fn update_schedule(
+    State(state): State<ApiState>,
+    Json(request): Json<ScheduleRequest>,
+) -> Result<Json<SchedulerConfig>, ApiError> {
+    if !request.confirmed {
+        return Err(ApiError::conflict("confirmation_required"));
+    }
+    let _confirmation_id = request.confirmation_id;
+    let current = state
+        .control
+        .scheduler_configuration()
+        .map_err(|_| ApiError::internal("scheduler_state_invalid"))?;
+    let config = SchedulerConfig {
+        enabled: request.enabled,
+        interval_seconds: request.interval_seconds.unwrap_or(current.interval_seconds),
+    };
+    state
+        .control
+        .update_scheduler(config)
+        .map(Json)
+        .map_err(|error| match error {
+            SchedulerError::InvalidInterval => ApiError::bad_request("invalid_schedule_interval"),
+            _ => ApiError::internal("scheduler_state_invalid"),
+        })
+}
+
+async fn get_relay_status() -> Result<Json<Value>, ApiError> {
+    let paths = commonkit_platform::AppPaths::discover()
+        .map_err(|_| ApiError::internal("relay_paths_unavailable"))?;
+    let path = paths.config.join("relay.json");
+    let config = match commonkit_relay::LegacyRelayReader::read(&path) {
+        Ok(config) => Some(config),
+        Err(commonkit_relay::LegacyRelayError::Missing) => None,
+        Err(_) => return Err(ApiError::internal("relay_config_invalid")),
+    };
+    Ok(Json(serde_json::json!({
+        "configured": config.is_some(),
+        "listen": config.as_ref().map(|value| &value.listen),
+        "servers": config.as_ref().map(|value| value.servers.len()).unwrap_or(0),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RelayRestartRequest {
+    confirmed: bool,
+}
+
+async fn restart_relay(
+    State(state): State<ApiState>,
+    Json(request): Json<RelayRestartRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !request.confirmed {
+        return Err(ApiError::conflict("confirmation_required"));
+    }
+    state
+        .relay_runtime
+        .restart()
+        .map_err(|_| ApiError::conflict("relay_unconfigured"))?;
+    state
+        .events
+        .publish("relay.restarted", serde_json::json!({}));
+    Ok(Json(serde_json::json!({"status": "restarted"})))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RelayReconcileRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    idempotency_key: String,
+    resolved: ResolvedMcpDeclarations,
+    target_identity_digest: Sha256Digest,
+    composed_loadout_digest: Sha256Digest,
+    provider_inputs_digest: Sha256Digest,
+    policy_digest: Sha256Digest,
+    ownership_map_digest: Sha256Digest,
+    artifact_set_digest: Sha256Digest,
+}
+
+async fn plan_relay_reconcile(
+    State(state): State<ApiState>,
+    Json(request): Json<RelayReconcileRequest>,
+) -> Result<(StatusCode, Json<Plan>), ApiError> {
+    if !request.confirmed {
+        return Err(ApiError::conflict("confirmation_required"));
+    }
+    if request.idempotency_key.is_empty() || request.idempotency_key.len() > 128 {
+        return Err(ApiError::bad_request("invalid_idempotency_key"));
+    }
+    let _confirmation_id = request.confirmation_id;
+    let converged = converge_provider_mcp(request.resolved)
+        .map_err(|_| ApiError::bad_request("relay_declarations_invalid"))?;
+    let paths = commonkit_platform::AppPaths::discover()
+        .map_err(|_| ApiError::internal("relay_paths_unavailable"))?;
+    paths
+        .create_private_roots()
+        .map_err(|_| ApiError::internal("relay_paths_unavailable"))?;
+    let mut adapter = RelayAdapter::open(
+        StableId::parse("relay").expect("static stable identifier"),
+        paths.config.join("relay.json"),
+        paths.state.join("relay"),
+    )
+    .map_err(|_| ApiError::internal("relay_state_unavailable"))?;
+    let operation = plan_relay_operation(
+        &mut adapter,
+        RelayPlanRequest {
+            desired: converged.relay.clone(),
+            inputs: RelayMutationInputs {
+                provider_inputs_digest: request.provider_inputs_digest.clone(),
+                policy_digest: request.policy_digest.clone(),
+                target_digest: request.target_identity_digest.clone(),
+            },
+        },
+    )
+    .map_err(|_| ApiError::internal("relay_plan_failed"))?;
+    let desired_digest = digest_domain_json("commonkit.relay-desired.v1", &converged.relay)
+        .map_err(|_| ApiError::internal("relay_plan_failed"))?;
+    let observed_digest = operation
+        .as_ref()
+        .and_then(|value| value.before_digest.clone())
+        .unwrap_or_else(|| desired_digest.clone());
+    let plan = build_plan(PlanDraft {
+        target_id: StableId::parse("local").expect("static stable identifier"),
+        desired_digest,
+        observed_digest,
+        policy_digest: request.policy_digest.clone(),
+        bindings: PlanBindings {
+            target_identity_digest: request.target_identity_digest,
+            composed_loadout_digest: request.composed_loadout_digest,
+            provider_inputs_digest: request.provider_inputs_digest,
+            ownership_map_digest: request.ownership_map_digest,
+            artifact_set_digest: request.artifact_set_digest,
+        },
+        operations: operation.into_iter().collect(),
+    })
+    .map_err(|_| ApiError::internal("relay_plan_failed"))?;
+    let plan = state.control.register_plan(plan)?;
+    Ok((StatusCode::CREATED, Json(plan)))
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1186,11 +1911,43 @@ impl BoundServer {
             .parent()
             .ok_or(ServiceError::UnsafeDiscoveryPath)?
             .join("plans");
-        let control = ControlPlane::with_plan_store(
-            Arc::new(UnavailableExecutor),
-            Arc::new(PlanStore::open(plan_root)?),
+        let plan_store = Arc::new(PlanStore::open(plan_root)?);
+        let paths = commonkit_platform::AppPaths::discover()
+            .map_err(|_| ServiceError::UnsafeDiscoveryPath)?;
+        paths
+            .create_private_roots()
+            .map_err(|_| ServiceError::UnsafeDiscoveryPath)?;
+        let relay_runtime = Arc::new(ManagedRelayRuntime::new(
+            token.expose_for_client().into(),
+            paths.config.join("relay.json"),
+        ));
+        let executor = RelayPlanExecutor::open(
+            plan_store.clone(),
+            &paths.receipts,
+            paths.config.join("relay.json"),
+            paths.state.join("relay"),
+            relay_runtime.clone(),
+        )
+        .map_err(|_| ServiceError::UnsafeDiscoveryPath)?;
+        let control = ControlPlane::with_plan_store(Arc::new(executor), plan_store);
+        control.set_scheduler_store(Arc::new(
+            SchedulerStore::open(
+                discovery_path
+                    .as_ref()
+                    .parent()
+                    .ok_or(ServiceError::UnsafeDiscoveryPath)?
+                    .join("scheduler"),
+            )
+            .map_err(|_| ServiceError::UnsafeDiscoveryPath)?,
+        ));
+        let application = router_with_control_and_relay(
+            token,
+            status,
+            local.to_string(),
+            events,
+            control,
+            relay_runtime,
         );
-        let application = router_with_control(token, status, local.to_string(), events, control);
         Ok(Self {
             listener,
             application,

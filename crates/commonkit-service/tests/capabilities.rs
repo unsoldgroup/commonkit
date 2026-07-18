@@ -18,11 +18,6 @@ async fn unavailable_v1_capabilities_return_stable_actionable_errors() {
     for (method, path) in [
         ("GET", "/control/v1/compose"),
         ("POST", "/control/v1/explain"),
-        ("POST", "/control/v1/sync/plan"),
-        ("POST", "/control/v1/verify"),
-        ("POST", "/control/v1/snapshots"),
-        ("POST", "/control/v1/snapshots/restore"),
-        ("POST", "/control/v1/rollback"),
     ] {
         let response = application
             .clone()
