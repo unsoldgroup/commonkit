@@ -90,6 +90,20 @@ impl ArtifactStore {
         Ok(bytes)
     }
 
+    pub fn verify_digest(&self, digest: &Sha256Digest) -> Result<(), ArtifactError> {
+        let path = self.path_for(digest);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ArtifactError::UnsafeArtifactType);
+        }
+        let reference = ContentReference {
+            digest: digest.clone(),
+            bytes: metadata.len(),
+            sensitivity: ContentSensitivity::Portable,
+        };
+        self.load(&reference).map(|_| ())
+    }
+
     fn path_for(&self, digest: &Sha256Digest) -> PathBuf {
         self.root.join(format!(
             "{}.blob",

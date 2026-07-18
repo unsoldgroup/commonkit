@@ -22,6 +22,8 @@ pub trait TargetFilesystem {
         path: &NormalizedManagedPath,
         content: &[u8],
     ) -> Result<(), TargetFilesystemError>;
+
+    fn remove(&self, path: &NormalizedManagedPath) -> Result<(), TargetFilesystemError>;
 }
 
 pub struct LocalTargetFilesystem {
@@ -124,6 +126,17 @@ impl TargetFilesystem for LocalTargetFilesystem {
         file.sync_all()?;
         Ok(())
     }
+
+    fn remove(&self, path: &NormalizedManagedPath) -> Result<(), TargetFilesystemError> {
+        if self.access != RootAccess::ReadWrite {
+            return Err(TargetFilesystemError::ReadOnly);
+        }
+        self.ensure_safe_ancestors(path, false)?;
+        if self.reject_symlink_leaf(path)? {
+            self.root.remove_file(path.as_str())?;
+        }
+        Ok(())
+    }
 }
 
 /// A deliberately closed SSH protocol. Implementations can map these requests to SFTP or a
@@ -144,14 +157,45 @@ pub enum SshFilesystemRequest {
         root_id: StableId,
         path: NormalizedManagedPath,
     },
+    StageArtifact {
+        run_id: StableId,
+        digest: commonkit_contracts::Sha256Digest,
+        content: Vec<u8>,
+    },
+    VerifyArtifact {
+        run_id: StableId,
+        digest: commonkit_contracts::Sha256Digest,
+    },
+    BindRecoveryReceipt {
+        run_id: StableId,
+        receipt_digest: commonkit_contracts::Sha256Digest,
+    },
+    RecoverRun {
+        run_id: StableId,
+        receipt_digest: commonkit_contracts::Sha256Digest,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SshFilesystemResponse {
     Absent,
-    File { content: Vec<u8> },
+    File {
+        content: Vec<u8>,
+    },
     Applied,
+    ArtifactStaged {
+        digest: commonkit_contracts::Sha256Digest,
+    },
+    ArtifactVerified {
+        digest: commonkit_contracts::Sha256Digest,
+    },
+    RecoveryReceiptBound {
+        receipt_digest: commonkit_contracts::Sha256Digest,
+    },
+    RecoveryReady {
+        receipt_digest: commonkit_contracts::Sha256Digest,
+    },
 }
 
 pub trait SshFilesystemTransport {
@@ -173,6 +217,18 @@ pub enum TargetFilesystemError {
     NotDirectory(String),
     #[error("managed target path is not a regular file: {0}")]
     NotFile(String),
+    #[error("invalid SSH target configuration: {0}")]
+    InvalidSshConfig(&'static str),
+    #[error("remote host key does not match the configured fingerprint")]
+    HostKeyMismatch,
+    #[error("remote helper failed ({status}): {message}")]
+    RemoteFailure { status: i32, message: String },
+    #[error("remote helper returned an invalid or unexpected response")]
+    InvalidRemoteResponse,
+    #[error("remote helper does not recognize target capability root: {0}")]
+    UnknownRoot(StableId),
+    #[error("remote artifact validation failed")]
+    RemoteArtifact,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

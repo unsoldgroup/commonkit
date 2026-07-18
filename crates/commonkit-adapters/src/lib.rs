@@ -9,8 +9,10 @@ mod git_sync;
 mod native;
 mod planning;
 mod provider;
+mod remote_helper;
 mod resources;
 mod service_lifecycle;
+mod ssh;
 mod target;
 
 pub use apm::{ApmProvider, ApmProviderConfig};
@@ -35,6 +37,7 @@ pub use provider::{
     ProviderContext, ProviderContractError, ProviderFailure, ProviderInputs, ProviderWorkspace,
     UnsupportedCapability,
 };
+pub use remote_helper::TargetHelper;
 pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
     OwnershipRules, ResourceError, ResourceProvenance, SafeSymlinkTarget,
@@ -43,6 +46,9 @@ pub use resources::{
 pub use service_lifecycle::{
     LifecycleCommand, ServiceAdapter, ServiceBackend, ServiceDesiredState, ServiceError,
     ServiceObservedState, ServiceSpec, ServiceStartMode,
+};
+pub use ssh::{
+    OpenSshConfig, OpenSshTransport, ProcessOutput, ProcessRemoteRunner, RemoteProcessRunner,
 };
 pub use target::{
     LocalTargetFilesystem, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
