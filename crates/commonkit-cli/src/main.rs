@@ -20,6 +20,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Initialize CommonKit's local private runtime directories.
+    Init,
     /// Report local runtime paths and contract versions.
     Status,
     /// Compose ordered layer documents and emit normalized state.
@@ -33,6 +35,33 @@ enum Command {
         #[arg(long = "layer", required = true)]
         layers: Vec<PathBuf>,
     },
+    /// Plan synchronization through the local CommonKit daemon.
+    Sync {
+        #[arg(long)]
+        confirmed: bool,
+    },
+    /// Show the deterministic changes in a synchronization plan.
+    Diff,
+    /// Apply a content-addressed plan through the local daemon.
+    Apply {
+        plan_id: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    /// Verify managed state and provider integrity.
+    Verify,
+    /// Roll back a durable run receipt.
+    Rollback {
+        run_id: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    /// Configure scheduled drift checks.
+    Schedule,
+    /// Export redacted diagnostics from the local daemon.
+    Diagnostics,
+    /// Inspect or configure the persistent MCP relay.
+    Relay,
 }
 
 fn main() {
@@ -44,6 +73,18 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
+        Command::Init => {
+            let paths = AppPaths::discover()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "status": "initialized",
+                    "configDirectory": paths.config,
+                    "stateDirectory": paths.state,
+                    "cacheDirectory": paths.cache,
+                }))?
+            );
+        }
         Command::Status => {
             let paths = AppPaths::discover()?;
             println!(
@@ -78,6 +119,31 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 .get(&pointer)
                 .ok_or_else(|| format!("no provenance for JSON pointer {pointer}"))?;
             println!("{}", serde_json::to_string_pretty(entry)?);
+        }
+        Command::Apply {
+            confirmed: false, ..
+        }
+        | Command::Rollback {
+            confirmed: false, ..
+        }
+        | Command::Sync { confirmed: false } => {
+            return Err(
+                "confirmation_required: pass --confirmed after reviewing the operation".into(),
+            );
+        }
+        Command::Sync { confirmed: true }
+        | Command::Apply {
+            confirmed: true, ..
+        }
+        | Command::Rollback {
+            confirmed: true, ..
+        }
+        | Command::Diff
+        | Command::Verify
+        | Command::Schedule
+        | Command::Diagnostics
+        | Command::Relay => {
+            return Err("capability_unavailable: the running CommonKit daemon does not yet expose this command; update or enable the required capability".into());
         }
     }
     Ok(())

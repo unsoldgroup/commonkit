@@ -11,7 +11,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::schemars::JsonSchema;
 use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 
@@ -20,6 +20,10 @@ pub type BackendFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, BackendEr
 pub trait ControlBackend: Send + Sync + 'static {
     fn get(&self, path: &'static str) -> BackendFuture<'_>;
     fn apply(&self, input: ApplyPlanInput) -> BackendFuture<'_>;
+    fn post(&self, path: &'static str, input: Value) -> BackendFuture<'_> {
+        let _ = (path, input);
+        Box::pin(async { Err(BackendError::Unsupported) })
+    }
 }
 
 #[derive(Clone)]
@@ -83,6 +87,20 @@ impl ControlBackend for DaemonBackend {
             decode(response).await
         })
     }
+
+    fn post(&self, path: &'static str, input: Value) -> BackendFuture<'_> {
+        Box::pin(async move {
+            let (base, authorization) = self.connection().await?;
+            let response = self
+                .client
+                .post(format!("{base}{path}"))
+                .header(AUTHORIZATION, authorization)
+                .json(&input)
+                .send()
+                .await?;
+            decode(response).await
+        })
+    }
 }
 
 async fn decode(response: reqwest::Response) -> Result<Value, BackendError> {
@@ -102,13 +120,38 @@ async fn decode(response: reqwest::Response) -> Result<Value, BackendError> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApplyPlanInput {
     pub plan_id: String,
     pub confirmed: bool,
     pub confirmation_id: String,
     pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadInput {
+    pub target_id: Option<String>,
+    pub pointer: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConsentInput {
+    pub confirmed: bool,
+    pub confirmation_id: String,
+    pub idempotency_key: String,
+}
+
+impl ConsentInput {
+    pub fn denied() -> Self {
+        Self {
+            confirmed: false,
+            confirmation_id: "not-confirmed".into(),
+            idempotency_key: "not-confirmed".into(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -149,6 +192,146 @@ impl CommonKitMcp {
     }
 
     #[tool(
+        name = "commonkit_compose",
+        description = "Compute the composed desired state and provenance without mutating a target."
+    )]
+    pub async fn compose(
+        &self,
+        Parameters(input): Parameters<ReadInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(error) = read_input_error(&input) {
+            return Ok(error);
+        }
+        tool_result(self.backend.get("/control/v1/compose").await)
+    }
+
+    #[tool(
+        name = "commonkit_explain",
+        description = "Explain desired-state and policy provenance without mutating a target."
+    )]
+    pub async fn explain(
+        &self,
+        Parameters(input): Parameters<ReadInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(error) = read_input_error(&input) {
+            return Ok(error);
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/explain",
+                    serde_json::to_value(&input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_verify",
+        description = "Verify managed target parity and provider integrity without mutation."
+    )]
+    pub async fn verify(
+        &self,
+        Parameters(input): Parameters<ReadInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(error) = read_input_error(&input) {
+            return Ok(error);
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/verify",
+                    serde_json::to_value(&input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_plan_sync",
+        description = "Plan a target synchronization. Requires explicit user confirmation because provider staging may access configured sources."
+    )]
+    pub async fn plan_sync(
+        &self,
+        Parameters(input): Parameters<ConsentInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(error) = consent_input_error(&input) {
+            return Ok(error);
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/sync/plan",
+                    serde_json::to_value(&input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_snapshot_create",
+        description = "Create a managed mutable-state snapshot. Requires explicit user confirmation."
+    )]
+    pub async fn snapshot_create(
+        &self,
+        Parameters(input): Parameters<ConsentInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(error) = consent_input_error(&input) {
+            return Ok(error);
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/snapshots",
+                    serde_json::to_value(&input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_snapshot_restore",
+        description = "Restore a managed mutable-state snapshot. Requires explicit user confirmation."
+    )]
+    pub async fn snapshot_restore(
+        &self,
+        Parameters(input): Parameters<ConsentInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(error) = consent_input_error(&input) {
+            return Ok(error);
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/snapshots/restore",
+                    serde_json::to_value(&input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_rollback",
+        description = "Rollback a CommonKit run from its durable receipt. Requires explicit user confirmation."
+    )]
+    pub async fn rollback(
+        &self,
+        Parameters(input): Parameters<ConsentInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Some(error) = consent_input_error(&input) {
+            return Ok(error);
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/rollback",
+                    serde_json::to_value(&input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
         name = "commonkit_apply_plan",
         description = "Apply a previously registered content-addressed plan. Requires explicit user confirmation and an idempotency key."
     )]
@@ -169,13 +352,63 @@ impl CommonKitMcp {
 
 fn tool_result(result: Result<Value, BackendError>) -> Result<CallToolResult, ErrorData> {
     Ok(match result {
-        Ok(value) => CallToolResult::structured(value),
+        Ok(value) if serde_json::to_vec(&value).is_ok_and(|bytes| bytes.len() <= 256 * 1024) => {
+            CallToolResult::structured(value)
+        }
+        Ok(_) => input_error(
+            "response_too_large",
+            "The daemon response exceeded the safe output limit",
+        ),
         Err(error) => CallToolResult::structured_error(json!({
             "code": error.code(),
             "message": error.safe_message(),
             "retryable": error.retryable(),
         })),
     })
+}
+
+fn read_input_error(input: &ReadInput) -> Option<CallToolResult> {
+    if input
+        .target_id
+        .as_ref()
+        .is_some_and(|value| value.len() > 128)
+        || input
+            .pointer
+            .as_ref()
+            .is_some_and(|value| value.len() > 1024)
+    {
+        return Some(input_error(
+            "invalid_input",
+            "Input exceeds the supported size",
+        ));
+    }
+    None
+}
+
+fn consent_input_error(input: &ConsentInput) -> Option<CallToolResult> {
+    if !input.confirmed {
+        return Some(input_error(
+            "confirmation_required",
+            "Explicit user confirmation is required",
+        ));
+    }
+    if input.confirmation_id.is_empty()
+        || input.confirmation_id.len() > 128
+        || input.idempotency_key.is_empty()
+        || input.idempotency_key.len() > 128
+    {
+        return Some(input_error(
+            "invalid_input",
+            "Confirmation fields are invalid",
+        ));
+    }
+    None
+}
+
+fn input_error(code: &str, message: &str) -> CallToolResult {
+    CallToolResult::structured_error(
+        json!({ "code": code, "message": message, "retryable": false }),
+    )
 }
 
 #[tool_handler(
@@ -200,6 +433,8 @@ pub enum BackendError {
     InvalidAuthorization,
     #[error("CommonKit daemon returned {status}: {code}")]
     Daemon { status: u16, code: String },
+    #[error("the requested CommonKit capability is not implemented by this backend")]
+    Unsupported,
 }
 
 impl BackendError {
@@ -211,12 +446,16 @@ impl BackendError {
             Self::Http(_) => "daemon_unreachable",
             Self::Service(_) | Self::InvalidAuthorization => "authorization_unavailable",
             Self::Daemon { code, .. } => code,
+            Self::Unsupported => "capability_unavailable",
         }
     }
 
     fn safe_message(&self) -> &'static str {
         match self {
             Self::Daemon { .. } => "The CommonKit daemon rejected the request",
+            Self::Unsupported => {
+                "This CommonKit capability is not available in the configured backend"
+            }
             _ => "The CommonKit daemon is unavailable",
         }
     }

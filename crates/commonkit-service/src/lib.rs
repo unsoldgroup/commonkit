@@ -252,6 +252,16 @@ pub fn router_with_control(
         .route("/control/v1/health", get(health))
         .route("/control/v1/events", get(get_events))
         .route("/control/v1/diagnostics", get(get_diagnostics))
+        .route("/control/v1/compose", get(capability_unavailable))
+        .route("/control/v1/explain", post(capability_unavailable))
+        .route("/control/v1/sync/plan", post(capability_unavailable))
+        .route("/control/v1/verify", post(capability_unavailable))
+        .route("/control/v1/snapshots", post(capability_unavailable))
+        .route(
+            "/control/v1/snapshots/restore",
+            post(capability_unavailable),
+        )
+        .route("/control/v1/rollback", post(capability_unavailable))
         .route("/control/v1/plans", post(register_plan))
         .route("/control/v1/plans/{id}", get(get_plan))
         .route("/control/v1/plans/{id}/apply", post(apply_plan))
@@ -834,6 +844,7 @@ async fn get_operation(
 struct ApiError {
     status: StatusCode,
     code: &'static str,
+    message: Option<&'static str>,
 }
 
 impl ApiError {
@@ -841,6 +852,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             code,
+            message: None,
         }
     }
 
@@ -848,6 +860,7 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             code,
+            message: None,
         }
     }
 
@@ -855,6 +868,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             code,
+            message: None,
         }
     }
 
@@ -862,6 +876,17 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code,
+            message: None,
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: "capability_unavailable",
+            message: Some(
+                "This capability is not implemented by the current CommonKit service; update the daemon or enable the required provider",
+            ),
         }
     }
 }
@@ -891,13 +916,17 @@ impl IntoResponse for ApiError {
                 "apiVersion": "commonkit.control/v1",
                 "error": {
                     "code": self.code,
-                    "message": self.code.replace('_', " "),
+                    "message": self.message.map(str::to_owned).unwrap_or_else(|| self.code.replace('_', " ")),
                     "retryable": false,
                 }
             })),
         )
             .into_response()
     }
+}
+
+async fn capability_unavailable() -> ApiError {
+    ApiError::unavailable()
 }
 
 #[derive(Debug, Clone, PartialEq)]

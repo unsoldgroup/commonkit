@@ -96,3 +96,58 @@ fn composes_layers_and_explains_the_winning_value() {
 
     fs::remove_dir_all(directory).expect("cleanup");
 }
+
+#[test]
+fn publishes_the_complete_v1_command_surface() {
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .arg("--help")
+        .output()
+        .expect("help");
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).expect("UTF-8");
+    for command in [
+        "init",
+        "status",
+        "sync",
+        "compose",
+        "explain",
+        "diff",
+        "apply",
+        "verify",
+        "rollback",
+        "schedule",
+        "diagnostics",
+        "relay",
+    ] {
+        assert!(help.contains(command), "missing {command} in {help}");
+    }
+}
+
+#[test]
+fn unavailable_commands_fail_with_a_stable_actionable_code() {
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .arg("verify")
+        .output()
+        .expect("verify");
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).expect("UTF-8");
+    assert!(error.contains("capability_unavailable"));
+    assert!(error.contains("CommonKit daemon"));
+}
+
+#[test]
+fn mutations_require_an_explicit_confirmation_flag() {
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args([
+            "apply",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ])
+        .output()
+        .expect("apply");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("confirmation_required")
+    );
+}

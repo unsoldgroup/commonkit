@@ -4,6 +4,7 @@ mod apm;
 mod artifacts;
 mod chezmoi;
 mod files;
+mod git_sync;
 mod native;
 mod planning;
 mod provider;
@@ -14,6 +15,10 @@ pub use apm::{ApmProvider, ApmProviderConfig};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
 pub use chezmoi::ChezmoiProvider;
 pub use files::{FileAdapter, FileAdapterError, FileIntent, ManagedRelativePath};
+pub use git_sync::{
+    FastForwardPolicy, GitCommandError, GitCommandOutput, GitCommandRunner, GitRepository,
+    GitRevision, GitSyncDisposition, GitSyncError, GitSyncStatus, ProcessGitRunner,
+};
 pub use native::NativeProvider;
 pub use planning::{ProviderPlanError, ProviderPlanRequest, build_provider_plan};
 pub use provider::{
