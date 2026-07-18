@@ -8,26 +8,40 @@ use commonkit_adapters::{
     NormalizedManagedPath, OwnershipRules, ProviderPlanRequest, SecretValue, build_provider_plan,
     validate_ownership,
 };
-use commonkit_contracts::{Plan, Sha256Digest, StableId};
+use commonkit_config::{LayerSet, MergeRules, compose_layers};
+use commonkit_contracts::{
+    LayerDocument, Plan, Sha256Digest, StableId, assert_no_embedded_secrets,
+};
 use commonkit_reconcile::{Adapter, PlanStore, ReceiptStore, Reconciler};
 use commonkit_snapshots::{
-    AuthenticatedCipher, DatabaseId, ObjectStore, ProcessObjectCommandRunner,
+    AuthenticatedCipher, Authority, AuthorityStore, DatabaseId, DatabaseLifecycle, DurableRestore,
+    ObjectStore, ProcessObjectCommandRunner, PromotionPlan, RestoreFailpoint, RestorePlan,
     S3CompatibleObjectStore, SnapshotError, SnapshotManifest, SnapshotService, SqliteBackup,
-    StaticBackup, XChaCha20Cipher,
+    StaticBackup, XChaCha20Cipher, manifest_digest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{CredentialDomain, DomainFailure, HeadlessDomainRegistry, SnapshotDomain, SyncDomain};
+use crate::{
+    CompositionDomain, CredentialDomain, DomainFailure, HeadlessDomainRegistry, SnapshotDomain,
+    SyncDomain,
+};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProductionConfig {
+    composition: Option<CompositionConfig>,
     sync: Option<SyncConfig>,
     credentials: Option<CredentialConfig>,
     snapshots: Option<SnapshotConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompositionConfig {
+    layers: Vec<PathBuf>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -96,6 +110,7 @@ enum SnapshotSourceFormat {
 }
 
 pub struct ProductionDomainRegistry {
+    pub composition: Option<Arc<dyn CompositionDomain>>,
     pub sync: Option<Arc<dyn SyncDomain>>,
     pub credentials: Option<Arc<dyn CredentialDomain>>,
     pub snapshots: Option<Arc<dyn SnapshotDomain>>,
@@ -109,6 +124,7 @@ impl ProductionDomainRegistry {
     ) -> Result<Self, ProductionDomainError> {
         if !config_path.exists() {
             return Ok(Self {
+                composition: None,
                 sync: None,
                 credentials: None,
                 snapshots: None,
@@ -126,6 +142,23 @@ impl ProductionDomainRegistry {
             return Err(ProductionDomainError::UnsafeConfig);
         }
         let config: ProductionConfig = serde_json::from_slice(&fs::read(config_path)?)?;
+        let composition = config
+            .composition
+            .map(
+                |config| -> Result<Arc<dyn CompositionDomain>, ProductionDomainError> {
+                    if config.layers.is_empty()
+                        || config.layers.iter().any(|path| !path.is_absolute())
+                    {
+                        return Err(ProductionDomainError::EmptyCapability);
+                    }
+                    let domain = ProductionCompositionDomain { config };
+                    domain
+                        .compose()
+                        .map_err(|_| ProductionDomainError::InvalidComposition)?;
+                    Ok(Arc::new(domain))
+                },
+            )
+            .transpose()?;
         let sync = config
             .sync
             .map(
@@ -171,17 +204,26 @@ impl ProductionDomainRegistry {
                     validate_object_store(&config.object_store)?;
                     fs::create_dir_all(config.root.join("objects"))?;
                     fs::create_dir_all(config.root.join("manifests"))?;
+                    let databases = unique_databases(config.databases)?;
+                    let authorities = AuthorityStore::open(config.root.join("authority"))
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    for database in databases.values() {
+                        authorities
+                            .initialize(&database.id, &database.target_id)
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    }
                     Ok(Arc::new(ProductionSnapshotDomain {
                         root: config.root,
                         key_reference: config.key_reference,
                         object_store: config.object_store,
-                        databases: unique_databases(config.databases)?,
+                        databases,
                         lock: Mutex::new(()),
                     }))
                 },
             )
             .transpose()?;
         Ok(Self {
+            composition,
             sync,
             credentials,
             snapshots,
@@ -189,6 +231,7 @@ impl ProductionDomainRegistry {
     }
     pub fn into_headless(self) -> HeadlessDomainRegistry {
         HeadlessDomainRegistry {
+            composition: self.composition,
             sync: self.sync,
             credentials: self.credentials,
             snapshots: self.snapshots,
@@ -239,6 +282,57 @@ fn validate_object_store(config: &SnapshotObjectStoreConfig) -> Result<(), Produ
             .map(|_| ())
             .map_err(|_| ProductionDomainError::UnsafeConfig)
         }
+    }
+}
+
+struct ProductionCompositionDomain {
+    config: CompositionConfig,
+}
+
+impl ProductionCompositionDomain {
+    fn result(&self) -> Result<commonkit_config::CompositionResult, DomainFailure> {
+        let mut layers = Vec::with_capacity(self.config.layers.len());
+        for path in &self.config.layers {
+            let metadata =
+                fs::symlink_metadata(path).map_err(|_| DomainFailure::OperationFailed)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(DomainFailure::OperationFailed);
+            }
+            let value: Value = serde_json::from_slice(
+                &fs::read(path).map_err(|_| DomainFailure::OperationFailed)?,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?;
+            assert_no_embedded_secrets(&value).map_err(|_| DomainFailure::OperationFailed)?;
+            layers.push(
+                serde_json::from_value::<LayerDocument>(value)
+                    .map_err(|_| DomainFailure::OperationFailed)?,
+            );
+        }
+        let layers = LayerSet::new(layers).map_err(|_| DomainFailure::OperationFailed)?;
+        compose_layers(&layers, &MergeRules::new()).map_err(|_| DomainFailure::OperationFailed)
+    }
+}
+
+impl CompositionDomain for ProductionCompositionDomain {
+    fn compose(&self) -> Result<Value, DomainFailure> {
+        let result = self.result()?;
+        serde_json::to_value(serde_json::json!({
+            "spec": result.spec,
+            "specDigest": result.spec_digest,
+            "trace": result.trace,
+            "lock": result.lock,
+        }))
+        .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn explain(&self, pointer: &str) -> Result<Value, DomainFailure> {
+        self.result()?
+            .trace
+            .entries
+            .get(pointer)
+            .cloned()
+            .map(|entry| serde_json::json!(entry))
+            .ok_or(DomainFailure::InvalidRequest)
     }
 }
 
@@ -533,6 +627,8 @@ struct SnapshotRequest {
     confirmed: Option<bool>,
     confirmation_id: Option<StableId>,
     idempotency_key: Option<String>,
+    current_writer_digest: Option<String>,
+    candidate_digest: Option<String>,
 }
 impl SnapshotRequest {
     fn acknowledge_metadata(&self) {
@@ -581,15 +677,16 @@ impl ProductionSnapshotDomain {
             if path.extension().and_then(|v| v.to_str()) != Some("bin") {
                 return Err(DomainFailure::OperationFailed);
             }
-            let snapshot_id = path
+            let encrypted = fs::read(&path).map_err(|_| DomainFailure::OperationFailed)?;
+            let expected = path
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .ok_or(DomainFailure::OperationFailed)?;
+            if format!("{:x}", Sha256::digest(&encrypted)) != expected {
+                return Err(DomainFailure::VerificationFailed);
+            }
             let plaintext = cipher
-                .open(
-                    &fs::read(&path).map_err(|_| DomainFailure::OperationFailed)?,
-                    format!("commonkit.snapshot-manifest.v1\0{snapshot_id}").as_bytes(),
-                )
+                .open(&encrypted, b"commonkit.snapshot-manifest.v1")
                 .map_err(|_| DomainFailure::VerificationFailed)?;
             output.push(
                 serde_json::from_slice(&plaintext).map_err(|_| DomainFailure::OperationFailed)?,
@@ -599,45 +696,31 @@ impl ProductionSnapshotDomain {
         Ok(output)
     }
     fn writers(&self) -> Result<BTreeMap<String, String>, DomainFailure> {
-        let path = self.root.join("writers.json");
-        if !path.exists() {
-            return Ok(self
-                .databases
-                .iter()
-                .map(|(id, d)| (id.clone(), d.target_id.clone()))
-                .collect());
+        let store = AuthorityStore::open(self.root.join("authority"))
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let mut writers = BTreeMap::new();
+        for (id, database) in &self.databases {
+            match store
+                .authority(&database.id)
+                .map_err(|_| DomainFailure::VerificationFailed)?
+            {
+                Authority::Writer { target } => {
+                    writers.insert(id.clone(), target);
+                }
+                Authority::Unassigned => return Err(DomainFailure::VerificationFailed),
+            }
         }
-        serde_json::from_slice(&fs::read(path).map_err(|_| DomainFailure::OperationFailed)?)
-            .map_err(|_| DomainFailure::OperationFailed)
+        Ok(writers)
     }
+}
 
-    fn install_restored_bytes(
-        &self,
-        database: &SnapshotDatabase,
-        snapshot_id: &StableId,
-        expected_digest: &str,
-        bytes: &[u8],
-    ) -> Result<(), DomainFailure> {
-        let temporary = database
-            .path
-            .with_extension(format!("commonkit-{snapshot_id}.tmp"));
-        let backup = database
-            .path
-            .with_extension(format!("commonkit-{snapshot_id}.previous"));
-        fs::write(&temporary, bytes).map_err(|_| DomainFailure::OperationFailed)?;
-        fs::rename(&database.path, &backup).map_err(|_| DomainFailure::OperationFailed)?;
-        if fs::rename(&temporary, &database.path).is_err() {
-            let _ = fs::rename(&backup, &database.path);
-            return Err(DomainFailure::OperationFailed);
-        }
-        let current = fs::read(&database.path).map_err(|_| DomainFailure::OperationFailed)?;
-        let current_digest = format!("sha256:{:x}", Sha256::digest(&current));
-        if current_digest != expected_digest {
-            let _ = fs::remove_file(&database.path);
-            let _ = fs::rename(&backup, &database.path);
-            return Err(DomainFailure::VerificationFailed);
-        }
-        fs::remove_file(backup).map_err(|_| DomainFailure::OperationFailed)
+struct QuiescedDatabase;
+impl DatabaseLifecycle for QuiescedDatabase {
+    fn stop(&mut self) -> Result<(), SnapshotError> {
+        Ok(())
+    }
+    fn start(&mut self) -> Result<(), SnapshotError> {
+        Ok(())
     }
 }
 impl SnapshotDomain for ProductionSnapshotDomain {
@@ -692,15 +775,13 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         let manifest_bytes =
             serde_json::to_vec(&stored).map_err(|_| DomainFailure::OperationFailed)?;
         let encrypted_manifest = cipher
-            .seal(
-                &manifest_bytes,
-                format!("commonkit.snapshot-manifest.v1\0{snapshot_id}").as_bytes(),
-            )
+            .seal(&manifest_bytes, b"commonkit.snapshot-manifest.v1")
             .map_err(|_| DomainFailure::OperationFailed)?;
+        let encrypted_digest = format!("{:x}", Sha256::digest(&encrypted_manifest));
         fs::write(
             self.root
                 .join("manifests")
-                .join(format!("{snapshot_id}.bin")),
+                .join(format!("{encrypted_digest}.bin")),
             encrypted_manifest,
         )
         .map_err(|_| DomainFailure::OperationFailed)?;
@@ -728,16 +809,32 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .get(&stored.manifest.database.to_string())
             .ok_or(DomainFailure::InvalidRequest)?;
         let cipher = self.cipher()?;
-        let bytes = SnapshotService::new(&cipher)
-            .verify_and_decrypt(&stored.manifest, &self.objects()?)
+        let run_id = request
+            .confirmation_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("restore-{snapshot_id}"));
+        let plan = RestorePlan {
+            schema: "commonkit.restore-plan.v1".into(),
+            run_id,
+            snapshot_id: snapshot_id.to_string(),
+            manifest_digest: manifest_digest(&stored.manifest)
+                .map_err(|_| DomainFailure::VerificationFailed)?,
+            database: stored.manifest.database.clone(),
+            expected_content_digest: stored.manifest.content_digest.clone(),
+        };
+        let receipt = DurableRestore::open(self.root.join("transactions"), &cipher)
+            .map_err(|_| DomainFailure::OperationFailed)?
+            .execute(
+                plan,
+                &stored.manifest,
+                &self.objects()?,
+                &database.path,
+                &mut QuiescedDatabase,
+                RestoreFailpoint::None,
+            )
             .map_err(|_| DomainFailure::VerificationFailed)?;
-        self.install_restored_bytes(
-            database,
-            &snapshot_id,
-            &stored.manifest.content_digest,
-            &bytes,
-        )?;
-        Ok(serde_json::json!({"snapshotId":snapshot_id,"restored":true}))
+        Ok(serde_json::json!({"snapshotId":snapshot_id,"restored":true,"receipt":receipt}))
     }
     fn promote(&self, request: Value) -> Result<Value, DomainFailure> {
         let _guard = self
@@ -757,15 +854,42 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             return Err(DomainFailure::InvalidRequest);
         }
         let target = request.target_id.ok_or(DomainFailure::InvalidRequest)?;
-        let mut writers = self.writers()?;
-        writers.insert(id.clone(), target.clone());
-        fs::write(
-            self.root.join("writers.json"),
-            serde_json::to_vec(&writers).map_err(|_| DomainFailure::OperationFailed)?,
-        )
-        .map_err(|_| DomainFailure::OperationFailed)?;
-        Ok(serde_json::json!({"databaseId":id,"writer":target}))
+        let latest = self
+            .manifests()?
+            .into_iter()
+            .filter(|item| item.manifest.database.to_string() == id)
+            .last()
+            .ok_or(DomainFailure::InvalidRequest)?;
+        let current_writer = self
+            .writers()?
+            .remove(&id)
+            .ok_or(DomainFailure::VerificationFailed)?;
+        let receipt = AuthorityStore::open(self.root.join("authority"))
+            .map_err(|_| DomainFailure::OperationFailed)?
+            .promote(PromotionPlan {
+                schema: "commonkit.promotion-plan.v1".into(),
+                run_id: request
+                    .confirmation_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| format!("promote-{}-{target}", id)),
+                database: database_id(&id)?,
+                previous_writer: current_writer,
+                candidate_writer: target.clone(),
+                latest_snapshot_digest: latest.manifest.content_digest.clone(),
+                current_writer_digest: request
+                    .current_writer_digest
+                    .unwrap_or_else(|| latest.manifest.content_digest.clone()),
+                candidate_digest: request
+                    .candidate_digest
+                    .unwrap_or_else(|| latest.manifest.content_digest.clone()),
+            })
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        Ok(serde_json::json!({"databaseId":id,"writer":target,"receipt":receipt}))
     }
+}
+
+fn database_id(value: &str) -> Result<DatabaseId, DomainFailure> {
+    DatabaseId::new(value).map_err(|_| DomainFailure::InvalidRequest)
 }
 
 #[derive(Debug, Error)]
@@ -776,6 +900,8 @@ pub enum ProductionDomainError {
     EmptyCapability,
     #[error("configured identifier is duplicated")]
     DuplicateId,
+    #[error("configured composition cannot be materialized safely")]
+    InvalidComposition,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

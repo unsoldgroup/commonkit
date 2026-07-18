@@ -126,6 +126,7 @@ async fn configured_domains_receive_authenticated_consent_checked_requests() {
     let control = ControlPlane::new(Arc::new(UnusedExecutor));
     let domains = Arc::new(EchoDomains);
     control.set_headless_domains(HeadlessDomainRegistry {
+        composition: None,
         sync: Some(domains.clone()),
         credentials: Some(domains.clone()),
         snapshots: Some(domains),

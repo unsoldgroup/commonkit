@@ -121,6 +121,7 @@ impl Default for SchedulerConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct SchedulerStore {
     path: PathBuf,
 }
@@ -619,8 +620,8 @@ fn router_with_control_and_relay(
         .route("/control/v1/health", get(health))
         .route("/control/v1/events", get(get_events))
         .route("/control/v1/diagnostics", get(get_diagnostics))
-        .route("/control/v1/compose", get(capability_unavailable))
-        .route("/control/v1/explain", post(capability_unavailable))
+        .route("/control/v1/compose", get(compose_state))
+        .route("/control/v1/explain", post(explain_state))
         .route("/control/v1/sync/plan", post(sync_plan))
         .route("/control/v1/verify", post(verify_target))
         .route(
@@ -1110,6 +1111,46 @@ pub trait SyncDomain: Send + Sync + 'static {
     fn rollback(&self, request: Value) -> Result<Value, DomainFailure>;
 }
 
+pub struct SyncDomainDriftChecker {
+    domain: Option<Arc<dyn SyncDomain>>,
+}
+
+impl SyncDomainDriftChecker {
+    pub fn new(domain: Option<Arc<dyn SyncDomain>>) -> Self {
+        Self { domain }
+    }
+}
+
+impl DriftChecker for SyncDomainDriftChecker {
+    fn check(&self) -> DriftResult {
+        let Some(domain) = &self.domain else {
+            return DriftResult {
+                state: OverallState::Error,
+                code: Some("sync_domain_unconfigured".into()),
+            };
+        };
+        match domain.verify(serde_json::json!({})) {
+            Ok(_) => DriftResult {
+                state: OverallState::Healthy,
+                code: None,
+            },
+            Err(DomainFailure::VerificationFailed | DomainFailure::StalePlan) => DriftResult {
+                state: OverallState::Drifted,
+                code: Some("managed_state_drifted".into()),
+            },
+            Err(_) => DriftResult {
+                state: OverallState::Error,
+                code: Some("drift_check_failed".into()),
+            },
+        }
+    }
+}
+
+pub trait CompositionDomain: Send + Sync + 'static {
+    fn compose(&self) -> Result<Value, DomainFailure>;
+    fn explain(&self, pointer: &str) -> Result<Value, DomainFailure>;
+}
+
 pub trait CredentialDomain: Send + Sync + 'static {
     fn apply(&self, request: Value) -> Result<Value, DomainFailure>;
     fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
@@ -1132,6 +1173,7 @@ pub enum DomainFailure {
 
 #[derive(Clone, Default)]
 pub struct HeadlessDomainRegistry {
+    pub composition: Option<Arc<dyn CompositionDomain>>,
     pub sync: Option<Arc<dyn SyncDomain>>,
     pub credentials: Option<Arc<dyn CredentialDomain>>,
     pub snapshots: Option<Arc<dyn SnapshotDomain>>,
@@ -1516,16 +1558,6 @@ impl ApiError {
         }
     }
 
-    fn unavailable() -> Self {
-        Self {
-            status: StatusCode::NOT_IMPLEMENTED,
-            code: "capability_unavailable",
-            message: Some(
-                "This capability is not implemented by the current CommonKit service; update the daemon or enable the required provider",
-            ),
-        }
-    }
-
     fn unavailable_code(code: &'static str) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -1571,8 +1603,42 @@ impl IntoResponse for ApiError {
     }
 }
 
-async fn capability_unavailable() -> ApiError {
-    ApiError::unavailable()
+async fn compose_state(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .composition
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("composition_domain_unconfigured"))?;
+    safe_domain_result(domain.compose())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExplainRequest {
+    pointer: String,
+}
+
+async fn explain_state(
+    State(state): State<ApiState>,
+    Json(request): Json<ExplainRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !request.pointer.starts_with('/') || request.pointer.len() > 4096 {
+        return Err(ApiError::bad_request("invalid_json_pointer"));
+    }
+    let domain = state
+        .control
+        .inner
+        .domains
+        .read()
+        .expect("domain registry lock")
+        .composition
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("composition_domain_unconfigured"))?;
+    safe_domain_result(domain.explain(&request.pointer))
 }
 
 async fn skill_inventory(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
@@ -2316,6 +2382,7 @@ pub struct BoundServer {
     discovery: DaemonDiscovery,
     relay: Option<(tokio::net::TcpListener, Router)>,
     relay_address: Option<SocketAddr>,
+    scheduler: Arc<DriftScheduler<SyncDomainDriftChecker>>,
 }
 
 impl BoundServer {
@@ -2399,17 +2466,26 @@ impl BoundServer {
             plan_store,
             paths.receipts.clone(),
         )?;
+        let drift_checker = Arc::new(SyncDomainDriftChecker::new(production_domains.sync.clone()));
         control.set_headless_domains(production_domains.into_headless());
-        control.set_scheduler_store(Arc::new(
-            SchedulerStore::open(
-                discovery_path
-                    .as_ref()
-                    .parent()
-                    .ok_or(ServiceError::UnsafeDiscoveryPath)?
-                    .join("scheduler"),
+        let scheduler_store = SchedulerStore::open(
+            discovery_path
+                .as_ref()
+                .parent()
+                .ok_or(ServiceError::UnsafeDiscoveryPath)?
+                .join("scheduler"),
+        )
+        .map_err(|_| ServiceError::UnsafeDiscoveryPath)?;
+        control.set_scheduler_store(Arc::new(scheduler_store.clone()));
+        let scheduler = Arc::new(
+            DriftScheduler::with_store(
+                drift_checker,
+                status.clone(),
+                events.clone(),
+                scheduler_store,
             )
             .map_err(|_| ServiceError::UnsafeDiscoveryPath)?,
-        ));
+        );
         let application = router_with_control_and_relay(
             token,
             status,
@@ -2436,6 +2512,7 @@ impl BoundServer {
             discovery,
             relay,
             relay_address,
+            scheduler,
         })
     }
 
@@ -2455,9 +2532,21 @@ impl BoundServer {
         let relay_task = self.relay.map(|(listener, application)| {
             tokio::spawn(async move { axum::serve(listener, application).await })
         });
+        let scheduler = self.scheduler.clone();
+        let interval = Duration::from_secs(scheduler.configuration().interval_seconds.max(1));
+        let (scheduler_shutdown, scheduler_signal) = tokio::sync::oneshot::channel();
+        let scheduler_task = tokio::spawn(async move {
+            scheduler
+                .run_until(interval, async move {
+                    let _ = scheduler_signal.await;
+                })
+                .await;
+        });
         let result = axum::serve(self.listener, self.application)
             .with_graceful_shutdown(shutdown)
             .await;
+        let _ = scheduler_shutdown.send(());
+        let _ = scheduler_task.await;
         if let Some(task) = relay_task {
             task.abort();
         }

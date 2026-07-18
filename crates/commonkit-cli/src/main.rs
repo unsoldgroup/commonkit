@@ -31,13 +31,13 @@ enum Command {
     Status,
     /// Compose ordered layer documents and emit normalized state.
     Compose {
-        #[arg(long = "layer", required = true)]
+        #[arg(long = "layer")]
         layers: Vec<PathBuf>,
     },
     /// Explain which layers contributed to a JSON pointer.
     Explain {
         pointer: String,
-        #[arg(long = "layer", required = true)]
+        #[arg(long = "layer")]
         layers: Vec<PathBuf>,
     },
     /// Plan synchronization through the local CommonKit daemon.
@@ -46,7 +46,7 @@ enum Command {
         confirmed: bool,
     },
     /// Show the deterministic changes in a synchronization plan.
-    Diff,
+    Diff { plan_id: String },
     /// Apply a content-addressed plan through the local daemon.
     Apply {
         plan_id: String,
@@ -65,6 +65,11 @@ enum Command {
     Schedule,
     /// Export redacted diagnostics from the local daemon.
     Diagnostics,
+    /// Inspect or provision credential references through the local daemon.
+    Credentials {
+        #[command(subcommand)]
+        command: CredentialCommand,
+    },
     /// Inspect or configure the persistent MCP relay.
     Relay {
         #[command(subcommand)]
@@ -74,6 +79,21 @@ enum Command {
     Skills {
         #[command(subcommand)]
         command: SkillsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredentialCommand {
+    Readiness {
+        references: Vec<String>,
+    },
+    Apply {
+        destination_ids: Vec<String>,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    Verify {
+        destination_ids: Vec<String>,
     },
 }
 
@@ -318,6 +338,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
         Command::Init => {
             let paths = AppPaths::discover()?;
+            paths.create_private_roots()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -343,6 +364,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             );
         }
         Command::Compose { layers } => {
+            if layers.is_empty() {
+                print_daemon(daemon_control("GET", "/control/v1/compose", None, None)?)?;
+                return Ok(());
+            }
             let result = compose(&layers)?;
             println!(
                 "{}",
@@ -355,6 +380,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             );
         }
         Command::Explain { pointer, layers } => {
+            if layers.is_empty() {
+                print_daemon(daemon_control(
+                    "POST",
+                    "/control/v1/explain",
+                    Some(json!({"pointer":pointer})),
+                    None,
+                )?)?;
+                return Ok(());
+            }
             let result = compose(&layers)?;
             let entry = result
                 .trace
@@ -417,9 +451,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             None,
             None,
         )?)?,
-        Command::Diff => {
-            return Err("plan_required: diff requires an explicit durable plan identifier".into());
-        }
+        Command::Diff { plan_id } => print_daemon(daemon_control(
+            "GET",
+            &format!("/control/v1/plans/{plan_id}"),
+            None,
+            None,
+        )?)?,
+        Command::Credentials { command } => run_credentials(command)?,
         Command::Relay { command } => run_relay(command)?,
         Command::Skills { command } => run_skills(command)?,
     }
@@ -772,6 +810,44 @@ fn daemon_control(
 fn print_daemon(value: Value) -> Result<(), Box<dyn Error>> {
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
+}
+
+fn run_credentials(command: CredentialCommand) -> Result<(), Box<dyn Error>> {
+    let value = match command {
+        CredentialCommand::Readiness { references } => daemon_control(
+            "POST",
+            "/control/v1/credentials/readiness",
+            Some(json!({"references": references})),
+            None,
+        )?,
+        CredentialCommand::Apply {
+            confirmed: false, ..
+        } => {
+            return Err(
+                "confirmation_required: pass --confirmed after reviewing the operation".into(),
+            );
+        }
+        CredentialCommand::Apply {
+            destination_ids,
+            confirmed: true,
+        } => daemon_control(
+            "POST",
+            "/control/v1/credentials/apply",
+            Some(json!({
+                "destinationIds": destination_ids,
+                "confirmed": true,
+                "confirmationId": "cli-credentials-apply"
+            })),
+            None,
+        )?,
+        CredentialCommand::Verify { destination_ids } => daemon_control(
+            "POST",
+            "/control/v1/credentials/verify",
+            Some(json!({"destinationIds": destination_ids})),
+            None,
+        )?,
+    };
+    print_daemon(value)
 }
 
 fn run_relay(command: RelayCommand) -> Result<(), Box<dyn Error>> {
