@@ -5,6 +5,8 @@ use commonkit_adapters::{
     BwsCommandError, BwsCommandRunner, BwsCredentialResolver, CredentialReadiness,
     CredentialReadinessInspector, CredentialReference, CredentialResolver, FakeCredentialResolver,
     LocalCredentialReadinessInspector, LocalSensitiveFileStore, NormalizedManagedPath,
+    PlatformKeychain, PlatformKeychainCredentialResolver, PlatformSecretCommandError,
+    PlatformSecretCommandRunner,
 };
 
 #[test]
@@ -38,6 +40,84 @@ fn accepts_only_strict_reference_uris_and_serializes_only_the_reference() {
         let error = CredentialReference::parse(value).expect_err(value);
         assert!(!error.to_string().contains(value), "error leaked input");
     }
+}
+
+#[derive(Default)]
+struct RecordingPlatformSecretRunner {
+    calls: Vec<(String, Vec<String>)>,
+}
+
+impl PlatformSecretCommandRunner for RecordingPlatformSecretRunner {
+    fn run(
+        &mut self,
+        executable: &str,
+        args: &[String],
+    ) -> Result<Vec<u8>, PlatformSecretCommandError> {
+        self.calls.push((executable.to_owned(), args.to_vec()));
+        Ok(b"native-secret\n".to_vec())
+    }
+}
+
+#[test]
+fn platform_keychains_use_fixed_arguments_and_expose_values_only_to_apply() {
+    let reference = CredentialReference::parse("keychain://commonkit/api-token").unwrap();
+
+    let mut mac = PlatformKeychainCredentialResolver::new(
+        PlatformKeychain::MacOs,
+        RecordingPlatformSecretRunner::default(),
+    );
+    let value = mac.resolve(&reference).unwrap();
+    assert_eq!(value.expose_for_apply(), b"native-secret");
+    assert_eq!(
+        mac.runner().calls,
+        vec![(
+            "security".to_owned(),
+            vec![
+                "find-generic-password".to_owned(),
+                "-s".to_owned(),
+                "commonkit".to_owned(),
+                "-a".to_owned(),
+                "api-token".to_owned(),
+                "-w".to_owned(),
+            ],
+        )]
+    );
+
+    let mut linux = PlatformKeychainCredentialResolver::new(
+        PlatformKeychain::LinuxSecretService,
+        RecordingPlatformSecretRunner::default(),
+    );
+    assert_eq!(
+        linux.resolve(&reference).unwrap().expose_for_apply(),
+        b"native-secret"
+    );
+    assert_eq!(
+        linux.runner().calls[0],
+        (
+            "secret-tool".to_owned(),
+            vec![
+                "lookup".to_owned(),
+                "service".to_owned(),
+                "commonkit".to_owned(),
+                "account".to_owned(),
+                "api-token".to_owned(),
+            ]
+        )
+    );
+}
+
+#[test]
+fn platform_keychain_resolver_rejects_other_reference_schemes() {
+    let reference = CredentialReference::parse("env://COMMONKIT_TOKEN").unwrap();
+    let mut resolver = PlatformKeychainCredentialResolver::new(
+        PlatformKeychain::MacOs,
+        RecordingPlatformSecretRunner::default(),
+    );
+    assert_eq!(
+        resolver.resolve(&reference).unwrap_err(),
+        commonkit_adapters::CredentialResolveError::UnsupportedReference
+    );
+    assert!(resolver.runner().calls.is_empty());
 }
 
 fn temporary_directory(label: &str) -> std::path::PathBuf {

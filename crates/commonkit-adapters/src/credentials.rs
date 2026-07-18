@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -198,6 +198,123 @@ pub trait CredentialResolver {
         &mut self,
         reference: &CredentialReference,
     ) -> Result<SecretValue, CredentialResolveError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformKeychain {
+    MacOs,
+    LinuxSecretService,
+}
+
+impl PlatformKeychain {
+    pub fn current() -> Result<Self, CredentialResolveError> {
+        match std::env::consts::OS {
+            "macos" => Ok(Self::MacOs),
+            "linux" => Ok(Self::LinuxSecretService),
+            _ => Err(CredentialResolveError::UnsupportedReference),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("platform credential command failed")]
+pub struct PlatformSecretCommandError;
+
+pub trait PlatformSecretCommandRunner {
+    fn run(
+        &mut self,
+        executable: &str,
+        args: &[String],
+    ) -> Result<Vec<u8>, PlatformSecretCommandError>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProcessPlatformSecretCommandRunner;
+
+impl PlatformSecretCommandRunner for ProcessPlatformSecretCommandRunner {
+    fn run(
+        &mut self,
+        executable: &str,
+        args: &[String],
+    ) -> Result<Vec<u8>, PlatformSecretCommandError> {
+        let mut command = Command::new(executable);
+        command
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        for name in ["DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let output = command.output().map_err(|_| PlatformSecretCommandError)?;
+        if !output.status.success() || output.stdout.len() > 1024 * 1024 {
+            return Err(PlatformSecretCommandError);
+        }
+        Ok(output.stdout)
+    }
+}
+
+pub struct PlatformKeychainCredentialResolver<R> {
+    platform: PlatformKeychain,
+    runner: R,
+}
+
+impl<R> PlatformKeychainCredentialResolver<R> {
+    pub fn new(platform: PlatformKeychain, runner: R) -> Self {
+        Self { platform, runner }
+    }
+
+    pub fn runner(&self) -> &R {
+        &self.runner
+    }
+}
+
+impl<R: PlatformSecretCommandRunner> CredentialResolver for PlatformKeychainCredentialResolver<R> {
+    fn resolve(
+        &mut self,
+        reference: &CredentialReference,
+    ) -> Result<SecretValue, CredentialResolveError> {
+        if reference.scheme() != "keychain" {
+            return Err(CredentialResolveError::UnsupportedReference);
+        }
+        let (service, account) = reference
+            .opaque()
+            .split_once('/')
+            .ok_or(CredentialResolveError::UnsupportedReference)?;
+        let (executable, args) = match self.platform {
+            PlatformKeychain::MacOs => (
+                "security",
+                vec![
+                    "find-generic-password".into(),
+                    "-s".into(),
+                    service.into(),
+                    "-a".into(),
+                    account.into(),
+                    "-w".into(),
+                ],
+            ),
+            PlatformKeychain::LinuxSecretService => (
+                "secret-tool",
+                vec![
+                    "lookup".into(),
+                    "service".into(),
+                    service.into(),
+                    "account".into(),
+                    account.into(),
+                ],
+            ),
+        };
+        let mut bytes = self
+            .runner
+            .run(executable, &args)
+            .map_err(|_| CredentialResolveError::ProviderFailed)?;
+        while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            bytes.pop();
+        }
+        SecretValue::new(bytes)
+    }
 }
 
 pub struct FakeCredentialResolver {
