@@ -1,26 +1,184 @@
-name: Release lifecycle matrix (disabled)
+name: Release lifecycle matrix
 
 on:
   workflow_dispatch:
+    inputs:
+      previous_tag:
+        description: Previously published signed release, for example v0.1.0
+        required: true
+        type: string
+      current_tag:
+        description: Newer published signed release to install as the update
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   install-update-uninstall:
-    if: ${{ false }}
     strategy:
       fail-fast: true
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install signed previous release
-        run: echo "disabled until signed installer fixtures exist"
-      - name: Update through signed Tauri metadata
-        run: echo "disabled until a two-version updater fixture exists"
-      - name: Verify standalone CLI
-        run: echo "disabled until packaged CLI fixtures exist"
-      - name: Uninstall and verify user data policy
-        run: echo "disabled until uninstall fixtures exist"
+      - uses: sigstore/cosign-installer@v3
+      - name: Download both published release generations
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir previous current
+          gh release download "${{ inputs.previous_tag }}" --dir previous
+          gh release download "${{ inputs.current_tag }}" --dir current
+      - name: Verify checksums and release identity on macOS and Linux
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for generation in previous current; do
+            (cd "$generation" && shasum -a 256 -c SHA256SUMS)
+            cosign verify-blob \
+              --bundle "$generation/SHA256SUMS.sig" \
+              --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/v.*$" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$generation/SHA256SUMS"
+          done
+      - name: Verify checksums and release identity on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          foreach ($generation in @('previous', 'current')) {
+            Get-Content "$generation/SHA256SUMS" | ForEach-Object {
+              if ($_ -notmatch '^([0-9a-f]{64})  (.+)$') { throw "Malformed checksum line: $_" }
+              $actual = (Get-FileHash -Algorithm SHA256 "$generation/$($Matches[2])").Hash.ToLowerInvariant()
+              if ($actual -ne $Matches[1]) { throw "Checksum mismatch: $($Matches[2])" }
+            }
+            cosign verify-blob `
+              --bundle "$generation/SHA256SUMS.sig" `
+              --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.github/workflows/release.yml@refs/tags/v.*$" `
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com `
+              "$generation/SHA256SUMS"
+            if ($LASTEXITCODE -ne 0) { throw "cosign verification failed for $generation" }
+          }
+      - name: Install previous signed macOS release
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=$(find previous -maxdepth 1 -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          mkdir "$RUNNER_TEMP/commonkit-mount"
+          hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/commonkit-mount" "$dmg"
+          app=$(find "$RUNNER_TEMP/commonkit-mount" -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$app"
+          sudo ditto "$app" /Applications/CommonKit.app
+          hdiutil detach "$RUNNER_TEMP/commonkit-mount"
+          codesign --verify --deep --strict /Applications/CommonKit.app
+          spctl --assess --type execute --verbose /Applications/CommonKit.app
+      - name: Update macOS by installing current signed release
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg=$(find current -maxdepth 1 -name '*.dmg' -print -quit)
+          test -n "$dmg"
+          mkdir "$RUNNER_TEMP/commonkit-update-mount"
+          hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/commonkit-update-mount" "$dmg"
+          app=$(find "$RUNNER_TEMP/commonkit-update-mount" -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$app"
+          sudo ditto "$app" /Applications/CommonKit.app
+          hdiutil detach "$RUNNER_TEMP/commonkit-update-mount"
+          codesign --verify --deep --strict /Applications/CommonKit.app
+          spctl --assess --type execute --verbose /Applications/CommonKit.app
+      - name: Install previous signed Debian release
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-0 libappindicator3-1 librsvg2-2
+          deb=$(find previous -maxdepth 1 -name '*.deb' -print -quit)
+          test -n "$deb"
+          package=$(dpkg-deb --field "$deb" Package)
+          test -n "$package"
+          echo "COMMONKIT_DEB_PACKAGE=$package" >> "$GITHUB_ENV"
+          sudo dpkg -i "$deb"
+          dpkg-query --show "$package"
+      - name: Update Linux by installing current signed Debian release
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          deb=$(find current -maxdepth 1 -name '*.deb' -print -quit)
+          test -n "$deb"
+          test "$(dpkg-deb --field "$deb" Package)" = "$COMMONKIT_DEB_PACKAGE"
+          sudo dpkg -i "$deb"
+          dpkg-query --show "$COMMONKIT_DEB_PACKAGE"
+      - name: Install previous signed NSIS release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem previous -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'Previous NSIS installer not found' }
+          if ((Get-AuthenticodeSignature $installer.FullName).Status -ne 'Valid') { throw 'Previous NSIS signature is not valid' }
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Previous NSIS install failed: $($process.ExitCode)" }
+      - name: Update Windows by installing current signed NSIS release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem current -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $installer) { throw 'Current NSIS installer not found' }
+          if ((Get-AuthenticodeSignature $installer.FullName).Status -ne 'Valid') { throw 'Current NSIS signature is not valid' }
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Current NSIS update failed: $($process.ExitCode)" }
+      - name: Verify current standalone CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ runner.os }}" in
+            macOS) cli=$(find current -maxdepth 1 -name 'commonkit-macos-universal' -print -quit) ;;
+            Linux) cli=$(find current -maxdepth 1 -name 'commonkit-linux-x86_64' -print -quit) ;;
+            Windows) cli=$(find current -maxdepth 1 -name 'commonkit-windows-x86_64.exe' -print -quit) ;;
+          esac
+          test -n "$cli"
+          chmod +x "$cli"
+          "$cli" --version
+      - name: Uninstall macOS and verify application removal
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          sudo rm -rf /Applications/CommonKit.app
+          test ! -e /Applications/CommonKit.app
+      - name: Uninstall Debian package and verify removal
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo dpkg -r "$COMMONKIT_DEB_PACKAGE"
+          ! dpkg-query --show "$COMMONKIT_DEB_PACKAGE"
+      - name: Uninstall NSIS package and verify registry removal
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $roots = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          $entry = Get-ItemProperty $roots -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'CommonKit' } |
+            Select-Object -First 1
+          if (-not $entry) { throw 'CommonKit uninstall registration not found' }
+          $command = if ($entry.QuietUninstallString) { $entry.QuietUninstallString } else { $entry.UninstallString }
+          if ($command -notmatch '^\s*"?([^"\r\n]+?\.exe)"?\s*(.*)$') { throw 'CommonKit uninstall command is malformed' }
+          $executable = $Matches[1]
+          $arguments = $Matches[2]
+          if ($arguments -notmatch '(^|\s)/S($|\s)') { $arguments = "$arguments /S".Trim() }
+          $process = Start-Process -FilePath $executable -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "NSIS uninstall failed: $($process.ExitCode)" }
+          $remaining = Get-ItemProperty $roots -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'CommonKit' }
+          if ($remaining) { throw 'CommonKit uninstall registration remains' }
