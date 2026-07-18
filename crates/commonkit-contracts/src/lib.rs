@@ -1,6 +1,6 @@
 //! Stable, side-effect-free CommonKit wire contracts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::{fmt, sync::OnceLock};
 
 use regex::Regex;
@@ -267,6 +267,16 @@ pub struct LayerDocument {
     pub kind: LayerKind,
     pub source: SourceMetadata,
     pub spec: Value,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SecurityPolicy {
+    pub denied_paths: BTreeSet<String>,
+    pub required_controls: BTreeMap<StableId, bool>,
+    pub allowlists: BTreeMap<StableId, BTreeSet<String>>,
+    pub minimums: BTreeMap<StableId, i64>,
+    pub maximums: BTreeMap<StableId, i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]

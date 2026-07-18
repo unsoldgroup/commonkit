@@ -8,7 +8,5 @@ rust-version.workspace = true
 
 [dependencies]
 commonkit-contracts = { path = "../commonkit-contracts" }
-thiserror.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+thiserror.workspace = true

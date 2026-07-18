@@ -1,8 +1,9 @@
 //! Layer loading and composition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use commonkit_contracts::{LayerDocument, LayerKind};
+use commonkit_contracts::{LayerDocument, LayerKind, canonical_json};
+use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub struct LayerSet {
@@ -47,4 +48,198 @@ pub enum LayerSetError {
     MissingRequired(LayerKind),
     #[error("layer kind appears more than once: {0:?}")]
     DuplicateKind(LayerKind),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeStrategy {
+    Replace,
+    RecursiveMap,
+    SetUnion,
+    MergeById { id_key: String },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MergeRules {
+    strategies: BTreeMap<String, MergeStrategy>,
+    deletable: BTreeSet<String>,
+}
+
+impl MergeRules {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_strategy(mut self, pointer: impl Into<String>, strategy: MergeStrategy) -> Self {
+        self.strategies.insert(pointer.into(), strategy);
+        self
+    }
+
+    pub fn allow_delete(mut self, pointer: impl Into<String>) -> Self {
+        self.deletable.insert(pointer.into());
+        self
+    }
+
+    fn strategy(&self, pointer: &str, base: &Value, overlay: &Value) -> MergeStrategy {
+        self.strategies.get(pointer).cloned().unwrap_or_else(|| {
+            if base.is_object() && overlay.is_object() {
+                MergeStrategy::RecursiveMap
+            } else {
+                MergeStrategy::Replace
+            }
+        })
+    }
+}
+
+pub fn merge_specs(base: &Value, overlay: &Value, rules: &MergeRules) -> Result<Value, MergeError> {
+    merge_value(base, overlay, "", rules)?
+        .ok_or_else(|| MergeError::DeleteNotAllowed { pointer: "".into() })
+}
+
+fn merge_value(
+    base: &Value,
+    overlay: &Value,
+    pointer: &str,
+    rules: &MergeRules,
+) -> Result<Option<Value>, MergeError> {
+    if is_delete(overlay) {
+        return if rules.deletable.contains(pointer) {
+            Ok(None)
+        } else {
+            Err(MergeError::DeleteNotAllowed {
+                pointer: pointer.into(),
+            })
+        };
+    }
+
+    match rules.strategy(pointer, base, overlay) {
+        MergeStrategy::Replace => Ok(Some(overlay.clone())),
+        MergeStrategy::RecursiveMap => {
+            let Some(base) = base.as_object() else {
+                return Ok(Some(overlay.clone()));
+            };
+            let Some(overlay) = overlay.as_object() else {
+                return Ok(Some(Value::Object(base.clone())));
+            };
+            let mut merged = base.clone();
+            for (key, value) in overlay {
+                let child_pointer = format!("{pointer}/{}", escape_pointer(key));
+                let previous = merged.get(key).unwrap_or(&Value::Null);
+                match merge_value(previous, value, &child_pointer, rules)? {
+                    Some(value) => {
+                        merged.insert(key.clone(), value);
+                    }
+                    None => {
+                        merged.remove(key);
+                    }
+                }
+            }
+            Ok(Some(Value::Object(merged)))
+        }
+        MergeStrategy::SetUnion => merge_set_union(base, overlay, pointer).map(Some),
+        MergeStrategy::MergeById { id_key } => {
+            merge_by_id(base, overlay, pointer, rules, &id_key).map(Some)
+        }
+    }
+}
+
+fn merge_set_union(base: &Value, overlay: &Value, pointer: &str) -> Result<Value, MergeError> {
+    let (Some(base), Some(overlay)) = (base.as_array(), overlay.as_array()) else {
+        return Err(MergeError::StrategyTypeMismatch {
+            pointer: pointer.into(),
+            expected: "array",
+        });
+    };
+    let mut result = base.clone();
+    let mut seen = BTreeSet::new();
+    for value in base.iter().chain(overlay) {
+        let key = canonical_json(value).map_err(|_| MergeError::Canonicalization)?;
+        if seen.insert(key) && !base.contains(value) {
+            result.push(value.clone());
+        }
+    }
+    Ok(Value::Array(result))
+}
+
+fn merge_by_id(
+    base: &Value,
+    overlay: &Value,
+    pointer: &str,
+    rules: &MergeRules,
+    id_key: &str,
+) -> Result<Value, MergeError> {
+    let (Some(base), Some(overlay)) = (base.as_array(), overlay.as_array()) else {
+        return Err(MergeError::StrategyTypeMismatch {
+            pointer: pointer.into(),
+            expected: "array",
+        });
+    };
+    let mut result = base.clone();
+    let mut positions = BTreeMap::new();
+    for (index, value) in result.iter().enumerate() {
+        positions.insert(item_id(value, pointer, id_key)?, index);
+    }
+    for value in overlay {
+        let id = item_id(value, pointer, id_key)?;
+        if let Some(index) = positions.get(&id).copied() {
+            let item_pointer = format!("{pointer}/{id}");
+            result[index] =
+                merge_value(&result[index], value, &item_pointer, rules)?.ok_or_else(|| {
+                    MergeError::DeleteNotAllowed {
+                        pointer: item_pointer.clone(),
+                    }
+                })?;
+        } else {
+            positions.insert(id, result.len());
+            result.push(value.clone());
+        }
+    }
+    Ok(Value::Array(result))
+}
+
+fn item_id(value: &Value, pointer: &str, id_key: &str) -> Result<String, MergeError> {
+    value
+        .as_object()
+        .and_then(|object: &Map<String, Value>| object.get(id_key))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| MergeError::MissingItemId {
+            pointer: pointer.into(),
+            id_key: id_key.into(),
+        })
+}
+
+fn is_delete(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        object.len() == 1 && object.get("$delete").and_then(Value::as_bool) == Some(true)
+    })
+}
+
+fn escape_pointer(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum MergeError {
+    #[error("delete is not allowed at {pointer}")]
+    DeleteNotAllowed { pointer: String },
+    #[error("merge strategy at {pointer} requires {expected}")]
+    StrategyTypeMismatch {
+        pointer: String,
+        expected: &'static str,
+    },
+    #[error("merge-by-ID at {pointer} requires string key {id_key}")]
+    MissingItemId { pointer: String, id_key: String },
+    #[error("canonicalization failed during set union")]
+    Canonicalization,
+}
+
+impl MergeError {
+    pub fn pointer(&self) -> &str {
+        match self {
+            Self::DeleteNotAllowed { pointer }
+            | Self::StrategyTypeMismatch { pointer, .. }
+            | Self::MissingItemId { pointer, .. } => pointer,
+            Self::Canonicalization => "",
+        }
+    }
 }
