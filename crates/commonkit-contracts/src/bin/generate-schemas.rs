@@ -26,6 +26,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "diagnostics.schema.json",
             commonkit_contracts::diagnostics_schema()?,
         ),
+        (
+            "execution-manifest.schema.json",
+            commonkit_contracts::execution_manifest_schema()?,
+        ),
+        (
+            "execution-receipt.schema.json",
+            commonkit_contracts::execution_receipt_schema()?,
+        ),
     ] {
         let mut output = serde_json::to_string_pretty(&schema)?;
         output.push('\n');

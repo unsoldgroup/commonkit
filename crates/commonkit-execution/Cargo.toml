@@ -1,0 +1,22 @@
+[package]
+name = "commonkit-execution"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+commonkit-contracts = { path = "../commonkit-contracts" }
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+libc.workspace = true
+chacha20poly1305.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

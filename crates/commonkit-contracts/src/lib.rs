@@ -49,7 +49,10 @@ pub fn assert_no_embedded_secrets(value: &Value) -> Result<(), ContractError> {
             Value::Object(values) => {
                 for (key, value) in values {
                     let child_location = format!("{location}/{}", escape_json_pointer(key));
-                    if is_secret_key(key) && !is_empty_or_false(value) {
+                    if is_secret_key(key)
+                        && value_can_contain_secret(value)
+                        && !is_empty_or_false(value)
+                    {
                         let safe_reference = value.as_str().is_some_and(is_reference);
                         if !safe_reference {
                             return Err(ContractError::EmbeddedSecret(child_location));
@@ -126,6 +129,10 @@ fn is_reference(value: &str) -> bool {
 
 fn is_empty_or_false(value: &Value) -> bool {
     matches!(value, Value::Null | Value::Bool(false)) || value.as_str() == Some("")
+}
+
+fn value_can_contain_secret(value: &Value) -> bool {
+    matches!(value, Value::String(_) | Value::Array(_) | Value::Object(_))
 }
 
 fn escape_json_pointer(value: &str) -> String {
@@ -636,6 +643,241 @@ pub struct DiagnosticBundle {
     pub components: Vec<ComponentDiagnostic>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Queued,
+    Assigned,
+    Preparing,
+    Running,
+    Checkpointing,
+    Succeeded,
+    Failed,
+    Canceled,
+    Interrupted,
+}
+
+impl JobState {
+    pub fn terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Canceled | Self::Interrupted
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkPolicy {
+    Deny,
+    Restricted,
+    Allow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceRequirements {
+    pub cpu_millis: u32,
+    pub memory_mib: u64,
+    pub disk_mib: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub retryable_exit_codes: BTreeSet<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ArtifactPolicy {
+    pub globs: Vec<String>,
+    pub retention_seconds: u64,
+    pub max_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserProfile {
+    pub chromium_revision: String,
+    pub operating_system: String,
+    pub fonts_digest: Sha256Digest,
+    pub locale: String,
+    pub timezone: String,
+    pub viewport_width: u32,
+    pub viewport_height: u32,
+    pub device_scale_factor_milli: u32,
+    pub headless: bool,
+    pub performance_class: Option<StableId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionManifest {
+    pub schema_version: SchemaVersion,
+    pub repository: String,
+    pub repository_revision: GitRevision,
+    pub workspace_bundle_digest: Option<Sha256Digest>,
+    pub argv: Vec<String>,
+    pub workdir: PortableSourcePath,
+    pub secret_refs: Vec<String>,
+    pub timeout_seconds: u64,
+    pub cancel_grace_seconds: u64,
+    pub resources: ResourceRequirements,
+    pub required_capabilities: BTreeSet<StableId>,
+    pub loadout_digest: Sha256Digest,
+    pub execution_profile_digest: Sha256Digest,
+    pub retry: RetryPolicy,
+    pub checkpoint_enabled: bool,
+    pub artifacts: ArtifactPolicy,
+    pub network_policy: NetworkPolicy,
+    pub repository_write: bool,
+    pub browser: Option<BrowserProfile>,
+}
+
+impl ExecutionManifest {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.argv.is_empty() {
+            return Err(ContractError::InvalidExecutionManifest(
+                "argv must not be empty".into(),
+            ));
+        }
+        if self.argv.iter().any(|arg| arg.contains('\0')) {
+            return Err(ContractError::InvalidExecutionManifest(
+                "argv contains NUL".into(),
+            ));
+        }
+        if self.secret_refs.iter().any(|value| !is_reference(value)) {
+            return Err(ContractError::InvalidExecutionManifest(
+                "secretRefs must contain references only".into(),
+            ));
+        }
+        let value = serde_json::to_value(self).map_err(|_| ContractError::Canonicalization)?;
+        assert_no_embedded_secrets(&value)
+    }
+    pub fn digest(&self) -> Result<Sha256Digest, ContractError> {
+        self.validate()?;
+        digest_domain_json("commonkit.execution-manifest.v1", self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Job {
+    pub id: String,
+    pub manifest_digest: Sha256Digest,
+    pub manifest: ExecutionManifest,
+    pub created_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Attempt {
+    pub id: String,
+    pub job_id: String,
+    pub number: u32,
+    pub revision: u64,
+    pub state: JobState,
+    pub target_id: Option<StableId>,
+    pub engine_run_ref: Option<String>,
+    pub fencing_token: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobEvent {
+    pub id: String,
+    pub job_id: String,
+    pub sequence: u64,
+    pub attempt_id: Option<String>,
+    pub kind: String,
+    pub at_unix_ms: u64,
+    pub data: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Lease {
+    pub job_id: String,
+    pub attempt_id: String,
+    pub worker_id: StableId,
+    pub fencing_token: u64,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Checkpoint {
+    pub id: String,
+    pub job_id: String,
+    pub attempt_id: String,
+    pub stage: String,
+    pub fencing_token: u64,
+    pub object_digest: Sha256Digest,
+    pub committed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Artifact {
+    pub id: String,
+    pub job_id: String,
+    pub attempt_id: String,
+    pub name: String,
+    pub object_digest: Sha256Digest,
+    pub size_bytes: u64,
+    pub media_type: String,
+    pub committed_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionTarget {
+    pub id: StableId,
+    pub platform: String,
+    pub healthy: bool,
+    pub draining: bool,
+    pub loadout_digest: Sha256Digest,
+    pub execution_profile_digest: Sha256Digest,
+    pub capabilities: BTreeSet<StableId>,
+    pub ready_secret_refs: BTreeSet<String>,
+    pub free: ResourceRequirements,
+    pub queue_depth: u32,
+    pub cost_score: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlacementExplanation {
+    pub target_id: StableId,
+    pub eligible: bool,
+    pub reasons: Vec<String>,
+    pub score: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionReceipt {
+    pub schema_version: SchemaVersion,
+    pub job_id: String,
+    pub attempt_id: String,
+    pub state: JobState,
+    pub exit_code: Option<i32>,
+    pub started_at_unix_ms: Option<u64>,
+    pub finished_at_unix_ms: Option<u64>,
+    pub artifact_ids: Vec<String>,
+    pub checkpoint_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BrowserShard {
+    pub shard_id: String,
+    pub ordinal: u32,
+    pub task_id: String,
+}
+
 pub fn layer_schema() -> Result<Value, ContractError> {
     let mut schema = serde_json::to_value(schema_for!(LayerDocument))
         .map_err(|_| ContractError::SchemaGeneration)?;
@@ -712,6 +954,20 @@ pub fn diagnostics_schema() -> Result<Value, ContractError> {
     )
 }
 
+pub fn execution_manifest_schema() -> Result<Value, ContractError> {
+    schema_with_id(
+        schema_for!(ExecutionManifest),
+        "https://schemas.commonkit.dev/v1/execution-manifest.schema.json",
+    )
+}
+
+pub fn execution_receipt_schema() -> Result<Value, ContractError> {
+    schema_with_id(
+        schema_for!(ExecutionReceipt),
+        "https://schemas.commonkit.dev/v1/execution-receipt.schema.json",
+    )
+}
+
 fn schema_with_id(schema: schemars::Schema, id: &str) -> Result<Value, ContractError> {
     let mut schema = serde_json::to_value(schema).map_err(|_| ContractError::SchemaGeneration)?;
     schema
@@ -737,4 +993,6 @@ pub enum ContractError {
     InvalidGitRevision(String),
     #[error("embedded secret-like value at {0}")]
     EmbeddedSecret(String),
+    #[error("invalid execution manifest: {0}")]
+    InvalidExecutionManifest(String),
 }

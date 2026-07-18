@@ -18,6 +18,14 @@ fn checked_in_layer_schema_matches_the_rust_contract() {
         "diagnostics.schema.json",
         commonkit_contracts::diagnostics_schema(),
     );
+    assert_schema(
+        "execution-manifest.schema.json",
+        commonkit_contracts::execution_manifest_schema(),
+    );
+    assert_schema(
+        "execution-receipt.schema.json",
+        commonkit_contracts::execution_receipt_schema(),
+    );
 }
 
 fn assert_schema(
