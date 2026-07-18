@@ -1,6 +1,6 @@
 //! Authenticated, loopback-only CommonKit local control API.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -10,14 +10,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::routing::get;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
-use commonkit_contracts::{CONTRACT_VERSION, SCHEMA_VERSION};
+use commonkit_contracts::{
+    CONTRACT_VERSION, Plan, SCHEMA_VERSION, Sha256Digest, StableId, digest_domain_json,
+};
+use commonkit_core::{PlanDraft, build_plan};
 use futures_util::StreamExt;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -193,6 +196,7 @@ struct ApiState {
     status: Arc<RwLock<ServiceStatus>>,
     authority: String,
     events: EventHub,
+    control: ControlPlane,
 }
 
 pub fn router(
@@ -209,16 +213,38 @@ pub fn router_with_events(
     authority: impl Into<String>,
     events: EventHub,
 ) -> Router {
+    router_with_control(
+        token,
+        status,
+        authority,
+        events,
+        ControlPlane::new(Arc::new(UnavailableExecutor)),
+    )
+}
+
+pub fn router_with_control(
+    token: ControlToken,
+    status: Arc<RwLock<ServiceStatus>>,
+    authority: impl Into<String>,
+    events: EventHub,
+    control: ControlPlane,
+) -> Router {
     let state = ApiState {
         token,
         status,
         authority: authority.into(),
         events,
+        control,
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
         .route("/control/v1/health", get(health))
         .route("/control/v1/events", get(get_events))
+        .route("/control/v1/plans", post(register_plan))
+        .route("/control/v1/plans/{id}", get(get_plan))
+        .route("/control/v1/plans/{id}/apply", post(apply_plan))
+        .route("/control/v1/operations/{id}", get(get_operation))
+        .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
 }
@@ -287,6 +313,376 @@ impl EventHub {
                 .cloned()
                 .collect(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyStatus {
+    Running,
+    Succeeded,
+    RolledBack,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApplyOperation {
+    pub id: Sha256Digest,
+    pub plan_id: Sha256Digest,
+    pub status: ApplyStatus,
+    pub failure_code: Option<StableId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionResult {
+    pub status: ApplyStatus,
+    pub failure_code: Option<StableId>,
+}
+
+pub trait PlanExecutor: Send + Sync + 'static {
+    fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult;
+}
+
+struct UnavailableExecutor;
+
+impl PlanExecutor for UnavailableExecutor {
+    fn execute(&self, _plan: &Plan, _confirmation_id: &StableId) -> ExecutionResult {
+        ExecutionResult {
+            status: ApplyStatus::Failed,
+            failure_code: Some(
+                StableId::parse("executor_unavailable").expect("static stable identifier"),
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ControlPlane {
+    inner: Arc<ControlPlaneInner>,
+}
+
+struct ControlPlaneInner {
+    plans: std::sync::RwLock<BTreeMap<Sha256Digest, Plan>>,
+    operations: std::sync::RwLock<BTreeMap<Sha256Digest, ApplyOperation>>,
+    idempotency: std::sync::Mutex<BTreeMap<String, (Sha256Digest, Sha256Digest)>>,
+    executor: Arc<dyn PlanExecutor>,
+}
+
+impl ControlPlane {
+    pub fn new(executor: Arc<dyn PlanExecutor>) -> Self {
+        Self {
+            inner: Arc::new(ControlPlaneInner {
+                plans: std::sync::RwLock::new(BTreeMap::new()),
+                operations: std::sync::RwLock::new(BTreeMap::new()),
+                idempotency: std::sync::Mutex::new(BTreeMap::new()),
+                executor,
+            }),
+        }
+    }
+
+    pub fn register_plan(&self, plan: Plan) -> Result<Plan, ControlError> {
+        validate_control_plan(&plan)?;
+        let mut plans = self.inner.plans.write().expect("plan lock");
+        if let Some(existing) = plans.get(&plan.id) {
+            if existing == &plan {
+                return Ok(existing.clone());
+            }
+            return Err(ControlError::PlanConflict);
+        }
+        plans.insert(plan.id.clone(), plan.clone());
+        Ok(plan)
+    }
+
+    pub fn plan(&self, id: &Sha256Digest) -> Option<Plan> {
+        self.inner.plans.read().expect("plan lock").get(id).cloned()
+    }
+
+    pub fn operation(&self, id: &Sha256Digest) -> Option<ApplyOperation> {
+        self.inner
+            .operations
+            .read()
+            .expect("operation lock")
+            .get(id)
+            .cloned()
+    }
+
+    pub fn apply(
+        &self,
+        plan_id: &Sha256Digest,
+        confirmation_id: &StableId,
+        idempotency_key: &str,
+    ) -> Result<(ApplyOperation, bool), ControlError> {
+        let (operation, created, job) =
+            self.reserve_apply(plan_id, confirmation_id, idempotency_key)?;
+        if let Some(job) = job {
+            return Ok((self.execute_job(job), created));
+        }
+        Ok((operation, created))
+    }
+
+    fn reserve_apply(
+        &self,
+        plan_id: &Sha256Digest,
+        confirmation_id: &StableId,
+        idempotency_key: &str,
+    ) -> Result<(ApplyOperation, bool, Option<ExecutionJob>), ControlError> {
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || !idempotency_key
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(ControlError::InvalidIdempotencyKey);
+        }
+        let plan = self.plan(plan_id).ok_or(ControlError::PlanNotFound)?;
+        let operation_id = digest_domain_json(
+            "commonkit.control-operation.v1",
+            &serde_json::json!({
+                "planId": plan_id,
+                "confirmationId": confirmation_id,
+                "idempotencyKey": idempotency_key,
+            }),
+        )?;
+
+        {
+            let mut keys = self.inner.idempotency.lock().expect("idempotency lock");
+            if let Some((bound_plan, existing_id)) = keys.get(idempotency_key) {
+                if bound_plan != plan_id {
+                    return Err(ControlError::IdempotencyConflict);
+                }
+                return self
+                    .operation(existing_id)
+                    .map(|operation| (operation, false, None))
+                    .ok_or(ControlError::OperationNotFound);
+            }
+            let running = ApplyOperation {
+                id: operation_id.clone(),
+                plan_id: plan_id.clone(),
+                status: ApplyStatus::Running,
+                failure_code: None,
+            };
+            self.inner
+                .operations
+                .write()
+                .expect("operation lock")
+                .insert(operation_id.clone(), running);
+            keys.insert(
+                idempotency_key.into(),
+                (plan_id.clone(), operation_id.clone()),
+            );
+        }
+        Ok((
+            self.operation(&operation_id)
+                .expect("reserved operation exists"),
+            true,
+            Some(ExecutionJob {
+                operation_id,
+                plan,
+                confirmation_id: confirmation_id.clone(),
+            }),
+        ))
+    }
+
+    fn execute_job(&self, job: ExecutionJob) -> ApplyOperation {
+        let execution = self.inner.executor.execute(&job.plan, &job.confirmation_id);
+        let completed = ApplyOperation {
+            id: job.operation_id.clone(),
+            plan_id: job.plan.id,
+            status: execution.status,
+            failure_code: execution.failure_code,
+        };
+        self.inner
+            .operations
+            .write()
+            .expect("operation lock")
+            .insert(job.operation_id, completed.clone());
+        completed
+    }
+}
+
+struct ExecutionJob {
+    operation_id: Sha256Digest,
+    plan: Plan,
+    confirmation_id: StableId,
+}
+
+fn validate_control_plan(plan: &Plan) -> Result<(), ControlError> {
+    let rebuilt = build_plan(PlanDraft {
+        target_id: plan.target_id.clone(),
+        desired_digest: plan.desired_digest.clone(),
+        observed_digest: plan.observed_digest.clone(),
+        policy_digest: plan.policy_digest.clone(),
+        operations: plan.operations.clone(),
+    })
+    .map_err(|_| ControlError::InvalidPlan)?;
+    if rebuilt != *plan {
+        return Err(ControlError::InvalidPlan);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum ControlError {
+    #[error("plan is invalid")]
+    InvalidPlan,
+    #[error("plan identity conflicts with registered content")]
+    PlanConflict,
+    #[error("plan was not found")]
+    PlanNotFound,
+    #[error("operation was not found")]
+    OperationNotFound,
+    #[error("idempotency key is invalid")]
+    InvalidIdempotencyKey,
+    #[error("idempotency key is already bound to another plan")]
+    IdempotencyConflict,
+    #[error(transparent)]
+    Contract(#[from] commonkit_contracts::ContractError),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ApplyRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+}
+
+async fn register_plan(
+    State(state): State<ApiState>,
+    Json(plan): Json<Plan>,
+) -> Result<(StatusCode, Json<Plan>), ApiError> {
+    state
+        .control
+        .register_plan(plan)
+        .map(|plan| (StatusCode::CREATED, Json(plan)))
+        .map_err(ApiError::from)
+}
+
+async fn get_plan(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Plan>, ApiError> {
+    let id = Sha256Digest::parse(id).map_err(|_| ApiError::bad_request("invalid_plan_id"))?;
+    state
+        .control
+        .plan(&id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("plan_not_found"))
+}
+
+async fn apply_plan(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<ApplyRequest>,
+) -> Result<(StatusCode, Json<ApplyOperation>), ApiError> {
+    if !request.confirmed {
+        return Err(ApiError::conflict("confirmation_required"));
+    }
+    let id = Sha256Digest::parse(id).map_err(|_| ApiError::bad_request("invalid_plan_id"))?;
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::bad_request("idempotency_key_required"))?;
+    let (operation, created, job) = state
+        .control
+        .reserve_apply(&id, &request.confirmation_id, key)
+        .map_err(ApiError::from)?;
+    if created {
+        state.events.publish(
+            "operation.updated",
+            serde_json::to_value(&operation).expect("operation serializes"),
+        );
+        let control = state.control.clone();
+        let events = state.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let completed = control.execute_job(job.expect("created operation has job"));
+            events.publish(
+                "operation.updated",
+                serde_json::to_value(completed).expect("operation serializes"),
+            );
+        });
+    }
+    Ok((
+        if created {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        },
+        Json(operation),
+    ))
+}
+
+async fn get_operation(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<ApplyOperation>, ApiError> {
+    let id = Sha256Digest::parse(id).map_err(|_| ApiError::bad_request("invalid_operation_id"))?;
+    state
+        .control
+        .operation(&id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("operation_not_found"))
+}
+
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+}
+
+impl ApiError {
+    fn bad_request(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+        }
+    }
+
+    fn not_found(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code,
+        }
+    }
+
+    fn conflict(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+        }
+    }
+}
+
+impl From<ControlError> for ApiError {
+    fn from(error: ControlError) -> Self {
+        match error {
+            ControlError::PlanNotFound => Self::not_found("plan_not_found"),
+            ControlError::OperationNotFound => Self::not_found("operation_not_found"),
+            ControlError::IdempotencyConflict | ControlError::PlanConflict => {
+                Self::conflict("conflict")
+            }
+            ControlError::InvalidIdempotencyKey => Self::bad_request("invalid_idempotency_key"),
+            ControlError::InvalidPlan | ControlError::Contract(_) => {
+                Self::bad_request("invalid_plan")
+            }
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "apiVersion": "commonkit.control/v1",
+                "error": {
+                    "code": self.code,
+                    "message": self.code.replace('_', " "),
+                    "retryable": false,
+                }
+            })),
+        )
+            .into_response()
     }
 }
 

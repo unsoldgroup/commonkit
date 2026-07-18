@@ -311,6 +311,7 @@ dependencies = [
  "axum",
  "clap",
  "commonkit-contracts",
+ "commonkit-core",
  "commonkit-platform",
  "futures-util",
  "rand",
