@@ -22,6 +22,8 @@ native providers ─┘              |
 
 Providers compute. Adapters mutate. Recovery consumes only durable plans, artifact manifests, artifacts, backup records, and receipts; it never re-runs a provider, downloads content, evaluates templates, or resolves credentials.
 
+SkillOpt is adjacent to, not inside, this desired-target provider fan-in. It computes immutable skill candidates under an independent evidence/policy harness. After human promotion into Git, APM materializes the approved source through this pipeline. See `docs/plans/skillopt-v1-integration.md`.
+
 ## Cold inventory
 
 Branch: `uns-1274-commonkit-v1-rust-tauri`
@@ -206,9 +208,10 @@ APM 0.25.0 uses the same inputs, materialized sets, ownership, bindings, artifac
 9. Execute the chezmoi fixture spike and classify every case.
 10. Implement only the proven chezmoi subset.
 11. Implement APM for local Claude and Codex on the same pipeline.
-12. Converge relay declarations/client config and preserve native fallbacks.
-13. Resume Git sync, credentials, snapshots, desktop, packaging, and platforms.
-14. Run adversarial review, failure injection, cross-platform, migration, threat-model, and release audits.
+12. Complete the SkillOpt candidate lifecycle gates, then feed only human-promoted Git source into APM and named-canary reconciliation.
+13. Converge relay declarations/client config and preserve native fallbacks.
+14. Resume Git sync, credentials, snapshots, desktop, packaging, and platforms.
+15. Run adversarial review, failure injection, cross-platform, migration, threat-model, and release audits.
 
 ## Completion evidence
 

@@ -10,7 +10,7 @@ CommonKit v1 is a portable, layered developer environment that moves shared capa
 
 Version 1 is complete only when all 12 flows in `CONTEXT.md` are implemented. The current Node CommonKit engine and TypeScript `mcp-local-relay` package are reference implementations whose tested behavior must be preserved or deliberately superseded during migration.
 
-## ADR 0005/0006 provider amendment
+## ADR 0005/0006 provider and SkillOpt amendment
 
 This focused amendment supersedes agent packaging, broad native client compilation, and home-file source-management portions of this scope where they conflict with ADR 0005 or ADR 0006. It does not change the product's composition, policy floor, target, reconciliation, credential, relay, snapshot, service, desktop, platform, or release responsibilities.
 
@@ -21,7 +21,24 @@ This focused amendment supersedes agent packaging, broad native client compilati
 - Provider outputs and backups are stored as integrity-checked content-addressed artifacts. Plans bind composed loadout, provider inputs, ownership map, and artifact-set digests. Recovery never re-runs providers.
 - CommonKit will not build a package marketplace, agent dependency resolver, package archive/SBOM/scanner, broad native client compiler, or dotfile template/source engine.
 
-The active implementation sequence is recorded in `docs/plans/provider-adapter-implementation.md`. Durable fresh-process recovery is the first gate; APM/chezmoi production integration cannot proceed until a new adapter process can reconstruct every applied operation from durable plans, artifacts, backups, and receipts.
+SkillOpt is a separate, safety-gated capability workflow above the agent-context provider boundary:
+
+```text
+pinned external SkillOpt
+  -> isolated train/validation optimization
+  -> independent held-out and policy harness
+  -> immutable candidate plus evidence
+  -> fresh Git/policy-bound human approval
+  -> APM compilation
+  -> CommonKit named-canary plan/apply/verify
+  -> authenticated durable rollback
+```
+
+SkillOpt computes candidates; it never mutates active skills, promotes source, compiles agent packages, schedules itself, or mutates a target. Canonical skill source is `.agents/skills/<name>/SKILL.md`; `.claude/skills` is a delivery symlink. Dataset approval, candidate adoption, and merge remain explicit human actions. A Claude `SessionEnd` hook may record freshness only; it must not harvest, evaluate, spend budget, or adopt. Codex has no equivalent hook in v1.
+
+The WIP reference implementation is branch `al-unsoldgroup/skillopt`, commit `fc7de87`, tracked by `USG-48`. It is explicitly not merge-ready. Its stricter partial fixes must be preserved, but integration proceeds by classified, reviewed changes rather than merging the branch wholesale. The six release blockers are: canonical-source enforcement, independent held-out evidence, corpus binding, real cross-platform provider isolation, fresh Git/policy revalidation, and authenticated verified canary rollback. See `docs/plans/skillopt-v1-integration.md`.
+
+The active implementation sequence is recorded in `docs/plans/provider-adapter-implementation.md`. Durable fresh-process recovery is the first gate; APM/chezmoi production integration cannot proceed until a new adapter process can reconstruct every applied operation from durable plans, artifacts, backups, and receipts. SkillOpt cannot graduate until APM provider convergence and durable authenticated canary rollback are proven.
 
 ## Problem
 
@@ -373,6 +390,16 @@ Exit: flows 2–4 and 6 pass end-to-end; repeat apply is a no-op; injected failu
 
 Exit: every capability is operable headlessly; mutation paths use plan-bound confirmation.
 
+### Phase 3a — SkillOpt candidate lifecycle
+
+- Integrate pinned external SkillOpt behind a strict, isolated provider boundary.
+- Bind reviewed train/validation inputs to skill, campaign, suite, and exact case IDs.
+- Evaluate held-out cases and policy only in an independent CommonKit-owned harness.
+- Store immutable redacted evidence and candidates; require fresh Git/policy-bound human promotion.
+- Compile promoted source through APM, reconcile a named canary through CommonKit, and verify durable authenticated rollback.
+
+Exit: all SkillOpt security gates in `docs/plans/skillopt-v1-integration.md` pass on the supported platform isolation matrix; neither provider nor harness can mutate source or targets.
+
 ### Phase 4 — Rust relay parity
 
 - Implement relay runtime, atomic desired-state reconciliation, lifecycle boundary, caches, notifications, provider modes, and health.
@@ -433,6 +460,8 @@ Exit: all 12 v1 flows pass on the declared platform matrix; release artifacts in
 - [ ] Tauri app and headless interfaces expose the same domain state.
 - [ ] Installers and updates are signed and verified.
 - [ ] Threat model, schemas, onboarding, support matrix, and migration docs are published.
+- [ ] SkillOpt receives only bound train/validation data in real isolation; held-out evidence comes only from the independent harness.
+- [ ] SkillOpt promotion is bound to fresh Git and policy digests, and named-canary rollback is persisted, authenticated, and verified.
 
 ## Defaults still requiring confirmation
 
