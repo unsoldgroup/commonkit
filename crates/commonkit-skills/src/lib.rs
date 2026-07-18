@@ -539,8 +539,23 @@ impl SkillOptSleepOptimizer {
         fs::write(&skill_path, current_skill)?;
         let tasks_path = input.join("reviewed-tasks.json");
         fs::copy(&self.config.tasks_file, &tasks_path)?;
-        let suite_path = input.join("suite-manifest.json");
-        fs::write(&suite_path, canonical_json(suite)?)?;
+        let provider_suite_path = input.join("suite-manifest.json");
+        fs::write(
+            &provider_suite_path,
+            canonical_json(&serde_json::json!({
+                "schemaVersion": suite.schema_version,
+                "id": suite.id,
+                "skillId": suite.skill_id,
+                "train": suite.train,
+                "validation": suite.validation,
+                "rubricDigest": suite.rubric_digest,
+                "harness": suite.harness,
+                "metric": {
+                    "id": suite.metric.id,
+                    "minimumImprovementBasisPoints": suite.metric.minimum_improvement_basis_points,
+                }
+            }))?,
+        )?;
         let stdout_path = staging.join("stdout.json");
         let stderr_path = staging.join("stderr.log");
         let stdout = private_output_file(&stdout_path)?;
@@ -650,6 +665,11 @@ impl SkillOptSleepOptimizer {
         }
         let candidate = read_bounded(&staging_dir.join("proposed_SKILL.md"), 256 * 1024)?;
         validate_candidate_content(&candidate)?;
+        // Held-out identities are materialized only after the provider exits.
+        // The independent harness receives the complete suite and corpus; the
+        // provider never receives either.
+        let harness_suite_path = staging.join("harness-suite-manifest.json");
+        fs::write(&harness_suite_path, canonical_json(suite)?)?;
         let harness_stdout = staging.join("harness-evaluation.json");
         let harness_stderr = staging.join("harness-stderr.log");
         let mut harness = isolated_command(
@@ -666,7 +686,7 @@ impl SkillOptSleepOptimizer {
             .arg("--candidate")
             .arg(staging_dir.join("proposed_SKILL.md"))
             .arg("--suite-manifest")
-            .arg(&suite_path)
+            .arg(&harness_suite_path)
             .arg("--corpus")
             .arg(&self.config.harness_corpus)
             .arg("--json")

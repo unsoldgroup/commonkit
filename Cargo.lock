@@ -464,6 +464,7 @@ dependencies = [
  "commonkit-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 
@@ -491,6 +492,7 @@ dependencies = [
  "axum",
  "clap",
  "commonkit-adapters",
+ "commonkit-config",
  "commonkit-contracts",
  "commonkit-core",
  "commonkit-platform",

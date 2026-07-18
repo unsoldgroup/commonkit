@@ -1,8 +1,10 @@
 use commonkit_contracts::{Operation, OperationKind, ResourceRef, Risk, Sha256Digest, StableId};
 use commonkit_core::{OperationDraft, finalize_operation};
 use commonkit_reconcile::{
-    Adapter, AdapterFailure, ApmCompilation, ApmCompiler, ReceiptStore, ReconcileOutcome,
-    SkillDeploymentRequest, SkillDeploymentState, SkillDeploymentWorkflow,
+    Adapter, AdapterFailure, ApmCompilation, ApmCompiler, AuthenticatedSkillPromotion,
+    CanaryStateObserver, DeploymentTrustStore, ReceiptStore, ReconcileOutcome,
+    SkillDeploymentError, SkillDeploymentRequest, SkillDeploymentState, SkillDeploymentWorkflow,
+    SkillPromotionAuthority,
 };
 
 fn temporary_directory(label: &str) -> std::path::PathBuf {
@@ -98,9 +100,7 @@ impl Adapter for RecordingAdapter {
 fn request() -> SkillDeploymentRequest {
     SkillDeploymentRequest {
         candidate_id: id("candidate-1"),
-        candidate_digest: digest('9'),
         promotion_receipt_id: digest('a'),
-        promoted_source_digest: digest('b'),
         apm_package: id("review-skill"),
         canary_loadout: id("codex-canary"),
         observed_digest: digest('c'),
@@ -108,18 +108,86 @@ fn request() -> SkillDeploymentRequest {
     }
 }
 
+struct Authority {
+    path: std::path::PathBuf,
+}
+impl SkillPromotionAuthority for Authority {
+    fn authenticate(
+        &self,
+        promotion_receipt_id: &Sha256Digest,
+    ) -> Result<AuthenticatedSkillPromotion, SkillDeploymentError> {
+        let value: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&self.path)
+                .map_err(|_| SkillDeploymentError::PromotionAuthorityMismatch)?,
+        )
+        .map_err(|_| SkillDeploymentError::PromotionAuthorityMismatch)?;
+        if promotion_receipt_id.as_str() != value["promotionReceiptId"].as_str().unwrap_or_default()
+            || value["candidateState"] != "promoted"
+        {
+            return Err(SkillDeploymentError::PromotionAuthorityMismatch);
+        }
+        Ok(AuthenticatedSkillPromotion {
+            candidate_id: StableId::parse(value["candidateId"].as_str().unwrap_or_default())
+                .map_err(|_| SkillDeploymentError::PromotionAuthorityMismatch)?,
+            candidate_digest: Sha256Digest::parse(
+                value["candidateDigest"].as_str().unwrap_or_default(),
+            )
+            .map_err(|_| SkillDeploymentError::PromotionAuthorityMismatch)?,
+            promotion_receipt_id: Sha256Digest::parse(
+                value["promotionReceiptId"].as_str().unwrap_or_default(),
+            )
+            .map_err(|_| SkillDeploymentError::PromotionAuthorityMismatch)?,
+            promoted_source_digest: Sha256Digest::parse(
+                value["promotedSourceDigest"].as_str().unwrap_or_default(),
+            )
+            .map_err(|_| SkillDeploymentError::PromotionAuthorityMismatch)?,
+        })
+    }
+}
+
+fn authority(root: &std::path::Path) -> Authority {
+    let path = root.join("durable-promotion-authority.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&serde_json::json!({
+            "promotionReceiptId": digest('a'),
+            "candidateId": "candidate-1",
+            "candidateDigest": digest('9'),
+            "promotedSourceDigest": digest('b'),
+            "candidateState": "promoted"
+        }))
+        .expect("authority json"),
+    )
+    .expect("durable authority");
+    Authority { path }
+}
+
+struct Observer(Sha256Digest);
+impl CanaryStateObserver for Observer {
+    fn observe_digest(
+        &mut self,
+        _: &StableId,
+        _: &[Operation],
+    ) -> Result<Sha256Digest, AdapterFailure> {
+        Ok(self.0.clone())
+    }
+}
+
 #[test]
 fn compiles_apm_applies_named_canary_and_links_receipts() {
     let temporary = temporary_directory("skill-deployment");
+    let anchors = temporary_directory("skill-deployment-anchors");
     let store = ReceiptStore::open(&temporary).expect("store");
-    let workflow = SkillDeploymentWorkflow::new(&store);
+    let trust = DeploymentTrustStore::open(&anchors, [7; 32]).expect("trust");
+    let workflow = SkillDeploymentWorkflow::new(&store, &trust);
     let mut compiler = Compiler {
         source_digest: digest('b'),
     };
+    let authority = authority(&temporary);
     let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(RecordingAdapter::default())];
 
     let prepared = workflow
-        .prepare(request(), &mut compiler)
+        .prepare(request(), &mut compiler, &authority)
         .expect("prepare canary");
     assert_eq!(prepared.plan.target_id, id("codex-canary"));
     assert_eq!(prepared.plan.bindings.provider_inputs_digest, digest('4'));
@@ -137,33 +205,92 @@ fn compiles_apm_applies_named_canary_and_links_receipts() {
     drop(store);
 
     let restarted_store = ReceiptStore::open(&temporary).expect("restart store");
-    let restarted_workflow = SkillDeploymentWorkflow::new(&restarted_store);
+    let restarted_trust = DeploymentTrustStore::open(&anchors, [7; 32]).expect("restart trust");
+    let restarted_workflow = SkillDeploymentWorkflow::new(&restarted_store, &restarted_trust);
+    let anchor_path = anchors.join("canary-run-1.anchor");
+    let authentic_anchor = std::fs::read(&anchor_path).expect("anchor");
+    std::fs::write(&anchor_path, b"caller-forged-anchor").expect("tamper anchor");
+    let error = restarted_workflow
+        .load(&id("canary-run-1"), &deployment_id)
+        .expect_err("independent anchor must authenticate the receipt");
+    assert_eq!(error.code(), "skill_deployment_anchor_mismatch");
+    std::fs::write(&anchor_path, authentic_anchor).expect("restore test anchor");
     let wrong_id = digest('f');
     let error = restarted_workflow
-        .rollback(&id("canary-run-1"), &wrong_id, &mut adapters)
+        .rollback(
+            &id("canary-run-1"),
+            &wrong_id,
+            &mut adapters,
+            &mut Observer(digest('c')),
+        )
         .expect_err("caller-supplied receipt identity must not be trusted");
     assert_eq!(error.code(), "skill_deployment_receipt_mismatch");
     let rollback = restarted_workflow
-        .rollback(&id("canary-run-1"), &deployment_id, &mut adapters)
+        .rollback(
+            &id("canary-run-1"),
+            &deployment_id,
+            &mut adapters,
+            &mut Observer(digest('c')),
+        )
         .expect("rollback canary");
     assert_eq!(rollback.state, SkillDeploymentState::RolledBack);
     assert_eq!(rollback.deployment_receipt_id, receipt.id);
     assert_eq!(rollback.restored_digest, digest('c'));
     std::fs::remove_dir_all(temporary).expect("cleanup");
+    std::fs::remove_dir_all(anchors).expect("cleanup anchors");
 }
 
 #[test]
 fn rejects_apm_output_not_compiled_from_promoted_source() {
     let temporary = temporary_directory("skill-deployment-stale");
+    let anchors = temporary_directory("skill-deployment-stale-anchors");
     let store = ReceiptStore::open(&temporary).expect("store");
-    let workflow = SkillDeploymentWorkflow::new(&store);
+    let trust = DeploymentTrustStore::open(&anchors, [7; 32]).expect("trust");
+    let workflow = SkillDeploymentWorkflow::new(&store, &trust);
     let mut compiler = Compiler {
         source_digest: digest('e'),
     };
+    let authority = authority(&temporary);
 
     let error = workflow
-        .prepare(request(), &mut compiler)
+        .prepare(request(), &mut compiler, &authority)
         .expect_err("stale APM compilation must fail");
     assert_eq!(error.code(), "apm_source_digest_mismatch");
     std::fs::remove_dir_all(temporary).expect("cleanup");
+    std::fs::remove_dir_all(anchors).expect("cleanup anchors");
+}
+
+#[test]
+fn rollback_fails_closed_when_fresh_target_observation_is_not_exact() {
+    let temporary = temporary_directory("skill-deployment-observation");
+    let anchors = temporary_directory("skill-deployment-observation-anchors");
+    let store = ReceiptStore::open(&temporary).expect("store");
+    let trust = DeploymentTrustStore::open(&anchors, [9; 32]).expect("trust");
+    let workflow = SkillDeploymentWorkflow::new(&store, &trust);
+    let mut compiler = Compiler {
+        source_digest: digest('b'),
+    };
+    let authority = authority(&temporary);
+    let prepared = workflow
+        .prepare(request(), &mut compiler, &authority)
+        .expect("prepare");
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(RecordingAdapter::default())];
+    let receipt = workflow
+        .apply(prepared, id("canary-run-observation"), &mut adapters)
+        .expect("apply");
+
+    let error = workflow
+        .rollback(
+            &id("canary-run-observation"),
+            &receipt.id,
+            &mut adapters,
+            &mut Observer(digest('e')),
+        )
+        .expect_err("mismatched restored state");
+    assert_eq!(
+        error.code(),
+        "skill_deployment_rollback_verification_failed"
+    );
+    std::fs::remove_dir_all(temporary).expect("cleanup");
+    std::fs::remove_dir_all(anchors).expect("cleanup anchors");
 }

@@ -3,9 +3,10 @@
 mod skill_deployment;
 
 pub use skill_deployment::{
-    ApmCompilation, ApmCompiler, PreparedSkillDeployment, SkillDeploymentError,
-    SkillDeploymentLineage, SkillDeploymentReceipt, SkillDeploymentRequest,
-    SkillDeploymentRollbackReceipt, SkillDeploymentState, SkillDeploymentWorkflow,
+    ApmCompilation, ApmCompiler, AuthenticatedSkillPromotion, CanaryStateObserver,
+    DeploymentTrustStore, PreparedSkillDeployment, SkillDeploymentError, SkillDeploymentLineage,
+    SkillDeploymentReceipt, SkillDeploymentRequest, SkillDeploymentRollbackReceipt,
+    SkillDeploymentState, SkillDeploymentWorkflow, SkillPromotionAuthority,
 };
 
 use std::fs::{self, File, OpenOptions};

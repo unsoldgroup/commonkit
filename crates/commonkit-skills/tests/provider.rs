@@ -43,6 +43,8 @@ while [ "$#" -gt 0 ]; do
   elif [ "$1" = "--target-skill-path" ]; then skill="$2"; shift 2
   else shift; fi
 done
+if grep -R 'held' "$project/input" >/dev/null 2>&1; then exit 71; fi
+if [ -e "$project/harness-suite-manifest.json" ]; then exit 72; fi
 mkdir -p "$project/.skillopt-sleep/staging/run-1"
 printf '# Review\n\nImproved safely.\n' > "$project/.skillopt-sleep/staging/run-1/proposed_SKILL.md"
 printf '{"live_skill_path":"%s","live_memory_path":"","has_skill":true,"has_memory":false,"accepted":true}' "$skill" > "$project/.skillopt-sleep/staging/run-1/manifest.json"
