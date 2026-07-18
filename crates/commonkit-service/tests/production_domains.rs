@@ -39,7 +39,7 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         vec![NormalizedResource {
             intent: FilesystemIntent::File {
                 path: NormalizedManagedPath::parse("home/config.txt").unwrap(),
-                content,
+                content: content.clone(),
                 mode: None,
                 expected_before: None,
             },
@@ -67,13 +67,13 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         "declaredRoots": ["home"], "protectedRoots": [], "caseSensitive": true,
         "targetIdentityDigest": digest_domain_json("test", &"target").unwrap(),
         "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
-        "observedDigest": digest_domain_json("test", &"observed").unwrap(),
         "policyDigest": digest_domain_json("test", &"policy").unwrap()
       },
       "credentials": { "root": root.join("credentials"), "destinations": [{
         "id": "api-token", "reference": format!("file://{}", source_secret.display()), "path": "tokens/api"
       }]},
       "snapshots": { "root": root.join("snapshots"), "keyReference": format!("file://{}", source_secret.display()),
+        "objectStore": {"type":"local"},
         "databases": [{"id":"context-mode", "path": database, "targetId":"local", "format":"file"}] }
     });
     let config_path = root.join("headless.json");
@@ -83,6 +83,10 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         ProductionDomainRegistry::load(&config_path, plan_store, root.join("receipts")).unwrap();
 
     let sync = registry.sync.as_ref().unwrap().clone();
+    assert_eq!(
+        sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"test","unexpected":true})),
+        Err(commonkit_service::DomainFailure::InvalidRequest)
+    );
     let plan = sync
         .plan(serde_json::json!({"confirmed":true,"confirmationId":"test"}))
         .unwrap();
@@ -113,6 +117,93 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
     assert_eq!(rolled_back["outcome"], "rolledback");
     assert!(!target.join("home/config.txt").exists());
 
+    let stale_plan: commonkit_contracts::Plan = serde_json::from_value(
+        sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"test"}))
+            .unwrap(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(target.join("home")).unwrap();
+    std::fs::write(target.join("home/config.txt"), b"hand edit").unwrap();
+    let rebound_plan: commonkit_contracts::Plan = serde_json::from_value(
+        sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"test"}))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(stale_plan.observed_digest, rebound_plan.observed_digest);
+    let mut stale_adapters: Vec<Box<dyn Adapter>> = vec![Box::new(
+        commonkit_adapters::FileAdapter::open(&target, &state.join("filesystem")).unwrap(),
+    )];
+    assert_eq!(
+        Reconciler::with_store(&receipts)
+            .execute(
+                &stale_plan,
+                StableId::parse("stale-production-run").unwrap(),
+                &mut stale_adapters,
+            )
+            .unwrap(),
+        ReconcileOutcome::Canceled
+    );
+    std::fs::remove_file(target.join("home/config.txt")).unwrap();
+
+    let artifact_plan: commonkit_contracts::Plan = serde_json::from_value(
+        sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"test"}))
+            .unwrap(),
+    )
+    .unwrap();
+    let artifact_path = state.join("filesystem/artifacts").join(format!(
+        "{}.blob",
+        content.digest.as_str().trim_start_matches("sha256:")
+    ));
+    std::fs::write(&artifact_path, b"tampered").unwrap();
+    let mut artifact_adapters: Vec<Box<dyn Adapter>> = vec![Box::new(
+        commonkit_adapters::FileAdapter::open(&target, &state.join("filesystem")).unwrap(),
+    )];
+    assert_ne!(
+        Reconciler::with_store(&receipts)
+            .execute(
+                &artifact_plan,
+                StableId::parse("tampered-artifact-run").unwrap(),
+                &mut artifact_adapters,
+            )
+            .unwrap(),
+        ReconcileOutcome::Succeeded
+    );
+    assert!(!target.join("home/config.txt").exists());
+    std::fs::write(&artifact_path, b"managed\n").unwrap();
+
+    let authenticated_plan: commonkit_contracts::Plan = serde_json::from_value(
+        sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"test"}))
+            .unwrap(),
+    )
+    .unwrap();
+    let authenticated_run = StableId::parse("authenticated-production-run").unwrap();
+    let mut authenticated_adapters: Vec<Box<dyn Adapter>> = vec![Box::new(
+        commonkit_adapters::FileAdapter::open(&target, &state.join("filesystem")).unwrap(),
+    )];
+    assert_eq!(
+        Reconciler::with_store(&receipts)
+            .execute(
+                &authenticated_plan,
+                authenticated_run.clone(),
+                &mut authenticated_adapters,
+            )
+            .unwrap(),
+        ReconcileOutcome::Succeeded
+    );
+    let receipt_directory = root.join("receipts").join(authenticated_run.as_str());
+    let latest_receipt = std::fs::read_dir(receipt_directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .max()
+        .unwrap();
+    std::fs::write(latest_receipt, b"{}").unwrap();
+    assert_eq!(
+        sync.rollback(
+            serde_json::json!({"confirmed":true,"confirmationId":"test","runId":authenticated_run})
+        ),
+        Err(commonkit_service::DomainFailure::InvalidRequest)
+    );
+
     let credentials = registry.credentials.unwrap();
     let applied = credentials.apply(serde_json::json!({"confirmed":true,"confirmationId":"test","destinationIds":["api-token"]})).unwrap();
     assert_eq!(applied, serde_json::json!({"applied":["api-token"]}));
@@ -131,6 +222,22 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
             .unwrap()
             .len(),
         1
+    );
+    let snapshot_listing = snapshots.list().unwrap().to_string();
+    assert!(!snapshot_listing.contains("never serialize me"));
+    let encrypted_manifest = std::fs::read(
+        std::fs::read_dir(root.join("snapshots/manifests"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(
+        !encrypted_manifest
+            .windows(b"context-mode".len())
+            .any(|window| window == b"context-mode")
     );
     std::fs::write(&database, b"database-v2").unwrap();
     snapshots.restore(serde_json::json!({"confirmed":true,"confirmationId":"test","snapshotId":created["snapshotId"]})).unwrap();
@@ -173,6 +280,36 @@ fn present_but_incomplete_capability_configuration_fails_closed() {
             &config,
             std::sync::Arc::new(PlanStore::open(temporary.path().join("plans")).unwrap()),
             temporary.path().join("receipts"),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn invalid_s3_snapshot_backend_fails_at_registry_load() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let key = root.join("key");
+    std::fs::write(&key, b"target-local-key").unwrap();
+    let config = root.join("headless.json");
+    write_json(
+        &config,
+        &serde_json::json!({
+            "sync": null,
+            "credentials": null,
+            "snapshots": {
+                "root": root.join("snapshots"),
+                "keyReference": format!("file://{}", key.display()),
+                "objectStore": {"type":"s3", "executable":"relative/aws", "endpoint":"http://insecure", "bucket":"bad", "prefix":"."},
+                "databases": [{"id":"context-mode", "path":root.join("context.sqlite"), "targetId":"local", "format":"sqlite"}]
+            }
+        }),
+    );
+    assert!(
+        ProductionDomainRegistry::load(
+            &config,
+            std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+            root.join("receipts"),
         )
         .is_err()
     );

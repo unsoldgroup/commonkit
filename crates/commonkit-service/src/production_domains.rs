@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex};
 use commonkit_adapters::{
     ArtifactStore, CredentialReference, FileAdapter, LocalSensitiveFileStore, MaterializedState,
     NormalizedManagedPath, OwnershipRules, ProviderPlanRequest, SecretValue, build_provider_plan,
+    validate_ownership,
 };
 use commonkit_contracts::{Plan, Sha256Digest, StableId};
 use commonkit_reconcile::{Adapter, PlanStore, ReceiptStore, Reconciler};
 use commonkit_snapshots::{
-    DatabaseId, ObjectStore, SnapshotError, SnapshotManifest, SnapshotService, SqliteBackup,
+    AuthenticatedCipher, DatabaseId, ObjectStore, ProcessObjectCommandRunner,
+    S3CompatibleObjectStore, SnapshotError, SnapshotManifest, SnapshotService, SqliteBackup,
     StaticBackup, XChaCha20Cipher,
 };
 use serde::{Deserialize, Serialize};
@@ -41,7 +43,6 @@ struct SyncConfig {
     case_sensitive: bool,
     target_identity_digest: Sha256Digest,
     composed_loadout_digest: Sha256Digest,
-    observed_digest: Sha256Digest,
     policy_digest: Sha256Digest,
 }
 
@@ -64,7 +65,19 @@ struct CredentialDestination {
 struct SnapshotConfig {
     root: PathBuf,
     key_reference: CredentialReference,
+    object_store: SnapshotObjectStoreConfig,
     databases: Vec<SnapshotDatabase>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum SnapshotObjectStoreConfig {
+    Local,
+    S3 {
+        executable: PathBuf,
+        endpoint: String,
+        bucket: String,
+        prefix: String,
+    },
 }
 #[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -155,11 +168,13 @@ impl ProductionDomainRegistry {
                     if config.databases.is_empty() || !config.root.is_absolute() {
                         return Err(ProductionDomainError::EmptyCapability);
                     }
+                    validate_object_store(&config.object_store)?;
                     fs::create_dir_all(config.root.join("objects"))?;
                     fs::create_dir_all(config.root.join("manifests"))?;
                     Ok(Arc::new(ProductionSnapshotDomain {
                         root: config.root,
                         key_reference: config.key_reference,
+                        object_store: config.object_store,
                         databases: unique_databases(config.databases)?,
                         lock: Mutex::new(()),
                     }))
@@ -203,6 +218,29 @@ fn unique_databases(
     }
     Ok(output)
 }
+fn validate_object_store(config: &SnapshotObjectStoreConfig) -> Result<(), ProductionDomainError> {
+    match config {
+        SnapshotObjectStoreConfig::Local => Ok(()),
+        SnapshotObjectStoreConfig::S3 {
+            executable,
+            endpoint,
+            bucket,
+            prefix,
+        } => {
+            if !executable.is_absolute() {
+                return Err(ProductionDomainError::UnsafeConfig);
+            }
+            S3CompatibleObjectStore::new(
+                ProcessObjectCommandRunner::new(executable),
+                endpoint.clone(),
+                bucket.clone(),
+                prefix.clone(),
+            )
+            .map(|_| ())
+            .map_err(|_| ProductionDomainError::UnsafeConfig)
+        }
+    }
+}
 
 struct ProductionSyncDomain {
     config: SyncConfig,
@@ -236,17 +274,30 @@ impl ProductionSyncDomain {
             self.config.protected_roots.clone(),
         )
         .map_err(|_| DomainFailure::OperationFailed)?;
+        let states = self.states()?;
+        let resources = states
+            .iter()
+            .flat_map(|state| state.resources.iter().cloned())
+            .collect::<Vec<_>>();
+        validate_ownership(&resources, &rules).map_err(|_| DomainFailure::OperationFailed)?;
+        let observed_digest = files
+            .observed_state_digest(
+                states
+                    .iter()
+                    .flat_map(|state| state.resources.iter().map(|resource| &resource.intent)),
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?;
         let plan = build_provider_plan(
             ProviderPlanRequest {
                 target_id: self.config.target_id.clone(),
                 target_identity_digest: self.config.target_identity_digest.clone(),
                 composed_loadout_digest: self.config.composed_loadout_digest.clone(),
-                observed_digest: self.config.observed_digest.clone(),
+                observed_digest,
                 policy_digest: self.config.policy_digest.clone(),
                 ownership_rules: &rules,
                 mapped_side_effects: BTreeSet::new(),
             },
-            &self.states()?,
+            &states,
             &artifacts,
             &mut files,
         )
@@ -258,18 +309,51 @@ impl ProductionSyncDomain {
     }
 }
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanRequest {
+    confirmed: bool,
+    #[serde(rename = "confirmationId")]
+    confirmation_id: StableId,
+    #[serde(rename = "idempotencyKey")]
+    idempotency_key: Option<String>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PlanReference {
+#[serde(deny_unknown_fields)]
+struct VerifyRequest {
     plan_id: Option<Sha256Digest>,
-    run_id: Option<StableId>,
+    target_id: Option<StableId>,
+    pointer: Option<String>,
+}
+impl VerifyRequest {
+    fn acknowledge_metadata(&self) {
+        let _ = (&self.target_id, &self.pointer);
+    }
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RollbackRequest {
+    run_id: StableId,
+    confirmed: bool,
+    confirmation_id: StableId,
+    idempotency_key: Option<String>,
 }
 impl SyncDomain for ProductionSyncDomain {
-    fn plan(&self, _: Value) -> Result<Value, DomainFailure> {
+    fn plan(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: PlanRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let _request_metadata = (
+            request.confirmed,
+            request.confirmation_id,
+            request.idempotency_key,
+        );
         serde_json::to_value(self.build()?).map_err(|_| DomainFailure::OperationFailed)
     }
     fn verify(&self, request: Value) -> Result<Value, DomainFailure> {
-        let reference: PlanReference =
+        let reference: VerifyRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        reference.acknowledge_metadata();
         let plan = match reference.plan_id {
             Some(id) => self
                 .plan_store
@@ -287,9 +371,14 @@ impl SyncDomain for ProductionSyncDomain {
         Ok(serde_json::json!({"planId":plan.id,"verified":true}))
     }
     fn rollback(&self, request: Value) -> Result<Value, DomainFailure> {
-        let reference: PlanReference =
+        let reference: RollbackRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
-        let run_id = reference.run_id.ok_or(DomainFailure::InvalidRequest)?;
+        let _metadata = (
+            reference.confirmed,
+            reference.confirmation_id,
+            reference.idempotency_key,
+        );
+        let run_id = reference.run_id;
         let receipts =
             ReceiptStore::open(&self.receipt_root).map_err(|_| DomainFailure::OperationFailed)?;
         let receipt = receipts
@@ -316,8 +405,17 @@ struct ProductionCredentialDomain {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 struct CredentialRequest {
     destination_ids: Vec<StableId>,
+    confirmed: Option<bool>,
+    confirmation_id: Option<StableId>,
+    idempotency_key: Option<String>,
+}
+impl CredentialRequest {
+    fn acknowledge_metadata(&self) {
+        let _ = (self.confirmed, &self.confirmation_id, &self.idempotency_key);
+    }
 }
 fn resolve(reference: &CredentialReference) -> Result<SecretValue, DomainFailure> {
     let bytes = match reference.scheme() {
@@ -340,6 +438,7 @@ impl CredentialDomain for ProductionCredentialDomain {
     fn apply(&self, request: Value) -> Result<Value, DomainFailure> {
         let request: CredentialRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        request.acknowledge_metadata();
         let store = LocalSensitiveFileStore::open(&self.root)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let mut applied = Vec::new();
@@ -358,6 +457,7 @@ impl CredentialDomain for ProductionCredentialDomain {
     fn verify(&self, request: Value) -> Result<Value, DomainFailure> {
         let request: CredentialRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        request.acknowledge_metadata();
         let mut verified = Vec::new();
         for id in request.destination_ids {
             let destination = self
@@ -384,6 +484,7 @@ impl CredentialDomain for ProductionCredentialDomain {
 struct ProductionSnapshotDomain {
     root: PathBuf,
     key_reference: CredentialReference,
+    object_store: SnapshotObjectStoreConfig,
     databases: BTreeMap<String, SnapshotDatabase>,
     lock: Mutex<()>,
 }
@@ -398,6 +499,24 @@ impl ObjectStore for LocalObjects {
             .map_err(|_| SnapshotError::ObjectNotFound(key.into()))
     }
 }
+enum SnapshotObjects {
+    Local(LocalObjects),
+    S3(S3CompatibleObjectStore<ProcessObjectCommandRunner>),
+}
+impl ObjectStore for SnapshotObjects {
+    fn put(&mut self, key: &str, value: &[u8]) -> Result<(), SnapshotError> {
+        match self {
+            Self::Local(store) => store.put(key, value),
+            Self::S3(store) => store.put(key, value),
+        }
+    }
+    fn get(&self, key: &str) -> Result<Vec<u8>, SnapshotError> {
+        match self {
+            Self::Local(store) => store.get(key),
+            Self::S3(store) => store.get(key),
+        }
+    }
+}
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredSnapshot {
@@ -406,12 +525,46 @@ struct StoredSnapshot {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields)]
 struct SnapshotRequest {
     database_id: Option<String>,
     snapshot_id: Option<StableId>,
     target_id: Option<String>,
+    confirmed: Option<bool>,
+    confirmation_id: Option<StableId>,
+    idempotency_key: Option<String>,
+}
+impl SnapshotRequest {
+    fn acknowledge_metadata(&self) {
+        let _ = (self.confirmed, &self.confirmation_id, &self.idempotency_key);
+    }
 }
 impl ProductionSnapshotDomain {
+    fn objects(&self) -> Result<SnapshotObjects, DomainFailure> {
+        match &self.object_store {
+            SnapshotObjectStoreConfig::Local => Ok(SnapshotObjects::Local(LocalObjects(
+                self.root.join("objects"),
+            ))),
+            SnapshotObjectStoreConfig::S3 {
+                executable,
+                endpoint,
+                bucket,
+                prefix,
+            } => {
+                if !executable.is_absolute() {
+                    return Err(DomainFailure::OperationFailed);
+                }
+                S3CompatibleObjectStore::new(
+                    ProcessObjectCommandRunner::new(executable),
+                    endpoint.clone(),
+                    bucket.clone(),
+                    prefix.clone(),
+                )
+                .map(SnapshotObjects::S3)
+                .map_err(|_| DomainFailure::OperationFailed)
+            }
+        }
+    }
     fn cipher(&self) -> Result<XChaCha20Cipher, DomainFailure> {
         let secret = resolve(&self.key_reference)?;
         let mut key = [0u8; 32];
@@ -420,18 +573,26 @@ impl ProductionSnapshotDomain {
     }
     fn manifests(&self) -> Result<Vec<StoredSnapshot>, DomainFailure> {
         let mut output: Vec<StoredSnapshot> = Vec::new();
+        let cipher = self.cipher()?;
         for entry in
             fs::read_dir(self.root.join("manifests")).map_err(|_| DomainFailure::OperationFailed)?
         {
             let path = entry.map_err(|_| DomainFailure::OperationFailed)?.path();
-            if path.extension().and_then(|v| v.to_str()) != Some("json") {
+            if path.extension().and_then(|v| v.to_str()) != Some("bin") {
                 return Err(DomainFailure::OperationFailed);
             }
-            output.push(
-                serde_json::from_slice(
-                    &fs::read(path).map_err(|_| DomainFailure::OperationFailed)?,
+            let snapshot_id = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or(DomainFailure::OperationFailed)?;
+            let plaintext = cipher
+                .open(
+                    &fs::read(&path).map_err(|_| DomainFailure::OperationFailed)?,
+                    format!("commonkit.snapshot-manifest.v1\0{snapshot_id}").as_bytes(),
                 )
-                .map_err(|_| DomainFailure::OperationFailed)?,
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+            output.push(
+                serde_json::from_slice(&plaintext).map_err(|_| DomainFailure::OperationFailed)?,
             );
         }
         output.sort_by(|a, b| a.snapshot_id.cmp(&b.snapshot_id));
@@ -487,6 +648,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .map_err(|_| DomainFailure::OperationFailed)?;
         let request: SnapshotRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        request.acknowledge_metadata();
         let id = request.database_id.ok_or(DomainFailure::InvalidRequest)?;
         let database = self
             .databases
@@ -500,7 +662,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .filter(|item| item.manifest.database.to_string() == id)
             .last()
             .map(|item| item.manifest.content_digest);
-        let mut objects = LocalObjects(self.root.join("objects"));
+        let mut objects = self.objects()?;
         let manifest = match database.format {
             SnapshotSourceFormat::Sqlite => service.snapshot(
                 &database.id,
@@ -527,11 +689,19 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             snapshot_id: snapshot_id.clone(),
             manifest,
         };
+        let manifest_bytes =
+            serde_json::to_vec(&stored).map_err(|_| DomainFailure::OperationFailed)?;
+        let encrypted_manifest = cipher
+            .seal(
+                &manifest_bytes,
+                format!("commonkit.snapshot-manifest.v1\0{snapshot_id}").as_bytes(),
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?;
         fs::write(
             self.root
                 .join("manifests")
-                .join(format!("{snapshot_id}.json")),
-            serde_json::to_vec(&stored).map_err(|_| DomainFailure::OperationFailed)?,
+                .join(format!("{snapshot_id}.bin")),
+            encrypted_manifest,
         )
         .map_err(|_| DomainFailure::OperationFailed)?;
         Ok(serde_json::json!({"snapshotId":snapshot_id,"databaseId":id}))
@@ -546,6 +716,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .map_err(|_| DomainFailure::OperationFailed)?;
         let request: SnapshotRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        request.acknowledge_metadata();
         let snapshot_id = request.snapshot_id.ok_or(DomainFailure::InvalidRequest)?;
         let stored = self
             .manifests()?
@@ -558,7 +729,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .ok_or(DomainFailure::InvalidRequest)?;
         let cipher = self.cipher()?;
         let bytes = SnapshotService::new(&cipher)
-            .verify_and_decrypt(&stored.manifest, &LocalObjects(self.root.join("objects")))
+            .verify_and_decrypt(&stored.manifest, &self.objects()?)
             .map_err(|_| DomainFailure::VerificationFailed)?;
         self.install_restored_bytes(
             database,
@@ -575,6 +746,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .map_err(|_| DomainFailure::OperationFailed)?;
         let request: SnapshotRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        request.acknowledge_metadata();
         let id = request.database_id.ok_or(DomainFailure::InvalidRequest)?;
         if !self.databases.contains_key(&id)
             || !self

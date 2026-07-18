@@ -154,6 +154,27 @@ impl FileAdapter {
         })
     }
 
+    /// Computes a canonical digest of the live state for the exact normalized
+    /// resources a provider intends to manage. Inspection stays capability-
+    /// rooted and follows the same semantic representation as prepare/verify.
+    pub fn observed_state_digest<'a>(
+        &self,
+        intents: impl IntoIterator<Item = &'a FilesystemIntent>,
+    ) -> Result<Sha256Digest, FileAdapterError> {
+        let mut observed = Vec::new();
+        for intent in intents {
+            validate_semantic_intent(intent)?;
+            observed.push((
+                intent.path().as_str().to_owned(),
+                inspect_resource(&self.target, &self.artifacts, intent.path().as_str())?,
+            ));
+        }
+        observed.sort_by(|left, right| left.0.cmp(&right.0));
+        observed.dedup_by(|left, right| left.0 == right.0);
+        digest_domain_json("commonkit.observed-managed-resources.v1", &observed)
+            .map_err(FileAdapterError::Contract)
+    }
+
     pub fn register(&mut self, intent: FileIntent) -> Result<Operation, FileAdapterError> {
         if let Ok(text) = std::str::from_utf8(&intent.content) {
             assert_no_embedded_secrets(&Value::String(text.into()))?;
