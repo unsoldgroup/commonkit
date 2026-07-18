@@ -10,6 +10,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::Duration;
 use zeroize::Zeroize;
 
@@ -127,6 +129,10 @@ pub enum SnapshotError {
     CandidateDoesNotMatchSnapshot,
     #[error("database backup or integrity validation failed")]
     DatabaseFailed,
+    #[error("snapshot object-store operation failed")]
+    ObjectStoreFailed,
+    #[error("snapshot object-store configuration is invalid")]
+    InvalidObjectStore,
     #[error("unsupported snapshot schema or cipher")]
     UnsupportedSnapshotFormat,
 }
@@ -262,6 +268,145 @@ impl AuthenticatedCipher for XChaCha20Cipher {
 pub trait ObjectStore {
     fn put(&mut self, key: &str, ciphertext: &[u8]) -> Result<(), SnapshotError>;
     fn get(&self, key: &str) -> Result<Vec<u8>, SnapshotError>;
+}
+
+pub trait ObjectCommandRunner {
+    fn run(&mut self, arguments: &[String], stdin: &[u8]) -> Result<Vec<u8>, SnapshotError>;
+}
+
+pub struct ProcessObjectCommandRunner {
+    executable: PathBuf,
+}
+
+impl ProcessObjectCommandRunner {
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+        }
+    }
+}
+
+impl ObjectCommandRunner for ProcessObjectCommandRunner {
+    fn run(&mut self, arguments: &[String], stdin: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+        let mut child = Command::new(&self.executable)
+            .args(arguments)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !stdin.is_empty() {
+            use std::io::Write;
+            child
+                .stdin
+                .as_mut()
+                .ok_or(SnapshotError::ObjectStoreFailed)?
+                .write_all(stdin)
+                .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        }
+        let output = child
+            .wait_with_output()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if output.status.success() {
+            Ok(output.stdout)
+        } else {
+            Err(SnapshotError::ObjectStoreFailed)
+        }
+    }
+}
+
+/// S3-compatible object storage through the AWS CLI's binary-safe stdin/stdout interface.
+/// Credentials remain in the CLI's external credential chain and never enter CommonKit state.
+pub struct S3CompatibleObjectStore<R> {
+    runner: Mutex<R>,
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+}
+
+impl<R> S3CompatibleObjectStore<R> {
+    pub fn new(
+        runner: R,
+        endpoint: impl Into<String>,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+    ) -> Result<Self, SnapshotError> {
+        let endpoint = endpoint.into();
+        let bucket = bucket.into();
+        let prefix = prefix.into().trim_matches('/').to_owned();
+        if !endpoint.starts_with("https://")
+            || bucket.is_empty()
+            || !bucket
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+            || prefix.split('/').any(|part| part == "." || part == "..")
+        {
+            return Err(SnapshotError::InvalidObjectStore);
+        }
+        Ok(Self {
+            runner: Mutex::new(runner),
+            endpoint,
+            bucket,
+            prefix,
+        })
+    }
+
+    fn uri(&self, key: &str) -> Result<String, SnapshotError> {
+        if !key.starts_with("sha256:")
+            || key.len() != 71
+            || !key[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(SnapshotError::InvalidObjectStore);
+        }
+        let separator = if self.prefix.is_empty() { "" } else { "/" };
+        Ok(format!(
+            "s3://{}/{}{separator}{key}",
+            self.bucket, self.prefix
+        ))
+    }
+}
+
+impl<R: ObjectCommandRunner> ObjectStore for S3CompatibleObjectStore<R> {
+    fn put(&mut self, key: &str, ciphertext: &[u8]) -> Result<(), SnapshotError> {
+        let uri = self.uri(key)?;
+        self.runner
+            .get_mut()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?
+            .run(
+                &[
+                    "s3".into(),
+                    "cp".into(),
+                    "-".into(),
+                    uri,
+                    "--endpoint-url".into(),
+                    self.endpoint.clone(),
+                    "--no-progress".into(),
+                ],
+                ciphertext,
+            )?;
+        Ok(())
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, SnapshotError> {
+        let uri = self.uri(key)?;
+        self.runner
+            .lock()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?
+            .run(
+                &[
+                    "s3".into(),
+                    "cp".into(),
+                    uri,
+                    "-".into(),
+                    "--endpoint-url".into(),
+                    self.endpoint.clone(),
+                    "--no-progress".into(),
+                ],
+                &[],
+            )
+    }
 }
 
 /// A target stages imported bytes away from the live database, then swaps them atomically.

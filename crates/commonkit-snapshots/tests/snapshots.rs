@@ -58,6 +58,53 @@ fn sqlite_backup_is_consistent_and_integrity_checked_without_copying_wal_files()
 }
 
 #[test]
+fn s3_compatible_store_uses_binary_stdio_and_fixed_argv_without_credentials() {
+    use commonkit_snapshots::{ObjectCommandRunner, ObjectStore, S3CompatibleObjectStore};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Runner(Arc<Mutex<Vec<(Vec<String>, Vec<u8>)>>>);
+    impl ObjectCommandRunner for Runner {
+        fn run(&mut self, arguments: &[String], stdin: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push((arguments.to_vec(), stdin.to_vec()));
+            Ok(
+                if arguments
+                    .get(2)
+                    .is_some_and(|value| value.starts_with("s3://"))
+                {
+                    b"ciphertext".to_vec()
+                } else {
+                    Vec::new()
+                },
+            )
+        }
+    }
+
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let mut store = S3CompatibleObjectStore::new(
+        Runner(calls.clone()),
+        "https://account.r2.cloudflarestorage.com",
+        "commonkit-snapshots",
+        "v1",
+    )
+    .unwrap();
+    let key = format!("sha256:{}", "a".repeat(64));
+    store.put(&key, b"ciphertext").unwrap();
+    assert_eq!(store.get(&key).unwrap(), b"ciphertext");
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].1, b"ciphertext");
+    assert_eq!(calls[0].0[0..3], ["s3", "cp", "-"]);
+    assert!(
+        calls
+            .iter()
+            .all(|(arguments, _)| arguments.iter().all(|value| !value.contains("secret")))
+    );
+}
+
+#[test]
 fn only_one_target_may_be_the_authoritative_writer() {
     let mut coordinator = SnapshotCoordinator::new(DatabaseId::new("context-mode").unwrap());
 
