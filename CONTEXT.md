@@ -2,6 +2,28 @@
 
 CommonKit is a portable, versioned collection of shared developer capabilities that can be materialized consistently across local machines, remote hosts, projects, and coding agents.
 
+## Product positioning
+
+**Primary audience**:
+AI-native developers and small engineering teams using multiple coding agents across local and remote development environments.
+
+**Primary promise**:
+Your best development setup, everywhere. CommonKit makes hard-won agent instructions, skills, hooks, tools, and policies portable so every machine and coding agent starts capable, consistent, and ready.
+
+**Supporting benefits**:
+Control, safety, and speed substantiate the primary capability promise; they do not compete with it as the lead message.
+
+**Continuous improvement**:
+CommonKit natively uses SkillOpt to produce evidence-backed skill improvement candidates from evaluations and approved, redacted usage evidence. Improvements are computed in isolation, reviewed by a human, promoted into Git-owned source, and then reconciled across targets. CommonKit never allows the optimizer to mutate active skills directly.
+
+**Secret provisioning**:
+CommonKit keeps secret values out of portable configuration and integrates with password managers to provision them independently on each target. Bitwarden Secrets Manager is the native first provider, not the permanent product boundary.
+
+_Avoid_: Claims that CommonKit synchronizes secrets, guarantees all machine identity remains local, or is exclusively coupled to Bitwarden.
+
+**Brand voice**:
+Concise, confident craftsperson. Use plain claims, concrete verbs, short sentences, and technically exact supporting evidence. Be opinionated without hype. Avoid flowery language, cute metaphors, enterprise jargon, and inflated AI-product claims.
+
 ## Language
 
 **CommonKit**:
