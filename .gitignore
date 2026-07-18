@@ -1,5 +1,6 @@
 commonkit.json
 node_modules/
+/target/
 dist/
 .build/
 **/.build/

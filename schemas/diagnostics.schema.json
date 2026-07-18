@@ -1,0 +1,97 @@
+{
+  "$defs": {
+    "ComponentDiagnostic": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/DiagnosticState"
+        }
+      },
+      "required": [
+        "id",
+        "state"
+      ],
+      "type": "object"
+    },
+    "DiagnosticState": {
+      "enum": [
+        "healthy",
+        "drifted",
+        "blocked",
+        "applying",
+        "degraded",
+        "offline"
+      ],
+      "type": "string"
+    },
+    "RuntimeDiagnostic": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "type": "string"
+        },
+        "operatingSystem": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "version",
+        "operatingSystem",
+        "architecture"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/diagnostics.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "components": {
+      "items": {
+        "$ref": "#/$defs/ComponentDiagnostic"
+      },
+      "type": "array"
+    },
+    "contractVersion": {
+      "type": "string"
+    },
+    "generatedAtUnixMs": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "overallState": {
+      "$ref": "#/$defs/DiagnosticState"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeDiagnostic"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "generatedAtUnixMs",
+    "runtime",
+    "overallState",
+    "components"
+  ],
+  "title": "DiagnosticBundle",
+  "type": "object"
+}

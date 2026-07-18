@@ -24,15 +24,39 @@ _Avoid_: Plugin, integration
 The process of planning, applying, and verifying a target against its selected loadout.
 _Avoid_: File copy, deployment
 
+**Job**:
+An immutable, content-addressed request for durable execution that outlives its submitting client.
+_Avoid_: Task process, remote command
+
+**Attempt**:
+A revisioned execution of a **Job** with its own lease, fencing token, and terminal receipt.
+_Avoid_: Job retry
+
+**Execution Profile**:
+Execution-only resource, capability, isolation, and comparability requirements for a **Job**.
+_Avoid_: Loadout
+
+**Execution Target**:
+A managed **Target** advertising durable-execution readiness, capacity, and an exact Loadout digest.
+_Avoid_: Worker box
+
 ## Relationships
 
 - A **CommonKit** defines one or more **Loadouts**.
 - A **CommonKit** composes configuration in this precedence order: public base, organization policy, personal kit, project loadout, then target overrides.
 - Organization security policy is a non-overridable floor. Later layers may tighten it but cannot weaken it.
 - A **Loadout** is materialized on one or more **Targets**.
+- A **Job** has one or more ordered **Attempts**, but at most one active leased **Attempt**.
+- An **Execution Target** references a managed **Target** and exact Loadout and **Execution Profile** digests.
+- MCP exposes context and durable execution controls; `commonkit-execd` owns lifecycle persistence independently of MCP sessions.
 - An **Adapter** participates in **Reconciliation** for one agent or service.
 - **Reconciliation** never treats secrets or machine identity as portable CommonKit content.
 - **mcp-local-relay** is an independently publishable package in the CommonKit repository. It remains the MCP data plane; CommonKit owns desired-state composition and reconciliation.
+- A GitHub repository is the durable store for portable, reviewable CommonKit state. Secrets and mutable database files do not belong in Git.
+- A local CommonKit service exposes peer interfaces for the macOS status bar, CLI, and MCP tools. The status bar does not communicate through MCP.
+- The version 1 runtime is implemented in Rust and shared by the CLI, local service, MCP server, and Tauri 2 desktop application. The existing TypeScript reconciliation engine and `mcp-local-relay` runtime are migration sources, not permanent sidecars.
+- Database adapters create consistent, integrity-checked, encrypted snapshots in S3-compatible object storage. Git records only snapshot descriptors and content hashes.
+- Version 1 uses one authoritative writer per database. Cross-machine database portability is snapshot and restore, not binary merging; multi-writer synchronization requires a later application-level export/import model.
 
 ## Example dialogue
 
@@ -46,6 +70,25 @@ _Avoid_: File copy, deployment
 
 ## Open — not yet resolved
 
-- Whether Git is mandatory or one possible CommonKit backend.
-- Which flows belong in the first public release.
 - How CommonKit adapters reconcile `mcp-local-relay` lifecycle and desired state.
+- Which GitHub authentication and repository-provisioning flow CommonKit supports in version 1.
+- Which S3-compatible object-store provider is the default for encrypted snapshots.
+
+## Version 1 contract
+
+Version 1 is complete only when it supports all of these flows:
+
+1. Initialize a target.
+2. Preview drift.
+3. Apply safely.
+4. Verify parity.
+5. Provision credential references independently.
+6. Recover or roll back.
+7. Manage multiple targets and layered configuration.
+8. Run scheduled read-only drift checks.
+9. Manage optional `mcp-local-relay` state.
+10. Add coding-agent adapters.
+11. Export redacted diagnostics.
+12. Provide open-source onboarding, schema, threat model, and CI.
+
+Version 1 supports macOS, Linux, and Windows as first-class managed targets. Every platform must support headless CLI/service operation; the desktop status application is an additional interface, not a runtime requirement.

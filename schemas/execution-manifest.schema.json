@@ -1,0 +1,253 @@
+{
+  "$defs": {
+    "ArtifactPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "globs": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "maxBytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retentionSeconds": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "globs",
+        "retentionSeconds",
+        "maxBytes"
+      ],
+      "type": "object"
+    },
+    "BrowserProfile": {
+      "additionalProperties": false,
+      "properties": {
+        "chromiumRevision": {
+          "type": "string"
+        },
+        "deviceScaleFactorMilli": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fontsDigest": {
+          "type": "string"
+        },
+        "headless": {
+          "type": "boolean"
+        },
+        "locale": {
+          "type": "string"
+        },
+        "operatingSystem": {
+          "type": "string"
+        },
+        "performanceClass": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timezone": {
+          "type": "string"
+        },
+        "viewportHeight": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "viewportWidth": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "chromiumRevision",
+        "operatingSystem",
+        "fontsDigest",
+        "locale",
+        "timezone",
+        "viewportWidth",
+        "viewportHeight",
+        "deviceScaleFactorMilli",
+        "headless"
+      ],
+      "type": "object"
+    },
+    "NetworkPolicy": {
+      "enum": [
+        "deny",
+        "restricted",
+        "allow"
+      ],
+      "type": "string"
+    },
+    "ResourceRequirements": {
+      "additionalProperties": false,
+      "properties": {
+        "cpuMillis": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "diskMib": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "memoryMib": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cpuMillis",
+        "memoryMib",
+        "diskMib"
+      ],
+      "type": "object"
+    },
+    "RetryPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "maxAttempts": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "retryableExitCodes": {
+          "items": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "maxAttempts",
+        "retryableExitCodes"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/execution-manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "argv": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/ArtifactPolicy"
+    },
+    "browser": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BrowserProfile"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "cancelGraceSeconds": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "checkpointEnabled": {
+      "type": "boolean"
+    },
+    "executionProfileDigest": {
+      "type": "string"
+    },
+    "loadoutDigest": {
+      "type": "string"
+    },
+    "networkPolicy": {
+      "$ref": "#/$defs/NetworkPolicy"
+    },
+    "repository": {
+      "type": "string"
+    },
+    "repositoryRevision": {
+      "type": "string"
+    },
+    "repositoryWrite": {
+      "type": "boolean"
+    },
+    "requiredCapabilities": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    },
+    "resources": {
+      "$ref": "#/$defs/ResourceRequirements"
+    },
+    "retry": {
+      "$ref": "#/$defs/RetryPolicy"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "secretRefs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "timeoutSeconds": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "workdir": {
+      "type": "string"
+    },
+    "workspaceBundleDigest": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "repository",
+    "repositoryRevision",
+    "argv",
+    "workdir",
+    "secretRefs",
+    "timeoutSeconds",
+    "cancelGraceSeconds",
+    "resources",
+    "requiredCapabilities",
+    "loadoutDigest",
+    "executionProfileDigest",
+    "retry",
+    "checkpointEnabled",
+    "artifacts",
+    "networkPolicy",
+    "repositoryWrite"
+  ],
+  "title": "ExecutionManifest",
+  "type": "object"
+}

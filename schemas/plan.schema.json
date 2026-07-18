@@ -1,0 +1,151 @@
+{
+  "$defs": {
+    "Operation": {
+      "additionalProperties": false,
+      "properties": {
+        "adapterId": {
+          "type": "string"
+        },
+        "afterDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "beforeDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dependsOn": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/OperationKind"
+        },
+        "requiresConfirmation": {
+          "type": "boolean"
+        },
+        "resource": {
+          "$ref": "#/$defs/ResourceRef"
+        },
+        "risk": {
+          "$ref": "#/$defs/Risk"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "adapterId",
+        "kind",
+        "resource",
+        "risk",
+        "requiresConfirmation",
+        "dependsOn",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "OperationKind": {
+      "enum": [
+        "create",
+        "update",
+        "delete",
+        "merge",
+        "enable",
+        "disable",
+        "restart",
+        "snapshot",
+        "restore"
+      ],
+      "type": "string"
+    },
+    "ResourceRef": {
+      "additionalProperties": false,
+      "properties": {
+        "managedPath": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "resourceId": {
+          "type": "string"
+        },
+        "resourceType": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "resourceType",
+        "resourceId"
+      ],
+      "type": "object"
+    },
+    "Risk": {
+      "enum": [
+        "read_only",
+        "low",
+        "medium",
+        "high",
+        "destructive"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/plan.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contractVersion": {
+      "type": "string"
+    },
+    "desiredDigest": {
+      "type": "string"
+    },
+    "id": {
+      "type": "string"
+    },
+    "observedDigest": {
+      "type": "string"
+    },
+    "operations": {
+      "items": {
+        "$ref": "#/$defs/Operation"
+      },
+      "type": "array"
+    },
+    "policyDigest": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "targetId": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "id",
+    "targetId",
+    "desiredDigest",
+    "observedDigest",
+    "policyDigest",
+    "operations"
+  ],
+  "title": "Plan",
+  "type": "object"
+}

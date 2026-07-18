@@ -1,0 +1,129 @@
+{
+  "$defs": {
+    "Contribution": {
+      "additionalProperties": false,
+      "properties": {
+        "layerId": {
+          "type": "string"
+        },
+        "layerKind": {
+          "$ref": "#/$defs/LayerKind"
+        },
+        "operation": {
+          "$ref": "#/$defs/MergeOperation"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceMetadata"
+        },
+        "valueDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "layerId",
+        "layerKind",
+        "source",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "LayerKind": {
+      "enum": [
+        "public_base",
+        "organization_policy",
+        "personal_kit",
+        "project_loadout",
+        "target_overrides"
+      ],
+      "type": "string"
+    },
+    "MergeOperation": {
+      "enum": [
+        "set",
+        "replace",
+        "recursive_merge",
+        "union",
+        "merge_by_id",
+        "delete"
+      ],
+      "type": "string"
+    },
+    "SourceMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "contentDigest": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "contentDigest"
+      ],
+      "type": "object"
+    },
+    "TraceEntry": {
+      "additionalProperties": false,
+      "properties": {
+        "contributions": {
+          "items": {
+            "$ref": "#/$defs/Contribution"
+          },
+          "type": "array"
+        },
+        "governingRules": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "winner": {
+          "$ref": "#/$defs/Contribution"
+        }
+      },
+      "required": [
+        "winner",
+        "contributions",
+        "governingRules"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/provenance.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "entries": {
+      "additionalProperties": {
+        "$ref": "#/$defs/TraceEntry"
+      },
+      "type": "object"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "stateDigest": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "stateDigest",
+    "entries"
+  ],
+  "title": "ProvenanceTrace",
+  "type": "object"
+}

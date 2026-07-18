@@ -1,0 +1,86 @@
+{
+  "$defs": {
+    "LayerKind": {
+      "enum": [
+        "public_base",
+        "organization_policy",
+        "personal_kit",
+        "project_loadout",
+        "target_overrides"
+      ],
+      "type": "string"
+    },
+    "LockedLayer": {
+      "additionalProperties": false,
+      "properties": {
+        "contentDigest": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/LayerKind"
+        },
+        "path": {
+          "type": "string"
+        },
+        "revision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "kind",
+        "path",
+        "schemaVersion",
+        "contentDigest"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/commonkit-lock.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contractVersion": {
+      "type": "string"
+    },
+    "layers": {
+      "items": {
+        "$ref": "#/$defs/LockedLayer"
+      },
+      "type": "array"
+    },
+    "normalizedDigest": {
+      "type": "string"
+    },
+    "repositoryRevision": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "layers",
+    "normalizedDigest"
+  ],
+  "title": "CommonKitLock",
+  "type": "object"
+}

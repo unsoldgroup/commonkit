@@ -1,0 +1,69 @@
+{
+  "$defs": {
+    "LayerKind": {
+      "enum": [
+        "public_base",
+        "organization_policy",
+        "personal_kit",
+        "project_loadout",
+        "target_overrides"
+      ],
+      "type": "string"
+    },
+    "SourceMetadata": {
+      "additionalProperties": false,
+      "properties": {
+        "contentDigest": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "path": {
+          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*[\\\\:\\x00])[^/]+(?:/[^/]+)*$",
+          "type": "string"
+        },
+        "revision": {
+          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "path",
+        "contentDigest"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/layer.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "pattern": "^[a-z][a-z0-9_-]{0,62}$",
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/LayerKind"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceMetadata"
+    },
+    "spec": true
+  },
+  "required": [
+    "schemaVersion",
+    "id",
+    "kind",
+    "source",
+    "spec"
+  ],
+  "title": "LayerDocument",
+  "type": "object"
+}

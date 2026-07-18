@@ -1,0 +1,138 @@
+{
+  "$defs": {
+    "CommonKitErrorBody": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "$ref": "#/$defs/ErrorCategory"
+        },
+        "causes": {
+          "items": {
+            "$ref": "#/$defs/ErrorCause"
+          },
+          "type": "array"
+        },
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "correlationId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "details": {
+          "additionalProperties": true,
+          "type": "object"
+        },
+        "message": {
+          "type": "string"
+        },
+        "remediation": {
+          "items": {
+            "$ref": "#/$defs/Remediation"
+          },
+          "type": "array"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "category",
+        "retryable",
+        "details",
+        "causes",
+        "remediation"
+      ],
+      "type": "object"
+    },
+    "ErrorCategory": {
+      "enum": [
+        "configuration",
+        "policy",
+        "path",
+        "target",
+        "plan",
+        "apply",
+        "verify",
+        "credential",
+        "relay",
+        "snapshot",
+        "api",
+        "internal"
+      ],
+      "type": "string"
+    },
+    "ErrorCause": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/ErrorCode"
+        },
+        "message": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "ErrorCode": {
+      "enum": [
+        "CK_CONFIG_001_INVALID_DOCUMENT",
+        "CK_CONFIG_002_UNSUPPORTED_SCHEMA",
+        "CK_CONFIG_004_DUPLICATE_ID",
+        "CK_CONFIG_005_LAYER_CARDINALITY",
+        "CK_CONFIG_007_INVALID_SOURCE_PATH",
+        "CK_CONFIG_008_DIGEST_MISMATCH",
+        "CK_POLICY_007_EMBEDDED_SECRET",
+        "CK_PLAN_006_CONFIRMATION_REQUIRED",
+        "CK_PLAN_007_REDACTION_FAILED",
+        "CK_INTERNAL_001_UNEXPECTED"
+      ],
+      "type": "string"
+    },
+    "Remediation": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "documentationUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/error.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/CommonKitErrorBody"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "error"
+  ],
+  "title": "ErrorEnvelope",
+  "type": "object"
+}
