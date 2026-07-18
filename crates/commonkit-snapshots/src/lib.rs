@@ -135,6 +135,494 @@ pub enum SnapshotError {
     InvalidObjectStore,
     #[error("unsupported snapshot schema or cipher")]
     UnsupportedSnapshotFormat,
+    #[error("durable snapshot transaction metadata failed integrity validation")]
+    TransactionIntegrity,
+    #[error("snapshot transaction was interrupted and requires recovery")]
+    Interrupted,
+    #[error("snapshot service lifecycle operation failed")]
+    LifecycleFailed,
+}
+
+/// Lifecycle coordination around database replacement. Implementations must not return from
+/// `stop` until writers have quiesced or from `start` until the service can reopen the database.
+pub trait DatabaseLifecycle {
+    fn stop(&mut self) -> Result<(), SnapshotError>;
+    fn start(&mut self) -> Result<(), SnapshotError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RestoreFailpoint {
+    None,
+    AfterSwap,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestorePlan {
+    pub schema: String,
+    pub run_id: String,
+    pub snapshot_id: String,
+    pub manifest_digest: String,
+    pub database: DatabaseId,
+    pub expected_content_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreReceipt {
+    pub schema: String,
+    pub run_id: String,
+    pub plan_digest: String,
+    pub state: RestoreState,
+    pub preimage_object_digest: Option<String>,
+    pub resulting_content_digest: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromotionPlan {
+    pub schema: String,
+    pub run_id: String,
+    pub database: DatabaseId,
+    pub previous_writer: String,
+    pub candidate_writer: String,
+    pub latest_snapshot_digest: String,
+    pub current_writer_digest: String,
+    pub candidate_digest: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromotionReceipt {
+    pub schema: String,
+    pub run_id: String,
+    pub plan_digest: String,
+    pub database: DatabaseId,
+    pub previous_writer: String,
+    pub authoritative_writer: String,
+    pub snapshot_digest: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromotionFailpoint {
+    None,
+    AfterAuthorityWrite,
+}
+
+/// Durable authoritative-writer state. Promotion validates both sides against the latest
+/// snapshot and atomically records an integrity-checked plan, writer state, and receipt.
+pub struct AuthorityStore {
+    root: PathBuf,
+}
+
+impl AuthorityStore {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
+        let root = root.into();
+        std::fs::create_dir_all(root.join("promotions"))
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        Ok(Self { root })
+    }
+
+    pub fn initialize(&self, database: &DatabaseId, writer: &str) -> Result<(), SnapshotError> {
+        let path = self.root.join(format!("authority-{database}.json"));
+        if path.exists() {
+            let existing: (Authority, String) = read_envelope(&path)?;
+            return match existing.0 {
+                Authority::Writer { target } if target == writer => Ok(()),
+                Authority::Writer { target } => Err(SnapshotError::WriterAlreadyAssigned(target)),
+                Authority::Unassigned => Err(SnapshotError::TransactionIntegrity),
+            };
+        }
+        write_envelope(
+            &path,
+            &Authority::Writer {
+                target: writer.into(),
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn authority(&self, database: &DatabaseId) -> Result<Authority, SnapshotError> {
+        read_envelope(&self.root.join(format!("authority-{database}.json"))).map(|pair| pair.0)
+    }
+
+    pub fn promote(&self, plan: PromotionPlan) -> Result<PromotionReceipt, SnapshotError> {
+        self.promote_with_failpoint(plan, PromotionFailpoint::None)
+    }
+
+    pub fn promote_with_failpoint(
+        &self,
+        plan: PromotionPlan,
+        failpoint: PromotionFailpoint,
+    ) -> Result<PromotionReceipt, SnapshotError> {
+        if plan.schema != "commonkit.promotion-plan.v1"
+            || plan.run_id.is_empty()
+            || plan.candidate_writer.is_empty()
+            || plan.current_writer_digest != plan.latest_snapshot_digest
+        {
+            return Err(SnapshotError::UnsnapshottedWriterChanges);
+        }
+        if plan.candidate_digest != plan.latest_snapshot_digest {
+            return Err(SnapshotError::CandidateDoesNotMatchSnapshot);
+        }
+        let authority = self.authority(&plan.database)?;
+        if authority
+            != (Authority::Writer {
+                target: plan.previous_writer.clone(),
+            })
+        {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        let run = self.root.join("promotions").join(&plan.run_id);
+        std::fs::create_dir_all(&run).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        let plan_digest = write_envelope(&run.join("plan.json"), &plan)?;
+        let new_authority = Authority::Writer {
+            target: plan.candidate_writer.clone(),
+        };
+        write_envelope(
+            &self.root.join(format!("authority-{}.json", plan.database)),
+            &new_authority,
+        )?;
+        if failpoint == PromotionFailpoint::AfterAuthorityWrite {
+            return Err(SnapshotError::Interrupted);
+        }
+        self.finish_promotion(plan, plan_digest, &run)
+    }
+
+    pub fn recover_promotion(&self, run_id: &str) -> Result<PromotionReceipt, SnapshotError> {
+        let run = self.root.join("promotions").join(run_id);
+        let (plan, plan_digest): (PromotionPlan, String) = read_envelope(&run.join("plan.json"))?;
+        if self.authority(&plan.database)?
+            != (Authority::Writer {
+                target: plan.candidate_writer.clone(),
+            })
+        {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        if run.join("receipt.json").exists() {
+            let (receipt, _): (PromotionReceipt, String) =
+                read_envelope(&run.join("receipt.json"))?;
+            if receipt.plan_digest != plan_digest {
+                return Err(SnapshotError::TransactionIntegrity);
+            }
+            return Ok(receipt);
+        }
+        self.finish_promotion(plan, plan_digest, &run)
+    }
+
+    fn finish_promotion(
+        &self,
+        plan: PromotionPlan,
+        plan_digest: String,
+        run: &Path,
+    ) -> Result<PromotionReceipt, SnapshotError> {
+        let receipt = PromotionReceipt {
+            schema: "commonkit.promotion-receipt.v1".into(),
+            run_id: plan.run_id,
+            plan_digest,
+            database: plan.database,
+            previous_writer: plan.previous_writer,
+            authoritative_writer: plan.candidate_writer,
+            snapshot_digest: plan.latest_snapshot_digest,
+        };
+        write_envelope(&run.join("receipt.json"), &receipt)?;
+        Ok(receipt)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RestoreState {
+    Planned,
+    Prepared,
+    Swapping,
+    Swapped,
+    Verified,
+    RolledBack,
+    Recoverable,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct IntegrityEnvelope<T> {
+    value: T,
+    digest: String,
+}
+
+/// Target-local content-addressed store. Values are already authenticated ciphertext; reads
+/// validate the filename digest before returning bytes.
+#[derive(Clone, Debug)]
+pub struct DurableObjectStore {
+    root: PathBuf,
+}
+
+impl DurableObjectStore {
+    pub fn open(root: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
+        let root = root.into();
+        std::fs::create_dir_all(&root).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        Ok(Self { root })
+    }
+
+    fn path(&self, digest: &str) -> Result<PathBuf, SnapshotError> {
+        validate_digest(digest)?;
+        Ok(self.root.join(&digest[7..]))
+    }
+}
+
+impl ObjectStore for DurableObjectStore {
+    fn put(&mut self, key: &str, ciphertext: &[u8]) -> Result<(), SnapshotError> {
+        if sha256(ciphertext) != key {
+            return Err(SnapshotError::IntegrityMismatch);
+        }
+        let path = self.path(key)?;
+        if path.exists() {
+            return self.get(key).map(|_| ());
+        }
+        atomic_write(&path, ciphertext)
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>, SnapshotError> {
+        let bytes = std::fs::read(self.path(key)?)
+            .map_err(|_| SnapshotError::ObjectNotFound(key.into()))?;
+        if sha256(&bytes) != key {
+            return Err(SnapshotError::IntegrityMismatch);
+        }
+        Ok(bytes)
+    }
+}
+
+/// Durable, restart-reconstructable restore transaction. Provider/object fetch and decryption
+/// happen before mutation. Recovery consumes only the persisted plan, receipt, staged database,
+/// and encrypted preimage object.
+pub struct DurableRestore<'a, C> {
+    root: PathBuf,
+    cipher: &'a C,
+    objects: DurableObjectStore,
+}
+
+impl<'a, C: AuthenticatedCipher> DurableRestore<'a, C> {
+    pub fn open(root: impl Into<PathBuf>, cipher: &'a C) -> Result<Self, SnapshotError> {
+        let root = root.into();
+        std::fs::create_dir_all(root.join("runs")).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        let objects = DurableObjectStore::open(root.join("objects"))?;
+        Ok(Self {
+            root,
+            cipher,
+            objects,
+        })
+    }
+
+    pub fn execute(
+        &mut self,
+        plan: RestorePlan,
+        manifest: &SnapshotManifest,
+        snapshot_objects: &impl ObjectStore,
+        database_path: &Path,
+        lifecycle: &mut impl DatabaseLifecycle,
+        failpoint: RestoreFailpoint,
+    ) -> Result<RestoreReceipt, SnapshotError> {
+        validate_plan(&plan, manifest)?;
+        let run = self.root.join("runs").join(&plan.run_id);
+        std::fs::create_dir_all(&run).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        let plan_digest = write_envelope(&run.join("plan.json"), &plan)?;
+        let mut receipt = RestoreReceipt {
+            schema: "commonkit.restore-receipt.v1".into(),
+            run_id: plan.run_id.clone(),
+            plan_digest,
+            state: RestoreState::Planned,
+            preimage_object_digest: None,
+            resulting_content_digest: None,
+        };
+        self.write_receipt(&run, &receipt)?;
+
+        let plaintext =
+            SnapshotService::new(self.cipher).verify_and_decrypt(manifest, snapshot_objects)?;
+        let staged = run.join("staged.database");
+        atomic_write(&staged, &plaintext)?;
+        if sha256(&std::fs::read(&staged).map_err(|_| SnapshotError::DatabaseFailed)?)
+            != plan.expected_content_digest
+        {
+            return Err(SnapshotError::IntegrityMismatch);
+        }
+        let previous = std::fs::read(database_path).map_err(|_| SnapshotError::DatabaseFailed)?;
+        let aad = format!("commonkit.restore-preimage.v1\0{}", plan.run_id);
+        let encrypted = self.cipher.seal(&previous, aad.as_bytes())?;
+        let preimage_digest = sha256(&encrypted);
+        self.objects.put(&preimage_digest, &encrypted)?;
+        receipt.preimage_object_digest = Some(preimage_digest);
+        receipt.state = RestoreState::Prepared;
+        self.write_receipt(&run, &receipt)?;
+
+        lifecycle.stop()?;
+        receipt.state = RestoreState::Swapping;
+        self.write_receipt(&run, &receipt)?;
+        replace_file(database_path, &staged)?;
+        receipt.state = RestoreState::Swapped;
+        self.write_receipt(&run, &receipt)?;
+        if failpoint == RestoreFailpoint::AfterSwap {
+            return Err(SnapshotError::Interrupted);
+        }
+        if verify_database(database_path, &plan.expected_content_digest, manifest).is_err() {
+            self.rollback(&plan, &mut receipt, database_path, lifecycle)?;
+            return Err(SnapshotError::RestoreVerificationFailed);
+        }
+        lifecycle.start()?;
+        receipt.state = RestoreState::Verified;
+        receipt.resulting_content_digest = Some(plan.expected_content_digest);
+        self.write_receipt(&run, &receipt)?;
+        Ok(receipt)
+    }
+
+    pub fn recover(
+        &mut self,
+        run_id: &str,
+        database_path: &Path,
+        lifecycle: &mut impl DatabaseLifecycle,
+    ) -> Result<RestoreReceipt, SnapshotError> {
+        let run = self.root.join("runs").join(run_id);
+        let (plan, plan_digest): (RestorePlan, String) = read_envelope(&run.join("plan.json"))?;
+        let (mut receipt, _): (RestoreReceipt, String) = read_envelope(&run.join("receipt.json"))?;
+        if receipt.run_id != plan.run_id || receipt.plan_digest != plan_digest {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        match receipt.state {
+            RestoreState::Verified | RestoreState::RolledBack => Ok(receipt),
+            RestoreState::Planned | RestoreState::Prepared => {
+                let _ = std::fs::remove_file(run.join("staged.database"));
+                receipt.state = RestoreState::RolledBack;
+                self.write_receipt(&run, &receipt)?;
+                Ok(receipt)
+            }
+            RestoreState::Swapping | RestoreState::Swapped | RestoreState::Recoverable => {
+                self.rollback(&plan, &mut receipt, database_path, lifecycle)?;
+                Ok(receipt)
+            }
+        }
+    }
+
+    fn rollback(
+        &self,
+        plan: &RestorePlan,
+        receipt: &mut RestoreReceipt,
+        database_path: &Path,
+        lifecycle: &mut impl DatabaseLifecycle,
+    ) -> Result<(), SnapshotError> {
+        let digest = receipt
+            .preimage_object_digest
+            .as_deref()
+            .ok_or(SnapshotError::TransactionIntegrity)?;
+        let encrypted = self.objects.get(digest)?;
+        let aad = format!("commonkit.restore-preimage.v1\0{}", plan.run_id);
+        let previous = self.cipher.open(&encrypted, aad.as_bytes())?;
+        let staged = self
+            .root
+            .join("runs")
+            .join(&plan.run_id)
+            .join("rollback.database");
+        atomic_write(&staged, &previous)?;
+        lifecycle.stop()?;
+        replace_file(database_path, &staged)?;
+        lifecycle.start()?;
+        receipt.state = RestoreState::RolledBack;
+        receipt.resulting_content_digest = Some(sha256(&previous));
+        self.write_receipt(&self.root.join("runs").join(&plan.run_id), receipt)
+    }
+
+    fn write_receipt(&self, run: &Path, receipt: &RestoreReceipt) -> Result<(), SnapshotError> {
+        write_envelope(&run.join("receipt.json"), receipt).map(|_| ())
+    }
+}
+
+fn validate_plan(plan: &RestorePlan, manifest: &SnapshotManifest) -> Result<(), SnapshotError> {
+    if plan.schema != "commonkit.restore-plan.v1"
+        || plan.database != manifest.database
+        || plan.expected_content_digest != manifest.content_digest
+        || plan.manifest_digest != manifest_digest(manifest)?
+        || plan.run_id.is_empty()
+        || plan.snapshot_id.is_empty()
+    {
+        return Err(SnapshotError::TransactionIntegrity);
+    }
+    Ok(())
+}
+
+pub fn manifest_digest(manifest: &SnapshotManifest) -> Result<String, SnapshotError> {
+    serde_jcs::to_vec(manifest)
+        .map(|bytes| sha256(&bytes))
+        .map_err(|_| SnapshotError::TransactionIntegrity)
+}
+
+fn write_envelope<T: Serialize>(path: &Path, value: &T) -> Result<String, SnapshotError> {
+    let value_bytes = serde_jcs::to_vec(value).map_err(|_| SnapshotError::TransactionIntegrity)?;
+    let digest = sha256(&value_bytes);
+    let envelope = IntegrityEnvelope {
+        value,
+        digest: digest.clone(),
+    };
+    let bytes = serde_jcs::to_vec(&envelope).map_err(|_| SnapshotError::TransactionIntegrity)?;
+    atomic_write(path, &bytes)?;
+    Ok(digest)
+}
+
+fn read_envelope<T: Serialize + for<'de> Deserialize<'de>>(
+    path: &Path,
+) -> Result<(T, String), SnapshotError> {
+    let bytes = std::fs::read(path).map_err(|_| SnapshotError::TransactionIntegrity)?;
+    let envelope: IntegrityEnvelope<T> =
+        serde_json::from_slice(&bytes).map_err(|_| SnapshotError::TransactionIntegrity)?;
+    let actual = sha256(
+        &serde_jcs::to_vec(&envelope.value).map_err(|_| SnapshotError::TransactionIntegrity)?,
+    );
+    if actual != envelope.digest {
+        return Err(SnapshotError::TransactionIntegrity);
+    }
+    Ok((envelope.value, envelope.digest))
+}
+
+fn validate_digest(value: &str) -> Result<(), SnapshotError> {
+    if value.len() != 71
+        || !value.starts_with("sha256:")
+        || !value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SnapshotError::IntegrityMismatch);
+    }
+    Ok(())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SnapshotError> {
+    let parent = path.parent().ok_or(SnapshotError::ObjectStoreFailed)?;
+    std::fs::create_dir_all(parent).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    let temporary = path.with_extension("commonkit.tmp");
+    std::fs::write(&temporary, bytes).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    std::fs::rename(temporary, path).map_err(|_| SnapshotError::ObjectStoreFailed)
+}
+
+fn replace_file(destination: &Path, staged: &Path) -> Result<(), SnapshotError> {
+    let replacement = destination.with_extension("commonkit-replacement");
+    std::fs::rename(staged, &replacement).map_err(|_| SnapshotError::DatabaseFailed)?;
+    if destination.exists() {
+        std::fs::remove_file(destination).map_err(|_| SnapshotError::DatabaseFailed)?;
+    }
+    std::fs::rename(replacement, destination).map_err(|_| SnapshotError::DatabaseFailed)
+}
+
+fn verify_database(
+    path: &Path,
+    expected_digest: &str,
+    manifest: &SnapshotManifest,
+) -> Result<(), SnapshotError> {
+    let bytes = std::fs::read(path).map_err(|_| SnapshotError::DatabaseFailed)?;
+    if sha256(&bytes) != expected_digest {
+        return Err(SnapshotError::IntegrityMismatch);
+    }
+    if manifest.source_format.starts_with("sqlite") {
+        let connection =
+            rusqlite::Connection::open(path).map_err(|_| SnapshotError::DatabaseFailed)?;
+        validate_sqlite(&connection)?;
+    }
+    Ok(())
 }
 
 pub trait ConsistentBackup {
