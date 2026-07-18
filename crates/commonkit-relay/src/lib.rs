@@ -11,6 +11,12 @@ use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
+mod runtime;
+pub use runtime::{
+    DownstreamRequest, PeerAddress, RelayErrorCode, RelayHealth, RelayRuntime, RuntimeNotification,
+    UpstreamError, UpstreamManager,
+};
+
 pub const DEFAULT_PORT: u16 = 3764;
 pub const DEFAULT_MCP_PATH: &str = "/mcp";
 pub const DEFAULT_TOOLS_TTL_MS: u64 = 15 * 60 * 1000;
