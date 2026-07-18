@@ -22,9 +22,10 @@ pub use credentials::{
     BwsCommandError, BwsCommandRunner, BwsCredentialResolver, CredentialReadiness,
     CredentialReadinessInspector, CredentialReference, CredentialReferenceError,
     CredentialResolveError, CredentialResolver, FakeCredentialResolver,
-    LocalCredentialReadinessInspector, LocalSensitiveFileStore, PlatformKeychain,
-    PlatformKeychainCredentialResolver, PlatformSecretCommandError, PlatformSecretCommandRunner,
-    ProcessBwsRunner, ProcessPlatformSecretCommandRunner, SecretValue, SensitiveFileError,
+    LocalCredentialReadinessInspector, LocalSensitiveFileStore, NativeWindowsCredentialReader,
+    PlatformKeychain, PlatformKeychainCredentialResolver, PlatformSecretCommandError,
+    PlatformSecretCommandRunner, ProcessBwsRunner, ProcessPlatformSecretCommandRunner, SecretValue,
+    SensitiveFileError, WindowsCredentialManagerResolver, WindowsCredentialReader,
 };
 pub use files::{FileAdapter, FileAdapterError, FileIntent, ManagedRelativePath};
 pub use git_sync::{

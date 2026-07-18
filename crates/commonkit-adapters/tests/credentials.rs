@@ -6,7 +6,7 @@ use commonkit_adapters::{
     CredentialReadinessInspector, CredentialReference, CredentialResolver, FakeCredentialResolver,
     LocalCredentialReadinessInspector, LocalSensitiveFileStore, NormalizedManagedPath,
     PlatformKeychain, PlatformKeychainCredentialResolver, PlatformSecretCommandError,
-    PlatformSecretCommandRunner,
+    PlatformSecretCommandRunner, WindowsCredentialManagerResolver, WindowsCredentialReader,
 };
 
 #[test]
@@ -43,6 +43,88 @@ fn accepts_only_strict_reference_uris_and_serializes_only_the_reference() {
 }
 
 #[derive(Default)]
+struct RecordingWindowsReader {
+    targets: Vec<String>,
+}
+
+impl WindowsCredentialReader for RecordingWindowsReader {
+    fn read_generic(
+        &mut self,
+        target: &str,
+    ) -> Result<Vec<u8>, commonkit_adapters::CredentialResolveError> {
+        self.targets.push(target.into());
+        Ok(b"windows-native-secret".to_vec())
+    }
+}
+
+#[test]
+fn windows_credential_manager_resolution_is_native_and_apply_time_only() {
+    let reference = CredentialReference::parse("keychain://commonkit/api-token").unwrap();
+    let mut resolver = WindowsCredentialManagerResolver::new(RecordingWindowsReader::default());
+    let value = resolver.resolve(&reference).unwrap();
+    assert_eq!(value.expose_for_apply(), b"windows-native-secret");
+    assert_eq!(format!("{value:?}"), "SecretValue(<redacted>)");
+    assert_eq!(
+        resolver.reader().targets,
+        vec!["commonkit/commonkit/api-token"]
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_credential_manager_round_trip_is_target_scoped() {
+    use commonkit_adapters::NativeWindowsCredentialReader;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Security::Credentials::{
+        CRED_PERSIST_SESSION, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredWriteW,
+    };
+
+    let service = format!("ci-{}", std::process::id());
+    let account = "round-trip";
+    let target = format!("commonkit/{service}/{account}");
+    let mut target_wide = std::ffi::OsStr::new(&target)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut username = "commonkit-ci"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let mut blob = b"native-windows-secret".to_vec();
+    let credential = CREDENTIALW {
+        Flags: 0,
+        Type: CRED_TYPE_GENERIC,
+        TargetName: target_wide.as_mut_ptr(),
+        Comment: std::ptr::null_mut(),
+        LastWritten: FILETIME {
+            dwLowDateTime: 0,
+            dwHighDateTime: 0,
+        },
+        CredentialBlobSize: blob.len() as u32,
+        CredentialBlob: blob.as_mut_ptr(),
+        Persist: CRED_PERSIST_SESSION,
+        AttributeCount: 0,
+        Attributes: std::ptr::null_mut(),
+        TargetAlias: std::ptr::null_mut(),
+        UserName: username.as_mut_ptr(),
+    };
+    assert_ne!(unsafe { CredWriteW(&credential, 0) }, 0);
+    struct Cleanup(Vec<u16>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            unsafe { CredDeleteW(self.0.as_ptr(), CRED_TYPE_GENERIC, 0) };
+        }
+    }
+    let _cleanup = Cleanup(target_wide.clone());
+    let reference = CredentialReference::parse(format!("keychain://{service}/{account}")).unwrap();
+    let value = WindowsCredentialManagerResolver::new(NativeWindowsCredentialReader)
+        .resolve(&reference)
+        .unwrap();
+    assert_eq!(value.expose_for_apply(), b"native-windows-secret");
+}
+
+#[derive(Default)]
 struct RecordingPlatformSecretRunner {
     calls: Vec<(String, Vec<String>)>,
 }
@@ -71,7 +153,7 @@ fn platform_keychains_use_fixed_arguments_and_expose_values_only_to_apply() {
     assert_eq!(
         mac.runner().calls,
         vec![(
-            "security".to_owned(),
+            "/usr/bin/security".to_owned(),
             vec![
                 "find-generic-password".to_owned(),
                 "-s".to_owned(),
@@ -94,7 +176,7 @@ fn platform_keychains_use_fixed_arguments_and_expose_values_only_to_apply() {
     assert_eq!(
         linux.runner().calls[0],
         (
-            "secret-tool".to_owned(),
+            "/usr/bin/secret-tool".to_owned(),
             vec![
                 "lookup".to_owned(),
                 "service".to_owned(),
@@ -111,6 +193,21 @@ fn platform_keychain_resolver_rejects_other_reference_schemes() {
     let reference = CredentialReference::parse("env://COMMONKIT_TOKEN").unwrap();
     let mut resolver = PlatformKeychainCredentialResolver::new(
         PlatformKeychain::MacOs,
+        RecordingPlatformSecretRunner::default(),
+    );
+    assert_eq!(
+        resolver.resolve(&reference).unwrap_err(),
+        commonkit_adapters::CredentialResolveError::UnsupportedReference
+    );
+    assert!(resolver.runner().calls.is_empty());
+}
+
+#[cfg(not(windows))]
+#[test]
+fn windows_keychain_selection_never_falls_back_to_a_process_command() {
+    let reference = CredentialReference::parse("keychain://commonkit/api-token").unwrap();
+    let mut resolver = PlatformKeychainCredentialResolver::new(
+        PlatformKeychain::WindowsCredentialManager,
         RecordingPlatformSecretRunner::default(),
     );
     assert_eq!(

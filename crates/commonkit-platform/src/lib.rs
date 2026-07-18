@@ -202,18 +202,31 @@ fn verify_private_permissions(
 #[cfg(windows)]
 fn set_private_permissions(path: &Path, _kind: PrivatePathKind) -> Result<(), PlatformError> {
     let user = std::env::var("USERNAME").map_err(|_| PlatformError::IdentityUnavailable)?;
-    if user.is_empty() || user.contains(['\r', '\n', ':']) {
-        return Err(PlatformError::IdentityUnavailable);
-    }
-    let grant = format!("{user}:(F)");
+    let arguments = windows_private_acl_args(&user)?;
     let status = std::process::Command::new("icacls.exe")
         .arg(path)
-        .args(["/inheritance:r", "/grant:r", &grant])
+        .args(arguments)
         .status()?;
     if !status.success() {
         return Err(PlatformError::AclFailed(path.to_path_buf()));
     }
     Ok(())
+}
+
+pub fn windows_private_acl_args(user: &str) -> Result<Vec<String>, PlatformError> {
+    if user.is_empty() || user.contains(['\r', '\n', ':']) {
+        return Err(PlatformError::IdentityUnavailable);
+    }
+    Ok(vec![
+        "/inheritance:r".into(),
+        "/remove:g".into(),
+        "*S-1-1-0".into(),
+        "*S-1-5-11".into(),
+        "*S-1-5-32-545".into(),
+        "*S-1-15-2-1".into(),
+        "/grant:r".into(),
+        format!("{user}:(F)"),
+    ])
 }
 
 #[cfg(windows)]
@@ -222,14 +235,38 @@ fn verify_private_permissions(
     _metadata: &std::fs::Metadata,
     _kind: PrivatePathKind,
 ) -> Result<(), PlatformError> {
-    let status = std::process::Command::new("icacls.exe")
+    let user = std::env::var("USERNAME").map_err(|_| PlatformError::IdentityUnavailable)?;
+    let output = std::process::Command::new("icacls.exe")
         .arg(path)
-        .arg("/verify")
-        .status()?;
-    if !status.success() {
+        .output()?;
+    if !output.status.success()
+        || !windows_acl_listing_is_private(&String::from_utf8_lossy(&output.stdout), &user)
+    {
         return Err(PlatformError::AclFailed(path.to_path_buf()));
     }
     Ok(())
+}
+
+/// Validates the security-relevant subset of `icacls <path>` output. `/verify`
+/// only checks canonical ACL structure; it does not reject broad or inherited grants.
+pub fn windows_acl_listing_is_private(listing: &str, user: &str) -> bool {
+    if user.is_empty() || user.contains(['\r', '\n', ':']) || listing.is_empty() {
+        return false;
+    }
+    let normalized = listing.to_ascii_lowercase();
+    let user = user.to_ascii_lowercase();
+    let broad = [
+        "everyone:",
+        "builtin\\users:",
+        "authenticated users:",
+        "all application packages:",
+        "todos:",
+        "utilisateurs authentifiés:",
+    ];
+    normalized.contains(&user)
+        && normalized.contains("(f)")
+        && !normalized.contains("(i)")
+        && !broad.iter().any(|identity| normalized.contains(identity))
 }
 
 #[derive(Debug, Error)]

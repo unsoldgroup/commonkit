@@ -286,18 +286,22 @@ impl<B: ServiceBackend> Adapter for ServiceAdapter<B> {
                 spec: intent.spec.clone(),
             })?;
         }
+        let running = if intent.desired == ServiceDesiredState::Stopped {
+            Some(
+                self.backend
+                    .inspect(&intent.spec.name)
+                    .map_err(|_| failure("service_inspect_failed", "service inspection failed"))?
+                    .running,
+            )
+        } else {
+            None
+        };
         match intent.desired {
             ServiceDesiredState::Running => self.execute(LifecycleCommand::Start {
                 backend: self.backend_id.clone(),
                 name: intent.spec.name,
             }),
-            ServiceDesiredState::Stopped
-                if self
-                    .backend
-                    .inspect(&intent.spec.name)
-                    .map(|v| v.running)
-                    .unwrap_or(false) =>
-            {
+            ServiceDesiredState::Stopped if running == Some(true) => {
                 self.execute(LifecycleCommand::Stop {
                     backend: self.backend_id.clone(),
                     name: intent.spec.name,

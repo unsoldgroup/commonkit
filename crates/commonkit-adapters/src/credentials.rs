@@ -204,6 +204,7 @@ pub trait CredentialResolver {
 pub enum PlatformKeychain {
     MacOs,
     LinuxSecretService,
+    WindowsCredentialManager,
 }
 
 impl PlatformKeychain {
@@ -211,6 +212,7 @@ impl PlatformKeychain {
         match std::env::consts::OS {
             "macos" => Ok(Self::MacOs),
             "linux" => Ok(Self::LinuxSecretService),
+            "windows" => Ok(Self::WindowsCredentialManager),
             _ => Err(CredentialResolveError::UnsupportedReference),
         }
     }
@@ -285,7 +287,7 @@ impl<R: PlatformSecretCommandRunner> CredentialResolver for PlatformKeychainCred
             .ok_or(CredentialResolveError::UnsupportedReference)?;
         let (executable, args) = match self.platform {
             PlatformKeychain::MacOs => (
-                "security",
+                "/usr/bin/security",
                 vec![
                     "find-generic-password".into(),
                     "-s".into(),
@@ -296,7 +298,7 @@ impl<R: PlatformSecretCommandRunner> CredentialResolver for PlatformKeychainCred
                 ],
             ),
             PlatformKeychain::LinuxSecretService => (
-                "secret-tool",
+                "/usr/bin/secret-tool",
                 vec![
                     "lookup".into(),
                     "service".into(),
@@ -305,6 +307,17 @@ impl<R: PlatformSecretCommandRunner> CredentialResolver for PlatformKeychainCred
                     account.into(),
                 ],
             ),
+            PlatformKeychain::WindowsCredentialManager => {
+                #[cfg(windows)]
+                {
+                    let mut native = WindowsCredentialManagerResolver::default();
+                    return native.resolve(reference);
+                }
+                #[cfg(not(windows))]
+                {
+                    return Err(CredentialResolveError::UnsupportedReference);
+                }
+            }
         };
         let mut bytes = self
             .runner
@@ -314,6 +327,93 @@ impl<R: PlatformSecretCommandRunner> CredentialResolver for PlatformKeychainCred
             bytes.pop();
         }
         SecretValue::new(bytes)
+    }
+}
+
+pub trait WindowsCredentialReader {
+    fn read_generic(&mut self, target: &str) -> Result<Vec<u8>, CredentialResolveError>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NativeWindowsCredentialReader;
+
+#[cfg(windows)]
+impl WindowsCredentialReader for NativeWindowsCredentialReader {
+    fn read_generic(&mut self, target: &str) -> Result<Vec<u8>, CredentialResolveError> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::Credentials::{
+            CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW,
+        };
+
+        let wide = std::ffi::OsStr::new(target)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let mut credential: *mut CREDENTIALW = std::ptr::null_mut();
+        let success = unsafe { CredReadW(wide.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+        if success == 0 || credential.is_null() {
+            return Err(CredentialResolveError::Unavailable);
+        }
+        struct OwnedCredential(*mut CREDENTIALW);
+        impl Drop for OwnedCredential {
+            fn drop(&mut self) {
+                unsafe { CredFree(self.0.cast()) }
+            }
+        }
+        let credential = OwnedCredential(credential);
+        let native = unsafe { &*credential.0 };
+        if native.CredentialBlobSize == 0 || native.CredentialBlob.is_null() {
+            return Err(CredentialResolveError::EmptyValue);
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(native.CredentialBlob, native.CredentialBlobSize as usize)
+        }
+        .to_vec())
+    }
+}
+
+#[cfg(not(windows))]
+impl WindowsCredentialReader for NativeWindowsCredentialReader {
+    fn read_generic(&mut self, _target: &str) -> Result<Vec<u8>, CredentialResolveError> {
+        Err(CredentialResolveError::UnsupportedReference)
+    }
+}
+
+pub struct WindowsCredentialManagerResolver<R = NativeWindowsCredentialReader> {
+    reader: R,
+}
+
+impl<R> WindowsCredentialManagerResolver<R> {
+    pub fn new(reader: R) -> Self {
+        Self { reader }
+    }
+    pub fn reader(&self) -> &R {
+        &self.reader
+    }
+}
+
+impl Default for WindowsCredentialManagerResolver<NativeWindowsCredentialReader> {
+    fn default() -> Self {
+        Self::new(NativeWindowsCredentialReader)
+    }
+}
+
+impl<R: WindowsCredentialReader> CredentialResolver for WindowsCredentialManagerResolver<R> {
+    fn resolve(
+        &mut self,
+        reference: &CredentialReference,
+    ) -> Result<SecretValue, CredentialResolveError> {
+        if reference.scheme() != "keychain" {
+            return Err(CredentialResolveError::UnsupportedReference);
+        }
+        let (service, account) = reference
+            .opaque()
+            .split_once('/')
+            .ok_or(CredentialResolveError::UnsupportedReference)?;
+        SecretValue::new(
+            self.reader
+                .read_generic(&format!("commonkit/{service}/{account}"))?,
+        )
     }
 }
 

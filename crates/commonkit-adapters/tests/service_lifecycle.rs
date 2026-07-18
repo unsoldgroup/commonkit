@@ -105,3 +105,37 @@ fn rejects_service_names_that_could_change_backend_argv_shape() {
     invalid.name = "relay; shutdown".into();
     assert!(ServiceAdapter::<FakeBackend>::validate_spec(&invalid).is_err());
 }
+
+struct FailingReinspection {
+    inspections: std::sync::atomic::AtomicUsize,
+}
+
+impl ServiceBackend for FailingReinspection {
+    fn inspect(&self, _name: &str) -> Result<ServiceObservedState, String> {
+        if self
+            .inspections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            Ok(ServiceObservedState::default())
+        } else {
+            Err("platform lifecycle unavailable".into())
+        }
+    }
+    fn execute(&self, _command: &LifecycleCommand) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn stopped_service_apply_fails_closed_when_platform_reinspection_fails() {
+    let backend = Arc::new(FailingReinspection {
+        inspections: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let mut adapter = ServiceAdapter::new("windows_task", backend).unwrap();
+    let operation = adapter
+        .register("relay", spec(), ServiceDesiredState::Stopped)
+        .unwrap();
+    let error = adapter.apply(&operation).unwrap_err();
+    assert_eq!(error.code.as_str(), "service_inspect_failed");
+}
