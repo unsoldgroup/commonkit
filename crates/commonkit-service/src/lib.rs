@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Query, Request, State};
@@ -49,6 +50,8 @@ pub struct ServiceStatus {
     pub state: OverallState,
     pub active_target: Option<String>,
     pub active_loadout: Option<String>,
+    pub last_drift_check_unix_ms: Option<u128>,
+    pub last_drift_error_code: Option<String>,
 }
 
 impl Default for ServiceStatus {
@@ -61,6 +64,72 @@ impl Default for ServiceStatus {
             state: OverallState::Offline,
             active_target: None,
             active_loadout: None,
+            last_drift_check_unix_ms: None,
+            last_drift_error_code: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DriftResult {
+    pub state: OverallState,
+    pub code: Option<String>,
+}
+
+pub trait DriftChecker: Send + Sync + 'static {
+    fn check(&self) -> DriftResult;
+}
+
+pub struct DriftScheduler<C> {
+    checker: Arc<C>,
+    status: Arc<RwLock<ServiceStatus>>,
+    events: EventHub,
+}
+
+impl<C: DriftChecker> DriftScheduler<C> {
+    pub fn new(checker: Arc<C>, status: Arc<RwLock<ServiceStatus>>, events: EventHub) -> Self {
+        Self {
+            checker,
+            status,
+            events,
+        }
+    }
+
+    pub async fn check_now(&self) -> DriftResult {
+        let result = self.checker.check();
+        let checked_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        {
+            let mut status = self.status.write().await;
+            status.state = result.state;
+            status.last_drift_check_unix_ms = Some(checked_at);
+            status.last_drift_error_code = result.code.clone();
+        }
+        self.events.publish(
+            "drift.checked",
+            serde_json::json!({
+                "checkedAtUnixMs": checked_at,
+                "state": result.state,
+                "code": result.code,
+            }),
+        );
+        result
+    }
+
+    pub async fn run_until<F>(&self, interval: Duration, shutdown: F)
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        let mut timer = tokio::time::interval(interval.max(Duration::from_secs(1)));
+        tokio::pin!(shutdown);
+        loop {
+            tokio::select! {
+                _ = timer.tick() => {
+                    self.check_now().await;
+                }
+                _ = &mut shutdown => break,
+            }
         }
     }
 }
