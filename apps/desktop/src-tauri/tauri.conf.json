@@ -1,0 +1,36 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CommonKit",
+  "version": "0.1.0",
+  "identifier": "com.unsoldgroup.commonkit",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [{
+      "label": "main",
+      "title": "CommonKit",
+      "width": 1080,
+      "height": 720,
+      "minWidth": 760,
+      "minHeight": 520,
+      "visible": false,
+      "center": true
+    }],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["../../../packages/mcp-local-relay/docs/assets/social-preview.png"],
+    "createUpdaterArtifacts": true,
+    "shortDescription": "Portable developer-environment orchestration",
+    "category": "DeveloperTool"
+  }
+}
