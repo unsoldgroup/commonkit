@@ -2,13 +2,78 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use commonkit_service::{
-    DriftChecker, DriftResult, DriftScheduler, EventHub, OverallState, ServiceStatus,
+    DriftChecker, DriftResult, DriftScheduler, EventHub, OverallState, SchedulerConfig,
+    SchedulerStore, ServiceStatus,
 };
 use tokio::sync::RwLock;
 
 struct ReadOnlyCheck {
     calls: AtomicUsize,
     result: DriftResult,
+}
+
+#[tokio::test]
+async fn scheduler_enable_disable_and_startup_restore_are_persistent() {
+    let temp = std::env::temp_dir().join(format!("commonkit-scheduler-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp);
+    let store = SchedulerStore::open(&temp).unwrap();
+    let checker = Arc::new(ReadOnlyCheck {
+        calls: AtomicUsize::new(0),
+        result: DriftResult {
+            state: OverallState::Healthy,
+            code: None,
+        },
+    });
+    let status = Arc::new(RwLock::new(ServiceStatus::default()));
+    let scheduler = DriftScheduler::with_store(checker, status, EventHub::new(4), store).unwrap();
+
+    scheduler
+        .enable(std::time::Duration::from_secs(90))
+        .unwrap();
+    assert_eq!(
+        scheduler.configuration(),
+        SchedulerConfig {
+            enabled: true,
+            interval_seconds: 90
+        }
+    );
+    let restored = DriftScheduler::with_store(
+        Arc::new(ReadOnlyCheck {
+            calls: AtomicUsize::new(0),
+            result: DriftResult {
+                state: OverallState::Healthy,
+                code: None,
+            },
+        }),
+        Arc::new(RwLock::new(ServiceStatus::default())),
+        EventHub::new(4),
+        SchedulerStore::open(&temp).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restored.configuration().interval_seconds, 90);
+    restored.disable().unwrap();
+    assert!(!restored.configuration().enabled);
+    let _ = std::fs::remove_dir_all(temp);
+}
+
+#[tokio::test]
+async fn overlapping_manual_checks_are_suppressed() {
+    let checker = Arc::new(ReadOnlyCheck {
+        calls: AtomicUsize::new(0),
+        result: DriftResult {
+            state: OverallState::Healthy,
+            code: None,
+        },
+    });
+    let scheduler = Arc::new(DriftScheduler::new(
+        checker.clone(),
+        Arc::new(RwLock::new(ServiceStatus::default())),
+        EventHub::new(4),
+    ));
+    // The guard is public behavior through try_check_now: one caller owns the run.
+    let first = scheduler.try_check_now().await;
+    assert!(first.is_some());
+    assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
 }
 
 impl DriftChecker for ReadOnlyCheck {

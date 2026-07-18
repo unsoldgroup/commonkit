@@ -25,3 +25,7 @@ Git contains declarative layers, provider manifests/locks, policy, and snapshot 
 5. Exercise rollback and restart recovery.
 6. Migrate relay and mutable snapshots only after filesystem parity.
 7. Retain native fallback until APM/chezmoi output parity is demonstrated for the loadout.
+
+## Release and update migration
+
+Choose an explicit update channel and review its signed release notes before migration. Do not switch an existing installation to desktop auto-update until updater metadata signature verification and rollback guidance have been exercised on that platform. Standalone CLI users update through the matching signed release artifact; installers must preserve portable kit data by default while removing application-managed services and startup entries on uninstall.

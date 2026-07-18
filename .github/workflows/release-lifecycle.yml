@@ -1,0 +1,26 @@
+name: Release lifecycle matrix (disabled)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-update-uninstall:
+    if: ${{ false }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install signed previous release
+        run: echo "disabled until signed installer fixtures exist"
+      - name: Update through signed Tauri metadata
+        run: echo "disabled until a two-version updater fixture exists"
+      - name: Verify standalone CLI
+        run: echo "disabled until packaged CLI fixtures exist"
+      - name: Uninstall and verify user data policy
+        run: echo "disabled until uninstall fixtures exist"

@@ -11,7 +11,10 @@ This matrix is a release gate, not a claim that unchecked rows are production-re
 | Credentials | env/file/BWS; Keychain reference | env/file/BWS; Secret Service pending | env/file/BWS; Credential Manager pending | Target-local only |
 | Snapshots | Provider-neutral core | Provider-neutral core | Provider-neutral core | Object-store transport-neutral |
 | Desktop | Tauri build gate | AppImage/deb gate | Signed installer gate | Manages through daemon |
+| Standalone CLI | Universal signed archive gate | Signed archive gate | Signed archive gate | Same control API |
 
 Windows remote management is out of v1; local Windows is required. Linux v1 packaging targets AppImage and Debian-family `.deb`. GitHub CLI is the initial GitHub authentication path. Snapshot storage remains S3-compatible and provider-neutral; Cloudflare R2 is the recommended deployment profile. BWS is the initial external secret-manager adapter.
 
 No row is release-ready until its installer, reconciliation, recovery, update, and uninstall tests pass on the named platform.
+
+Release packaging and lifecycle workflows are validation-only and deliberately disabled until production signing identities and real two-version fixtures are provisioned. A green ordinary CI run does not imply installer or updater support.

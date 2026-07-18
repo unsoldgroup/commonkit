@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -89,10 +90,80 @@ pub trait DriftChecker: Send + Sync + 'static {
     fn check(&self) -> DriftResult;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SchedulerConfig {
+    pub enabled: bool,
+    pub interval_seconds: u64,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self { enabled: false, interval_seconds: 900 }
+    }
+}
+
+pub struct SchedulerStore {
+    path: PathBuf,
+}
+
+impl SchedulerStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, SchedulerError> {
+        std::fs::create_dir_all(root.as_ref())?;
+        make_private_directory(root.as_ref())?;
+        Ok(Self { path: root.as_ref().join("scheduler.json") })
+    }
+
+    fn load(&self) -> Result<SchedulerConfig, SchedulerError> {
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(SchedulerError::UnsafeState),
+            Ok(_) => Ok(serde_json::from_slice(&std::fs::read(&self.path)?)?),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(SchedulerConfig::default()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn save(&self, config: SchedulerConfig) -> Result<(), SchedulerError> {
+        let bytes = serde_json::to_vec(&config)?;
+        let temporary = self.path.with_extension(format!("{}.tmp", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+        let result = (|| {
+            let mut file = options.open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &self.path)?;
+            Ok::<_, std::io::Error>(())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        result.map_err(Into::into)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SchedulerError {
+    #[error("scheduler state is not a regular file")] UnsafeState,
+    #[error("scheduler interval must be at least one second")] InvalidInterval,
+    #[error(transparent)] Io(#[from] std::io::Error),
+    #[error(transparent)] Json(#[from] serde_json::Error),
+}
+
+fn make_private_directory(path: &Path) -> Result<(), std::io::Error> {
+    #[cfg(unix)] {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 pub struct DriftScheduler<C> {
     checker: Arc<C>,
     status: Arc<RwLock<ServiceStatus>>,
     events: EventHub,
+    configuration: std::sync::Mutex<SchedulerConfig>,
+    store: Option<SchedulerStore>,
+    running: AtomicBool,
 }
 
 impl<C: DriftChecker> DriftScheduler<C> {
@@ -101,10 +172,52 @@ impl<C: DriftChecker> DriftScheduler<C> {
             checker,
             status,
             events,
+            configuration: std::sync::Mutex::new(SchedulerConfig::default()),
+            store: None,
+            running: AtomicBool::new(false),
         }
     }
 
+    pub fn with_store(
+        checker: Arc<C>, status: Arc<RwLock<ServiceStatus>>, events: EventHub, store: SchedulerStore,
+    ) -> Result<Self, SchedulerError> {
+        let configuration = store.load()?;
+        Ok(Self { checker, status, events, configuration: std::sync::Mutex::new(configuration), store: Some(store), running: AtomicBool::new(false) })
+    }
+
+    pub fn configuration(&self) -> SchedulerConfig {
+        *self.configuration.lock().expect("scheduler configuration lock")
+    }
+
+    pub fn enable(&self, interval: Duration) -> Result<(), SchedulerError> {
+        if interval.as_secs() == 0 { return Err(SchedulerError::InvalidInterval); }
+        self.update_configuration(SchedulerConfig { enabled: true, interval_seconds: interval.as_secs() })
+    }
+
+    pub fn disable(&self) -> Result<(), SchedulerError> {
+        let mut next = self.configuration();
+        next.enabled = false;
+        self.update_configuration(next)
+    }
+
+    fn update_configuration(&self, next: SchedulerConfig) -> Result<(), SchedulerError> {
+        if let Some(store) = &self.store { store.save(next)?; }
+        *self.configuration.lock().expect("scheduler configuration lock") = next;
+        Ok(())
+    }
+
     pub async fn check_now(&self) -> DriftResult {
+        self.try_check_now().await.unwrap_or(DriftResult { state: self.status.read().await.state, code: Some("drift_check_in_progress".into()) })
+    }
+
+    pub async fn try_check_now(&self) -> Option<DriftResult> {
+        if self.running.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            self.events.publish("drift.skipped", serde_json::json!({ "code": "overlap_suppressed" }));
+            return None;
+        }
+        struct Reset<'a>(&'a AtomicBool);
+        impl Drop for Reset<'_> { fn drop(&mut self) { self.0.store(false, Ordering::Release); } }
+        let _reset = Reset(&self.running);
         let result = self.checker.check();
         let checked_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -123,7 +236,7 @@ impl<C: DriftChecker> DriftScheduler<C> {
                 "code": result.code,
             }),
         );
-        result
+        Some(result)
     }
 
     pub async fn run_until<F>(&self, interval: Duration, shutdown: F)
@@ -135,7 +248,7 @@ impl<C: DriftChecker> DriftScheduler<C> {
         loop {
             tokio::select! {
                 _ = timer.tick() => {
-                    self.check_now().await;
+                    if self.configuration().enabled { self.try_check_now().await; }
                 }
                 _ = &mut shutdown => break,
             }

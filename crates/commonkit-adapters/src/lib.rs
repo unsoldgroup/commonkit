@@ -10,6 +10,7 @@ mod native;
 mod planning;
 mod provider;
 mod resources;
+mod service_lifecycle;
 mod target;
 
 pub use apm::{ApmProvider, ApmProviderConfig};
@@ -38,6 +39,10 @@ pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
     OwnershipRules, ResourceError, ResourceProvenance, SafeSymlinkTarget,
     materialized_resources_digest, validate_ownership,
+};
+pub use service_lifecycle::{
+    LifecycleCommand, ServiceAdapter, ServiceBackend, ServiceDesiredState, ServiceError,
+    ServiceObservedState, ServiceSpec, ServiceStartMode,
 };
 pub use target::{
     LocalTargetFilesystem, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,

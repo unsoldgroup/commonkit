@@ -4,6 +4,23 @@ use commonkit_snapshots::{
 };
 
 #[test]
+fn production_cipher_uses_random_nonces_and_rejects_wrong_keys_or_tampering() {
+    use commonkit_snapshots::{AuthenticatedCipher, XChaCha20Cipher};
+
+    let cipher = XChaCha20Cipher::new([7; 32]);
+    let first = cipher.seal(b"database", b"manifest").unwrap();
+    let second = cipher.seal(b"database", b"manifest").unwrap();
+    assert_ne!(first, second, "each snapshot requires a fresh nonce");
+    assert_eq!(cipher.open(&first, b"manifest").unwrap(), b"database");
+
+    let wrong_key = XChaCha20Cipher::new([8; 32]);
+    assert!(wrong_key.open(&first, b"manifest").is_err());
+    let mut tampered = first;
+    *tampered.last_mut().unwrap() ^= 1;
+    assert!(cipher.open(&tampered, b"manifest").is_err());
+}
+
+#[test]
 fn only_one_target_may_be_the_authoritative_writer() {
     let mut coordinator = SnapshotCoordinator::new(DatabaseId::new("context-mode").unwrap());
 

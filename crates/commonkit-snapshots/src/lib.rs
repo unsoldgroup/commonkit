@@ -2,10 +2,14 @@
 //!
 //! Portable metadata contains digests and encrypted-object references, never plaintext data.
 
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+use zeroize::Zeroize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -132,6 +136,70 @@ pub trait AuthenticatedCipher {
     fn algorithm(&self) -> &str;
     fn seal(&self, plaintext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, SnapshotError>;
     fn open(&self, ciphertext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, SnapshotError>;
+}
+
+/// Production snapshot cipher. Ciphertext is `24-byte nonce || authenticated ciphertext`.
+/// The key is target-local material and is never serializable or exposed through formatting.
+pub struct XChaCha20Cipher([u8; 32]);
+
+impl XChaCha20Cipher {
+    pub fn new(key: [u8; 32]) -> Self {
+        Self(key)
+    }
+}
+
+impl Drop for XChaCha20Cipher {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl fmt::Debug for XChaCha20Cipher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("XChaCha20Cipher(<redacted>)")
+    }
+}
+
+impl AuthenticatedCipher for XChaCha20Cipher {
+    fn algorithm(&self) -> &str {
+        "XCHACHA20-POLY1305"
+    }
+
+    fn seal(&self, plaintext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+        let cipher = XChaCha20Poly1305::new((&self.0).into());
+        let mut nonce = [0_u8; 24];
+        rand::rng().fill_bytes(&mut nonce);
+        let body = cipher
+            .encrypt(
+                XNonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: associated_data,
+                },
+            )
+            .map_err(|_| SnapshotError::AuthenticationFailed)?;
+        let mut output = Vec::with_capacity(nonce.len() + body.len());
+        output.extend_from_slice(&nonce);
+        output.extend_from_slice(&body);
+        nonce.zeroize();
+        Ok(output)
+    }
+
+    fn open(&self, ciphertext: &[u8], associated_data: &[u8]) -> Result<Vec<u8>, SnapshotError> {
+        if ciphertext.len() < 24 + 16 {
+            return Err(SnapshotError::AuthenticationFailed);
+        }
+        let (nonce, body) = ciphertext.split_at(24);
+        XChaCha20Poly1305::new((&self.0).into())
+            .decrypt(
+                XNonce::from_slice(nonce),
+                Payload {
+                    msg: body,
+                    aad: associated_data,
+                },
+            )
+            .map_err(|_| SnapshotError::AuthenticationFailed)
+    }
 }
 
 pub trait ObjectStore {
