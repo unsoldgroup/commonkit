@@ -1,11 +1,15 @@
 //! Capability adapters supplied with CommonKit.
 
+mod apm;
 mod artifacts;
+mod chezmoi;
 mod files;
 mod provider;
 mod resources;
 
+pub use apm::{ApmProvider, ApmProviderConfig};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
+pub use chezmoi::ChezmoiProvider;
 pub use files::{FileAdapter, FileAdapterError, FileIntent, ManagedRelativePath};
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,
