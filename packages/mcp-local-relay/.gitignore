@@ -1,11 +1,10 @@
-commonkit.json
 node_modules/
 dist/
 .build/
 **/.build/
+.DS_Store
 *.log
 *.tmp
-.DS_Store
 .env
 .env.*
 !.env.example

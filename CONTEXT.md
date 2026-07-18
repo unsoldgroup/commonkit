@@ -27,9 +27,12 @@ _Avoid_: File copy, deployment
 ## Relationships
 
 - A **CommonKit** defines one or more **Loadouts**.
+- A **CommonKit** composes configuration in this precedence order: public base, organization policy, personal kit, project loadout, then target overrides.
+- Organization security policy is a non-overridable floor. Later layers may tighten it but cannot weaken it.
 - A **Loadout** is materialized on one or more **Targets**.
 - An **Adapter** participates in **Reconciliation** for one agent or service.
 - **Reconciliation** never treats secrets or machine identity as portable CommonKit content.
+- **mcp-local-relay** is an independently publishable package in the CommonKit repository. It remains the MCP data plane; CommonKit owns desired-state composition and reconciliation.
 
 ## Example dialogue
 
@@ -43,7 +46,6 @@ _Avoid_: File copy, deployment
 
 ## Open — not yet resolved
 
-- Whether a CommonKit is primarily personal, team-owned, or composed from layers.
 - Whether Git is mandatory or one possible CommonKit backend.
 - Which flows belong in the first public release.
-- Whether MCP relay lifecycle is an adapter or a separate companion product.
+- How CommonKit adapters reconcile `mcp-local-relay` lifecycle and desired state.

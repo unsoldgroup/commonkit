@@ -1,0 +1,14 @@
+{
+  "id": "posthog",
+  "name": "PostHog",
+  "category": "Product analytics",
+  "mode": "posthog-cli",
+  "remote": {
+    "type": "streamable_http",
+    "url": "https://mcp.posthog.com/mcp"
+  },
+  "envFile": "~/.config/mcp-local-relay/posthog.env",
+  "cache": {
+    "toolsTtlMs": 900000
+  }
+}

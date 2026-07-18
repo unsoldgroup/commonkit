@@ -7,6 +7,12 @@ It is intentionally one-way and declarative: portable configuration is
 versioned, while credentials and runtime identity remain independently
 provisioned on each target.
 
+This repository is a pnpm workspace. It also owns the independently
+publishable [`mcp-local-relay`](packages/mcp-local-relay) package, which keeps
+MCP upstreams warm and exposes them through one persistent local endpoint.
+CommonKit remains the desired-state control plane; the relay is its MCP data
+plane.
+
 Requires Node.js 24+, SSH, and rsync. Copy `commonkit.example.json` to
 `commonkit.json` and select your target before running it.
 
@@ -17,6 +23,14 @@ commonkit apply --dry-run
 commonkit apply --yes
 commonkit plugins --yes
 commonkit verify
+```
+
+Run all workspace checks with:
+
+```sh
+pnpm install
+pnpm test
+pnpm typecheck
 ```
 
 ## What it synchronizes

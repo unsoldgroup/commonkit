@@ -1,0 +1,12 @@
+{
+  "id": "docs",
+  "name": "Docs",
+  "category": "Documentation",
+  "remote": {
+    "type": "streamable_http",
+    "url": "https://your-docs-mcp.example.com/mcp"
+  },
+  "cache": {
+    "toolsTtlMs": 900000
+  }
+}

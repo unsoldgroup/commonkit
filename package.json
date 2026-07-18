@@ -1,13 +1,18 @@
 {
   "name": "commonkit",
   "version": "0.1.0",
-  "description": "Safely synchronize a local AI development environment to a headless VPS",
+  "description": "Portable, layered developer capabilities and policy across machines, projects, and coding agents",
   "type": "module",
+  "packageManager": "pnpm@10.28.2",
   "bin": {
     "commonkit": "./src/cli.mjs"
   },
   "scripts": {
-    "test": "node --test"
+    "build": "pnpm --filter mcp-local-relay build",
+    "test": "pnpm run test:commonkit && pnpm run test:relay",
+    "test:commonkit": "node --test test/*.test.mjs",
+    "test:relay": "pnpm --filter mcp-local-relay test",
+    "typecheck": "pnpm --filter mcp-local-relay typecheck"
   },
   "engines": {
     "node": ">=24"
