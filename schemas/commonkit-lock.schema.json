@@ -10,60 +10,77 @@
       ],
       "type": "string"
     },
-    "SourceMetadata": {
+    "LockedLayer": {
       "additionalProperties": false,
       "properties": {
         "contentDigest": {
-          "pattern": "^sha256:[0-9a-f]{64}$",
           "type": "string"
         },
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/LayerKind"
+        },
         "path": {
-          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.?/)(?!.*[\\\\:\\x00])[^/]+(?:/[^/]+)*$",
           "type": "string"
         },
         "revision": {
-          "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$",
           "type": [
             "string",
             "null"
           ]
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
+        "id",
+        "kind",
         "path",
+        "schemaVersion",
         "contentDigest"
       ],
       "type": "object"
     }
   },
-  "$id": "https://schemas.commonkit.dev/v1/layer.schema.json",
+  "$id": "https://schemas.commonkit.dev/v1/commonkit-lock.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
-    "id": {
-      "pattern": "^[a-z][a-z0-9_-]{0,62}$",
+    "contractVersion": {
       "type": "string"
     },
-    "kind": {
-      "$ref": "#/$defs/LayerKind"
+    "layers": {
+      "items": {
+        "$ref": "#/$defs/LockedLayer"
+      },
+      "type": "array"
+    },
+    "normalizedDigest": {
+      "type": "string"
+    },
+    "repositoryRevision": {
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "schemaVersion": {
       "format": "uint32",
       "minimum": 0,
       "type": "integer"
-    },
-    "source": {
-      "$ref": "#/$defs/SourceMetadata"
-    },
-    "spec": true
+    }
   },
   "required": [
     "schemaVersion",
-    "id",
-    "kind",
-    "source",
-    "spec"
+    "contractVersion",
+    "layers",
+    "normalizedDigest"
   ],
-  "title": "LayerDocument",
+  "title": "CommonKitLock",
   "type": "object"
 }

@@ -1,0 +1,104 @@
+{
+  "$defs": {
+    "ReceiptState": {
+      "enum": [
+        "prepared",
+        "applying",
+        "verifying",
+        "succeeded",
+        "recovery_required",
+        "rolling_back",
+        "rolled_back",
+        "rollback_failed",
+        "canceled"
+      ],
+      "type": "string"
+    },
+    "ReceiptTransition": {
+      "additionalProperties": false,
+      "properties": {
+        "entryDigest": {
+          "type": "string"
+        },
+        "previousDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/ReceiptState"
+        }
+      },
+      "required": [
+        "sequence",
+        "state",
+        "entryDigest"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contractVersion": {
+      "type": "string"
+    },
+    "desiredDigest": {
+      "type": "string"
+    },
+    "observedDigest": {
+      "type": "string"
+    },
+    "planId": {
+      "type": "string"
+    },
+    "policyDigest": {
+      "type": "string"
+    },
+    "receiptId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "state": {
+      "$ref": "#/$defs/ReceiptState"
+    },
+    "targetId": {
+      "type": "string"
+    },
+    "transitions": {
+      "items": {
+        "$ref": "#/$defs/ReceiptTransition"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "receiptId",
+    "runId",
+    "planId",
+    "targetId",
+    "desiredDigest",
+    "observedDigest",
+    "policyDigest",
+    "state",
+    "transitions"
+  ],
+  "title": "RunReceipt",
+  "type": "object"
+}

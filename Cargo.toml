@@ -3,6 +3,7 @@ members = [
   "crates/commonkit-contracts",
   "crates/commonkit-config",
   "crates/commonkit-core",
+  "crates/commonkit-reconcile",
 ]
 resolver = "2"
 

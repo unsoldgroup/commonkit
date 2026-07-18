@@ -4,6 +4,16 @@ use std::{fs, path::PathBuf};
 fn checked_in_layer_schema_matches_the_rust_contract() {
     assert_schema("layer.schema.json", commonkit_contracts::layer_schema());
     assert_schema("error.schema.json", commonkit_contracts::error_schema());
+    assert_schema(
+        "provenance.schema.json",
+        commonkit_contracts::provenance_schema(),
+    );
+    assert_schema(
+        "commonkit-lock.schema.json",
+        commonkit_contracts::lock_schema(),
+    );
+    assert_schema("plan.schema.json", commonkit_contracts::plan_schema());
+    assert_schema("receipt.schema.json", commonkit_contracts::receipt_schema());
 }
 
 fn assert_schema(

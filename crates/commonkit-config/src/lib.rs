@@ -2,7 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use commonkit_contracts::{LayerDocument, LayerKind, canonical_json};
+use commonkit_contracts::{
+    CommonKitLock, ContractError, Contribution, LayerDocument, LayerKind, LockedLayer,
+    MergeOperation, ProvenanceTrace, SCHEMA_VERSION, SchemaVersion, Sha256Digest, TraceEntry,
+    canonical_json, digest_json,
+};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
@@ -30,6 +34,122 @@ impl LayerSet {
     pub fn iter(&self) -> impl Iterator<Item = &LayerDocument> {
         self.layers.iter()
     }
+}
+
+pub struct CompositionResult {
+    pub spec: Value,
+    pub spec_digest: Sha256Digest,
+    pub trace: ProvenanceTrace,
+    pub lock: CommonKitLock,
+}
+
+pub fn compose_layers(
+    layers: &LayerSet,
+    rules: &MergeRules,
+) -> Result<CompositionResult, ComposeError> {
+    let mut spec = Value::Object(Map::new());
+    let mut contributions: BTreeMap<String, Vec<Contribution>> = BTreeMap::new();
+
+    for layer in layers.iter() {
+        collect_contributions(&layer.spec, "", &spec, layer, &mut contributions)?;
+        spec = merge_specs(&spec, &layer.spec, rules)?;
+    }
+    let spec_digest = digest_json(&spec)?;
+    let entries = contributions
+        .into_iter()
+        .filter_map(|(pointer, contributions)| {
+            contributions.last().cloned().map(|winner| {
+                (
+                    pointer,
+                    TraceEntry {
+                        winner,
+                        contributions,
+                        governing_rules: Vec::new(),
+                    },
+                )
+            })
+        })
+        .collect();
+    let locked_layers = layers
+        .iter()
+        .map(|layer| LockedLayer {
+            id: layer.id.clone(),
+            kind: layer.kind,
+            path: layer.source.path.clone(),
+            schema_version: layer.schema_version,
+            revision: layer.source.revision.clone(),
+            content_digest: layer.source.content_digest.clone(),
+        })
+        .collect();
+    Ok(CompositionResult {
+        spec,
+        spec_digest: spec_digest.clone(),
+        trace: ProvenanceTrace {
+            schema_version: SchemaVersion(SCHEMA_VERSION),
+            state_digest: spec_digest.clone(),
+            entries,
+        },
+        lock: CommonKitLock {
+            schema_version: SchemaVersion(SCHEMA_VERSION),
+            contract_version: commonkit_contracts::CONTRACT_VERSION.into(),
+            repository_revision: None,
+            layers: locked_layers,
+            normalized_digest: spec_digest,
+        },
+    })
+}
+
+fn collect_contributions(
+    overlay: &Value,
+    pointer: &str,
+    current: &Value,
+    layer: &LayerDocument,
+    contributions: &mut BTreeMap<String, Vec<Contribution>>,
+) -> Result<(), ContractError> {
+    if let Some(object) = overlay.as_object()
+        && !object.is_empty()
+        && !is_delete(overlay)
+    {
+        for (key, value) in object {
+            let child_pointer = format!("{pointer}/{}", escape_pointer(key));
+            collect_contributions(value, &child_pointer, current, layer, contributions)?;
+        }
+        return Ok(());
+    }
+    if pointer.is_empty() {
+        return Ok(());
+    }
+    let operation = if is_delete(overlay) {
+        MergeOperation::Delete
+    } else if current.pointer(pointer).is_some() {
+        MergeOperation::Replace
+    } else {
+        MergeOperation::Set
+    };
+    let value_digest = if operation == MergeOperation::Delete {
+        None
+    } else {
+        Some(digest_json(overlay)?)
+    };
+    contributions
+        .entry(pointer.into())
+        .or_default()
+        .push(Contribution {
+            layer_id: layer.id.clone(),
+            layer_kind: layer.kind,
+            source: layer.source.clone(),
+            operation,
+            value_digest,
+        });
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum ComposeError {
+    #[error(transparent)]
+    Merge(#[from] MergeError),
+    #[error(transparent)]
+    Contract(#[from] ContractError),
 }
 
 fn precedence(kind: LayerKind) -> u8 {

@@ -8,7 +8,7 @@ fn parses_a_versioned_organization_layer() {
         "kind": "organization_policy",
         "source": {
             "path": "layers/organization.json",
-            "revision": "57a085e",
+            "revision": "57a085e7d0b558e71c8d2255b7e60e6c677dee76",
             "contentDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
         },
         "spec": {
@@ -53,6 +53,20 @@ fn rejects_non_portable_layer_sources_and_invalid_digests() {
     }
     assert!(Sha256Digest::parse("sha256:fixture").is_err());
     assert!(Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).is_ok());
+}
+
+#[test]
+fn rejects_mutable_or_abbreviated_git_revisions() {
+    for revision in [
+        "main",
+        "57a085e",
+        "ABCDEF0123456789012345678901234567890123",
+    ] {
+        assert!(
+            commonkit_core::GitRevision::parse(revision).is_err(),
+            "{revision}"
+        );
+    }
 }
 
 #[test]

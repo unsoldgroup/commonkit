@@ -9,6 +9,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, schema) in [
         ("layer.schema.json", commonkit_contracts::layer_schema()?),
         ("error.schema.json", commonkit_contracts::error_schema()?),
+        (
+            "provenance.schema.json",
+            commonkit_contracts::provenance_schema()?,
+        ),
+        (
+            "commonkit-lock.schema.json",
+            commonkit_contracts::lock_schema()?,
+        ),
+        ("plan.schema.json", commonkit_contracts::plan_schema()?),
+        (
+            "receipt.schema.json",
+            commonkit_contracts::receipt_schema()?,
+        ),
     ] {
         let mut output = serde_json::to_string_pretty(&schema)?;
         output.push('\n');

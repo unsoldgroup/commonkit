@@ -1,0 +1,15 @@
+[package]
+name = "commonkit-reconcile"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+commonkit-contracts = { path = "../commonkit-contracts" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+commonkit-core = { path = "../commonkit-core" }

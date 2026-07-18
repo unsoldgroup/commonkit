@@ -1,10 +1,191 @@
 //! CommonKit composition, policy, and planning primitives.
 
-use std::sync::OnceLock;
+use std::{collections::BTreeSet, sync::OnceLock};
 
 pub use commonkit_contracts::*;
 use regex::Regex;
 use thiserror::Error;
+
+#[derive(Debug, Clone)]
+pub struct OperationDraft {
+    pub adapter_id: StableId,
+    pub kind: OperationKind,
+    pub resource: ResourceRef,
+    pub risk: Risk,
+    pub requires_confirmation: bool,
+    pub depends_on: Vec<Sha256Digest>,
+    pub before_digest: Option<Sha256Digest>,
+    pub after_digest: Option<Sha256Digest>,
+    pub summary: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationSemantic<'a> {
+    adapter_id: &'a StableId,
+    kind: OperationKind,
+    resource: &'a ResourceRef,
+    risk: Risk,
+    requires_confirmation: bool,
+    depends_on: &'a [Sha256Digest],
+    before_digest: &'a Option<Sha256Digest>,
+    after_digest: &'a Option<Sha256Digest>,
+}
+
+pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, ContractError> {
+    draft
+        .depends_on
+        .sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    draft.depends_on.dedup();
+    let id = digest_domain_json(
+        "commonkit.operation.v1",
+        &OperationSemantic {
+            adapter_id: &draft.adapter_id,
+            kind: draft.kind,
+            resource: &draft.resource,
+            risk: draft.risk,
+            requires_confirmation: draft.requires_confirmation,
+            depends_on: &draft.depends_on,
+            before_digest: &draft.before_digest,
+            after_digest: &draft.after_digest,
+        },
+    )?;
+    Ok(Operation {
+        id,
+        adapter_id: draft.adapter_id,
+        kind: draft.kind,
+        resource: draft.resource,
+        risk: draft.risk,
+        requires_confirmation: draft.requires_confirmation,
+        depends_on: draft.depends_on,
+        before_digest: draft.before_digest,
+        after_digest: draft.after_digest,
+        summary: draft.summary,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanDraft {
+    pub target_id: StableId,
+    pub desired_digest: Sha256Digest,
+    pub observed_digest: Sha256Digest,
+    pub policy_digest: Sha256Digest,
+    pub operations: Vec<Operation>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PlanSemantic<'a> {
+    target_id: &'a StableId,
+    desired_digest: &'a Sha256Digest,
+    observed_digest: &'a Sha256Digest,
+    policy_digest: &'a Sha256Digest,
+    operation_ids: Vec<&'a Sha256Digest>,
+}
+
+pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
+    let mut known = BTreeSet::new();
+    for operation in &draft.operations {
+        if !known.insert(operation.id.as_str().to_owned()) {
+            return Err(PlanBuildError::DuplicateOperation(operation.id.clone()));
+        }
+    }
+    for operation in &draft.operations {
+        for dependency in &operation.depends_on {
+            if !known.contains(dependency.as_str()) {
+                return Err(PlanBuildError::MissingDependency(dependency.clone()));
+            }
+        }
+    }
+
+    let mut emitted = BTreeSet::new();
+    let mut ordered = Vec::with_capacity(draft.operations.len());
+    while !draft.operations.is_empty() {
+        let next = draft
+            .operations
+            .iter()
+            .enumerate()
+            .filter(|(_, operation)| {
+                operation
+                    .depends_on
+                    .iter()
+                    .all(|dependency| emitted.contains(dependency.as_str()))
+            })
+            .min_by(|(_, left), (_, right)| operation_order(left, right))
+            .map(|(index, _)| index)
+            .ok_or(PlanBuildError::DependencyCycle)?;
+        let operation = draft.operations.remove(next);
+        emitted.insert(operation.id.as_str().to_owned());
+        ordered.push(operation);
+    }
+    for operation in &ordered {
+        let recomputed = finalize_operation(OperationDraft {
+            adapter_id: operation.adapter_id.clone(),
+            kind: operation.kind,
+            resource: operation.resource.clone(),
+            risk: operation.risk,
+            requires_confirmation: operation.requires_confirmation,
+            depends_on: operation.depends_on.clone(),
+            before_digest: operation.before_digest.clone(),
+            after_digest: operation.after_digest.clone(),
+            summary: operation.summary.clone(),
+        })?;
+        if recomputed.id != operation.id {
+            return Err(PlanBuildError::OperationIdMismatch(operation.id.clone()));
+        }
+    }
+    let id = digest_domain_json(
+        "commonkit.plan.v1",
+        &PlanSemantic {
+            target_id: &draft.target_id,
+            desired_digest: &draft.desired_digest,
+            observed_digest: &draft.observed_digest,
+            policy_digest: &draft.policy_digest,
+            operation_ids: ordered.iter().map(|operation| &operation.id).collect(),
+        },
+    )?;
+    Ok(Plan {
+        schema_version: SchemaVersion(SCHEMA_VERSION),
+        contract_version: CONTRACT_VERSION.into(),
+        id,
+        target_id: draft.target_id,
+        desired_digest: draft.desired_digest,
+        observed_digest: draft.observed_digest,
+        policy_digest: draft.policy_digest,
+        operations: ordered,
+    })
+}
+
+fn operation_order(left: &Operation, right: &Operation) -> std::cmp::Ordering {
+    (
+        left.adapter_id.as_str(),
+        left.resource.resource_type.as_str(),
+        left.resource.resource_id.as_str(),
+        left.kind,
+        left.id.as_str(),
+    )
+        .cmp(&(
+            right.adapter_id.as_str(),
+            right.resource.resource_type.as_str(),
+            right.resource.resource_id.as_str(),
+            right.kind,
+            right.id.as_str(),
+        ))
+}
+
+#[derive(Debug, Error)]
+pub enum PlanBuildError {
+    #[error(transparent)]
+    Contract(#[from] ContractError),
+    #[error("duplicate operation ID: {0}")]
+    DuplicateOperation(Sha256Digest),
+    #[error("operation dependency is missing: {0}")]
+    MissingDependency(Sha256Digest),
+    #[error("operation dependency graph contains a cycle")]
+    DependencyCycle,
+    #[error("operation semantic ID does not match its content: {0}")]
+    OperationIdMismatch(Sha256Digest),
+}
 
 pub fn is_forbidden_path(candidate: &str) -> bool {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
