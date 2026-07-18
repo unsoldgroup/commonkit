@@ -18,9 +18,9 @@ use thiserror::Error;
 pub type BackendFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, BackendError>> + Send + 'a>>;
 
 pub trait ControlBackend: Send + Sync + 'static {
-    fn get(&self, path: &'static str) -> BackendFuture<'_>;
+    fn get<'a>(&'a self, path: &'a str) -> BackendFuture<'a>;
     fn apply(&self, input: ApplyPlanInput) -> BackendFuture<'_>;
-    fn post(&self, path: &'static str, input: Value) -> BackendFuture<'_> {
+    fn post<'a>(&'a self, path: &'a str, input: Value) -> BackendFuture<'a> {
         let _ = (path, input);
         Box::pin(async { Err(BackendError::Unsupported) })
     }
@@ -57,7 +57,7 @@ impl DaemonBackend {
 }
 
 impl ControlBackend for DaemonBackend {
-    fn get(&self, path: &'static str) -> BackendFuture<'_> {
+    fn get<'a>(&'a self, path: &'a str) -> BackendFuture<'a> {
         Box::pin(async move {
             let (base, authorization) = self.connection().await?;
             let response = self
@@ -88,7 +88,7 @@ impl ControlBackend for DaemonBackend {
         })
     }
 
-    fn post(&self, path: &'static str, input: Value) -> BackendFuture<'_> {
+    fn post<'a>(&'a self, path: &'a str, input: Value) -> BackendFuture<'a> {
         Box::pin(async move {
             let (base, authorization) = self.connection().await?;
             let response = self
@@ -174,6 +174,36 @@ pub struct ScheduleInput {
     pub confirmation_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillEvidencePreviewInput {
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillOpportunitiesInput {
+    pub minimum_evidence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ShowSkillCandidateInput {
+    pub candidate_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProposeSkillPromotionInput {
+    pub candidate_id: String,
+    pub repository_revision: String,
+    pub approver: String,
+    pub approved_at_unix_ms: u64,
+    pub reason: String,
+    pub confirmed: bool,
+    pub confirmation_id: String,
+}
+
 impl ConsentInput {
     pub fn denied() -> Self {
         Self {
@@ -245,6 +275,95 @@ impl CommonKitMcp {
     )]
     pub async fn schedule_status(&self) -> Result<CallToolResult, ErrorData> {
         tool_result(self.backend.get("/control/v1/schedule").await)
+    }
+
+    #[tool(
+        name = "commonkit_list_skills",
+        description = "List canonical Git-owned skills without mutation."
+    )]
+    pub async fn list_skills(&self) -> Result<CallToolResult, ErrorData> {
+        tool_result(self.backend.get("/control/v1/skills").await)
+    }
+
+    #[tool(
+        name = "commonkit_list_skill_candidates",
+        description = "List durable evaluated skill candidates without mutation."
+    )]
+    pub async fn list_skill_candidates(&self) -> Result<CallToolResult, ErrorData> {
+        tool_result(self.backend.get("/control/v1/skills/candidates").await)
+    }
+
+    #[tool(
+        name = "commonkit_show_skill_candidate",
+        description = "Read one immutable skill candidate without mutation."
+    )]
+    pub async fn show_skill_candidate(
+        &self,
+        Parameters(input): Parameters<ShowSkillCandidateInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = format!("/control/v1/skills/candidates/{}", input.candidate_id);
+        tool_result(self.backend.get(&path).await)
+    }
+
+    #[tool(
+        name = "commonkit_preview_skill_evidence",
+        description = "Preview local evidence redaction and sensitivity without importing it."
+    )]
+    pub async fn preview_skill_evidence(
+        &self,
+        Parameters(input): Parameters<SkillEvidencePreviewInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/skills/evidence/preview",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_skill_opportunities",
+        description = "Compute evidence-backed skill optimization opportunities without invoking a provider."
+    )]
+    pub async fn skill_opportunities(
+        &self,
+        Parameters(input): Parameters<SkillOpportunitiesInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/skills/opportunities",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_propose_skill_promotion",
+        description = "Create a confirmation-bound promotion proposal; never applies or adopts a candidate."
+    )]
+    pub async fn propose_skill_promotion(
+        &self,
+        Parameters(input): Parameters<ProposeSkillPromotionInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !input.confirmed {
+            return Ok(CallToolResult::structured_error(
+                json!({"code":"confirmation_required","message":"Explicit user confirmation is required","retryable":false}),
+            ));
+        }
+        let path = format!(
+            "/control/v1/skills/candidates/{}/promotion-plans",
+            input.candidate_id
+        );
+        tool_result(self.backend.post(&path, json!({
+            "confirmed": true,
+            "confirmationId": input.confirmation_id,
+            "repositoryRevision": input.repository_revision,
+            "approval": {"approver": input.approver, "approvedAtUnixMs": input.approved_at_unix_ms, "reason": input.reason}
+        })).await)
     }
 
     #[tool(
@@ -345,16 +464,28 @@ impl CommonKitMcp {
         Parameters(input): Parameters<RelayReconcileInput>,
     ) -> Result<CallToolResult, ErrorData> {
         if !input.confirmed {
-            return Ok(input_error("confirmation_required", "Explicit user confirmation is required"));
+            return Ok(input_error(
+                "confirmation_required",
+                "Explicit user confirmation is required",
+            ));
         }
         if input.confirmation_id.is_empty() || input.idempotency_key.is_empty() {
-            return Ok(input_error("invalid_input", "Confirmation fields are invalid"));
+            return Ok(input_error(
+                "invalid_input",
+                "Confirmation fields are invalid",
+            ));
         }
         if serde_json::to_vec(&input).is_ok_and(|bytes| bytes.len() > 512 * 1024) {
-            return Ok(input_error("invalid_input", "Relay request exceeds the safe size"));
+            return Ok(input_error(
+                "invalid_input",
+                "Relay request exceeds the safe size",
+            ));
         }
         if input.resolved.is_null() {
-            return Ok(input_error("invalid_input", "Resolved MCP declarations are required"));
+            return Ok(input_error(
+                "invalid_input",
+                "Resolved MCP declarations are required",
+            ));
         }
         tool_result(
             self.backend

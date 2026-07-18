@@ -35,7 +35,10 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
     events.publish("status.changed", json!({"state": "healthy"}));
     let server = BoundServer::bind_with_relay_address(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), commonkit_relay::DEFAULT_PORT),
+        SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            commonkit_relay::DEFAULT_PORT,
+        ),
         token,
         status,
         events,

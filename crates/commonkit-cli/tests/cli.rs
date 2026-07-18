@@ -3,6 +3,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 fn temporary_directory(test: &str) -> std::path::PathBuf {
     let nonce = SystemTime::now()
@@ -118,6 +120,7 @@ fn publishes_the_complete_v1_command_surface() {
         "schedule",
         "diagnostics",
         "relay",
+        "skills",
     ] {
         assert!(help.contains(command), "missing {command} in {help}");
     }
@@ -150,4 +153,102 @@ fn mutations_require_an_explicit_confirmation_flag() {
             .unwrap()
             .contains("confirmation_required")
     );
+}
+
+#[test]
+fn skill_schedule_is_explicit_and_persistent() {
+    let directory = temporary_directory("cli-skill-schedule");
+    fs::create_dir_all(directory.join(".agents/skills/review")).expect("skills");
+    fs::write(
+        directory.join(".agents/skills/review/SKILL.md"),
+        "# Review\n",
+    )
+    .expect("skill");
+    let state = directory.join("state");
+    let denied = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["skills", "schedule", "enable", "--repository"])
+        .arg(&directory)
+        .arg("--state")
+        .arg(&state)
+        .args([
+            "--kind",
+            "candidate_generation",
+            "--interval-seconds",
+            "86400",
+            "--maximum-cost-micros",
+            "100",
+        ])
+        .output()
+        .expect("denied");
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("confirmation_required"));
+    let enabled = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["skills", "schedule", "enable", "--repository"])
+        .arg(&directory)
+        .arg("--state")
+        .arg(&state)
+        .args([
+            "--kind",
+            "candidate_generation",
+            "--interval-seconds",
+            "86400",
+            "--maximum-cost-micros",
+            "100",
+            "--confirmed",
+        ])
+        .output()
+        .expect("enable");
+    assert!(
+        enabled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enabled.stderr)
+    );
+    let status = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["skills", "schedule", "status", "--repository"])
+        .arg(&directory)
+        .arg("--state")
+        .arg(&state)
+        .output()
+        .expect("status");
+    let status: Value = serde_json::from_slice(&status.stdout).expect("json");
+    assert_eq!(status["schedule"]["kind"], "candidate_generation");
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn checks_the_external_skillopt_provider_lock() {
+    let directory = temporary_directory("cli-provider");
+    let environment = directory.join("provider");
+    fs::create_dir_all(environment.join("bin")).expect("bin");
+    for (name, body) in [
+        ("python", "#!/bin/sh\nprintf '0.2.0\\n'\n"),
+        ("skillopt-sleep", "#!/bin/sh\nexit 0\n"),
+    ] {
+        let path = environment.join("bin").join(name);
+        fs::write(&path, body).expect("tool");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("mode");
+    }
+    let lock = json!({"id":"skillopt","version":"0.2.0","adapterContract":"skillopt-sleep-v1","source":"pypi","packageDigest":format!("sha256:{}", "8".repeat(64)),"capabilities":["json-report","reviewed-tasks","staged-skill"],"sourceRevision":null});
+    let lock_path = directory.join("provider-lock.json");
+    fs::write(&lock_path, serde_json::to_vec(&lock).expect("lock")).expect("lock");
+    let marker = json!({"provider":"skillopt","version":"0.2.0","adapterContract":"skillopt-sleep-v1","source":"pypi","packageDigest":format!("sha256:{}", "8".repeat(64)),"capabilities":["json-report","reviewed-tasks","staged-skill"],"compatible":true});
+    fs::write(
+        environment.join("commonkit-provider-lock.json"),
+        serde_json::to_vec(&marker).expect("marker"),
+    )
+    .expect("marker");
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["skills", "provider", "check", "--environment"])
+        .arg(&environment)
+        .arg("--lock")
+        .arg(&lock_path)
+        .output()
+        .expect("check");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::remove_dir_all(directory).expect("cleanup");
 }

@@ -3,8 +3,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_service::{BoundServer, ControlToken, EventHub, ServiceStatus};
-use tokio::sync::{RwLock, oneshot};
 use std::io::{Read, Write};
+use tokio::sync::{RwLock, oneshot};
 
 fn temporary_directory() -> std::path::PathBuf {
     let nonce = SystemTime::now()
@@ -66,10 +66,14 @@ async fn hosts_a_separate_authenticated_loopback_mcp_listener() {
         Arc::new(RwLock::new(ServiceStatus::default())),
         EventHub::new(8),
         directory.join("daemon.json"),
-    ).await.expect("bind");
+    )
+    .await
+    .expect("bind");
     let relay = server.relay_address().expect("relay address");
     let (shutdown, signal) = oneshot::channel();
-    let task = tokio::spawn(server.run_until(async move { let _ = signal.await; }));
+    let task = tokio::spawn(server.run_until(async move {
+        let _ = signal.await;
+    }));
     let tools_bearer = bearer.clone();
     let response = tokio::task::spawn_blocking(move || {
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;

@@ -33,8 +33,12 @@ use commonkit_reconcile::{
 };
 use commonkit_relay::{
     DownstreamRequest, HttpUpstreamManager, PeerAddress, RelayAdapter, RelayLifecycleControl,
-    RelayMutationInputs, RelayPlanRequest, RelayRuntime, ResolvedMcpDeclarations, converge_provider_mcp,
-    plan_relay_operation,
+    RelayMutationInputs, RelayPlanRequest, RelayRuntime, ResolvedMcpDeclarations,
+    converge_provider_mcp, plan_relay_operation,
+};
+use commonkit_skills::{
+    Approval as SkillApproval, EvidenceImport, PromotionPlan, PromotionReceipt, ScheduleKind,
+    SkillEngine, SkillSchedule,
 };
 use futures_util::StreamExt;
 use rand::RngCore;
@@ -392,6 +396,7 @@ struct ApiState {
     events: EventHub,
     control: ControlPlane,
     relay_runtime: Arc<ManagedRelayRuntime>,
+    skills: Option<Arc<SkillEngine>>,
 }
 
 struct ManagedRelayRuntime {
@@ -411,53 +416,78 @@ impl ManagedRelayRuntime {
 
     fn handle(&self, authorization: Option<&str>, body: &Value) -> Result<Value, &'static str> {
         let expected = format!("Bearer {}", self.token);
-        if authorization != Some(expected.as_str()) { return Err("unauthorized"); }
+        if authorization != Some(expected.as_str()) {
+            return Err("unauthorized");
+        }
         let method = body.get("method").and_then(Value::as_str);
         match method {
-            Some("initialize") => return Ok(serde_json::json!({
-                "protocolVersion": body.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
-                "capabilities": {"tools": {"listChanged": true}},
-                "serverInfo": {"name": "commonkit-relay", "version": env!("CARGO_PKG_VERSION")}
-            })),
+            Some("initialize") => {
+                return Ok(serde_json::json!({
+                    "protocolVersion": body.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
+                    "capabilities": {"tools": {"listChanged": true}},
+                    "serverInfo": {"name": "commonkit-relay", "version": env!("CARGO_PKG_VERSION")}
+                }));
+            }
             Some("notifications/initialized") | Some("ping") => return Ok(serde_json::json!({})),
             _ => {}
         }
         let request = match method {
             Some("tools/list") => DownstreamRequest::ListTools,
             Some("tools/call") => DownstreamRequest::CallTool {
-                name: body.pointer("/params/name").and_then(Value::as_str).ok_or("invalid_request")?.into(),
-                arguments: body.pointer("/params/arguments").cloned().unwrap_or_else(|| serde_json::json!({})),
+                name: body
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .ok_or("invalid_request")?
+                    .into(),
+                arguments: body
+                    .pointer("/params/arguments")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
             },
             _ => return Err("method_not_found"),
         };
         let runtime = self.runtime.lock().map_err(|_| "relay_unavailable")?;
         let runtime = runtime.as_ref().ok_or("relay_unconfigured")?;
-        runtime.handle(PeerAddress::Loopback, authorization, request).map_err(|error| match error.code() {
-            commonkit_relay::RelayErrorCode::Unauthorized => "unauthorized",
-            commonkit_relay::RelayErrorCode::Forbidden => "forbidden",
-            commonkit_relay::RelayErrorCode::ToolNotFound => "tool_not_found",
-            commonkit_relay::RelayErrorCode::UpstreamUnavailable => "upstream_unavailable",
-            commonkit_relay::RelayErrorCode::InvalidState => "relay_invalid_state",
-        })
+        runtime
+            .handle(PeerAddress::Loopback, authorization, request)
+            .map_err(|error| match error.code() {
+                commonkit_relay::RelayErrorCode::Unauthorized => "unauthorized",
+                commonkit_relay::RelayErrorCode::Forbidden => "forbidden",
+                commonkit_relay::RelayErrorCode::ToolNotFound => "tool_not_found",
+                commonkit_relay::RelayErrorCode::UpstreamUnavailable => "upstream_unavailable",
+                commonkit_relay::RelayErrorCode::InvalidState => "relay_invalid_state",
+            })
     }
 }
 
 async fn relay_mcp(
-    State(runtime): State<Arc<ManagedRelayRuntime>>, headers: HeaderMap, Json(body): Json<Value>,
+    State(runtime): State<Arc<ManagedRelayRuntime>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
 ) -> Response {
     let id = body.get("id").cloned().unwrap_or(Value::Null);
-    let authorization = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok());
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
     match runtime.handle(authorization, &body) {
-        Ok(result) => Json(serde_json::json!({"jsonrpc":"2.0", "id":id, "result":result})).into_response(),
+        Ok(result) => {
+            Json(serde_json::json!({"jsonrpc":"2.0", "id":id, "result":result})).into_response()
+        }
         Err(code) => {
-            let status = match code { "unauthorized" => StatusCode::UNAUTHORIZED, "relay_unconfigured" => StatusCode::SERVICE_UNAVAILABLE, _ => StatusCode::BAD_REQUEST };
+            let status = match code {
+                "unauthorized" => StatusCode::UNAUTHORIZED,
+                "relay_unconfigured" => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::BAD_REQUEST,
+            };
             (status, Json(serde_json::json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32000,"message":code}}))).into_response()
         }
     }
 }
 
 fn relay_router(runtime: Arc<ManagedRelayRuntime>) -> Router {
-    Router::new().route("/mcp", post(relay_mcp)).with_state(runtime)
+    Router::new()
+        .route("/mcp", post(relay_mcp))
+        .with_state(runtime)
 }
 
 fn default_relay_runtime(token: &ControlToken) -> Arc<ManagedRelayRuntime> {
@@ -536,7 +566,34 @@ pub fn router_with_control(
     control: ControlPlane,
 ) -> Router {
     let relay_runtime = default_relay_runtime(&token);
-    router_with_control_and_relay(token, status, authority, events, control, relay_runtime)
+    router_with_control_and_relay(
+        token,
+        status,
+        authority,
+        events,
+        control,
+        relay_runtime,
+        None,
+    )
+}
+
+pub fn router_with_skills(
+    token: ControlToken,
+    status: Arc<RwLock<ServiceStatus>>,
+    authority: impl Into<String>,
+    events: EventHub,
+    skills: Arc<SkillEngine>,
+) -> Router {
+    let relay_runtime = default_relay_runtime(&token);
+    router_with_control_and_relay(
+        token,
+        status,
+        authority,
+        events,
+        ControlPlane::new(Arc::new(UnavailableExecutor)),
+        relay_runtime,
+        Some(skills),
+    )
 }
 
 fn router_with_control_and_relay(
@@ -546,6 +603,7 @@ fn router_with_control_and_relay(
     events: EventHub,
     control: ControlPlane,
     relay_runtime: Arc<ManagedRelayRuntime>,
+    skills: Option<Arc<SkillEngine>>,
 ) -> Router {
     let state = ApiState {
         token,
@@ -554,6 +612,7 @@ fn router_with_control_and_relay(
         events,
         control,
         relay_runtime,
+        skills,
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
@@ -588,6 +647,37 @@ fn router_with_control_and_relay(
         .route("/control/v1/plans/{id}", get(get_plan))
         .route("/control/v1/plans/{id}/apply", post(apply_plan))
         .route("/control/v1/operations/{id}", get(get_operation))
+        .route("/control/v1/skills", get(skill_inventory))
+        .route("/control/v1/skills/candidates", get(skill_candidates))
+        .route("/control/v1/skills/candidates/{id}", get(skill_candidate))
+        .route(
+            "/control/v1/skills/candidates/{id}/promotion-plans",
+            post(skill_promotion_plan),
+        )
+        .route(
+            "/control/v1/skills/evidence/preview",
+            post(skill_evidence_preview),
+        )
+        .route(
+            "/control/v1/skills/evidence/import",
+            post(skill_evidence_import),
+        )
+        .route(
+            "/control/v1/skills/opportunities",
+            post(skill_opportunities),
+        )
+        .route(
+            "/control/v1/skills/promotions/apply",
+            post(skill_promotion_apply),
+        )
+        .route(
+            "/control/v1/skills/promotions/rollback",
+            post(skill_promotion_rollback),
+        )
+        .route(
+            "/control/v1/skills/schedule",
+            get(skill_schedule_status).post(skill_schedule_update),
+        )
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
@@ -724,15 +814,24 @@ impl LocalPlanExecutor {
     }
 
     pub fn with_relay(
-        mut self, live: impl AsRef<Path>, state: impl AsRef<Path>,
+        mut self,
+        live: impl AsRef<Path>,
+        state: impl AsRef<Path>,
         lifecycle: Arc<dyn RelayLifecycleControl>,
     ) -> Self {
-        self.relay = Some(RelayExecutorConfig { live: live.as_ref().into(), state: state.as_ref().into(), lifecycle });
+        self.relay = Some(RelayExecutorConfig {
+            live: live.as_ref().into(),
+            state: state.as_ref().into(),
+            lifecycle,
+        });
         self
     }
 
     fn adapters(&self) -> Result<Vec<Box<dyn Adapter>>, LocalExecutionError> {
-        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FileAdapter::open(&self.target_root, &self.adapter_state)?)];
+        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FileAdapter::open(
+            &self.target_root,
+            &self.adapter_state,
+        )?)];
         if let Some(relay) = &self.relay {
             adapters.push(Box::new(
                 RelayAdapter::open(stable_code("relay"), &relay.live, &relay.state)?
@@ -1476,6 +1575,254 @@ async fn capability_unavailable() -> ApiError {
     ApiError::unavailable()
 }
 
+async fn skill_inventory(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let engine = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?;
+    let inventory = engine
+        .inventory()
+        .map_err(|_| ApiError::internal("skill_inventory_failed"))?;
+    Ok(Json(serde_json::to_value(inventory).map_err(|_| {
+        ApiError::internal("skill_inventory_failed")
+    })?))
+}
+
+async fn skill_candidates(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let engine = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?;
+    let candidates = engine
+        .candidates()
+        .map_err(|_| ApiError::internal("skill_candidates_failed"))?;
+    Ok(Json(serde_json::to_value(candidates).map_err(|_| {
+        ApiError::internal("skill_candidates_failed")
+    })?))
+}
+
+async fn skill_candidate(
+    State(state): State<ApiState>,
+    AxumPath(candidate_id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let candidate_id =
+        StableId::parse(candidate_id).map_err(|_| ApiError::bad_request("invalid_candidate_id"))?;
+    let candidate = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?
+        .candidate(&candidate_id)
+        .map_err(|_| ApiError::not_found("candidate_not_found"))?;
+    Ok(Json(serde_json::to_value(candidate).map_err(|_| {
+        ApiError::internal("skill_candidate_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillEvidencePreviewRequest {
+    content: String,
+}
+
+async fn skill_evidence_preview(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillEvidencePreviewRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if request.content.len() > 256 * 1024 {
+        return Err(ApiError::bad_request("evidence_too_large"));
+    }
+    let preview = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?
+        .preview_evidence(request.content.as_bytes())
+        .map_err(|_| ApiError::bad_request("evidence_preview_rejected"))?;
+    Ok(Json(serde_json::to_value(preview).map_err(|_| {
+        ApiError::internal("evidence_preview_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillEvidenceImportRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    skill_id: StableId,
+    source_kind: commonkit_contracts::EvidenceSourceKind,
+    consent: commonkit_contracts::EvidenceConsent,
+    retention: commonkit_contracts::EvidenceRetention,
+    created_at_unix_ms: u64,
+    content: String,
+}
+
+async fn skill_evidence_import(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillEvidenceImportRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    if request.content.len() > 256 * 1024 {
+        return Err(ApiError::bad_request("evidence_too_large"));
+    }
+    let envelope = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?
+        .import_evidence(EvidenceImport {
+            skill_id: request.skill_id,
+            source_kind: request.source_kind,
+            consent: request.consent,
+            retention: request.retention,
+            created_at_unix_ms: request.created_at_unix_ms,
+            bytes: request.content.into_bytes(),
+        })
+        .map_err(|_| ApiError::bad_request("evidence_import_rejected"))?;
+    Ok(Json(serde_json::to_value(envelope).map_err(|_| {
+        ApiError::internal("evidence_import_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillOpportunitiesRequest {
+    minimum_evidence: u64,
+}
+
+async fn skill_opportunities(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillOpportunitiesRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let opportunities = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?
+        .opportunities(request.minimum_evidence)
+        .map_err(|_| ApiError::bad_request("skill_opportunities_rejected"))?;
+    Ok(Json(serde_json::to_value(opportunities).map_err(|_| {
+        ApiError::internal("skill_opportunities_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillPromotionPlanRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    repository_revision: commonkit_contracts::GitRevision,
+    approval: SkillApproval,
+}
+
+fn require_skill_confirmation(confirmed: bool, confirmation_id: &StableId) -> Result<(), ApiError> {
+    if !confirmed || confirmation_id.as_str().is_empty() {
+        return Err(ApiError::bad_request("confirmation_required"));
+    }
+    Ok(())
+}
+
+async fn skill_promotion_plan(
+    State(state): State<ApiState>,
+    AxumPath(candidate_id): AxumPath<String>,
+    Json(request): Json<SkillPromotionPlanRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let candidate_id =
+        StableId::parse(candidate_id).map_err(|_| ApiError::bad_request("invalid_candidate_id"))?;
+    let engine = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?;
+    let plan = engine
+        .plan_promotion(&candidate_id, request.approval, request.repository_revision)
+        .map_err(|_| ApiError::conflict("skill_promotion_rejected"))?;
+    Ok(Json(serde_json::to_value(plan).map_err(|_| {
+        ApiError::internal("skill_promotion_plan_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillPromotionApplyRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    plan: PromotionPlan,
+}
+
+async fn skill_promotion_apply(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillPromotionApplyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let receipt = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?
+        .apply_promotion(&request.plan)
+        .map_err(|_| ApiError::conflict("skill_promotion_apply_rejected"))?;
+    Ok(Json(serde_json::to_value(receipt).map_err(|_| {
+        ApiError::internal("skill_promotion_apply_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillPromotionRollbackRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    receipt: PromotionReceipt,
+}
+
+async fn skill_promotion_rollback(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillPromotionRollbackRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let receipt = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?
+        .rollback_promotion(&request.receipt)
+        .map_err(|_| ApiError::conflict("skill_promotion_rollback_rejected"))?;
+    Ok(Json(serde_json::to_value(receipt).map_err(|_| {
+        ApiError::internal("skill_promotion_rollback_failed")
+    })?))
+}
+
+async fn skill_schedule_status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let status = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?
+        .schedule_status()
+        .map_err(|_| ApiError::internal("skill_schedule_failed"))?;
+    Ok(Json(serde_json::to_value(status).map_err(|_| {
+        ApiError::internal("skill_schedule_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillScheduleUpdateRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    enabled: bool,
+    kind: ScheduleKind,
+    interval_seconds: u64,
+    maximum_cost_micros_per_period: u64,
+}
+
+async fn skill_schedule_update(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillScheduleUpdateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let engine = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?;
+    let status = if request.enabled {
+        engine.configure_schedule(SkillSchedule {
+            kind: request.kind,
+            enabled: true,
+            interval_seconds: request.interval_seconds,
+            maximum_cost_micros_per_period: request.maximum_cost_micros_per_period,
+        })
+    } else {
+        engine.disable_schedule()
+    }
+    .map_err(|_| ApiError::bad_request("skill_schedule_rejected"))?;
+    Ok(Json(serde_json::to_value(status).map_err(|_| {
+        ApiError::internal("skill_schedule_failed")
+    })?))
+}
+
 fn require_consent(value: &Value) -> Result<(), ApiError> {
     assert_domain_request_safe(value)?;
     if value.get("confirmed").and_then(Value::as_bool) != Some(true) {
@@ -1993,7 +2340,15 @@ impl BoundServer {
         if !relay_address.ip().is_loopback() {
             return Err(ServiceError::NonLoopbackBind(relay_address.ip()));
         }
-        Self::bind_inner(address, Some(relay_address), token, status, events, discovery_path).await
+        Self::bind_inner(
+            address,
+            Some(relay_address),
+            token,
+            status,
+            events,
+            discovery_path,
+        )
+        .await
     }
 
     async fn bind_inner(
@@ -2027,9 +2382,17 @@ impl BoundServer {
             paths.config.join("relay.json"),
         ));
         let executor = LocalPlanExecutor::open(
-            plan_store.clone(), &paths.receipts, &paths.config, paths.state.join("filesystem"),
-        ).map_err(|_| ServiceError::UnsafeDiscoveryPath)?
-        .with_relay(paths.config.join("relay.json"), paths.state.join("relay"), relay_runtime.clone());
+            plan_store.clone(),
+            &paths.receipts,
+            &paths.config,
+            paths.state.join("filesystem"),
+        )
+        .map_err(|_| ServiceError::UnsafeDiscoveryPath)?
+        .with_relay(
+            paths.config.join("relay.json"),
+            paths.state.join("relay"),
+            relay_runtime.clone(),
+        );
         let control = ControlPlane::with_plan_store(Arc::new(executor), plan_store.clone());
         let production_domains = ProductionDomainRegistry::load_optional(
             &paths.config.join("headless.json"),
@@ -2054,12 +2417,18 @@ impl BoundServer {
             events,
             control,
             relay_runtime.clone(),
+            None,
         );
         let relay = match relay_address {
-            Some(address) => Some((tokio::net::TcpListener::bind(address).await?, relay_router(relay_runtime))),
+            Some(address) => Some((
+                tokio::net::TcpListener::bind(address).await?,
+                relay_router(relay_runtime),
+            )),
             None => None,
         };
-        let relay_address = relay.as_ref().and_then(|(listener, _)| listener.local_addr().ok());
+        let relay_address = relay
+            .as_ref()
+            .and_then(|(listener, _)| listener.local_addr().ok());
         Ok(Self {
             listener,
             application,
@@ -2074,20 +2443,24 @@ impl BoundServer {
         &self.discovery
     }
 
-    pub fn relay_address(&self) -> Option<SocketAddr> { self.relay_address }
+    pub fn relay_address(&self) -> Option<SocketAddr> {
+        self.relay_address
+    }
 
     pub async fn run_until<F>(self, shutdown: F) -> Result<(), ServiceError>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let discovery_path = self.discovery_path.clone();
-        let relay_task = self.relay.map(|(listener, application)| tokio::spawn(async move {
-            axum::serve(listener, application).await
-        }));
+        let relay_task = self.relay.map(|(listener, application)| {
+            tokio::spawn(async move { axum::serve(listener, application).await })
+        });
         let result = axum::serve(self.listener, self.application)
             .with_graceful_shutdown(shutdown)
             .await;
-        if let Some(task) = relay_task { task.abort(); }
+        if let Some(task) = relay_task {
+            task.abort();
+        }
         match std::fs::remove_file(discovery_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

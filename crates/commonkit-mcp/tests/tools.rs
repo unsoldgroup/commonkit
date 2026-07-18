@@ -1,8 +1,9 @@
 use std::sync::{Arc, Mutex};
 
 use commonkit_mcp::{
-    ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend, ReadInput,
-    RelayReconcileInput,
+    ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend,
+    ProposeSkillPromotionInput, ReadInput, RelayReconcileInput, ShowSkillCandidateInput,
+    SkillEvidencePreviewInput, SkillOpportunitiesInput,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
@@ -14,7 +15,7 @@ struct FakeBackend {
 }
 
 impl ControlBackend for FakeBackend {
-    fn get(&self, path: &'static str) -> BackendFuture<'_> {
+    fn get<'a>(&'a self, path: &'a str) -> BackendFuture<'a> {
         Box::pin(async move { Ok(json!({"path": path, "state": "healthy"})) })
     }
 
@@ -26,7 +27,7 @@ impl ControlBackend for FakeBackend {
         Box::pin(async move { Ok(json!({"planId": input.plan_id, "status": "running"})) })
     }
 
-    fn post(&self, path: &'static str, _input: serde_json::Value) -> BackendFuture<'_> {
+    fn post<'a>(&'a self, path: &'a str, _input: serde_json::Value) -> BackendFuture<'a> {
         self.posts.lock().expect("posts").push(path.into());
         Box::pin(async move { Ok(json!({"path": path})) })
     }
@@ -44,17 +45,30 @@ fn publishes_stable_initial_tool_names() {
             "commonkit_explain",
             "commonkit_export_diagnostics",
             "commonkit_get_status",
+            "commonkit_list_skill_candidates",
+            "commonkit_list_skills",
             "commonkit_plan_sync",
+            "commonkit_preview_skill_evidence",
+            "commonkit_propose_skill_promotion",
             "commonkit_relay_reconcile",
             "commonkit_relay_status",
             "commonkit_rollback",
             "commonkit_schedule_status",
             "commonkit_schedule_update",
+            "commonkit_show_skill_candidate",
+            "commonkit_skill_opportunities",
             "commonkit_snapshot_create",
             "commonkit_snapshot_restore",
             "commonkit_verify",
         ]
     );
+    assert!(!names.iter().any(|name| matches!(
+        name.as_str(),
+        "commonkit_optimize_skill"
+            | "commonkit_skill_provider_upgrade"
+            | "commonkit_apply_skill_promotion"
+            | "commonkit_rollback_skill_promotion"
+    )));
 }
 
 #[tokio::test]
@@ -65,6 +79,57 @@ async fn read_tools_return_structured_daemon_data() {
         result.structured_content.expect("structured")["state"],
         "healthy"
     );
+    let inventory = server.list_skills().await.expect("skill inventory");
+    assert_eq!(
+        inventory.structured_content.expect("structured")["path"],
+        "/control/v1/skills"
+    );
+    let candidates = server
+        .list_skill_candidates()
+        .await
+        .expect("skill candidates");
+    assert_eq!(
+        candidates.structured_content.expect("structured")["path"],
+        "/control/v1/skills/candidates"
+    );
+}
+
+#[tokio::test]
+async fn skill_tools_are_read_or_proposal_only() {
+    let backend = Arc::new(FakeBackend::default());
+    let server = CommonKitMcp::new(backend.clone());
+    server
+        .show_skill_candidate(Parameters(ShowSkillCandidateInput {
+            candidate_id: "candidate-1".into(),
+        }))
+        .await
+        .expect("show");
+    server
+        .preview_skill_evidence(Parameters(SkillEvidencePreviewInput {
+            content: "redacted sample".into(),
+        }))
+        .await
+        .expect("preview");
+    server
+        .skill_opportunities(Parameters(SkillOpportunitiesInput {
+            minimum_evidence: 3,
+        }))
+        .await
+        .expect("opportunities");
+    let denied = server
+        .propose_skill_promotion(Parameters(ProposeSkillPromotionInput {
+            candidate_id: "candidate-1".into(),
+            repository_revision: "a".repeat(40),
+            approver: "reviewer-1".into(),
+            approved_at_unix_ms: 1,
+            reason: "reviewed".into(),
+            confirmed: false,
+            confirmation_id: "approval-1".into(),
+        }))
+        .await
+        .expect("denied");
+    assert_eq!(denied.is_error, Some(true));
+    assert!(backend.applies.lock().expect("applies").is_empty());
 }
 
 #[tokio::test]
@@ -106,14 +171,25 @@ async fn every_mutation_tool_requires_consent_before_backend_execution() {
             "confirmation_required"
         );
     }
-    let denied = server.relay_reconcile(Parameters(RelayReconcileInput {
-        confirmed: false,
-        confirmation_id: "not-confirmed".into(), idempotency_key: "not-confirmed".into(),
-        resolved: json!({}), target_identity_digest: String::new(),
-        composed_loadout_digest: String::new(), provider_inputs_digest: String::new(),
-        policy_digest: String::new(), ownership_map_digest: String::new(), artifact_set_digest: String::new(),
-    })).await.expect("relay denial");
-    assert_eq!(denied.structured_content.expect("structured")["code"], "confirmation_required");
+    let denied = server
+        .relay_reconcile(Parameters(RelayReconcileInput {
+            confirmed: false,
+            confirmation_id: "not-confirmed".into(),
+            idempotency_key: "not-confirmed".into(),
+            resolved: json!({}),
+            target_identity_digest: String::new(),
+            composed_loadout_digest: String::new(),
+            provider_inputs_digest: String::new(),
+            policy_digest: String::new(),
+            ownership_map_digest: String::new(),
+            artifact_set_digest: String::new(),
+        }))
+        .await
+        .expect("relay denial");
+    assert_eq!(
+        denied.structured_content.expect("structured")["code"],
+        "confirmation_required"
+    );
     assert!(backend.applies.lock().expect("applies").is_empty());
     assert!(backend.posts.lock().expect("posts").is_empty());
 }
