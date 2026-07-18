@@ -1,0 +1,23 @@
+[package]
+name = "commonkit-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "commonkit-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+commonkit-platform = { path = "../commonkit-platform" }
+commonkit-service = { path = "../commonkit-service" }
+reqwest.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true

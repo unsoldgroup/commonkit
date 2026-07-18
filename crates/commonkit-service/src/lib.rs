@@ -183,6 +183,11 @@ impl ControlToken {
         }
     }
 
+    pub fn load(path: &Path) -> Result<Self, ServiceError> {
+        validate_token_file(path)?;
+        read_token(&mut std::fs::File::open(path)?)
+    }
+
     pub fn expose_for_client(&self) -> &str {
         std::str::from_utf8(&self.0).expect("generated token is ASCII")
     }
