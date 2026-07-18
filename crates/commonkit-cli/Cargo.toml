@@ -1,0 +1,18 @@
+[package]
+name = "commonkit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "commonkit"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+commonkit-config = { path = "../commonkit-config" }
+commonkit-contracts = { path = "../commonkit-contracts" }
+commonkit-platform = { path = "../commonkit-platform" }
+serde_json.workspace = true
