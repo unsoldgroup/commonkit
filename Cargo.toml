@@ -1,0 +1,18 @@
+[workspace]
+members = [
+  "crates/commonkit-contracts",
+  "crates/commonkit-core",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/unsoldgroup/commonkit"
+rust-version = "1.85"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
