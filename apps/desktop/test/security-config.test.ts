@@ -18,3 +18,13 @@ test("desktop is single-window, CSP-bound, and emits updater artifacts", async (
   assert.equal(config.bundle.createUpdaterArtifacts, true);
   assert.equal(config.app.withGlobalTauri, false);
 });
+
+test("updater commands separate inspection from explicitly confirmed installation", async () => {
+  const source = await readFile(new URL("src/lib.rs", root), "utf8");
+  assert.match(source, /struct UpdateSummary/);
+  assert.match(source, /update\.body/);
+  assert.match(source, /install_update/);
+  assert.match(source, /confirmed:\s*bool/);
+  assert.match(source, /download_and_install/);
+  assert.doesNotMatch(source, /check_for_update[\s\S]{0,500}download_and_install/);
+});

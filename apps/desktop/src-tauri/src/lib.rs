@@ -52,6 +52,15 @@ struct CapabilityState { id: &'static str, ready: bool, detail: &'static str }
 #[serde(rename_all = "camelCase")]
 struct DesktopSnapshot { status: ServiceStatus, capabilities: Vec<CapabilityState>, last_event_id: Option<u64> }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSummary {
+    current_version: String,
+    version: String,
+    notes: Option<String>,
+    published_at: Option<String>,
+}
+
 impl ServiceClient {
     fn discover() -> Result<Self, DesktopError> {
         let paths = AppPaths::discover().map_err(|_| DesktopError::ServiceUnavailable)?;
@@ -135,9 +144,30 @@ fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
 }
 
 #[tauri::command]
-async fn check_for_update(app: tauri::AppHandle) -> Result<Option<String>, String> {
+async fn check_for_update(app: tauri::AppHandle) -> Result<Option<UpdateSummary>, String> {
     let Some(update) = app.updater().map_err(|error| error.to_string())?.check().await.map_err(|error| error.to_string())? else { return Ok(None) };
-    Ok(Some(update.version))
+    Ok(Some(UpdateSummary {
+        current_version: update.current_version,
+        version: update.version,
+        notes: update.body,
+        published_at: update.date.map(|date| date.to_string()),
+    }))
+}
+
+fn authorize_update_install(confirmed: bool, expected: &str, available: &str) -> Result<(), String> {
+    if !confirmed { return Err("explicit update confirmation is required".into()); }
+    validate_id(expected).map_err(|error| error.to_string())?;
+    if expected != available { return Err("the available update changed; review and confirm it again".into()); }
+    Ok(())
+}
+
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle, expected_version: String, confirmed: bool) -> Result<(), String> {
+    let Some(update) = app.updater().map_err(|error| error.to_string())?.check().await.map_err(|error| error.to_string())? else {
+        return Err("the confirmed update is no longer available".into());
+    };
+    authorize_update_install(confirmed, &expected_version, &update.version)?;
+    update.download_and_install(|_, _| {}, || {}).await.map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -154,7 +184,7 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _, _| { let _ = show_main_window(app.clone()); }))
         .plugin(tauri_plugin_autostart::Builder::new().args(["--minimized"]).build())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .invoke_handler(tauri::generate_handler![desktop_snapshot, apply_plan, set_autostart, check_for_update, show_main_window])
+        .invoke_handler(tauri::generate_handler![desktop_snapshot, apply_plan, set_autostart, check_for_update, install_update, show_main_window])
         .setup(|app| {
             let open = MenuItem::with_id(app, "open", "Open CommonKit", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -179,5 +209,10 @@ mod tests {
         assert!(validate_digest("../../control.token").is_err());
         assert!(validate_id("desktop-confirmation-1").is_ok());
         assert!(validate_id("bad/value").is_err());
+    }
+    #[test] fn update_install_requires_consent_bound_to_the_observed_version() {
+        assert!(authorize_update_install(false, "0.2.0", "0.2.0").is_err());
+        assert!(authorize_update_install(true, "0.2.0", "0.3.0").is_err());
+        assert!(authorize_update_install(true, "0.2.0", "0.2.0").is_ok());
     }
 }

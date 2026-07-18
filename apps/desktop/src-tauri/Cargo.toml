@@ -22,3 +22,6 @@ tauri-plugin-updater = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "time"] }
 
+[dev-dependencies]
+base64 = "0.22"
+minisign-verify = "0.2.5"

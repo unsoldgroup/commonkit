@@ -26,7 +26,7 @@ for (const [label, predicate] of [
 
 const updater = JSON.parse(await readFile(join(root, "latest.json"), "utf8"));
 const expectedPlatforms = ["darwin-aarch64", "darwin-x86_64", "linux-x86_64", "windows-x86_64"];
-if (!updater.version || !updater.platforms ||
+if (!updater.version || !updater.notes?.trim() || !updater.platforms ||
     JSON.stringify(Object.keys(updater.platforms).sort()) !== JSON.stringify(expectedPlatforms)) {
   throw new Error("latest.json is incomplete");
 }

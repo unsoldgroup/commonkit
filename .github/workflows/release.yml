@@ -180,8 +180,13 @@ jobs:
           pattern: commonkit-*
           path: release-artifacts
           merge-multiple: true
+      - name: Generate release notes for the in-app consent screen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$RELEASE_TAG" --jq .body > "$RUNNER_TEMP/release-notes.md"
       - name: Assemble latest.json updater metadata
-        run: node scripts/assemble-updater-manifest.mjs release-artifacts "${{ inputs.tag || github.ref_name }}"
+        run: node scripts/assemble-updater-manifest.mjs release-artifacts "${{ inputs.tag || github.ref_name }}" "$RUNNER_TEMP/release-notes.md"
       - name: Generate syft SPDX SBOM from final payload set
         uses: anchore/sbom-action@v0
         with:

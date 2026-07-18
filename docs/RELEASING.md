@@ -4,11 +4,13 @@ Release automation runs only for version tags or an explicit workflow dispatch. 
 
 ## Release gate
 
-A release requires a signed and notarized universal macOS application, a signed Windows NSIS installer, Linux AppImage and Debian packages, and a standalone CLI for every supported platform. Every payload is covered by the SHA-256 manifest and its GitHub OIDC signature, plus an SPDX SBOM and release notes. Tauri updater payloads carry dedicated detached updater signatures referenced by `latest.json`; `latest.json` is covered by the signed checksum manifest.
+A release requires a signed and notarized universal macOS application, a signed Windows NSIS installer, Linux AppImage and Debian packages, and a standalone CLI for every supported platform. Every payload is covered by the SHA-256 manifest and its GitHub OIDC signature, plus an SPDX SBOM and release notes. Tauri updater payloads carry dedicated detached updater signatures referenced by `latest.json`; `latest.json` is covered by the signed checksum manifest. Generated release notes are embedded in `latest.json` and shown before the separate, version-bound install confirmation.
 
 The pipeline must fail closed when any code-signing, notarization, updater-signing, endpoint, checksum, signature, or SBOM input is absent or invalid. Secrets are supplied by the CI secret store and are never committed, logged, or replaced with development identities.
 
-The separately dispatched lifecycle matrix downloads two published releases, verifies their checksum manifests and GitHub OIDC identities, installs the older signed package, installs the newer signed package as an upgrade, runs the standalone CLI, and uninstalls the desktop package on macOS, Linux, and Windows. This proves installer lifecycle behavior; it does not yet automate the in-application updater UI or a deliberately invalid updater signature. Those remain release-candidate gates and must not be inferred from a green packaging job.
+The separately dispatched lifecycle matrix first runs the desktop consent tests and a checked-in, non-production two-version updater fixture. The fixture verifies valid detached signatures and proves that tampering or replaying a newer signature against the older payload fails. The matrix then downloads two published releases, verifies their checksum manifests and GitHub OIDC identities, installs the older signed package, installs the newer signed package as an upgrade, runs the standalone CLI, and uninstalls the desktop package on macOS, Linux, and Windows.
+
+The local fixture does not use a production updater identity, and the lifecycle workflow still upgrades with platform installers rather than driving the in-application UI. A successful workflow therefore does not prove production notarization or an end-to-end production updater download; those remain release-candidate gates until exercised with the production identities and endpoint.
 
 ## Third-party material
 

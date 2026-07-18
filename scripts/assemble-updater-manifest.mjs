@@ -1,12 +1,14 @@
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-const [root, rawTag] = process.argv.slice(2);
-if (!root || !rawTag) throw new Error("usage: assemble-updater-manifest.mjs <root> <tag>");
+const [root, rawTag, notesPath] = process.argv.slice(2);
+if (!root || !rawTag || !notesPath) throw new Error("usage: assemble-updater-manifest.mjs <root> <tag> <release-notes-file>");
 const version = rawTag.replace(/^refs\/tags\//, "").replace(/^v/, "");
 if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) throw new Error("invalid release version");
 
 const names = await readdir(root);
+const notes = (await readFile(notesPath, "utf8")).trim();
+if (!notes) throw new Error("release notes must not be empty");
 const macPayload = names.find((name) => name.endsWith(".app.tar.gz"));
 const definitions = [
   ["darwin-aarch64", macPayload],
@@ -28,4 +30,4 @@ for (const [platform, name] of definitions) {
     signature,
   };
 }
-await writeFile(join(root, "latest.json"), `${JSON.stringify({ version, platforms }, null, 2)}\n`);
+await writeFile(join(root, "latest.json"), `${JSON.stringify({ version, notes, platforms }, null, 2)}\n`);
