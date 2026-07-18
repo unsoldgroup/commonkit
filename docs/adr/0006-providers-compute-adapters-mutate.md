@@ -1,0 +1,5 @@
+# Providers compute desired state; adapters mutate targets
+
+CommonKit separates desired-state computation from target mutation. Version-pinned providers such as APM, chezmoi, and native migration providers inspect versioned inputs and materialize normalized resources into isolated staging. CommonKit validates one ownership map, binds provider inputs and artifact sets into a content-addressed plan, and delegates live changes only to filesystem, service, credential, relay, snapshot, and other mutation adapters. Providers never apply directly to a managed live target and are never re-run during rollback or interrupted-run recovery.
+
+APM is the preferred agent-context provider. Chezmoi is the preferred home-configuration provider for semantics that its pinned CLI can reproduce faithfully in isolation. Native providers remain supported for migration, fallback, and capabilities that cannot be safely delegated. CommonKit does not reimplement either provider's package, source, or template engine.

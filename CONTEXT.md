@@ -20,6 +20,18 @@ _Avoid_: Box, VPS, environment
 A translator between CommonKit's normalized model and an agent or service's native configuration.
 _Avoid_: Plugin, integration
 
+**Agent-context provider**:
+A package system that resolves, locks, audits, and compiles agent instructions, skills, prompts, hooks, plugins, and MCP declarations.
+_Avoid_: CommonKit package manager
+
+**Desired-state provider**:
+A version-pinned, non-mutating resolver that converts provider-owned inputs into normalized desired resources and provenance.
+_Avoid_: Adapter, installer
+
+**Operation adapter**:
+A CommonKit-controlled mutator that prepares, applies, verifies, and rolls back normalized operations on a target.
+_Avoid_: Provider, package manager
+
 **Reconciliation**:
 The process of planning, applying, and verifying a target against its selected loadout.
 _Avoid_: File copy, deployment
@@ -31,6 +43,15 @@ _Avoid_: File copy, deployment
 - Organization security policy is a non-overridable floor. Later layers may tighten it but cannot weaken it.
 - A **Loadout** is materialized on one or more **Targets**.
 - An **Adapter** participates in **Reconciliation** for one agent or service.
+- A **Loadout** selects a version-pinned **Agent-context provider** for portable agent content.
+- A **Desired-state provider** computes resources in isolated staging; it never mutates a managed live target.
+- An **Operation adapter** is the only component allowed to mutate, verify, or roll back a target.
+- APM is CommonKit's preferred **Agent-context provider**; CommonKit does not compete with APM's package resolution, distribution, compilation, or package-audit responsibilities.
+- Chezmoi is CommonKit's preferred home-configuration provider for the subset of semantics proven equivalent under isolated materialization; unsupported destination-dependent or executable features fail closed.
+- Native providers remain available for migration, fallback, and capabilities not safely delegated upstream.
+- CommonKit stages provider output and applies it through CommonKit **Reconciliation** so target mutation remains plan-bound, receipted, verifiable, and recoverable.
+- APM policy governs which agent packages and primitives may be installed; CommonKit policy governs targets, paths, permissions, services, credentials, schedules, relay exposure, and mutation authorization.
+- The APM lockfile owns the resolved agent-package graph and content integrity; the CommonKit lockfile references its digest and owns composed loadout, target, and adapter state.
 - **Reconciliation** never treats secrets or machine identity as portable CommonKit content.
 - **mcp-local-relay** is an independently publishable package in the CommonKit repository. It remains the MCP data plane; CommonKit owns desired-state composition and reconciliation.
 - A GitHub repository is the durable store for portable, reviewable CommonKit state. Secrets and mutable database files do not belong in Git.
@@ -48,10 +69,11 @@ _Avoid_: File copy, deployment
 
 - "Toolbox" was the initial metaphor; resolved: the product and domain object are **CommonKit**.
 - "Profile" described a selected subset; resolved: use **Loadout** unless later user research favors a more conventional term.
+- "Agent package manager" overlapped with CommonKit's initial adapter scope; resolved: package management belongs to the selected **Agent-context provider**, with APM preferred, while CommonKit orchestrates the complete developer environment.
 
 ## Open — not yet resolved
 
-- How CommonKit adapters reconcile `mcp-local-relay` lifecycle and desired state.
+- How the APM adapter translates MCP declarations into `mcp-local-relay` upstream desired state and generated client configuration.
 - Which GitHub authentication and repository-provisioning flow CommonKit supports in version 1.
 - Which S3-compatible object-store provider is the default for encrypted snapshots.
 

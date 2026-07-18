@@ -10,6 +10,19 @@ CommonKit v1 is a portable, layered developer environment that moves shared capa
 
 Version 1 is complete only when all 12 flows in `CONTEXT.md` are implemented. The current Node CommonKit engine and TypeScript `mcp-local-relay` package are reference implementations whose tested behavior must be preserved or deliberately superseded during migration.
 
+## ADR 0005/0006 provider amendment
+
+This focused amendment supersedes agent packaging, broad native client compilation, and home-file source-management portions of this scope where they conflict with ADR 0005 or ADR 0006. It does not change the product's composition, policy floor, target, reconciliation, credential, relay, snapshot, service, desktop, platform, or release responsibilities.
+
+- Version-pinned desired-state providers compute normalized resources in isolated staging and never mutate managed live targets.
+- APM 0.25.0 is the preferred agent-context provider for the initial Claude and Codex path. Native Claude/Codex behavior remains a migration fallback until parity is proven.
+- Chezmoi 2.70.4 is the preferred home-configuration provider for semantics that pass the isolated-destination parity suite. CommonKit does not reimplement chezmoi and rejects unsupported destination-dependent, executable, networked, or secret-resolving features.
+- CommonKit alone validates ownership and policy, creates content-addressed plans, performs mutations through operation adapters, and owns confirmations, receipts, verification, recovery, and rollback.
+- Provider outputs and backups are stored as integrity-checked content-addressed artifacts. Plans bind composed loadout, provider inputs, ownership map, and artifact-set digests. Recovery never re-runs providers.
+- CommonKit will not build a package marketplace, agent dependency resolver, package archive/SBOM/scanner, broad native client compiler, or dotfile template/source engine.
+
+The active implementation sequence is recorded in `docs/plans/provider-adapter-implementation.md`. Durable fresh-process recovery is the first gate; APM/chezmoi production integration cannot proceed until a new adapter process can reconstruct every applied operation from durable plans, artifacts, backups, and receipts.
+
 ## Problem
 
 Developer capabilities are fragmented across machine-local configuration, repositories, remote hosts, agent runtimes, service managers, credentials, and mutable context databases. Moving to another machine requires manual copying and produces silent drift. Existing synchronization is one-way, host-specific, and hard-coded. The relay has a useful local data plane and status interface, but it is macOS-centric and separate from the desired-state control plane.
@@ -349,7 +362,8 @@ Exit: composition and safety property tests pass identically on all three OS run
 ### Phase 2 — Transactional reconciliation
 
 - Implement inspect, plan, apply, verify, receipts, backups, rollback, and local/SSH executors.
-- Port current Claude, Codex, plugin, hook, file/tree, and context verification behavior through adapters.
+- Implement durable content-addressed provider artifacts, normalized filesystem resources, ownership validation, and fresh-process adapter reconstruction.
+- Integrate APM and chezmoi as non-mutating desired-state providers after their isolation contracts pass; preserve current native Claude, Codex, and file behavior as migration fallback.
 
 Exit: flows 2–4 and 6 pass end-to-end; repeat apply is a no-op; injected failures recover.
 

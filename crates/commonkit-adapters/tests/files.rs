@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_adapters::{FileAdapter, FileIntent, ManagedRelativePath};
-use commonkit_contracts::{Sha256Digest, StableId};
-use commonkit_reconcile::Adapter;
+use commonkit_contracts::{OperationPhase, ReceiptState, Sha256Digest, StableId};
+use commonkit_core::{PlanDraft, build_plan};
+use commonkit_reconcile::{Adapter, ReceiptJournal, ReceiptStore, ReconcileOutcome, Reconciler};
 use sha2::{Digest, Sha256};
 
 fn temporary_directory(test: &str) -> PathBuf {
@@ -105,6 +106,80 @@ fn rejects_literal_secrets_in_portable_file_content() {
         adapter
             .register(intent("config.txt", b"API_KEY=literal-secret", None))
             .is_err()
+    );
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn a_fresh_process_recovers_an_applied_file_without_reconstructing_the_provider() {
+    let root = temporary_directory("file-fresh-process-recovery");
+    let target = root.join("target");
+    let adapter_state = root.join("adapter-state");
+    let receipt_state = root.join("receipts");
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("config.txt"), b"before").expect("preimage");
+
+    let operation = {
+        let mut adapter = FileAdapter::open(&target, &adapter_state).expect("first process");
+        let operation = adapter
+            .register(intent("config.txt", b"after", Some(digest(b"before"))))
+            .expect("operation");
+        adapter.prepare(&operation).expect("prepare");
+        adapter.apply(&operation).expect("apply");
+        operation
+    };
+    assert_eq!(
+        fs::read(target.join("config.txt")).expect("applied"),
+        b"after"
+    );
+
+    let plan = build_plan(PlanDraft {
+        target_id: StableId::parse("local-target").expect("target ID"),
+        desired_digest: digest(b"desired"),
+        observed_digest: digest(b"observed"),
+        policy_digest: digest(b"policy"),
+        operations: vec![operation.clone()],
+    })
+    .expect("plan");
+    let run_id = StableId::parse("run-file-crash").expect("run ID");
+    let store = ReceiptStore::open(&receipt_state).expect("receipt store");
+    let mut journal = ReceiptJournal::new(
+        run_id.clone(),
+        plan.id.clone(),
+        plan.target_id.clone(),
+        plan.desired_digest.clone(),
+        plan.observed_digest.clone(),
+        plan.policy_digest.clone(),
+    )
+    .expect("journal");
+    store.persist(&journal).expect("initial checkpoint");
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+        .expect("prepared checkpoint");
+    store.persist(&journal).expect("persist prepared state");
+    journal
+        .transition(ReceiptState::Applying)
+        .expect("applying checkpoint");
+    store.persist(&journal).expect("persist applying state");
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Applied, None)
+        .expect("applied checkpoint");
+    store.persist(&journal).expect("persist crash state");
+
+    let fresh_adapter = FileAdapter::open(&target, &adapter_state).expect("fresh process");
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(fresh_adapter)];
+    let outcome = Reconciler::with_store(&store)
+        .recover_run(run_id.clone(), &plan, &mut adapters)
+        .expect("recover from durable plan and receipt");
+
+    assert_eq!(outcome, ReconcileOutcome::RolledBack);
+    assert_eq!(
+        fs::read(target.join("config.txt")).expect("restored preimage"),
+        b"before"
+    );
+    assert_eq!(
+        store.load(run_id).expect("receipt").receipt().state,
+        ReceiptState::RolledBack
     );
     fs::remove_dir_all(root).expect("cleanup");
 }
