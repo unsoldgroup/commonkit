@@ -9,3 +9,6 @@ rust-version.workspace = true
 [dependencies]
 directories.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
