@@ -195,6 +195,22 @@ If CommonKit redistributes chezmoi, its complete MIT notice must ship in `THIRD_
 
 APM 0.25.0 uses the same inputs, materialized sets, ownership, bindings, artifacts, and adapters. Frozen install, compile, and CI audit occur in a disposable workspace. See the detailed APM plan for fixed commands, policy bypass denial, MCP limitations, and its vertical acceptance slices.
 
+## SSH target staging
+
+APM and chezmoi execute in an isolated workspace on the trusted controller, parameterized by the
+remote target's declared platform, architecture, policy, roots, and read-only observed-fact
+digests. CommonKit validates the complete materialized state before contacting the target. It then
+copies only deduplicated portable content-addressed artifacts through the pinned, typed SSH helper
+and verifies each artifact remotely. The returned durable receipt binds target, provider ID and
+exact version, provider-input digest, materialized-state digest, and ordered artifact digests.
+
+Provider executables are not uploaded or invoked remotely. This keeps provider computation outside
+the live target mutation boundary and avoids depending on target-installed Python or Go runtimes.
+Sensitive artifacts, unsupported capabilities, and provider-declared side effects fail before the
+first remote request. Destination-observing chezmoi semantics remain unsupported because controller
+staging cannot prove equivalence without exposing the live destination to provider code. Live
+changes continue exclusively through CommonKit operation adapters after plan approval.
+
 ## Implementation order
 
 1. Keep the real fresh-process recovery test red.

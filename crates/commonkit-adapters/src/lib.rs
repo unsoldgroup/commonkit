@@ -10,6 +10,7 @@ mod native;
 mod planning;
 mod provider;
 mod remote_helper;
+mod remote_provider;
 mod resources;
 mod service_lifecycle;
 mod ssh;
@@ -40,6 +41,9 @@ pub use provider::{
     UnsupportedCapability,
 };
 pub use remote_helper::TargetHelper;
+pub use remote_provider::{
+    RemoteMaterializationReceipt, RemoteProviderStager, RemoteProviderStagingError,
+};
 pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
     OwnershipRules, ResourceError, ResourceProvenance, SafeSymlinkTarget,

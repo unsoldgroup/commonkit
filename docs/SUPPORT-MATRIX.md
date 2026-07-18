@@ -6,8 +6,8 @@ This matrix is a release gate, not a claim that unchecked rows are production-re
 | --- | --- | --- | --- | --- |
 | Composition, policy, plans, receipts | Implemented | CI contract | CI contract | Transport-neutral |
 | Local filesystem reconciliation | Implemented | CI contract | CI contract; ACL/reparse release tests required | Typed SSH boundary |
-| APM 0.25.0 Claude + Codex | Real release verified (arm64); x86_64 gated | Contract implemented; release binaries gated | Contract implemented; x86_64 gated, arm64 unavailable upstream | Deferred until remote staging harness |
-| chezmoi 2.70.4 safe subset | Isolation contract | Isolation contract | Isolation contract | Deferred until remote staging harness |
+| APM 0.25.0 Claude + Codex | Real release verified (arm64); x86_64 gated | Contract implemented; release binaries gated | Contract implemented; x86_64 gated, arm64 unavailable upstream | Controller-isolated materialization for SSH targets; verified portable artifacts staged through the typed helper |
+| chezmoi 2.70.4 safe subset | Isolation contract | Isolation contract | Isolation contract | Controller-isolated materialization for SSH targets; destination-observing features remain denied |
 | Credentials | env/file/BWS; absolute-path Keychain CLI | env/file/BWS; absolute-path Secret Service CLI | env/file/BWS; native Credential Manager API, Windows CI gated | Target-local only |
 | Snapshots | Provider-neutral core | Provider-neutral core | Provider-neutral core | Object-store transport-neutral |
 | Desktop | Status/update shell; management flows incomplete | Build gate; management flows incomplete | Build gate; management flows incomplete | Management UI not yet wired |
