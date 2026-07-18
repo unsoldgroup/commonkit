@@ -5,8 +5,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use commonkit_contracts::{
-    CONTRACT_VERSION, ContractError, Operation, Plan, ReceiptState, ReceiptTransition, RunReceipt,
-    SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
+    CONTRACT_VERSION, ContractError, Operation, OperationPhase, OperationProgress, Plan,
+    ReceiptState, ReceiptTransition, RunReceipt, SCHEMA_VERSION, SchemaVersion, Sha256Digest,
+    StableId, canonical_json, digest_domain_json,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use serde::Serialize;
@@ -25,7 +26,9 @@ impl ReceiptJournal {
         observed_digest: Sha256Digest,
         policy_digest: Sha256Digest,
     ) -> Result<Self, ReceiptError> {
-        let first = make_transition(0, ReceiptState::Prepared, None)?;
+        let progress = Vec::new();
+        let progress_digest = digest_domain_json("commonkit.operation-progress.v1", &progress)?;
+        let first = make_transition(0, ReceiptState::Prepared, None, progress_digest)?;
         Ok(Self {
             receipt: RunReceipt {
                 schema_version: SchemaVersion(SCHEMA_VERSION),
@@ -38,6 +41,7 @@ impl ReceiptJournal {
                 observed_digest,
                 policy_digest,
                 state: ReceiptState::Prepared,
+                operation_progress: progress,
                 transitions: vec![first],
             },
         })
@@ -55,9 +59,83 @@ impl ReceiptJournal {
             .transitions
             .last()
             .map(|entry| entry.entry_digest.clone());
-        let transition = make_transition(self.receipt.transitions.len() as u64, next, previous)?;
+        let progress_digest = digest_domain_json(
+            "commonkit.operation-progress.v1",
+            &self.receipt.operation_progress,
+        )?;
+        let transition = make_transition(
+            self.receipt.transitions.len() as u64,
+            next,
+            previous,
+            progress_digest,
+        )?;
         self.receipt.receipt_id = transition.entry_digest.clone();
         self.receipt.state = next;
+        self.receipt.transitions.push(transition);
+        Ok(())
+    }
+
+    pub fn record_operation(
+        &mut self,
+        operation_id: Sha256Digest,
+        phase: OperationPhase,
+        failure_code: Option<StableId>,
+    ) -> Result<(), ReceiptError> {
+        if failure_code.is_some()
+            != matches!(
+                phase,
+                OperationPhase::PrepareFailed
+                    | OperationPhase::ApplyFailed
+                    | OperationPhase::VerifyFailed
+                    | OperationPhase::RollbackFailed
+            )
+        {
+            return Err(ReceiptError::InvalidOperationProgress);
+        }
+        if let Some(progress) = self
+            .receipt
+            .operation_progress
+            .iter_mut()
+            .find(|progress| progress.operation_id == operation_id)
+        {
+            if !legal_operation_transition(progress.phase, phase) {
+                return Err(ReceiptError::InvalidOperationProgress);
+            }
+            progress.phase = phase;
+            progress.failure_code = failure_code;
+        } else {
+            if !matches!(
+                phase,
+                OperationPhase::Prepared | OperationPhase::PrepareFailed
+            ) {
+                return Err(ReceiptError::InvalidOperationProgress);
+            }
+            self.receipt.operation_progress.push(OperationProgress {
+                operation_id,
+                phase,
+                failure_code,
+            });
+        }
+        self.append_progress_transition()
+    }
+
+    fn append_progress_transition(&mut self) -> Result<(), ReceiptError> {
+        let previous = self
+            .receipt
+            .transitions
+            .last()
+            .map(|entry| entry.entry_digest.clone());
+        let progress_digest = digest_domain_json(
+            "commonkit.operation-progress.v1",
+            &self.receipt.operation_progress,
+        )?;
+        let transition = make_transition(
+            self.receipt.transitions.len() as u64,
+            self.receipt.state,
+            previous,
+            progress_digest,
+        )?;
+        self.receipt.receipt_id = transition.entry_digest.clone();
         self.receipt.transitions.push(transition);
         Ok(())
     }
@@ -78,14 +156,30 @@ impl ReceiptJournal {
             if transition.sequence != sequence as u64 || transition.previous_digest != previous {
                 return Err(ReceiptError::InvalidHashChain);
             }
-            let expected =
-                make_transition(transition.sequence, transition.state, previous.clone())?;
+            let expected = make_transition(
+                transition.sequence,
+                transition.state,
+                previous.clone(),
+                transition.progress_digest.clone(),
+            )?;
             if expected.entry_digest != transition.entry_digest {
                 return Err(ReceiptError::InvalidHashChain);
             }
             previous = Some(transition.entry_digest.clone());
         }
         if previous.as_ref() != Some(&self.receipt.receipt_id) {
+            return Err(ReceiptError::InvalidHashChain);
+        }
+        let progress_digest = digest_domain_json(
+            "commonkit.operation-progress.v1",
+            &self.receipt.operation_progress,
+        )?;
+        if self
+            .receipt
+            .transitions
+            .last()
+            .is_none_or(|transition| transition.progress_digest != progress_digest)
+        {
             return Err(ReceiptError::InvalidHashChain);
         }
         Ok(())
@@ -175,11 +269,25 @@ impl<'a> Reconciler<'a> {
 
         for operation in &plan.operations {
             let adapter = adapter_for(adapters, &operation.adapter_id)?;
-            if adapter.prepare(operation).is_err() {
-                journal.transition(ReceiptState::Canceled)?;
-                self.persist(&journal)?;
-                return Ok(ReconcileOutcome::Canceled);
+            match adapter.prepare(operation) {
+                Ok(()) => journal.record_operation(
+                    operation.id.clone(),
+                    OperationPhase::Prepared,
+                    None,
+                )?,
+                Err(failure) => {
+                    journal.record_operation(
+                        operation.id.clone(),
+                        OperationPhase::PrepareFailed,
+                        Some(stable_failure_code(&failure)),
+                    )?;
+                    self.persist(&journal)?;
+                    journal.transition(ReceiptState::Canceled)?;
+                    self.persist(&journal)?;
+                    return Ok(ReconcileOutcome::Canceled);
+                }
             }
+            self.persist(&journal)?;
         }
 
         journal.transition(ReceiptState::Applying)?;
@@ -187,24 +295,109 @@ impl<'a> Reconciler<'a> {
         let mut applied = Vec::new();
         for operation in &plan.operations {
             let adapter = adapter_for(adapters, &operation.adapter_id)?;
-            if adapter.apply(operation).is_err() {
-                return self.recover(&mut journal, &applied, adapters);
+            match adapter.apply(operation) {
+                Ok(()) => {
+                    journal.record_operation(operation.id.clone(), OperationPhase::Applied, None)?
+                }
+                Err(failure) => {
+                    journal.record_operation(
+                        operation.id.clone(),
+                        OperationPhase::ApplyFailed,
+                        Some(stable_failure_code(&failure)),
+                    )?;
+                    self.persist(&journal)?;
+                    return self.recover(&mut journal, &applied, adapters);
+                }
             }
             applied.push(operation.clone());
+            self.persist(&journal)?;
         }
 
         journal.transition(ReceiptState::Verifying)?;
         self.persist(&journal)?;
         for operation in &plan.operations {
             let adapter = adapter_for(adapters, &operation.adapter_id)?;
-            if adapter.verify(operation).is_err() {
-                return self.recover(&mut journal, &applied, adapters);
+            match adapter.verify(operation) {
+                Ok(()) => journal.record_operation(
+                    operation.id.clone(),
+                    OperationPhase::Verified,
+                    None,
+                )?,
+                Err(failure) => {
+                    journal.record_operation(
+                        operation.id.clone(),
+                        OperationPhase::VerifyFailed,
+                        Some(stable_failure_code(&failure)),
+                    )?;
+                    self.persist(&journal)?;
+                    return self.recover(&mut journal, &applied, adapters);
+                }
             }
+            self.persist(&journal)?;
         }
 
         journal.transition(ReceiptState::Succeeded)?;
         self.persist(&journal)?;
         Ok(ReconcileOutcome::Succeeded)
+    }
+
+    pub fn recover_run(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        validate_plan(plan)?;
+        let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
+        let mut journal = store.load(run_id)?;
+        let receipt = journal.receipt();
+        if receipt.plan_id != plan.id
+            || receipt.target_id != plan.target_id
+            || receipt.desired_digest != plan.desired_digest
+            || receipt.observed_digest != plan.observed_digest
+            || receipt.policy_digest != plan.policy_digest
+        {
+            return Err(ReconcileError::ReceiptPlanMismatch);
+        }
+
+        match receipt.state {
+            ReceiptState::Prepared => {
+                journal.transition(ReceiptState::Canceled)?;
+                self.persist(&journal)?;
+                return Ok(ReconcileOutcome::Canceled);
+            }
+            ReceiptState::Applying | ReceiptState::Verifying => {
+                journal.transition(ReceiptState::RecoveryRequired)?;
+                self.persist(&journal)?;
+            }
+            ReceiptState::RecoveryRequired => {}
+            ReceiptState::RollingBack => {}
+            state => return Err(ReconcileError::RunAlreadyTerminal(state)),
+        }
+        if journal.receipt().state == ReceiptState::RecoveryRequired {
+            journal.transition(ReceiptState::RollingBack)?;
+            self.persist(&journal)?;
+        }
+
+        let progress = journal.receipt().operation_progress.clone();
+        let mut applied = Vec::new();
+        for operation in &plan.operations {
+            let phase = progress
+                .iter()
+                .find(|entry| entry.operation_id == operation.id)
+                .map(|entry| entry.phase);
+            if matches!(
+                phase,
+                Some(
+                    OperationPhase::Applied
+                        | OperationPhase::Verified
+                        | OperationPhase::VerifyFailed
+                )
+            ) {
+                applied.push(operation.clone());
+            }
+        }
+        self.rollback_from_rolling_back(&mut journal, &applied, adapters)
     }
 
     fn recover(
@@ -218,12 +411,34 @@ impl<'a> Reconciler<'a> {
         journal.transition(ReceiptState::RollingBack)?;
         self.persist(journal)?;
 
+        self.rollback_from_rolling_back(journal, applied, adapters)
+    }
+
+    fn rollback_from_rolling_back(
+        &self,
+        journal: &mut ReceiptJournal,
+        applied: &[Operation],
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
         let mut rollback_failed = false;
         for operation in applied.iter().rev() {
             let adapter = adapter_for(adapters, &operation.adapter_id)?;
-            if adapter.rollback(operation).is_err() {
-                rollback_failed = true;
+            match adapter.rollback(operation) {
+                Ok(()) => journal.record_operation(
+                    operation.id.clone(),
+                    OperationPhase::RolledBack,
+                    None,
+                )?,
+                Err(failure) => {
+                    rollback_failed = true;
+                    journal.record_operation(
+                        operation.id.clone(),
+                        OperationPhase::RollbackFailed,
+                        Some(stable_failure_code(&failure)),
+                    )?;
+                }
             }
+            self.persist(journal)?;
         }
         let outcome = if rollback_failed {
             ReconcileOutcome::RollbackFailed
@@ -241,6 +456,11 @@ impl<'a> Reconciler<'a> {
         }
         Ok(())
     }
+}
+
+fn stable_failure_code(failure: &AdapterFailure) -> StableId {
+    StableId::parse(failure.code.clone())
+        .unwrap_or_else(|_| StableId::parse("adapter_failure").expect("static stable ID"))
 }
 
 fn adapter_for<'a>(
@@ -279,6 +499,12 @@ pub enum ReconcileError {
     PlanMismatch,
     #[error("adapter is not registered: {0}")]
     AdapterNotFound(StableId),
+    #[error("durable receipt store is required for restart recovery")]
+    DurableStoreRequired,
+    #[error("receipt is not bound to the supplied plan")]
+    ReceiptPlanMismatch,
+    #[error("run is already terminal in state {0:?}")]
+    RunAlreadyTerminal(ReceiptState),
 }
 
 impl ReceiptStore {
@@ -400,12 +626,14 @@ struct TransitionSemantic<'a> {
     sequence: u64,
     state: ReceiptState,
     previous_digest: &'a Option<Sha256Digest>,
+    progress_digest: &'a Sha256Digest,
 }
 
 fn make_transition(
     sequence: u64,
     state: ReceiptState,
     previous_digest: Option<Sha256Digest>,
+    progress_digest: Sha256Digest,
 ) -> Result<ReceiptTransition, ContractError> {
     let entry_digest = digest_domain_json(
         "commonkit.receipt-transition.v1",
@@ -413,14 +641,38 @@ fn make_transition(
             sequence,
             state,
             previous_digest: &previous_digest,
+            progress_digest: &progress_digest,
         },
     )?;
     Ok(ReceiptTransition {
         sequence,
         state,
         previous_digest,
+        progress_digest,
         entry_digest,
     })
+}
+
+fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool {
+    matches!(
+        (from, to),
+        (
+            OperationPhase::Prepared,
+            OperationPhase::Applied | OperationPhase::ApplyFailed
+        ) | (
+            OperationPhase::Applied,
+            OperationPhase::Verified
+                | OperationPhase::VerifyFailed
+                | OperationPhase::RolledBack
+                | OperationPhase::RollbackFailed
+        ) | (
+            OperationPhase::Verified,
+            OperationPhase::RolledBack | OperationPhase::RollbackFailed
+        ) | (
+            OperationPhase::VerifyFailed,
+            OperationPhase::RolledBack | OperationPhase::RollbackFailed
+        )
+    )
 }
 
 fn legal_transition(from: ReceiptState, to: ReceiptState) -> bool {
@@ -454,6 +706,8 @@ pub enum ReceiptError {
     },
     #[error("receipt transition hash chain is invalid")]
     InvalidHashChain,
+    #[error("operation progress transition is invalid")]
+    InvalidOperationProgress,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

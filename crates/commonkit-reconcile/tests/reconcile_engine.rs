@@ -1,13 +1,27 @@
 use std::sync::{Arc, Mutex};
 
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use commonkit_contracts::{
-    Operation, OperationKind, ReceiptState, ResourceRef, Risk, Sha256Digest, StableId,
+    Operation, OperationKind, OperationPhase, ReceiptState, ResourceRef, Risk, Sha256Digest,
+    StableId,
 };
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
-use commonkit_reconcile::{Adapter, AdapterFailure, ReconcileOutcome, Reconciler};
+use commonkit_reconcile::{
+    Adapter, AdapterFailure, ReceiptJournal, ReceiptStore, ReconcileOutcome, Reconciler,
+};
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).expect("digest")
+}
+
+fn temporary_directory(test: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!("commonkit-{test}-{}-{nonce}", std::process::id()))
 }
 
 fn operation(adapter: &str, resource: &str) -> Operation {
@@ -178,4 +192,55 @@ fn reports_recovery_required_when_rollback_fails() {
         ReconcileOutcome::RollbackFailed.receipt_state(),
         ReceiptState::RollbackFailed
     );
+}
+
+#[test]
+fn restart_recovery_rolls_back_durably_recorded_operations_in_reverse_order() {
+    let directory = temporary_directory("restart-recovery");
+    let store = ReceiptStore::open(&directory).expect("store");
+    let plan = plan();
+    let run_id = StableId::parse("run-crashed").expect("run");
+    let mut journal = ReceiptJournal::new(
+        run_id.clone(),
+        plan.id.clone(),
+        plan.target_id.clone(),
+        plan.desired_digest.clone(),
+        plan.observed_digest.clone(),
+        plan.policy_digest.clone(),
+    )
+    .expect("journal");
+    store.persist(&journal).expect("initial checkpoint");
+    for operation in &plan.operations {
+        journal
+            .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+            .expect("prepared");
+        store.persist(&journal).expect("prepared checkpoint");
+    }
+    journal
+        .transition(ReceiptState::Applying)
+        .expect("applying");
+    store.persist(&journal).expect("applying checkpoint");
+    for operation in &plan.operations {
+        journal
+            .record_operation(operation.id.clone(), OperationPhase::Applied, None)
+            .expect("applied");
+        store.persist(&journal).expect("applied checkpoint");
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter(events.clone()))];
+    let outcome = Reconciler::with_store(&store)
+        .recover_run(run_id.clone(), &plan, &mut adapters)
+        .expect("recover");
+
+    assert_eq!(outcome, ReconcileOutcome::RolledBack);
+    assert_eq!(
+        *events.lock().expect("events"),
+        ["rollback:beta", "rollback:alpha"]
+    );
+    assert_eq!(
+        store.load(run_id).expect("receipt").receipt().state,
+        ReceiptState::RolledBack
+    );
+    std::fs::remove_dir_all(directory).expect("cleanup");
 }

@@ -547,6 +547,28 @@ pub enum ReceiptState {
     Canceled,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OperationPhase {
+    Prepared,
+    PrepareFailed,
+    Applied,
+    ApplyFailed,
+    Verified,
+    VerifyFailed,
+    RolledBack,
+    RollbackFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationProgress {
+    pub operation_id: Sha256Digest,
+    pub phase: OperationPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<StableId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReceiptTransition {
@@ -554,6 +576,7 @@ pub struct ReceiptTransition {
     pub state: ReceiptState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_digest: Option<Sha256Digest>,
+    pub progress_digest: Sha256Digest,
     pub entry_digest: Sha256Digest,
 }
 
@@ -570,6 +593,7 @@ pub struct RunReceipt {
     pub observed_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
     pub state: ReceiptState,
+    pub operation_progress: Vec<OperationProgress>,
     pub transitions: Vec<ReceiptTransition>,
 }
 

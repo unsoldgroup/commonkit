@@ -1,5 +1,40 @@
 {
   "$defs": {
+    "OperationPhase": {
+      "enum": [
+        "prepared",
+        "prepare_failed",
+        "applied",
+        "apply_failed",
+        "verified",
+        "verify_failed",
+        "rolled_back",
+        "rollback_failed"
+      ],
+      "type": "string"
+    },
+    "OperationProgress": {
+      "additionalProperties": false,
+      "properties": {
+        "failureCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/OperationPhase"
+        }
+      },
+      "required": [
+        "operationId",
+        "phase"
+      ],
+      "type": "object"
+    },
     "ReceiptState": {
       "enum": [
         "prepared",
@@ -26,6 +61,9 @@
             "null"
           ]
         },
+        "progressDigest": {
+          "type": "string"
+        },
         "sequence": {
           "format": "uint64",
           "minimum": 0,
@@ -38,6 +76,7 @@
       "required": [
         "sequence",
         "state",
+        "progressDigest",
         "entryDigest"
       ],
       "type": "object"
@@ -55,6 +94,12 @@
     },
     "observedDigest": {
       "type": "string"
+    },
+    "operationProgress": {
+      "items": {
+        "$ref": "#/$defs/OperationProgress"
+      },
+      "type": "array"
     },
     "planId": {
       "type": "string"
@@ -97,6 +142,7 @@
     "observedDigest",
     "policyDigest",
     "state",
+    "operationProgress",
     "transitions"
   ],
   "title": "RunReceipt",
