@@ -79,6 +79,24 @@ exit 92
     let serialized = serde_json::to_string(&config).unwrap();
     assert!(!serialized.to_ascii_lowercase().contains("token"));
     assert!(!serialized.contains("ghp_"));
+
+    let plans = std::sync::Arc::new(
+        commonkit_reconcile::PlanStore::open(temporary.path().join("plans")).unwrap(),
+    );
+    let registry = commonkit_service::ProductionDomainRegistry::load(
+        &result.headless_config,
+        plans,
+        temporary.path().join("receipts"),
+    )
+    .unwrap();
+    let composition = registry.composition.unwrap().compose().unwrap();
+    assert_eq!(composition["spec"], serde_json::json!({}));
+    let plan = registry
+        .sync
+        .unwrap()
+        .plan(serde_json::json!({"confirmed":true,"confirmationId":"first-diff"}))
+        .unwrap();
+    assert_eq!(plan["operations"], serde_json::json!([]));
 }
 
 #[test]
