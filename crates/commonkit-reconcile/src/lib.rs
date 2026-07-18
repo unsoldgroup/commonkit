@@ -1,8 +1,12 @@
 //! Transaction receipts and reconciliation state machine.
 
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
 use commonkit_contracts::{
     CONTRACT_VERSION, ContractError, ReceiptState, ReceiptTransition, RunReceipt, SCHEMA_VERSION,
-    SchemaVersion, Sha256Digest, StableId, digest_domain_json,
+    SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -61,6 +65,12 @@ impl ReceiptJournal {
         &self.receipt
     }
 
+    fn from_receipt(receipt: RunReceipt) -> Result<Self, ReceiptError> {
+        let journal = Self { receipt };
+        journal.verify_chain()?;
+        Ok(journal)
+    }
+
     pub fn verify_chain(&self) -> Result<(), ReceiptError> {
         let mut previous = None;
         for (sequence, transition) in self.receipt.transitions.iter().enumerate() {
@@ -79,6 +89,127 @@ impl ReceiptJournal {
         }
         Ok(())
     }
+}
+
+/// An immutable, one-snapshot-per-transition receipt store.
+///
+/// Final files are never replaced. A crash therefore exposes either the prior
+/// complete transition or the next complete transition, never a torn update.
+pub struct ReceiptStore {
+    root: PathBuf,
+}
+
+impl ReceiptStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, ReceiptError> {
+        fs::create_dir_all(root.as_ref())?;
+        sync_directory(root.as_ref())?;
+        Ok(Self {
+            root: root.as_ref().to_path_buf(),
+        })
+    }
+
+    pub fn persist(&self, journal: &ReceiptJournal) -> Result<(), ReceiptError> {
+        journal.verify_chain()?;
+        let receipt = journal.receipt();
+        let run_directory = self.root.join(receipt.run_id.as_str());
+        fs::create_dir_all(&run_directory)?;
+
+        if let Ok(current) = self.load(receipt.run_id.clone()) {
+            let current_count = current.receipt().transitions.len();
+            let incoming_count = receipt.transitions.len();
+            if current_count >= incoming_count {
+                if current.receipt() == receipt {
+                    return Ok(());
+                }
+                return Err(ReceiptError::StaleWrite {
+                    persisted_sequence: current_count.saturating_sub(1) as u64,
+                    attempted_sequence: incoming_count.saturating_sub(1) as u64,
+                });
+            }
+            if current.receipt().transitions != receipt.transitions[..current_count] {
+                return Err(ReceiptError::ConflictingHistory);
+            }
+        }
+
+        let sequence = receipt.transitions.len().saturating_sub(1) as u64;
+        let digest = receipt
+            .transitions
+            .last()
+            .ok_or(ReceiptError::InvalidHashChain)?
+            .entry_digest
+            .as_str()
+            .trim_start_matches("sha256:");
+        let final_path = run_directory.join(format!("{sequence:020}-{digest}.json"));
+        if final_path.exists() {
+            return Ok(());
+        }
+        let temporary_path = run_directory.join(format!(".{sequence:020}-{digest}.tmp"));
+        let bytes = canonical_json(receipt)?;
+        let mut temporary = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)?;
+        temporary.write_all(&bytes)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        fs::rename(&temporary_path, &final_path)?;
+        sync_directory(&run_directory)?;
+        Ok(())
+    }
+
+    pub fn load(&self, run_id: StableId) -> Result<ReceiptJournal, ReceiptError> {
+        let run_directory = self.root.join(run_id.as_str());
+        let mut snapshots = Vec::new();
+        for entry in fs::read_dir(&run_directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .ok_or(ReceiptError::InvalidSnapshotName)?;
+            let sequence = name
+                .split_once('-')
+                .and_then(|(value, _)| value.parse::<u64>().ok())
+                .ok_or(ReceiptError::InvalidSnapshotName)?;
+            snapshots.push((sequence, path));
+        }
+        snapshots.sort_by_key(|(sequence, _)| *sequence);
+        if snapshots.is_empty() {
+            return Err(ReceiptError::NotFound(run_id));
+        }
+
+        let mut previous: Option<RunReceipt> = None;
+        for (expected, (sequence, path)) in snapshots.into_iter().enumerate() {
+            if sequence != expected as u64 {
+                return Err(ReceiptError::SnapshotGap);
+            }
+            let receipt: RunReceipt = serde_json::from_slice(&fs::read(path)?)?;
+            if receipt.run_id != run_id || receipt.transitions.len() != expected + 1 {
+                return Err(ReceiptError::ConflictingHistory);
+            }
+            ReceiptJournal::from_receipt(receipt.clone())?;
+            if let Some(prior) = &previous
+                && prior.transitions != receipt.transitions[..prior.transitions.len()]
+            {
+                return Err(ReceiptError::ConflictingHistory);
+            }
+            previous = Some(receipt);
+        }
+        ReceiptJournal::from_receipt(previous.expect("non-empty snapshots"))
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+    File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -141,4 +272,23 @@ pub enum ReceiptError {
     },
     #[error("receipt transition hash chain is invalid")]
     InvalidHashChain,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("receipt not found for run {0}")]
+    NotFound(StableId),
+    #[error("receipt snapshot filename is invalid")]
+    InvalidSnapshotName,
+    #[error("receipt snapshots contain a sequence gap")]
+    SnapshotGap,
+    #[error("receipt snapshots contain conflicting history")]
+    ConflictingHistory,
+    #[error(
+        "stale receipt write at sequence {attempted_sequence}; persisted sequence is {persisted_sequence}"
+    )]
+    StaleWrite {
+        persisted_sequence: u64,
+        attempted_sequence: u64,
+    },
 }
