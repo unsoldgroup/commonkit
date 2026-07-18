@@ -293,6 +293,385 @@ impl<'de> Deserialize<'de> for GitRevision {
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
+pub enum SkillLifecycle {
+    Active,
+    Library,
+    Experimental,
+    Retired,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentSensitivity {
+    Portable,
+    LocalSensitive,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillDescriptor {
+    pub id: StableId,
+    pub source_path: PortableSourcePath,
+    pub source_digest: Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package: Option<StableId>,
+    pub targets: BTreeSet<StableId>,
+    pub lifecycle: SkillLifecycle,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvaluationCaseManifest {
+    pub content_digest: Sha256Digest,
+    pub case_ids: BTreeSet<StableId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HarnessLock {
+    pub kind: StableId,
+    pub version: String,
+    pub environment_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvaluationMetric {
+    pub id: StableId,
+    pub minimum_improvement_basis_points: u32,
+    pub maximum_held_out_regression_basis_points: u32,
+    pub required_case_ids: BTreeSet<StableId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillEvaluationSuite {
+    pub schema_version: SchemaVersion,
+    pub id: StableId,
+    pub skill_id: StableId,
+    pub train: EvaluationCaseManifest,
+    pub validation: EvaluationCaseManifest,
+    pub held_out: EvaluationCaseManifest,
+    pub rubric_digest: Sha256Digest,
+    pub harness: HarnessLock,
+    pub metric: EvaluationMetric,
+}
+
+impl SkillEvaluationSuite {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        let mut seen = BTreeSet::new();
+        for manifest in [&self.train, &self.validation, &self.held_out] {
+            for case_id in &manifest.case_ids {
+                if !seen.insert(case_id.clone()) {
+                    return Err(ContractError::EvaluationCaseOverlap(case_id.to_string()));
+                }
+            }
+        }
+        if self.train.case_ids.is_empty()
+            || self.validation.case_ids.is_empty()
+            || self.held_out.case_ids.is_empty()
+        {
+            return Err(ContractError::EmptyEvaluationSplit);
+        }
+        if !self
+            .metric
+            .required_case_ids
+            .is_subset(&self.held_out.case_ids)
+        {
+            return Err(ContractError::RequiredCaseOutsideHeldOut);
+        }
+        validate_lock_text(&self.harness.version, "harness version")
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, ContractError> {
+        self.validate()?;
+        digest_domain_json("commonkit.skill-evaluation-suite.v1", self)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderLock {
+    pub id: StableId,
+    pub version: String,
+    pub adapter_contract: StableId,
+    pub source: ProviderSource,
+    pub package_digest: Sha256Digest,
+    pub capabilities: BTreeSet<StableId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<GitRevision>,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSource {
+    Pypi,
+    Container,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ModelLock {
+    pub provider: StableId,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OptimizationLimits {
+    pub maximum_cases: u32,
+    pub maximum_edits: u32,
+    pub timeout_seconds: u32,
+    pub maximum_cost_micros: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillOptimizationManifest {
+    pub schema_version: SchemaVersion,
+    pub id: StableId,
+    pub skill: SkillDescriptor,
+    pub suite_digest: Sha256Digest,
+    pub evidence_digests: Vec<Sha256Digest>,
+    pub provider: ProviderLock,
+    pub optimizer: ModelLock,
+    pub target: ModelLock,
+    pub limits: OptimizationLimits,
+    pub policy_digest: Sha256Digest,
+    pub repository_revision: GitRevision,
+}
+
+impl SkillOptimizationManifest {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.skill.targets.is_empty() {
+            return Err(ContractError::MissingSkillTarget);
+        }
+        validate_lock_text(&self.provider.version, "provider version")?;
+        if self.provider.id.as_str() == "skillopt"
+            && (self.provider.version != "0.2.0"
+                || self.provider.adapter_contract.as_str() != "skillopt-sleep-v1"
+                || self.provider.source != ProviderSource::Pypi
+                || !["reviewed-tasks", "staged-skill", "json-report"]
+                    .iter()
+                    .all(|capability| {
+                        self.provider
+                            .capabilities
+                            .iter()
+                            .any(|present| present.as_str() == *capability)
+                    }))
+        {
+            return Err(ContractError::UnsupportedProviderVersion);
+        }
+        validate_lock_text(&self.optimizer.model, "optimizer model")?;
+        validate_lock_text(&self.target.model, "target model")?;
+        if self.limits.maximum_cases == 0
+            || self.limits.maximum_edits == 0
+            || self.limits.timeout_seconds == 0
+            || self.limits.maximum_cost_micros == 0
+        {
+            return Err(ContractError::InvalidOptimizationLimits);
+        }
+        assert_no_embedded_secrets(
+            &serde_json::to_value(self).map_err(|_| ContractError::Canonicalization)?,
+        )
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, ContractError> {
+        self.validate()?;
+        digest_domain_json("commonkit.skill-optimization-manifest.v1", self)
+    }
+}
+
+fn validate_lock_text(value: &str, field: &'static str) -> Result<(), ContractError> {
+    if value.trim().is_empty() || value.len() > 200 || value.contains(['\0', '\n', '\r']) {
+        Err(ContractError::InvalidLockText(field))
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvaluationOutcome {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvaluationReceipt {
+    pub schema_version: SchemaVersion,
+    pub baseline_basis_points: u32,
+    pub candidate_basis_points: u32,
+    pub held_out_baseline_basis_points: u32,
+    pub held_out_candidate_basis_points: u32,
+    pub required_cases: BTreeMap<StableId, EvaluationOutcome>,
+    pub cost_micros: u64,
+    pub harness: HarnessLock,
+    pub scorer_digest: Sha256Digest,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CandidateState {
+    Staged,
+    Rejected,
+    Approvable,
+    Approved,
+    Promoted,
+    Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillCandidate {
+    pub schema_version: SchemaVersion,
+    pub id: StableId,
+    pub manifest_digest: Sha256Digest,
+    pub parent_skill_digest: Sha256Digest,
+    pub provider: ProviderLock,
+    pub optimizer: ModelLock,
+    pub target: ModelLock,
+    pub configuration_digest: Sha256Digest,
+    pub input_digests: Vec<Sha256Digest>,
+    pub candidate_digest: Sha256Digest,
+    pub candidate_bytes: u64,
+    pub candidate_sensitivity: ContentSensitivity,
+    pub patch_digest: Sha256Digest,
+    pub evaluation: EvaluationReceipt,
+    pub optimization_history_digest: Sha256Digest,
+    pub policy_passed: bool,
+    pub state: CandidateState,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSourceKind {
+    ManualFailure,
+    ClaudeSession,
+    CodexSession,
+    EvaluationCase,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceConsent {
+    LocalOnly,
+    ApprovedForProvider,
+    ApprovedPortable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceRetention {
+    pub delete_after_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EvidenceEnvelope {
+    pub schema_version: SchemaVersion,
+    pub id: StableId,
+    pub skill_id: StableId,
+    pub source_kind: EvidenceSourceKind,
+    pub content_digest: Sha256Digest,
+    pub content_bytes: u64,
+    pub sensitivity: ContentSensitivity,
+    pub redaction_report_digest: Sha256Digest,
+    pub consent: EvidenceConsent,
+    pub retention: EvidenceRetention,
+    pub created_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillLifecycleSchema {
+    pub descriptor: SkillDescriptor,
+    pub suite: SkillEvaluationSuite,
+    pub manifest: SkillOptimizationManifest,
+    pub candidate: SkillCandidate,
+    pub evidence: EvidenceEnvelope,
+}
+
+impl SkillCandidate {
+    pub fn validate_against(
+        &self,
+        manifest: &SkillOptimizationManifest,
+        suite: &SkillEvaluationSuite,
+    ) -> Result<(), ContractError> {
+        manifest.validate()?;
+        suite.validate()?;
+        if self.manifest_digest != manifest.digest()? {
+            return Err(ContractError::CandidateManifestMismatch);
+        }
+        if self.parent_skill_digest != manifest.skill.source_digest {
+            return Err(ContractError::CandidateParentMismatch);
+        }
+        if self.provider != manifest.provider
+            || self.optimizer != manifest.optimizer
+            || self.target != manifest.target
+            || self.configuration_digest
+                != digest_domain_json("commonkit.skillopt-configuration.v1", &manifest.limits)?
+        {
+            return Err(ContractError::CandidateProviderMismatch);
+        }
+        let mut expected_inputs = vec![
+            manifest.skill.source_digest.clone(),
+            manifest.suite_digest.clone(),
+            manifest.policy_digest.clone(),
+        ];
+        expected_inputs.extend(manifest.evidence_digests.clone());
+        if self.input_digests != expected_inputs {
+            return Err(ContractError::CandidateInputMismatch);
+        }
+        if self.evaluation.harness != suite.harness {
+            return Err(ContractError::CandidateHarnessMismatch);
+        }
+        if self.candidate_bytes == 0 || !self.policy_passed {
+            return Err(ContractError::CandidatePolicyFailed);
+        }
+        let improvement = self
+            .evaluation
+            .candidate_basis_points
+            .saturating_sub(self.evaluation.baseline_basis_points);
+        if improvement < suite.metric.minimum_improvement_basis_points {
+            return Err(ContractError::CandidateInsufficientImprovement);
+        }
+        let regression = self
+            .evaluation
+            .held_out_baseline_basis_points
+            .saturating_sub(self.evaluation.held_out_candidate_basis_points);
+        if regression > suite.metric.maximum_held_out_regression_basis_points {
+            return Err(ContractError::CandidateHeldOutRegression);
+        }
+        if suite.metric.required_case_ids.iter().any(|case_id| {
+            self.evaluation.required_cases.get(case_id) != Some(&EvaluationOutcome::Passed)
+        }) {
+            return Err(ContractError::CandidateRequiredCaseFailed);
+        }
+        if self.evaluation.cost_micros > manifest.limits.maximum_cost_micros {
+            return Err(ContractError::CandidateCostExceeded);
+        }
+        Ok(())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
 pub enum LayerKind {
     PublicBase,
     OrganizationPolicy,
@@ -726,6 +1105,13 @@ pub fn diagnostics_schema() -> Result<Value, ContractError> {
     )
 }
 
+pub fn skills_schema() -> Result<Value, ContractError> {
+    schema_with_id(
+        schema_for!(SkillLifecycleSchema),
+        "https://schemas.commonkit.dev/v1/skills.schema.json",
+    )
+}
+
 fn schema_with_id(schema: schemars::Schema, id: &str) -> Result<Value, ContractError> {
     let mut schema = serde_json::to_value(schema).map_err(|_| ContractError::SchemaGeneration)?;
     schema
@@ -751,4 +1137,38 @@ pub enum ContractError {
     InvalidGitRevision(String),
     #[error("embedded secret-like value at {0}")]
     EmbeddedSecret(String),
+    #[error("evaluation case {0} appears in more than one split")]
+    EvaluationCaseOverlap(String),
+    #[error("evaluation train, validation, and held-out splits must be non-empty")]
+    EmptyEvaluationSplit,
+    #[error("required evaluation cases must belong to the held-out split")]
+    RequiredCaseOutsideHeldOut,
+    #[error("{0} must be a bounded non-empty single-line value")]
+    InvalidLockText(&'static str),
+    #[error("an optimizable skill must declare at least one target")]
+    MissingSkillTarget,
+    #[error("optimization limits must be positive")]
+    InvalidOptimizationLimits,
+    #[error("unsupported SkillOpt provider version or compatibility contract")]
+    UnsupportedProviderVersion,
+    #[error("candidate manifest digest does not match")]
+    CandidateManifestMismatch,
+    #[error("candidate parent skill digest does not match")]
+    CandidateParentMismatch,
+    #[error("candidate provider or configuration provenance does not match")]
+    CandidateProviderMismatch,
+    #[error("candidate input digests do not match")]
+    CandidateInputMismatch,
+    #[error("candidate harness does not match the evaluation suite")]
+    CandidateHarnessMismatch,
+    #[error("candidate failed content or policy validation")]
+    CandidatePolicyFailed,
+    #[error("candidate improvement is below the required threshold")]
+    CandidateInsufficientImprovement,
+    #[error("candidate regressed on the held-out split")]
+    CandidateHeldOutRegression,
+    #[error("candidate failed a required held-out case")]
+    CandidateRequiredCaseFailed,
+    #[error("candidate evaluation exceeded its cost limit")]
+    CandidateCostExceeded,
 }

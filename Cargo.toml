@@ -11,6 +11,7 @@ members = [
   "crates/commonkit-mcp",
   "crates/commonkit-relay",
   "crates/commonkit-snapshots",
+  "crates/commonkit-skills",
 ]
 resolver = "2"
 

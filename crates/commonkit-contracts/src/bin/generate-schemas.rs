@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "diagnostics.schema.json",
             commonkit_contracts::diagnostics_schema()?,
         ),
+        ("skills.schema.json", commonkit_contracts::skills_schema()?),
     ] {
         let mut output = serde_json::to_string_pretty(&schema)?;
         output.push('\n');

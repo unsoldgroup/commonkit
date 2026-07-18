@@ -380,6 +380,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -494,15 +495,31 @@ dependencies = [
  "commonkit-platform",
  "commonkit-reconcile",
  "commonkit-relay",
+ "commonkit-snapshots",
  "futures-util",
  "rand 0.9.5",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
+ "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
  "tower",
+]
+
+[[package]]
+name = "commonkit-skills"
+version = "0.1.0"
+dependencies = [
+ "commonkit-adapters",
+ "commonkit-contracts",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
