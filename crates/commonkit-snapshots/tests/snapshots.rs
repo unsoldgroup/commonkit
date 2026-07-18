@@ -21,6 +21,43 @@ fn production_cipher_uses_random_nonces_and_rejects_wrong_keys_or_tampering() {
 }
 
 #[test]
+fn sqlite_backup_is_consistent_and_integrity_checked_without_copying_wal_files() {
+    use commonkit_snapshots::{ConsistentBackup, SqliteBackup};
+    use rusqlite::Connection;
+
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("context.sqlite");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .unwrap();
+    connection
+        .execute("create table context(value text not null)", [])
+        .unwrap();
+    connection
+        .execute("insert into context values ('portable')", [])
+        .unwrap();
+
+    let bytes = SqliteBackup::new(&database).export().unwrap();
+    let restored = directory.path().join("restored.sqlite");
+    std::fs::write(&restored, bytes).unwrap();
+    let restored = Connection::open(restored).unwrap();
+    assert_eq!(
+        restored
+            .query_row("select value from context", [], |row| row
+                .get::<_, String>(0))
+            .unwrap(),
+        "portable"
+    );
+    assert_eq!(
+        restored
+            .query_row("pragma integrity_check", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "ok"
+    );
+}
+
+#[test]
 fn only_one_target_may_be_the_authoritative_writer() {
     let mut coordinator = SnapshotCoordinator::new(DatabaseId::new("context-mode").unwrap());
 

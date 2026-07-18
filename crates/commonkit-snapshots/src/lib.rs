@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use zeroize::Zeroize;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -123,6 +125,8 @@ pub enum SnapshotError {
     UnsnapshottedWriterChanges,
     #[error("promotion candidate does not match the latest snapshot")]
     CandidateDoesNotMatchSnapshot,
+    #[error("database backup or integrity validation failed")]
+    DatabaseFailed,
     #[error("unsupported snapshot schema or cipher")]
     UnsupportedSnapshotFormat,
 }
@@ -130,6 +134,59 @@ pub enum SnapshotError {
 pub trait ConsistentBackup {
     fn source_format(&self) -> &str;
     fn export(&self) -> Result<Vec<u8>, SnapshotError>;
+}
+
+/// Uses SQLite's online backup API to obtain a consistent database image. WAL/SHM files are
+/// consumed by SQLite and are never included in the exported bytes.
+pub struct SqliteBackup {
+    source: PathBuf,
+}
+
+impl SqliteBackup {
+    pub fn new(source: impl AsRef<Path>) -> Self {
+        Self {
+            source: source.as_ref().to_path_buf(),
+        }
+    }
+}
+
+impl ConsistentBackup for SqliteBackup {
+    fn source_format(&self) -> &str {
+        "sqlite3-online-backup"
+    }
+
+    fn export(&self) -> Result<Vec<u8>, SnapshotError> {
+        use rusqlite::backup::Backup;
+        use rusqlite::{Connection, OpenFlags};
+
+        let source = Connection::open_with_flags(
+            &self.source,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|_| SnapshotError::DatabaseFailed)?;
+        validate_sqlite(&source)?;
+        let directory = tempfile::tempdir().map_err(|_| SnapshotError::DatabaseFailed)?;
+        let destination_path = directory.path().join("snapshot.sqlite");
+        let mut destination =
+            Connection::open(&destination_path).map_err(|_| SnapshotError::DatabaseFailed)?;
+        Backup::new(&source, &mut destination)
+            .and_then(|backup| backup.run_to_completion(64, Duration::from_millis(5), None))
+            .map_err(|_| SnapshotError::DatabaseFailed)?;
+        validate_sqlite(&destination)?;
+        drop(destination);
+        std::fs::read(destination_path).map_err(|_| SnapshotError::DatabaseFailed)
+    }
+}
+
+fn validate_sqlite(connection: &rusqlite::Connection) -> Result<(), SnapshotError> {
+    let result: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|_| SnapshotError::DatabaseFailed)?;
+    if result == "ok" {
+        Ok(())
+    } else {
+        Err(SnapshotError::DatabaseFailed)
+    }
 }
 
 pub trait AuthenticatedCipher {
