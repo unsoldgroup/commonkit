@@ -404,6 +404,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "commonkit-relay"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "url",
+]
+
+[[package]]
 name = "commonkit-service"
 version = "0.1.0"
 dependencies = [
