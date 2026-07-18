@@ -1,6 +1,10 @@
 //! Rust MCP relay configuration and atomic desired-state lifecycle.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,6 +14,219 @@ use url::Url;
 pub const DEFAULT_PORT: u16 = 3764;
 pub const DEFAULT_MCP_PATH: &str = "/mcp";
 pub const DEFAULT_TOOLS_TTL_MS: u64 = 15 * 60 * 1000;
+
+static TEMP_FILE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Error)]
+pub enum RelayStorageError {
+    #[error("relay storage root is invalid")]
+    InvalidRoot,
+    #[error("relay file escapes its approved root")]
+    RootEscape,
+    #[error("relay env file permissions are not private")]
+    InsecureEnvPermissions,
+    #[error("relay env files require a platform ACL verifier on Windows")]
+    WindowsAclVerificationRequired,
+    #[error("relay storage operation failed")]
+    Io(#[source] std::io::Error),
+    #[error("relay tool cache serialization failed")]
+    Serialization(#[source] serde_json::Error),
+}
+
+impl From<std::io::Error> for RelayStorageError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for RelayStorageError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialization(error)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EnvFileLoader {
+    root: PathBuf,
+}
+
+impl EnvFileLoader {
+    pub fn new(root: impl AsRef<Path>) -> Result<Self, RelayStorageError> {
+        let root = root
+            .as_ref()
+            .canonicalize()
+            .map_err(|_| RelayStorageError::InvalidRoot)?;
+        if !root.is_dir() {
+            return Err(RelayStorageError::InvalidRoot);
+        }
+        Ok(Self { root })
+    }
+
+    pub fn load(
+        &self,
+        path: Option<impl AsRef<Path>>,
+    ) -> Result<BTreeMap<String, String>, RelayStorageError> {
+        let Some(path) = path else {
+            return Ok(BTreeMap::new());
+        };
+        let path = contained_path(&self.root, path.as_ref())?;
+        if !path.exists() {
+            return Ok(BTreeMap::new());
+        }
+        let path = path.canonicalize()?;
+        if !path.starts_with(&self.root) {
+            return Err(RelayStorageError::RootEscape);
+        }
+        #[cfg(windows)]
+        return Err(RelayStorageError::WindowsAclVerificationRequired);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if fs::metadata(&path)?.permissions().mode() & 0o077 != 0 {
+                return Err(RelayStorageError::InsecureEnvPermissions);
+            }
+        }
+        let content = fs::read_to_string(path)?;
+        Ok(parse_env_file(&content))
+    }
+}
+
+fn parse_env_file(content: &str) -> BTreeMap<String, String> {
+    content
+        .lines()
+        .filter_map(|raw_line| {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (key, raw_value) = line.split_once('=')?;
+            let key = key.trim();
+            if key.is_empty() {
+                return None;
+            }
+            let value = raw_value.trim();
+            let value = if value.len() >= 2
+                && ((value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\'')))
+            {
+                &value[1..value.len() - 1]
+            } else {
+                value
+            };
+            Some((key.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCache {
+    pub cached_at: u64,
+    pub tools: Vec<RelayTool>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolCacheStore {
+    root: PathBuf,
+}
+
+impl ToolCacheStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, RelayStorageError> {
+        fs::create_dir_all(root.as_ref())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(root.as_ref(), fs::Permissions::from_mode(0o700))?;
+        }
+        let root = root.as_ref().canonicalize()?;
+        if !root.is_dir() {
+            return Err(RelayStorageError::InvalidRoot);
+        }
+        Ok(Self { root })
+    }
+
+    pub fn load(&self, id: &RelayServerId) -> Result<Option<ToolCache>, RelayStorageError> {
+        let path = self.cache_path(id);
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        Ok(serde_json::from_str(&content).ok())
+    }
+
+    pub fn load_or_retain(
+        &self,
+        id: &RelayServerId,
+        cache: &mut ToolCache,
+    ) -> Result<bool, RelayStorageError> {
+        let Some(loaded) = self.load(id)? else {
+            return Ok(false);
+        };
+        *cache = loaded;
+        Ok(true)
+    }
+
+    pub fn save(&self, id: &RelayServerId, cache: &ToolCache) -> Result<(), RelayStorageError> {
+        let destination = self.cache_path(id);
+        let nonce = TEMP_FILE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = self.root.join(format!(
+            ".{}.{}.{}.tmp",
+            id.as_str(),
+            std::process::id(),
+            nonce
+        ));
+        let bytes = serde_json::to_vec_pretty(cache)?;
+        let result = (|| -> Result<(), RelayStorageError> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            fs::rename(&temporary, destination)?;
+            sync_directory(&self.root)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    fn cache_path(&self, id: &RelayServerId) -> PathBuf {
+        self.root.join(format!("{}.tools.json", id.as_str()))
+    }
+}
+
+fn contained_path(root: &Path, requested: &Path) -> Result<PathBuf, RelayStorageError> {
+    if requested
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(RelayStorageError::RootEscape);
+    }
+    let path = if requested.is_absolute() {
+        requested.to_owned()
+    } else {
+        root.join(requested)
+    };
+    if !path.starts_with(root) {
+        return Err(RelayStorageError::RootEscape);
+    }
+    Ok(path)
+}
+
+fn sync_directory(path: &Path) -> Result<(), RelayStorageError> {
+    #[cfg(unix)]
+    fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -122,7 +339,9 @@ pub struct RelayConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RelayTool {
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(default)]
     pub input_schema: Value,
 }
 

@@ -23,6 +23,7 @@ use commonkit_contracts::{
     assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, build_plan};
+use commonkit_reconcile::{PlanStore, PlanStoreError};
 use futures_util::StreamExt;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -372,6 +373,7 @@ pub struct ControlPlane {
 
 struct ControlPlaneInner {
     plans: std::sync::RwLock<BTreeMap<Sha256Digest, Plan>>,
+    plan_store: Option<Arc<PlanStore>>,
     operations: std::sync::RwLock<BTreeMap<Sha256Digest, ApplyOperation>>,
     idempotency: std::sync::Mutex<BTreeMap<String, (Sha256Digest, Sha256Digest)>>,
     executor: Arc<dyn PlanExecutor>,
@@ -382,6 +384,19 @@ impl ControlPlane {
         Self {
             inner: Arc::new(ControlPlaneInner {
                 plans: std::sync::RwLock::new(BTreeMap::new()),
+                plan_store: None,
+                operations: std::sync::RwLock::new(BTreeMap::new()),
+                idempotency: std::sync::Mutex::new(BTreeMap::new()),
+                executor,
+            }),
+        }
+    }
+
+    pub fn with_plan_store(executor: Arc<dyn PlanExecutor>, plan_store: Arc<PlanStore>) -> Self {
+        Self {
+            inner: Arc::new(ControlPlaneInner {
+                plans: std::sync::RwLock::new(BTreeMap::new()),
+                plan_store: Some(plan_store),
                 operations: std::sync::RwLock::new(BTreeMap::new()),
                 idempotency: std::sync::Mutex::new(BTreeMap::new()),
                 executor,
@@ -391,6 +406,9 @@ impl ControlPlane {
 
     pub fn register_plan(&self, plan: Plan) -> Result<Plan, ControlError> {
         validate_control_plan(&plan)?;
+        if let Some(store) = &self.inner.plan_store {
+            store.persist(&plan)?;
+        }
         let mut plans = self.inner.plans.write().expect("plan lock");
         if let Some(existing) = plans.get(&plan.id) {
             if existing == &plan {
@@ -403,7 +421,13 @@ impl ControlPlane {
     }
 
     pub fn plan(&self, id: &Sha256Digest) -> Option<Plan> {
-        self.inner.plans.read().expect("plan lock").get(id).cloned()
+        if let Some(plan) = self.inner.plans.read().expect("plan lock").get(id) {
+            return Some(plan.clone());
+        }
+        self.inner
+            .plan_store
+            .as_ref()
+            .and_then(|store| store.load(id).ok())
     }
 
     pub fn operation(&self, id: &Sha256Digest) -> Option<ApplyOperation> {
@@ -521,6 +545,7 @@ fn validate_control_plan(plan: &Plan) -> Result<(), ControlError> {
         desired_digest: plan.desired_digest.clone(),
         observed_digest: plan.observed_digest.clone(),
         policy_digest: plan.policy_digest.clone(),
+        bindings: plan.bindings.clone(),
         operations: plan.operations.clone(),
     })
     .map_err(|_| ControlError::InvalidPlan)?;
@@ -546,6 +571,8 @@ pub enum ControlError {
     IdempotencyConflict,
     #[error(transparent)]
     Contract(#[from] commonkit_contracts::ContractError),
+    #[error(transparent)]
+    PlanStore(#[from] PlanStoreError),
 }
 
 #[derive(Debug, Deserialize)]
@@ -680,6 +707,7 @@ impl From<ControlError> for ApiError {
             ControlError::InvalidPlan | ControlError::Contract(_) => {
                 Self::bad_request("invalid_plan")
             }
+            ControlError::PlanStore(_) => Self::internal("plan_store_failed"),
         }
     }
 }
@@ -840,7 +868,16 @@ impl BoundServer {
         let local = listener.local_addr()?;
         let discovery = DaemonDiscovery::new(local.port(), &token)?;
         discovery.persist(discovery_path.as_ref())?;
-        let application = router_with_events(token, status, local.to_string(), events);
+        let plan_root = discovery_path
+            .as_ref()
+            .parent()
+            .ok_or(ServiceError::UnsafeDiscoveryPath)?
+            .join("plans");
+        let control = ControlPlane::with_plan_store(
+            Arc::new(UnavailableExecutor),
+            Arc::new(PlanStore::open(plan_root)?),
+        );
+        let application = router_with_control(token, status, local.to_string(), events, control);
         Ok(Self {
             listener,
             application,
@@ -1013,4 +1050,6 @@ pub enum ServiceError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    PlanStore(#[from] PlanStoreError),
 }

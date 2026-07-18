@@ -4,6 +4,7 @@
       "enum": [
         "prepared",
         "prepare_failed",
+        "apply_started",
         "applied",
         "apply_failed",
         "verified",
@@ -32,6 +33,30 @@
       "required": [
         "operationId",
         "phase"
+      ],
+      "type": "object"
+    },
+    "PlanBindings": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactSetDigest": {
+          "type": "string"
+        },
+        "composedLoadoutDigest": {
+          "type": "string"
+        },
+        "ownershipMapDigest": {
+          "type": "string"
+        },
+        "providerInputsDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "composedLoadoutDigest",
+        "providerInputsDigest",
+        "ownershipMapDigest",
+        "artifactSetDigest"
       ],
       "type": "object"
     },
@@ -86,6 +111,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "bindings": {
+      "$ref": "#/$defs/PlanBindings"
+    },
     "contractVersion": {
       "type": "string"
     },
@@ -141,6 +169,7 @@
     "desiredDigest",
     "observedDigest",
     "policyDigest",
+    "bindings",
     "state",
     "operationProgress",
     "transitions"

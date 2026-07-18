@@ -30,6 +30,9 @@
         "kind": {
           "$ref": "#/$defs/OperationKind"
         },
+        "payloadDigest": {
+          "type": "string"
+        },
         "requiresConfirmation": {
           "type": "boolean"
         },
@@ -51,6 +54,7 @@
         "risk",
         "requiresConfirmation",
         "dependsOn",
+        "payloadDigest",
         "summary"
       ],
       "type": "object"
@@ -68,6 +72,30 @@
         "restore"
       ],
       "type": "string"
+    },
+    "PlanBindings": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactSetDigest": {
+          "type": "string"
+        },
+        "composedLoadoutDigest": {
+          "type": "string"
+        },
+        "ownershipMapDigest": {
+          "type": "string"
+        },
+        "providerInputsDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "composedLoadoutDigest",
+        "providerInputsDigest",
+        "ownershipMapDigest",
+        "artifactSetDigest"
+      ],
+      "type": "object"
     },
     "ResourceRef": {
       "additionalProperties": false,
@@ -106,6 +134,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
+    "bindings": {
+      "$ref": "#/$defs/PlanBindings"
+    },
     "contractVersion": {
       "type": "string"
     },
@@ -144,6 +175,7 @@
     "desiredDigest",
     "observedDigest",
     "policyDigest",
+    "bindings",
     "operations"
   ],
   "title": "Plan",

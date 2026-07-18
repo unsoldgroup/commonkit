@@ -16,6 +16,7 @@ pub struct OperationDraft {
     pub depends_on: Vec<Sha256Digest>,
     pub before_digest: Option<Sha256Digest>,
     pub after_digest: Option<Sha256Digest>,
+    pub payload_digest: Sha256Digest,
     pub summary: String,
 }
 
@@ -30,6 +31,7 @@ struct OperationSemantic<'a> {
     depends_on: &'a [Sha256Digest],
     before_digest: &'a Option<Sha256Digest>,
     after_digest: &'a Option<Sha256Digest>,
+    payload_digest: &'a Sha256Digest,
 }
 
 pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, ContractError> {
@@ -48,6 +50,7 @@ pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, Contra
             depends_on: &draft.depends_on,
             before_digest: &draft.before_digest,
             after_digest: &draft.after_digest,
+            payload_digest: &draft.payload_digest,
         },
     )?;
     Ok(Operation {
@@ -60,6 +63,7 @@ pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, Contra
         depends_on: draft.depends_on,
         before_digest: draft.before_digest,
         after_digest: draft.after_digest,
+        payload_digest: draft.payload_digest,
         summary: draft.summary,
     })
 }
@@ -70,6 +74,7 @@ pub struct PlanDraft {
     pub desired_digest: Sha256Digest,
     pub observed_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
+    pub bindings: PlanBindings,
     pub operations: Vec<Operation>,
 }
 
@@ -80,6 +85,7 @@ struct PlanSemantic<'a> {
     desired_digest: &'a Sha256Digest,
     observed_digest: &'a Sha256Digest,
     policy_digest: &'a Sha256Digest,
+    bindings: &'a PlanBindings,
     operation_ids: Vec<&'a Sha256Digest>,
 }
 
@@ -128,6 +134,7 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
             depends_on: operation.depends_on.clone(),
             before_digest: operation.before_digest.clone(),
             after_digest: operation.after_digest.clone(),
+            payload_digest: operation.payload_digest.clone(),
             summary: operation.summary.clone(),
         })?;
         if recomputed.id != operation.id {
@@ -141,6 +148,7 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
             desired_digest: &draft.desired_digest,
             observed_digest: &draft.observed_digest,
             policy_digest: &draft.policy_digest,
+            bindings: &draft.bindings,
             operation_ids: ordered.iter().map(|operation| &operation.id).collect(),
         },
     )?;
@@ -152,6 +160,7 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
         desired_digest: draft.desired_digest,
         observed_digest: draft.observed_digest,
         policy_digest: draft.policy_digest,
+        bindings: draft.bindings,
         operations: ordered,
     })
 }

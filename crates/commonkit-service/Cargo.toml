@@ -16,6 +16,7 @@ clap.workspace = true
 commonkit-contracts = { path = "../commonkit-contracts" }
 commonkit-core = { path = "../commonkit-core" }
 commonkit-platform = { path = "../commonkit-platform" }
+commonkit-reconcile = { path = "../commonkit-reconcile" }
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

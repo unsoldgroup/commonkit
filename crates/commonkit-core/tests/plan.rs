@@ -1,6 +1,6 @@
 use commonkit_core::{
-    OperationDraft, OperationKind, PlanBuildError, PlanDraft, ResourceRef, Risk, Sha256Digest,
-    StableId, build_plan, finalize_operation,
+    OperationDraft, OperationKind, PlanBindings, PlanBuildError, PlanDraft, ResourceRef, Risk,
+    Sha256Digest, StableId, build_plan, finalize_operation,
 };
 
 fn id(value: &str) -> StableId {
@@ -25,7 +25,17 @@ fn operation(adapter: &str, resource: &str, summary: &str) -> OperationDraft {
         depends_on: vec![],
         before_digest: Some(digest('1')),
         after_digest: Some(digest('2')),
+        payload_digest: digest('3'),
         summary: summary.into(),
+    }
+}
+
+fn bindings() -> PlanBindings {
+    PlanBindings {
+        composed_loadout_digest: digest('4'),
+        provider_inputs_digest: digest('5'),
+        ownership_map_digest: digest('6'),
+        artifact_set_digest: digest('7'),
     }
 }
 
@@ -46,6 +56,7 @@ fn plan_id_and_order_are_independent_of_input_enumeration() {
         desired_digest: digest('a'),
         observed_digest: digest('b'),
         policy_digest: digest('c'),
+        bindings: bindings(),
         operations,
     };
 
@@ -63,6 +74,10 @@ fn plan_id_and_order_are_independent_of_input_enumeration() {
     let mut changed = draft(left.operations.clone());
     changed.desired_digest = digest('d');
     assert_ne!(left.id, build_plan(changed).expect("changed plan").id);
+
+    let mut changed = draft(left.operations.clone());
+    changed.bindings.provider_inputs_digest = digest('8');
+    assert_ne!(left.id, build_plan(changed).expect("changed bindings").id);
 }
 
 #[test]
@@ -77,6 +92,7 @@ fn orders_dependencies_before_dependents_and_rejects_cycles() {
         desired_digest: digest('a'),
         observed_digest: digest('b'),
         policy_digest: digest('c'),
+        bindings: bindings(),
         operations,
     };
     let plan = build_plan(draft(vec![dependent.clone(), prerequisite.clone()])).expect("plan");

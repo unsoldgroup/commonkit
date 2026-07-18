@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_contracts::{
-    Operation, OperationKind, OperationPhase, ReceiptState, ResourceRef, Risk, Sha256Digest,
-    StableId,
+    Operation, OperationKind, OperationPhase, PlanBindings, ReceiptState, ResourceRef, Risk,
+    Sha256Digest, StableId,
 };
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_reconcile::{
@@ -14,6 +14,15 @@ use commonkit_reconcile::{
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).expect("digest")
+}
+
+fn bindings() -> PlanBindings {
+    PlanBindings {
+        composed_loadout_digest: digest('4'),
+        provider_inputs_digest: digest('5'),
+        ownership_map_digest: digest('6'),
+        artifact_set_digest: digest('7'),
+    }
 }
 
 fn temporary_directory(test: &str) -> PathBuf {
@@ -38,6 +47,7 @@ fn operation(adapter: &str, resource: &str) -> Operation {
         depends_on: vec![],
         before_digest: Some(digest('1')),
         after_digest: Some(digest('2')),
+        payload_digest: digest('3'),
         summary: resource.into(),
     })
     .expect("operation")
@@ -114,6 +124,7 @@ fn plan() -> commonkit_contracts::Plan {
         desired_digest: digest('a'),
         observed_digest: digest('b'),
         policy_digest: digest('c'),
+        bindings: bindings(),
         operations: vec![operation("files", "alpha"), operation("files", "beta")],
     })
     .expect("plan")
@@ -146,7 +157,7 @@ fn prepares_every_operation_before_mutation_then_applies_and_verifies_in_plan_or
 }
 
 #[test]
-fn rolls_back_only_applied_operations_in_reverse_order_after_apply_failure() {
+fn rolls_back_started_operations_in_reverse_order_after_apply_failure() {
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut failing = adapter(events.clone());
     failing.fail_apply_for = Some("beta".into());
@@ -167,6 +178,7 @@ fn rolls_back_only_applied_operations_in_reverse_order_after_apply_failure() {
             "prepare:beta",
             "apply:alpha",
             "apply:beta",
+            "rollback:beta",
             "rollback:alpha"
         ]
     );
@@ -207,6 +219,7 @@ fn restart_recovery_rolls_back_durably_recorded_operations_in_reverse_order() {
         plan.desired_digest.clone(),
         plan.observed_digest.clone(),
         plan.policy_digest.clone(),
+        plan.bindings.clone(),
     )
     .expect("journal");
     store.persist(&journal).expect("initial checkpoint");
@@ -221,6 +234,10 @@ fn restart_recovery_rolls_back_durably_recorded_operations_in_reverse_order() {
         .expect("applying");
     store.persist(&journal).expect("applying checkpoint");
     for operation in &plan.operations {
+        journal
+            .record_operation(operation.id.clone(), OperationPhase::ApplyStarted, None)
+            .expect("apply started");
+        store.persist(&journal).expect("apply-started checkpoint");
         journal
             .record_operation(operation.id.clone(), OperationPhase::Applied, None)
             .expect("applied");

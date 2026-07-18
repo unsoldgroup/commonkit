@@ -517,7 +517,17 @@ pub struct Operation {
     pub before_digest: Option<Sha256Digest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_digest: Option<Sha256Digest>,
+    pub payload_digest: Sha256Digest,
     pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanBindings {
+    pub composed_loadout_digest: Sha256Digest,
+    pub provider_inputs_digest: Sha256Digest,
+    pub ownership_map_digest: Sha256Digest,
+    pub artifact_set_digest: Sha256Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -530,6 +540,7 @@ pub struct Plan {
     pub desired_digest: Sha256Digest,
     pub observed_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
+    pub bindings: PlanBindings,
     pub operations: Vec<Operation>,
 }
 
@@ -552,6 +563,7 @@ pub enum ReceiptState {
 pub enum OperationPhase {
     Prepared,
     PrepareFailed,
+    ApplyStarted,
     Applied,
     ApplyFailed,
     Verified,
@@ -592,6 +604,7 @@ pub struct RunReceipt {
     pub desired_digest: Sha256Digest,
     pub observed_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
+    pub bindings: PlanBindings,
     pub state: ReceiptState,
     pub operation_progress: Vec<OperationProgress>,
     pub transitions: Vec<ReceiptTransition>,

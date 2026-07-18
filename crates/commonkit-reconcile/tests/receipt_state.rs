@@ -1,8 +1,17 @@
-use commonkit_contracts::{ReceiptState, Sha256Digest, StableId};
+use commonkit_contracts::{PlanBindings, ReceiptState, Sha256Digest, StableId};
 use commonkit_reconcile::{ReceiptError, ReceiptJournal};
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).expect("digest")
+}
+
+fn bindings() -> PlanBindings {
+    PlanBindings {
+        composed_loadout_digest: digest('4'),
+        provider_inputs_digest: digest('5'),
+        ownership_map_digest: digest('6'),
+        artifact_set_digest: digest('7'),
+    }
 }
 
 #[test]
@@ -14,6 +23,7 @@ fn records_a_hash_chained_success_path() {
         digest('b'),
         digest('c'),
         digest('d'),
+        bindings(),
     )
     .expect("journal");
     journal
@@ -40,6 +50,7 @@ fn enforces_recovery_and_terminal_state_transitions() {
         digest('b'),
         digest('c'),
         digest('d'),
+        bindings(),
     )
     .expect("journal");
     assert!(matches!(

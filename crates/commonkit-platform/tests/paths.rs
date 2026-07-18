@@ -11,6 +11,7 @@ fn derives_separate_private_state_domains() {
     )
     .expect("paths");
     assert_eq!(paths.receipts, paths.state.join("receipts"));
+    assert_eq!(paths.plans, paths.state.join("plans"));
     assert_eq!(paths.backups, paths.state.join("backups"));
     assert_eq!(paths.snapshots, paths.state.join("snapshots"));
     assert_ne!(paths.config, paths.state);

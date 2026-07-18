@@ -11,6 +11,7 @@ cap-std.workspace = true
 commonkit-contracts = { path = "../commonkit-contracts" }
 commonkit-core = { path = "../commonkit-core" }
 commonkit-reconcile = { path = "../commonkit-reconcile" }
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

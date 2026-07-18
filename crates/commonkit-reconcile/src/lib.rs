@@ -3,15 +3,18 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use commonkit_contracts::{
     CONTRACT_VERSION, ContractError, Operation, OperationPhase, OperationProgress, Plan,
-    ReceiptState, ReceiptTransition, RunReceipt, SCHEMA_VERSION, SchemaVersion, Sha256Digest,
-    StableId, canonical_json, digest_domain_json,
+    PlanBindings, ReceiptState, ReceiptTransition, RunReceipt, SCHEMA_VERSION, SchemaVersion,
+    Sha256Digest, StableId, canonical_json, digest_domain_json,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use serde::Serialize;
 use thiserror::Error;
+
+static PLAN_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 pub struct ReceiptJournal {
     receipt: RunReceipt,
@@ -25,6 +28,7 @@ impl ReceiptJournal {
         desired_digest: Sha256Digest,
         observed_digest: Sha256Digest,
         policy_digest: Sha256Digest,
+        bindings: PlanBindings,
     ) -> Result<Self, ReceiptError> {
         let progress = Vec::new();
         let progress_digest = digest_domain_json("commonkit.operation-progress.v1", &progress)?;
@@ -40,6 +44,7 @@ impl ReceiptJournal {
                 desired_digest,
                 observed_digest,
                 policy_digest,
+                bindings,
                 state: ReceiptState::Prepared,
                 operation_progress: progress,
                 transitions: vec![first],
@@ -194,6 +199,124 @@ pub struct ReceiptStore {
     root: PathBuf,
 }
 
+/// Immutable content-addressed storage for approved plans.
+pub struct PlanStore {
+    root: PathBuf,
+}
+
+impl PlanStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self, PlanStoreError> {
+        fs::create_dir_all(root.as_ref())?;
+        set_private_directory(root.as_ref())?;
+        let root = root.as_ref().canonicalize()?;
+        if !root.is_dir() {
+            return Err(PlanStoreError::InvalidRoot);
+        }
+        Ok(Self { root })
+    }
+
+    pub fn persist(&self, plan: &Plan) -> Result<(), PlanStoreError> {
+        validate_plan(plan).map_err(|_| PlanStoreError::InvalidPlan)?;
+        let bytes = canonical_json(plan)?;
+        let destination = self.path(&plan.id);
+        if destination.exists() {
+            return if read_plan_bytes(&destination)? == bytes {
+                Ok(())
+            } else {
+                Err(PlanStoreError::PlanConflict)
+            };
+        }
+        let nonce = PLAN_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = self.root.join(format!(
+            ".plan-{}-{}-{nonce}.tmp",
+            std::process::id(),
+            plan.id.as_str().trim_start_matches("sha256:")
+        ));
+        let result = (|| -> Result<(), PlanStoreError> {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(&temporary)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            match fs::hard_link(&temporary, &destination) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if read_plan_bytes(&destination)? != bytes {
+                        return Err(PlanStoreError::PlanConflict);
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+            fs::remove_file(&temporary)?;
+            sync_directory(&self.root)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    pub fn load(&self, id: &Sha256Digest) -> Result<Plan, PlanStoreError> {
+        let bytes = read_plan_bytes(&self.path(id))?;
+        let plan: Plan = serde_json::from_slice(&bytes)?;
+        if &plan.id != id || validate_plan(&plan).is_err() {
+            return Err(PlanStoreError::InvalidPlan);
+        }
+        Ok(plan)
+    }
+
+    fn path(&self, id: &Sha256Digest) -> PathBuf {
+        self.root.join(format!(
+            "{}.json",
+            id.as_str().trim_start_matches("sha256:")
+        ))
+    }
+}
+
+fn read_plan_bytes(path: &Path) -> Result<Vec<u8>, PlanStoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(PlanStoreError::UnsafeEntry);
+    }
+    Ok(fs::read(path)?)
+}
+
+#[cfg(unix)]
+fn set_private_directory(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn set_private_directory(_path: &Path) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum PlanStoreError {
+    #[error("plan store root is invalid")]
+    InvalidRoot,
+    #[error("plan store entry is not an ordinary file")]
+    UnsafeEntry,
+    #[error("plan is invalid or does not match its content address")]
+    InvalidPlan,
+    #[error("plan ID is already bound to different content")]
+    PlanConflict,
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Serialization(#[from] serde_json::Error),
+    #[error(transparent)]
+    Contract(#[from] ContractError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdapterFailure {
     pub code: String,
@@ -264,6 +387,7 @@ impl<'a> Reconciler<'a> {
             plan.desired_digest.clone(),
             plan.observed_digest.clone(),
             plan.policy_digest.clone(),
+            plan.bindings.clone(),
         )?;
         self.persist(&journal)?;
 
@@ -294,6 +418,8 @@ impl<'a> Reconciler<'a> {
         self.persist(&journal)?;
         let mut applied = Vec::new();
         for operation in &plan.operations {
+            journal.record_operation(operation.id.clone(), OperationPhase::ApplyStarted, None)?;
+            self.persist(&journal)?;
             let adapter = adapter_for(adapters, &operation.adapter_id)?;
             match adapter.apply(operation) {
                 Ok(()) => {
@@ -306,6 +432,7 @@ impl<'a> Reconciler<'a> {
                         Some(stable_failure_code(&failure)),
                     )?;
                     self.persist(&journal)?;
+                    applied.push(operation.clone());
                     return self.recover(&mut journal, &applied, adapters);
                 }
             }
@@ -356,6 +483,7 @@ impl<'a> Reconciler<'a> {
             || receipt.desired_digest != plan.desired_digest
             || receipt.observed_digest != plan.observed_digest
             || receipt.policy_digest != plan.policy_digest
+            || receipt.bindings != plan.bindings
         {
             return Err(ReconcileError::ReceiptPlanMismatch);
         }
@@ -389,7 +517,9 @@ impl<'a> Reconciler<'a> {
             if matches!(
                 phase,
                 Some(
-                    OperationPhase::Applied
+                    OperationPhase::ApplyStarted
+                        | OperationPhase::Applied
+                        | OperationPhase::ApplyFailed
                         | OperationPhase::Verified
                         | OperationPhase::VerifyFailed
                 )
@@ -481,6 +611,7 @@ fn validate_plan(plan: &Plan) -> Result<(), ReconcileError> {
         desired_digest: plan.desired_digest.clone(),
         observed_digest: plan.observed_digest.clone(),
         policy_digest: plan.policy_digest.clone(),
+        bindings: plan.bindings.clone(),
         operations: plan.operations.clone(),
     })?;
     if rebuilt != *plan {
@@ -656,22 +787,33 @@ fn make_transition(
 fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool {
     matches!(
         (from, to),
-        (
-            OperationPhase::Prepared,
-            OperationPhase::Applied | OperationPhase::ApplyFailed
-        ) | (
-            OperationPhase::Applied,
-            OperationPhase::Verified
-                | OperationPhase::VerifyFailed
-                | OperationPhase::RolledBack
-                | OperationPhase::RollbackFailed
-        ) | (
-            OperationPhase::Verified,
-            OperationPhase::RolledBack | OperationPhase::RollbackFailed
-        ) | (
-            OperationPhase::VerifyFailed,
-            OperationPhase::RolledBack | OperationPhase::RollbackFailed
-        )
+        (OperationPhase::Prepared, OperationPhase::ApplyStarted)
+            | (
+                OperationPhase::ApplyStarted,
+                OperationPhase::Applied
+                    | OperationPhase::ApplyFailed
+                    | OperationPhase::RolledBack
+                    | OperationPhase::RollbackFailed
+            )
+            | (
+                OperationPhase::Applied,
+                OperationPhase::Verified
+                    | OperationPhase::VerifyFailed
+                    | OperationPhase::RolledBack
+                    | OperationPhase::RollbackFailed
+            )
+            | (
+                OperationPhase::Verified,
+                OperationPhase::RolledBack | OperationPhase::RollbackFailed
+            )
+            | (
+                OperationPhase::VerifyFailed,
+                OperationPhase::RolledBack | OperationPhase::RollbackFailed
+            )
+            | (
+                OperationPhase::ApplyFailed,
+                OperationPhase::RolledBack | OperationPhase::RollbackFailed
+            )
     )
 }
 

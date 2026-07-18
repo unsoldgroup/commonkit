@@ -1,10 +1,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    fs,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use commonkit_contracts::{OperationKind, ResourceRef, Risk, Sha256Digest, StableId};
+use commonkit_contracts::{OperationKind, PlanBindings, ResourceRef, Risk, Sha256Digest, StableId};
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
+use commonkit_reconcile::PlanStore;
 use commonkit_service::{
     ApplyStatus, ControlPlane, ControlToken, EventHub, ExecutionResult, PlanExecutor,
     ServiceStatus, router_with_control,
@@ -14,6 +20,23 @@ use tower::ServiceExt;
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).expect("digest")
+}
+
+fn bindings() -> PlanBindings {
+    PlanBindings {
+        composed_loadout_digest: digest('4'),
+        provider_inputs_digest: digest('5'),
+        ownership_map_digest: digest('6'),
+        artifact_set_digest: digest('7'),
+    }
+}
+
+fn temporary_directory(test: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!("commonkit-{test}-{}-{nonce}", std::process::id()))
 }
 
 fn plan() -> commonkit_contracts::Plan {
@@ -30,6 +53,7 @@ fn plan() -> commonkit_contracts::Plan {
         depends_on: vec![],
         before_digest: None,
         after_digest: Some(digest('d')),
+        payload_digest: digest('e'),
         summary: "create config".into(),
     })
     .expect("operation");
@@ -38,6 +62,7 @@ fn plan() -> commonkit_contracts::Plan {
         desired_digest: digest('a'),
         observed_digest: digest('b'),
         policy_digest: digest('c'),
+        bindings: bindings(),
         operations: vec![operation],
     })
     .expect("plan")
@@ -85,6 +110,22 @@ fn validates_registered_plans_and_executes_each_idempotency_key_once() {
     let mut tampered = plan;
     tampered.target_id = StableId::parse("other").expect("target");
     assert!(control.register_plan(tampered).is_err());
+}
+
+#[test]
+fn reloads_a_registered_plan_after_the_control_plane_restarts() {
+    let root = temporary_directory("control-plan-restart");
+    let store = Arc::new(PlanStore::open(&root).expect("plan store"));
+    let executor = Arc::new(SuccessfulExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let plan = ControlPlane::with_plan_store(executor.clone(), store.clone())
+        .register_plan(plan())
+        .expect("register");
+
+    let restarted = ControlPlane::with_plan_store(executor, store);
+    assert_eq!(restarted.plan(&plan.id), Some(plan));
+    fs::remove_dir_all(root).expect("cleanup");
 }
 
 #[tokio::test]

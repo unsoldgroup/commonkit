@@ -2,11 +2,20 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use commonkit_contracts::{ReceiptState, Sha256Digest, StableId};
+use commonkit_contracts::{PlanBindings, ReceiptState, Sha256Digest, StableId};
 use commonkit_reconcile::{ReceiptError, ReceiptJournal, ReceiptStore};
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).expect("digest")
+}
+
+fn bindings() -> PlanBindings {
+    PlanBindings {
+        composed_loadout_digest: digest('4'),
+        provider_inputs_digest: digest('5'),
+        ownership_map_digest: digest('6'),
+        artifact_set_digest: digest('7'),
+    }
 }
 
 fn temporary_directory(test: &str) -> PathBuf {
@@ -25,6 +34,7 @@ fn journal(run_id: &str) -> ReceiptJournal {
         digest('b'),
         digest('c'),
         digest('d'),
+        bindings(),
     )
     .expect("journal")
 }

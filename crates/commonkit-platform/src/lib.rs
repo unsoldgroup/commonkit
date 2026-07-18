@@ -11,6 +11,7 @@ pub struct AppPaths {
     pub state: PathBuf,
     pub cache: PathBuf,
     pub receipts: PathBuf,
+    pub plans: PathBuf,
     pub backups: PathBuf,
     pub snapshots: PathBuf,
 }
@@ -39,6 +40,7 @@ impl AppPaths {
         }
         Ok(Self {
             receipts: state.join("receipts"),
+            plans: state.join("plans"),
             backups: state.join("backups"),
             snapshots: state.join("snapshots"),
             config,
@@ -53,6 +55,7 @@ impl AppPaths {
             &self.state,
             &self.cache,
             &self.receipts,
+            &self.plans,
             &self.backups,
             &self.snapshots,
         ] {
