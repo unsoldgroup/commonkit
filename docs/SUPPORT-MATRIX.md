@@ -10,11 +10,11 @@ This matrix is a release gate, not a claim that unchecked rows are production-re
 | chezmoi 2.70.4 safe subset | Isolation contract | Isolation contract | Isolation contract | Deferred until remote staging harness |
 | Credentials | env/file/BWS; absolute-path Keychain CLI | env/file/BWS; absolute-path Secret Service CLI | env/file/BWS; native Credential Manager API, Windows CI gated | Target-local only |
 | Snapshots | Provider-neutral core | Provider-neutral core | Provider-neutral core | Object-store transport-neutral |
-| Desktop | Tauri build gate | AppImage/deb gate | Signed installer gate | Manages through daemon |
+| Desktop | Status/update shell; management flows incomplete | Build gate; management flows incomplete | Build gate; management flows incomplete | Management UI not yet wired |
 | Standalone CLI | Universal signed archive gate | Signed archive gate | Signed archive gate | Same control API |
 
 Windows remote management is out of v1; local Windows is required. Linux v1 packaging targets AppImage and Debian-family `.deb`. GitHub CLI is the initial GitHub authentication path. Snapshot storage remains S3-compatible and provider-neutral; Cloudflare R2 is the recommended deployment profile. BWS is the initial external secret-manager adapter.
 
 No row is release-ready until its installer, reconciliation, recovery, update, and uninstall tests pass on the named platform.
 
-Release packaging and lifecycle workflows are validation-only and deliberately disabled until production signing identities and real two-version fixtures are provisioned. A green ordinary CI run does not imply installer or updater support.
+Release packaging and lifecycle workflows are executable and fail closed without production signing identities. They have not been demonstrated with production notarization/signing and a published two-version updater path. A green ordinary CI run does not imply installer or updater support.

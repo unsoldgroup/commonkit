@@ -127,7 +127,9 @@ nostalgia. Use it selectively for status, actions, and proof.
 
 - Skill optimization is under active development until it ships in the current
   release.
-- Recovery uses backups today; apply is not yet a transactional rollback.
+- Filesystem apply and successful-run rollback use durable plans, artifacts,
+  backups, and authenticated receipts. Installed-platform and snapshot restore
+  recovery remain release gates.
 - Sensitive-state exclusions cover documented paths and secret-like values;
   they are not a universal identity-isolation guarantee.
 
@@ -137,7 +139,7 @@ nostalgia. Use it selectively for status, actions, and proof.
 - "All identity stays local."
 - "Skills improve themselves."
 - "CommonKit replaces APM, Chezmoi, SkillOpt, or your password manager."
-- "One-click rollback" until transactional rollback exists.
+- "One-click rollback" until installed-platform and snapshot recovery gates pass.
 
 ## Reader journey
 
