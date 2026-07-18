@@ -1,9 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DesktopSnapshot } from "./contracts.ts";
+import type { DesktopSnapshot, ManagementSnapshot } from "./contracts.ts";
 import type { UpdateSummary } from "./updater-view.ts";
 
 export const desktopApi = {
   snapshot: () => invoke<DesktopSnapshot>("desktop_snapshot"),
+  managementSnapshot: () => invoke<ManagementSnapshot>("desktop_management_snapshot"),
   applyPlan: (planId: string, confirmationId: string) => invoke("apply_plan", { planId, confirmationId }),
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
   checkForUpdate: () => invoke<UpdateSummary | null>("check_for_update"),

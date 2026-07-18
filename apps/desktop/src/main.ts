@@ -2,11 +2,13 @@ import "./style.css";
 import { desktopApi } from "./api.ts";
 import { navigation, routeFromHash, type Route } from "./navigation.ts";
 import { statusView } from "./view-model.ts";
-import type { DesktopSnapshot } from "./contracts.ts";
+import type { DesktopSnapshot, ManagementSnapshot } from "./contracts.ts";
 import { updatePanel, type UpdateUiState } from "./updater-view.ts";
+import { managementPanel } from "./management-view.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
+let management: ManagementSnapshot | null = null;
 let updateState: UpdateUiState = { kind: "idle" };
 
 function placeholder(route: Route): string {
@@ -30,7 +32,7 @@ function render(): void {
   const body = route === "settings" ? updatePanel(updateState) : route === "status" && snapshot ? (() => {
     const view = statusView(snapshot.status);
     return `<section class="panel"><p class="eyebrow">Local target</p><h1>${view.heading}</h1><p>${view.detail}</p><dl><dt>Target</dt><dd>${snapshot.status.activeTarget ?? "Not selected"}</dd><dt>Loadout</dt><dd>${snapshot.status.activeLoadout ?? "Not selected"}</dd><dt>Runtime</dt><dd>${snapshot.status.runtimeVersion}</dd></dl>${view.primaryRoute !== "status" ? `<a class="primary" href="#${view.primaryRoute}">Continue</a>` : ""}</section>`;
-  })() : placeholder(route);
+  })() : management && route in management ? managementPanel(route, management) : placeholder(route);
   app.innerHTML = `<aside><div class="brand">CommonKit</div><nav>${navigation.map(({ route: id, label }) => `<a class="${route === id ? "active" : ""}" href="#${id}">${label}</a>`).join("")}</nav></aside><main>${body}</main>`;
   if (route === "settings") bindUpdateActions();
 }
@@ -69,3 +71,4 @@ function bindUpdateActions(): void {
 addEventListener("hashchange", render);
 render();
 desktopApi.snapshot().then((value) => { snapshot = value; render(); }).catch(() => render());
+desktopApi.managementSnapshot().then((value) => { management = value; render(); }).catch(() => render());

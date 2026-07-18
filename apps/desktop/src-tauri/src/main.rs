@@ -1,1 +1,3 @@
-fn main() { commonkit_desktop::run(); }
+fn main() {
+    commonkit_desktop::run();
+}

@@ -18,3 +18,12 @@ export interface DesktopSnapshot {
   capabilities: CapabilityState[];
   lastEventId: number | null;
 }
+
+export interface ManagementSnapshot {
+  plans: unknown;
+  credentials: unknown;
+  snapshots: unknown;
+  relay: unknown;
+  schedule: unknown;
+  diagnostics: unknown;
+}
