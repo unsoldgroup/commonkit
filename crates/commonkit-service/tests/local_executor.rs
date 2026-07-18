@@ -8,6 +8,17 @@ use commonkit_contracts::{PlanBindings, ReceiptState, Sha256Digest, StableId};
 use commonkit_core::{PlanDraft, build_plan};
 use commonkit_reconcile::{PlanStore, ReceiptJournal, ReceiptStore};
 use commonkit_service::{ApplyStatus, LocalPlanExecutor, PlanExecutor};
+use commonkit_relay::{
+    RelayAdapter, RelayConfig, RelayLifecycleControl, RelayMutationInputs, RelayPlanError,
+    RelayPlanRequest, plan_relay_operation,
+};
+use serde_json::json;
+
+struct NoopRelayLifecycle;
+impl RelayLifecycleControl for NoopRelayLifecycle {
+    fn reload(&self, _: &RelayConfig) -> Result<(), RelayPlanError> { Ok(()) }
+    fn restart(&self) -> Result<(), RelayPlanError> { Ok(()) }
+}
 
 fn temp(name: &str) -> PathBuf {
     let nonce = SystemTime::now()
@@ -122,5 +133,31 @@ fn local_execution_is_receipt_idempotent_and_startup_scan_cancels_prepared_runs(
         receipts.load(pending_id).unwrap().receipt().state,
         ReceiptState::Canceled
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn one_durable_run_dispatches_filesystem_and_relay_operations() {
+    let root = temp("mixed-adapters");
+    let (plans, file_plan) = fixture(&root);
+    let relay_live = root.join("relay.json");
+    let relay_state = root.join("relay-state");
+    let mut relay = RelayAdapter::open(StableId::parse("relay").unwrap(), &relay_live, &relay_state).unwrap();
+    let desired = RelayConfig::normalize(json!({"servers": []})).unwrap();
+    let relay_operation = plan_relay_operation(&mut relay, RelayPlanRequest {
+        desired,
+        inputs: RelayMutationInputs { provider_inputs_digest: digest(8), policy_digest: digest(3), target_digest: digest(9) },
+    }).unwrap().unwrap();
+    let mixed = build_plan(PlanDraft {
+        target_id: file_plan.target_id.clone(), desired_digest: digest(10), observed_digest: digest(11),
+        policy_digest: file_plan.policy_digest.clone(), bindings: file_plan.bindings.clone(),
+        operations: vec![file_plan.operations[0].clone(), relay_operation],
+    }).unwrap();
+    plans.persist(&mixed).unwrap();
+    let executor = LocalPlanExecutor::open(plans, root.join("receipts"), root.join("target"), root.join("adapter")).unwrap()
+        .with_relay(&relay_live, &relay_state, Arc::new(NoopRelayLifecycle));
+    assert_eq!(executor.execute(&mixed, &StableId::parse("mixed-approved").unwrap()).status, ApplyStatus::Succeeded);
+    assert_eq!(fs::read(root.join("target/config/commonkit.txt")).unwrap(), b"managed\n");
+    assert!(relay_live.is_file());
     fs::remove_dir_all(root).unwrap();
 }

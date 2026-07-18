@@ -32,8 +32,8 @@ use commonkit_reconcile::{
     Adapter, PlanStore, PlanStoreError, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
 };
 use commonkit_relay::{
-    HttpUpstreamManager, RelayAdapter, RelayLifecycleControl, RelayMutationInputs,
-    RelayPlanRequest, RelayRuntime, ResolvedMcpDeclarations, converge_provider_mcp,
+    DownstreamRequest, HttpUpstreamManager, PeerAddress, RelayAdapter, RelayLifecycleControl,
+    RelayMutationInputs, RelayPlanRequest, RelayRuntime, ResolvedMcpDeclarations, converge_provider_mcp,
     plan_relay_operation,
 };
 use futures_util::StreamExt;
@@ -405,6 +405,56 @@ impl ManagedRelayRuntime {
             runtime: std::sync::Mutex::new(None),
         }
     }
+
+    fn handle(&self, authorization: Option<&str>, body: &Value) -> Result<Value, &'static str> {
+        let expected = format!("Bearer {}", self.token);
+        if authorization != Some(expected.as_str()) { return Err("unauthorized"); }
+        let method = body.get("method").and_then(Value::as_str);
+        match method {
+            Some("initialize") => return Ok(serde_json::json!({
+                "protocolVersion": body.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or("2025-06-18"),
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": {"name": "commonkit-relay", "version": env!("CARGO_PKG_VERSION")}
+            })),
+            Some("notifications/initialized") | Some("ping") => return Ok(serde_json::json!({})),
+            _ => {}
+        }
+        let request = match method {
+            Some("tools/list") => DownstreamRequest::ListTools,
+            Some("tools/call") => DownstreamRequest::CallTool {
+                name: body.pointer("/params/name").and_then(Value::as_str).ok_or("invalid_request")?.into(),
+                arguments: body.pointer("/params/arguments").cloned().unwrap_or_else(|| serde_json::json!({})),
+            },
+            _ => return Err("method_not_found"),
+        };
+        let runtime = self.runtime.lock().map_err(|_| "relay_unavailable")?;
+        let runtime = runtime.as_ref().ok_or("relay_unconfigured")?;
+        runtime.handle(PeerAddress::Loopback, authorization, request).map_err(|error| match error.code() {
+            commonkit_relay::RelayErrorCode::Unauthorized => "unauthorized",
+            commonkit_relay::RelayErrorCode::Forbidden => "forbidden",
+            commonkit_relay::RelayErrorCode::ToolNotFound => "tool_not_found",
+            commonkit_relay::RelayErrorCode::UpstreamUnavailable => "upstream_unavailable",
+            commonkit_relay::RelayErrorCode::InvalidState => "relay_invalid_state",
+        })
+    }
+}
+
+async fn relay_mcp(
+    State(runtime): State<Arc<ManagedRelayRuntime>>, headers: HeaderMap, Json(body): Json<Value>,
+) -> Response {
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
+    let authorization = headers.get(header::AUTHORIZATION).and_then(|value| value.to_str().ok());
+    match runtime.handle(authorization, &body) {
+        Ok(result) => Json(serde_json::json!({"jsonrpc":"2.0", "id":id, "result":result})).into_response(),
+        Err(code) => {
+            let status = match code { "unauthorized" => StatusCode::UNAUTHORIZED, "relay_unconfigured" => StatusCode::SERVICE_UNAVAILABLE, _ => StatusCode::BAD_REQUEST };
+            (status, Json(serde_json::json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32000,"message":code}}))).into_response()
+        }
+    }
+}
+
+fn relay_router(runtime: Arc<ManagedRelayRuntime>) -> Router {
+    Router::new().route("/mcp", post(relay_mcp)).with_state(runtime)
 }
 
 fn default_relay_runtime(token: &ControlToken) -> Arc<ManagedRelayRuntime> {
@@ -643,7 +693,14 @@ pub struct LocalPlanExecutor {
     receipt_store: ReceiptStore,
     target_root: PathBuf,
     adapter_state: PathBuf,
+    relay: Option<RelayExecutorConfig>,
     execution_lock: std::sync::Mutex<()>,
+}
+
+struct RelayExecutorConfig {
+    live: PathBuf,
+    state: PathBuf,
+    lifecycle: Arc<dyn RelayLifecycleControl>,
 }
 
 impl LocalPlanExecutor {
@@ -658,8 +715,28 @@ impl LocalPlanExecutor {
             receipt_store: ReceiptStore::open(receipt_root)?,
             target_root: target_root.as_ref().to_path_buf(),
             adapter_state: adapter_state.as_ref().to_path_buf(),
+            relay: None,
             execution_lock: std::sync::Mutex::new(()),
         })
+    }
+
+    pub fn with_relay(
+        mut self, live: impl AsRef<Path>, state: impl AsRef<Path>,
+        lifecycle: Arc<dyn RelayLifecycleControl>,
+    ) -> Self {
+        self.relay = Some(RelayExecutorConfig { live: live.as_ref().into(), state: state.as_ref().into(), lifecycle });
+        self
+    }
+
+    fn adapters(&self) -> Result<Vec<Box<dyn Adapter>>, LocalExecutionError> {
+        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FileAdapter::open(&self.target_root, &self.adapter_state)?)];
+        if let Some(relay) = &self.relay {
+            adapters.push(Box::new(
+                RelayAdapter::open(stable_code("relay"), &relay.live, &relay.state)?
+                    .with_lifecycle(relay.lifecycle.clone()),
+            ));
+        }
+        Ok(adapters)
     }
 
     /// Recovers every non-terminal run from durable receipts without resolving
@@ -695,8 +772,7 @@ impl LocalPlanExecutor {
         run_id: StableId,
         plan: &Plan,
     ) -> Result<ReconcileOutcome, LocalExecutionError> {
-        let adapter = FileAdapter::open(&self.target_root, &self.adapter_state)?;
-        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter)];
+        let mut adapters = self.adapters()?;
         Ok(Reconciler::with_store(&self.receipt_store).recover_run(run_id, plan, &mut adapters)?)
     }
 
@@ -722,8 +798,7 @@ impl LocalPlanExecutor {
             Err(ReceiptError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
         }
-        let adapter = FileAdapter::open(&self.target_root, &self.adapter_state)?;
-        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter)];
+        let mut adapters = self.adapters()?;
         Ok(Reconciler::with_store(&self.receipt_store).execute(&durable, run_id, &mut adapters)?)
     }
 }
@@ -1889,11 +1964,38 @@ pub struct BoundServer {
     application: Router,
     discovery_path: std::path::PathBuf,
     discovery: DaemonDiscovery,
+    relay: Option<(tokio::net::TcpListener, Router)>,
+    relay_address: Option<SocketAddr>,
 }
 
 impl BoundServer {
     pub async fn bind(
         address: SocketAddr,
+        token: ControlToken,
+        status: Arc<RwLock<ServiceStatus>>,
+        events: EventHub,
+        discovery_path: impl AsRef<Path>,
+    ) -> Result<Self, ServiceError> {
+        Self::bind_inner(address, None, token, status, events, discovery_path).await
+    }
+
+    pub async fn bind_with_relay_address(
+        address: SocketAddr,
+        relay_address: SocketAddr,
+        token: ControlToken,
+        status: Arc<RwLock<ServiceStatus>>,
+        events: EventHub,
+        discovery_path: impl AsRef<Path>,
+    ) -> Result<Self, ServiceError> {
+        if !relay_address.ip().is_loopback() {
+            return Err(ServiceError::NonLoopbackBind(relay_address.ip()));
+        }
+        Self::bind_inner(address, Some(relay_address), token, status, events, discovery_path).await
+    }
+
+    async fn bind_inner(
+        address: SocketAddr,
+        relay_address: Option<SocketAddr>,
         token: ControlToken,
         status: Arc<RwLock<ServiceStatus>>,
         events: EventHub,
@@ -1921,14 +2023,10 @@ impl BoundServer {
             token.expose_for_client().into(),
             paths.config.join("relay.json"),
         ));
-        let executor = RelayPlanExecutor::open(
-            plan_store.clone(),
-            &paths.receipts,
-            paths.config.join("relay.json"),
-            paths.state.join("relay"),
-            relay_runtime.clone(),
-        )
-        .map_err(|_| ServiceError::UnsafeDiscoveryPath)?;
+        let executor = LocalPlanExecutor::open(
+            plan_store.clone(), &paths.receipts, &paths.config, paths.state.join("filesystem"),
+        ).map_err(|_| ServiceError::UnsafeDiscoveryPath)?
+        .with_relay(paths.config.join("relay.json"), paths.state.join("relay"), relay_runtime.clone());
         let control = ControlPlane::with_plan_store(Arc::new(executor), plan_store);
         control.set_scheduler_store(Arc::new(
             SchedulerStore::open(
@@ -1946,13 +2044,20 @@ impl BoundServer {
             local.to_string(),
             events,
             control,
-            relay_runtime,
+            relay_runtime.clone(),
         );
+        let relay = match relay_address {
+            Some(address) => Some((tokio::net::TcpListener::bind(address).await?, relay_router(relay_runtime))),
+            None => None,
+        };
+        let relay_address = relay.as_ref().and_then(|(listener, _)| listener.local_addr().ok());
         Ok(Self {
             listener,
             application,
             discovery_path: discovery_path.as_ref().to_path_buf(),
             discovery,
+            relay,
+            relay_address,
         })
     }
 
@@ -1960,14 +2065,20 @@ impl BoundServer {
         &self.discovery
     }
 
+    pub fn relay_address(&self) -> Option<SocketAddr> { self.relay_address }
+
     pub async fn run_until<F>(self, shutdown: F) -> Result<(), ServiceError>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let discovery_path = self.discovery_path.clone();
+        let relay_task = self.relay.map(|(listener, application)| tokio::spawn(async move {
+            axum::serve(listener, application).await
+        }));
         let result = axum::serve(self.listener, self.application)
             .with_graceful_shutdown(shutdown)
             .await;
+        if let Some(task) = relay_task { task.abort(); }
         match std::fs::remove_file(discovery_path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
