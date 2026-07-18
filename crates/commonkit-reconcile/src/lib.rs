@@ -647,6 +647,28 @@ impl ReceiptStore {
         })
     }
 
+    /// Returns every durably recorded run identifier in stable order.
+    ///
+    /// Invalid directory names fail closed: callers must not silently skip a
+    /// receipt that may require recovery.
+    pub fn run_ids(&self) -> Result<Vec<StableId>, ReceiptError> {
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                return Err(ReceiptError::InvalidRunDirectory);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| ReceiptError::InvalidRunDirectory)?;
+            ids.push(StableId::parse(name).map_err(|_| ReceiptError::InvalidRunDirectory)?);
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     pub fn persist(&self, journal: &ReceiptJournal) -> Result<(), ReceiptError> {
         journal.verify_chain()?;
         let receipt = journal.receipt();
@@ -862,6 +884,8 @@ pub enum ReceiptError {
     SnapshotGap,
     #[error("receipt snapshots contain conflicting history")]
     ConflictingHistory,
+    #[error("receipt store contains an invalid run directory")]
+    InvalidRunDirectory,
     #[error(
         "stale receipt write at sequence {attempted_sequence}; persisted sequence is {persisted_sequence}"
     )]

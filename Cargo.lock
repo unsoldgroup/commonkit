@@ -420,6 +420,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "clap",
+ "commonkit-adapters",
  "commonkit-contracts",
  "commonkit-core",
  "commonkit-platform",

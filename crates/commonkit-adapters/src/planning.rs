@@ -14,6 +14,7 @@ use crate::{
 
 pub struct ProviderPlanRequest<'a> {
     pub target_id: StableId,
+    pub target_identity_digest: Sha256Digest,
     pub composed_loadout_digest: Sha256Digest,
     pub observed_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
@@ -109,6 +110,7 @@ pub fn build_provider_plan(
         observed_digest: request.observed_digest,
         policy_digest: request.policy_digest,
         bindings: PlanBindings {
+            target_identity_digest: request.target_identity_digest,
             composed_loadout_digest: request.composed_loadout_digest,
             provider_inputs_digest,
             ownership_map_digest,

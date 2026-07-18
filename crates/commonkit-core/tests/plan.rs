@@ -32,6 +32,7 @@ fn operation(adapter: &str, resource: &str, summary: &str) -> OperationDraft {
 
 fn bindings() -> PlanBindings {
     PlanBindings {
+        target_identity_digest: digest('3'),
         composed_loadout_digest: digest('4'),
         provider_inputs_digest: digest('5'),
         ownership_map_digest: digest('6'),
@@ -78,6 +79,13 @@ fn plan_id_and_order_are_independent_of_input_enumeration() {
     let mut changed = draft(left.operations.clone());
     changed.bindings.provider_inputs_digest = digest('8');
     assert_ne!(left.id, build_plan(changed).expect("changed bindings").id);
+
+    let mut changed = draft(left.operations.clone());
+    changed.bindings.target_identity_digest = digest('9');
+    assert_ne!(
+        left.id,
+        build_plan(changed).expect("changed target identity").id
+    );
 }
 
 #[test]

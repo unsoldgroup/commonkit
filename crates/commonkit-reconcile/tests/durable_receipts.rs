@@ -11,6 +11,7 @@ fn digest(character: char) -> Sha256Digest {
 
 fn bindings() -> PlanBindings {
     PlanBindings {
+        target_identity_digest: digest('3'),
         composed_loadout_digest: digest('4'),
         provider_inputs_digest: digest('5'),
         ownership_map_digest: digest('6'),

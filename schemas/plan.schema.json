@@ -87,9 +87,13 @@
         },
         "providerInputsDigest": {
           "type": "string"
+        },
+        "targetIdentityDigest": {
+          "type": "string"
         }
       },
       "required": [
+        "targetIdentityDigest",
         "composedLoadoutDigest",
         "providerInputsDigest",
         "ownershipMapDigest",

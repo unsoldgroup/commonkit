@@ -8,6 +8,7 @@ mod native;
 mod planning;
 mod provider;
 mod resources;
+mod target;
 
 pub use apm::{ApmProvider, ApmProviderConfig};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
@@ -24,4 +25,8 @@ pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
     OwnershipRules, ResourceError, ResourceProvenance, SafeSymlinkTarget,
     materialized_resources_digest, validate_ownership,
+};
+pub use target::{
+    LocalTargetFilesystem, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
+    TargetFilesystem, TargetFilesystemError,
 };

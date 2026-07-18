@@ -23,6 +23,7 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
 
 fn bindings() -> PlanBindings {
     PlanBindings {
+        target_identity_digest: digest(b"target"),
         composed_loadout_digest: digest(b"loadout"),
         provider_inputs_digest: digest(b"inputs"),
         ownership_map_digest: digest(b"ownership"),

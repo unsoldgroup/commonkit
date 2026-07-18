@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,13 +17,16 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use commonkit_adapters::FileAdapter;
 use commonkit_contracts::{
-    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan,
+    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan, ReceiptState,
     RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
     assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, build_plan};
-use commonkit_reconcile::{PlanStore, PlanStoreError};
+use commonkit_reconcile::{
+    Adapter, PlanStore, PlanStoreError, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
+};
 use futures_util::StreamExt;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -351,6 +354,174 @@ pub struct ExecutionResult {
 
 pub trait PlanExecutor: Send + Sync + 'static {
     fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult;
+}
+
+/// Executes approved local plans through CommonKit's durable reconciliation
+/// state machine. Provider code is never invoked here: every operation must
+/// already reference materialized artifacts reconstructable by the adapter.
+pub struct LocalPlanExecutor {
+    plan_store: Arc<PlanStore>,
+    receipt_store: ReceiptStore,
+    target_root: PathBuf,
+    adapter_state: PathBuf,
+    execution_lock: std::sync::Mutex<()>,
+}
+
+impl LocalPlanExecutor {
+    pub fn open(
+        plan_store: Arc<PlanStore>,
+        receipt_root: impl AsRef<Path>,
+        target_root: impl AsRef<Path>,
+        adapter_state: impl AsRef<Path>,
+    ) -> Result<Self, LocalExecutionError> {
+        Ok(Self {
+            plan_store,
+            receipt_store: ReceiptStore::open(receipt_root)?,
+            target_root: target_root.as_ref().to_path_buf(),
+            adapter_state: adapter_state.as_ref().to_path_buf(),
+            execution_lock: std::sync::Mutex::new(()),
+        })
+    }
+
+    /// Recovers every non-terminal run from durable receipts without resolving
+    /// providers, credentials, templates, or downloads again.
+    pub fn recover_pending(
+        &self,
+    ) -> Result<Vec<(StableId, ReconcileOutcome)>, LocalExecutionError> {
+        let _guard = self
+            .execution_lock
+            .lock()
+            .map_err(|_| LocalExecutionError::Lock)?;
+        let mut recovered = Vec::new();
+        for run_id in self.receipt_store.run_ids()? {
+            let receipt = self.receipt_store.load(run_id.clone())?;
+            if matches!(
+                receipt.receipt().state,
+                ReceiptState::Succeeded
+                    | ReceiptState::Canceled
+                    | ReceiptState::RolledBack
+                    | ReceiptState::RollbackFailed
+            ) {
+                continue;
+            }
+            let plan = self.plan_store.load(&receipt.receipt().plan_id)?;
+            let outcome = self.recover_one(run_id.clone(), &plan)?;
+            recovered.push((run_id, outcome));
+        }
+        Ok(recovered)
+    }
+
+    fn recover_one(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+    ) -> Result<ReconcileOutcome, LocalExecutionError> {
+        let adapter = FileAdapter::open(&self.target_root, &self.adapter_state)?;
+        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter)];
+        Ok(Reconciler::with_store(&self.receipt_store).recover_run(run_id, plan, &mut adapters)?)
+    }
+
+    fn execute_durable(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+    ) -> Result<ReconcileOutcome, LocalExecutionError> {
+        let durable = self.plan_store.load(&plan.id)?;
+        if durable != *plan {
+            return Err(LocalExecutionError::PlanMismatch);
+        }
+        let run_id = durable_run_id(&plan.id, confirmation_id)?;
+        match self.receipt_store.load(run_id.clone()) {
+            Ok(receipt) => match receipt.receipt().state {
+                ReceiptState::Succeeded => return Ok(ReconcileOutcome::Succeeded),
+                ReceiptState::Canceled => return Ok(ReconcileOutcome::Canceled),
+                ReceiptState::RolledBack => return Ok(ReconcileOutcome::RolledBack),
+                ReceiptState::RollbackFailed => return Ok(ReconcileOutcome::RollbackFailed),
+                _ => return self.recover_one(run_id, &durable),
+            },
+            Err(ReceiptError::NotFound(_)) => {}
+            Err(ReceiptError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let adapter = FileAdapter::open(&self.target_root, &self.adapter_state)?;
+        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter)];
+        Ok(Reconciler::with_store(&self.receipt_store).execute(&durable, run_id, &mut adapters)?)
+    }
+}
+
+impl PlanExecutor for LocalPlanExecutor {
+    fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult {
+        let result = self
+            .execution_lock
+            .lock()
+            .map_err(|_| LocalExecutionError::Lock)
+            .and_then(|_guard| self.execute_durable(plan, confirmation_id));
+        match result {
+            Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
+                status: ApplyStatus::Succeeded,
+                failure_code: None,
+            },
+            Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
+                status: ApplyStatus::RolledBack,
+                failure_code: None,
+            },
+            Ok(ReconcileOutcome::RollbackFailed) => ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("rollback_failed")),
+            },
+            Err(error) => ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(error.code()),
+            },
+        }
+    }
+}
+
+fn durable_run_id(
+    plan_id: &Sha256Digest,
+    confirmation_id: &StableId,
+) -> Result<StableId, commonkit_contracts::ContractError> {
+    let digest = digest_domain_json(
+        "commonkit.local-run.v1",
+        &serde_json::json!({ "planId": plan_id, "confirmationId": confirmation_id }),
+    )?;
+    StableId::parse(format!("run-{}", &digest.as_str()[7..63]))
+}
+
+fn stable_code(value: &str) -> StableId {
+    StableId::parse(value).expect("static failure code")
+}
+
+#[derive(Debug, Error)]
+pub enum LocalExecutionError {
+    #[error("the supplied plan does not match durable approved content")]
+    PlanMismatch,
+    #[error("the local execution lock is poisoned")]
+    Lock,
+    #[error(transparent)]
+    Contract(#[from] commonkit_contracts::ContractError),
+    #[error(transparent)]
+    PlanStore(#[from] PlanStoreError),
+    #[error(transparent)]
+    Receipt(#[from] ReceiptError),
+    #[error(transparent)]
+    Reconcile(#[from] commonkit_reconcile::ReconcileError),
+    #[error(transparent)]
+    Adapter(#[from] commonkit_adapters::FileAdapterError),
+}
+
+impl LocalExecutionError {
+    fn code(&self) -> StableId {
+        stable_code(match self {
+            Self::PlanMismatch => "stale_plan",
+            Self::Lock => "executor_unavailable",
+            Self::PlanStore(_) => "plan_invalid",
+            Self::Receipt(_) => "receipt_invalid",
+            Self::Reconcile(_) => "reconcile_failed",
+            Self::Adapter(_) => "adapter_unavailable",
+            Self::Contract(_) => "contract_invalid",
+        })
+    }
 }
 
 struct UnavailableExecutor;

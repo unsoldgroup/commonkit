@@ -25,6 +25,7 @@ fn plan() -> commonkit_contracts::Plan {
         observed_digest: digest('b'),
         policy_digest: digest('c'),
         bindings: PlanBindings {
+            target_identity_digest: digest('3'),
             composed_loadout_digest: digest('d'),
             provider_inputs_digest: digest('e'),
             ownership_map_digest: digest('f'),

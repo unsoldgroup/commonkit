@@ -1,9 +1,15 @@
 //! CommonKit composition, policy, and planning primitives.
 
+mod target;
+
 use std::{collections::BTreeSet, sync::OnceLock};
 
 pub use commonkit_contracts::*;
 use regex::Regex;
+pub use target::{
+    CaseSensitivity, OperatingSystem, PlatformFacts, RootAccess, TargetInventory,
+    TargetInventoryError, TargetRoot, TargetTransport,
+};
 use thiserror::Error;
 
 #[derive(Debug, Clone)]

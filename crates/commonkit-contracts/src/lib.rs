@@ -524,6 +524,7 @@ pub struct Operation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlanBindings {
+    pub target_identity_digest: Sha256Digest,
     pub composed_loadout_digest: Sha256Digest,
     pub provider_inputs_digest: Sha256Digest,
     pub ownership_map_digest: Sha256Digest,
