@@ -77,7 +77,7 @@ impl ChezmoiProvider {
                 .file_name()
                 .and_then(|value| value.to_str())
                 .unwrap_or("");
-            let capability = if name.starts_with("run_") {
+            let capability = if name.starts_with("run_") || name == ".chezmoiscripts" {
                 Some("script")
             } else if name.starts_with("modify_") {
                 Some("modify")
@@ -141,11 +141,11 @@ impl ChezmoiProvider {
                 ProviderFailure::Inspect(format!("could not execute chezmoi: {error}"))
             })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success()
-            || !stdout
-                .split_whitespace()
-                .any(|word| word == CHEZMOI_VERSION)
-        {
+        let reported_version = stdout
+            .strip_prefix("chezmoi version ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(|word| word.trim_start_matches('v').trim_end_matches(','));
+        if !output.status.success() || reported_version != Some(CHEZMOI_VERSION) {
             return Err(ProviderFailure::Inspect(format!(
                 "chezmoi {CHEZMOI_VERSION} is required; install the exact pinned release"
             )));
@@ -222,18 +222,23 @@ impl DesiredStateProvider for ChezmoiProvider {
                 ))
             })?;
         }
-        for directory in [
-            &destination,
-            &self.cache,
-            &self.persistent_state,
-            &self.working_tree,
-        ] {
+        for directory in [&destination, &self.cache, &self.working_tree] {
             fs::create_dir_all(directory).map_err(|error| {
                 ProviderFailure::Materialize(format!(
                     "could not create isolated provider path: {error}"
                 ))
             })?;
         }
+        let state_parent = self.persistent_state.parent().ok_or_else(|| {
+            ProviderFailure::Materialize(
+                "chezmoi persistent-state path requires an isolated parent directory".into(),
+            )
+        })?;
+        fs::create_dir_all(state_parent).map_err(|error| {
+            ProviderFailure::Materialize(format!(
+                "could not create isolated persistent-state parent: {error}"
+            ))
+        })?;
         let status = Command::new(&self.executable)
             .arg("--source")
             .arg(&self.source)

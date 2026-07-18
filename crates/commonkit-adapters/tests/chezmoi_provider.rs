@@ -76,6 +76,29 @@ fn materializes_only_into_isolated_destination_with_fixed_flags() {
 }
 
 #[test]
+fn accepts_the_official_pinned_version_output_and_rejects_other_versions() {
+    let fixture = Fixture::new("official-version");
+    fs::write(
+        &fixture.version_output,
+        "chezmoi version v2.70.4, commit 64583685c5eb36e10670bad076d5406a08baf751, built at 2026-05-19T22:47:23Z, built by goreleaser\n",
+    )
+    .unwrap();
+    fixture.provider().inspect_inputs(&context()).unwrap();
+
+    fs::write(
+        &fixture.version_output,
+        "chezmoi version v2.70.40, commit malicious\n",
+    )
+    .unwrap();
+    let error = fixture
+        .provider()
+        .inspect_inputs(&context())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("2.70.4 is required"), "{error}");
+}
+
+#[test]
 fn rejects_unsafe_source_features_before_starting_a_process() {
     let cases = [
         ("run_before_setup.sh", "script"),
@@ -84,6 +107,8 @@ fn rejects_unsafe_source_features_before_starting_a_process() {
         ("create_token", "create"),
         ("exact_dot_config", "exact_directory"),
         ("encrypted.age", "encrypted_source"),
+        (".chezmoiscripts", "script"),
+        (".chezmoiexternals", "external"),
         ("dot_config.tmpl", "destination_dependent_template"),
     ];
     for (name, capability) in cases {
@@ -112,6 +137,69 @@ fn rejects_unsafe_source_features_before_starting_a_process() {
             "provider process started for {name}"
         );
     }
+}
+
+#[test]
+#[ignore = "requires COMMONKIT_CHEZMOI_2_70_4 pointing to the official pinned binary"]
+fn real_chezmoi_release_materializes_supported_fixtures_deterministically() {
+    let executable = std::env::var_os("COMMONKIT_CHEZMOI_2_70_4")
+        .expect("set COMMONKIT_CHEZMOI_2_70_4 to the official chezmoi 2.70.4 binary");
+    let fixture = Fixture::new("real-release");
+    fs::write(fixture.source.join("dot_regular"), "regular\n").unwrap();
+    fs::write(fixture.source.join("executable_dot_tool"), "#!/bin/sh\n").unwrap();
+    fs::write(fixture.source.join("private_dot_secret"), "private\n").unwrap();
+    fs::write(fixture.source.join("readonly_dot_readonly"), "readonly\n").unwrap();
+    fs::create_dir(fixture.source.join("dot_config")).unwrap();
+    fs::write(fixture.source.join("dot_config/app"), "app\n").unwrap();
+    fs::write(fixture.source.join("symlink_dot_link"), ".regular\n").unwrap();
+    fs::write(
+        fixture.source.join("dot_machine.tmpl"),
+        "{{ .chezmoi.os }}-{{ .chezmoi.arch }}\n",
+    )
+    .unwrap();
+    fs::write(fixture.source.join("dot_ignored"), "ignored\n").unwrap();
+    fs::write(fixture.source.join(".chezmoiignore"), ".ignored\n").unwrap();
+
+    let provider = fixture.provider_with_executable(PathBuf::from(executable));
+    let first = provider
+        .materialize(&context(), &fixture.workspace(), &fixture.artifacts())
+        .unwrap();
+    let second = provider
+        .materialize(&context(), &fixture.workspace(), &fixture.artifacts())
+        .unwrap();
+    assert_eq!(first.digest, second.digest);
+    assert!(first.resources.iter().any(|resource| matches!(
+        &resource.intent,
+        FilesystemIntent::Symlink { path, target, .. }
+            if path.as_str() == "home/.link" && target.as_str() == ".regular"
+    )));
+    assert!(
+        !first
+            .resources
+            .iter()
+            .any(|resource| { resource.intent.path().as_str() == "home/.ignored" })
+    );
+    for (path, expected_mode) in [
+        ("home/.regular", 0o644),
+        ("home/.tool", 0o755),
+        ("home/.secret", 0o600),
+        ("home/.readonly", 0o444),
+    ] {
+        assert!(
+            first.resources.iter().any(|resource| matches!(
+                &resource.intent,
+                FilesystemIntent::File { path: actual, mode: Some(mode), .. }
+                    if actual.as_str() == path && mode.value() == expected_mode
+            )),
+            "missing {path} with mode {expected_mode:o}"
+        );
+    }
+    assert!(first.resources.iter().any(|resource| matches!(
+        &resource.intent,
+        FilesystemIntent::Directory { path, exact: false, .. }
+            if path.as_str() == "home/.config"
+    )));
+    assert_eq!(fs::read_dir(&fixture.live).unwrap().count(), 0);
 }
 
 #[test]
@@ -185,6 +273,7 @@ struct Fixture {
     config: PathBuf,
     executable: PathBuf,
     calls: PathBuf,
+    version_output: PathBuf,
     live: PathBuf,
 }
 
@@ -195,18 +284,20 @@ impl Fixture {
         let config = root.join("chezmoi.toml");
         let executable = root.join("fake-chezmoi");
         let calls = root.join("calls");
+        let version_output = root.join("version-output");
         let live = root.join("live");
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(root.join("stage")).unwrap();
         fs::create_dir_all(&live).unwrap();
         fs::write(&config, "[data]\n").unwrap();
+        fs::write(&version_output, "chezmoi version v2.70.4\n").unwrap();
         fs::write(
             &executable,
             format!(
                 r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
   printf '%s\n' "$*" >> '{}'
-  echo 'chezmoi version 2.70.4'
+  cat '{}'
   exit 0
 fi
 printf '%s\n' "$*" >> '{}'
@@ -227,6 +318,7 @@ find "$dest" -name 'dot_*' | while read path; do
 done
 "#,
                 calls.display(),
+                version_output.display(),
                 calls.display()
             ),
         )
@@ -238,13 +330,18 @@ done
             config,
             executable,
             calls,
+            version_output,
             live,
         }
     }
 
     fn provider(&self) -> ChezmoiProvider {
+        self.provider_with_executable(self.executable.clone())
+    }
+
+    fn provider_with_executable(&self, executable: PathBuf) -> ChezmoiProvider {
         ChezmoiProvider::new(
-            &self.executable,
+            executable,
             &self.source,
             &self.config,
             self.root.join("stage/cache"),
@@ -255,7 +352,7 @@ done
     }
 
     fn workspace(&self) -> ProviderWorkspace {
-        ProviderWorkspace::open(self.root.join("stage"), &[self.live.clone()]).unwrap()
+        ProviderWorkspace::open(self.root.join("stage"), std::slice::from_ref(&self.live)).unwrap()
     }
 
     fn artifacts(&self) -> ArtifactStore {
