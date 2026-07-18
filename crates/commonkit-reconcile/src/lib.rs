@@ -1,5 +1,13 @@
 //! Transaction receipts and reconciliation state machine.
 
+mod skill_deployment;
+
+pub use skill_deployment::{
+    ApmCompilation, ApmCompiler, PreparedSkillDeployment, SkillDeploymentError,
+    SkillDeploymentLineage, SkillDeploymentReceipt, SkillDeploymentRequest,
+    SkillDeploymentRollbackReceipt, SkillDeploymentState, SkillDeploymentWorkflow,
+};
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -11,7 +19,7 @@ use commonkit_contracts::{
     Sha256Digest, StableId, canonical_json, digest_domain_json,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 static PLAN_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -340,7 +348,8 @@ pub trait Adapter {
     fn rollback(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReconcileOutcome {
     Succeeded,
     Canceled,
@@ -661,6 +670,10 @@ pub enum ReconcileError {
 }
 
 impl ReceiptStore {
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ReceiptError> {
         fs::create_dir_all(root.as_ref())?;
         sync_directory(root.as_ref())?;
