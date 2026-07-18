@@ -597,6 +597,45 @@ pub struct RunReceipt {
     pub transitions: Vec<ReceiptTransition>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticState {
+    Healthy,
+    Drifted,
+    Blocked,
+    Applying,
+    Degraded,
+    Offline,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeDiagnostic {
+    pub version: String,
+    pub operating_system: String,
+    pub architecture: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ComponentDiagnostic {
+    pub id: StableId,
+    pub state: DiagnosticState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<StableId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DiagnosticBundle {
+    pub schema_version: SchemaVersion,
+    pub contract_version: String,
+    pub generated_at_unix_ms: u64,
+    pub runtime: RuntimeDiagnostic,
+    pub overall_state: DiagnosticState,
+    pub components: Vec<ComponentDiagnostic>,
+}
+
 pub fn layer_schema() -> Result<Value, ContractError> {
     let mut schema = serde_json::to_value(schema_for!(LayerDocument))
         .map_err(|_| ContractError::SchemaGeneration)?;
@@ -663,6 +702,13 @@ pub fn receipt_schema() -> Result<Value, ContractError> {
     schema_with_id(
         schema_for!(RunReceipt),
         "https://schemas.commonkit.dev/v1/receipt.schema.json",
+    )
+}
+
+pub fn diagnostics_schema() -> Result<Value, ContractError> {
+    schema_with_id(
+        schema_for!(DiagnosticBundle),
+        "https://schemas.commonkit.dev/v1/diagnostics.schema.json",
     )
 }
 

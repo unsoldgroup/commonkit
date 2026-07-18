@@ -18,7 +18,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use commonkit_contracts::{
-    CONTRACT_VERSION, Plan, SCHEMA_VERSION, Sha256Digest, StableId, digest_domain_json,
+    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan,
+    RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
+    assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, build_plan};
 use futures_util::StreamExt;
@@ -240,6 +242,7 @@ pub fn router_with_control(
         .route("/control/v1/status", get(get_status))
         .route("/control/v1/health", get(health))
         .route("/control/v1/events", get(get_events))
+        .route("/control/v1/diagnostics", get(get_diagnostics))
         .route("/control/v1/plans", post(register_plan))
         .route("/control/v1/plans/{id}", get(get_plan))
         .route("/control/v1/plans/{id}/apply", post(apply_plan))
@@ -651,6 +654,13 @@ impl ApiError {
             code,
         }
     }
+
+    fn internal(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code,
+        }
+    }
 }
 
 impl From<ControlError> for ApiError {
@@ -858,6 +868,63 @@ impl BoundServer {
 
 async fn get_status(State(state): State<ApiState>) -> Json<ServiceStatus> {
     Json(state.status.read().await.clone())
+}
+
+async fn get_diagnostics(
+    State(state): State<ApiState>,
+) -> Result<Json<DiagnosticBundle>, ApiError> {
+    let status = state.status.read().await.clone();
+    let generated_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ApiError::internal("clock_unavailable"))?
+        .as_millis()
+        .try_into()
+        .map_err(|_| ApiError::internal("clock_overflow"))?;
+    let scheduler_code = status
+        .last_drift_error_code
+        .as_deref()
+        .and_then(|code| StableId::parse(code).ok());
+    let bundle = DiagnosticBundle {
+        schema_version: SchemaVersion(SCHEMA_VERSION),
+        contract_version: CONTRACT_VERSION.into(),
+        generated_at_unix_ms,
+        runtime: RuntimeDiagnostic {
+            version: env!("CARGO_PKG_VERSION").into(),
+            operating_system: std::env::consts::OS.into(),
+            architecture: std::env::consts::ARCH.into(),
+        },
+        overall_state: diagnostic_state(status.state),
+        components: vec![
+            ComponentDiagnostic {
+                id: StableId::parse("daemon").expect("static stable ID"),
+                state: DiagnosticState::Healthy,
+                code: None,
+            },
+            ComponentDiagnostic {
+                id: StableId::parse("drift_scheduler").expect("static stable ID"),
+                state: if scheduler_code.is_some() {
+                    DiagnosticState::Degraded
+                } else {
+                    diagnostic_state(status.state)
+                },
+                code: scheduler_code,
+            },
+        ],
+    };
+    let value = serde_json::to_value(&bundle).map_err(|_| ApiError::internal("serialization"))?;
+    assert_no_embedded_secrets(&value).map_err(|_| ApiError::internal("redaction_failed"))?;
+    Ok(Json(bundle))
+}
+
+fn diagnostic_state(state: OverallState) -> DiagnosticState {
+    match state {
+        OverallState::Healthy => DiagnosticState::Healthy,
+        OverallState::Drifted => DiagnosticState::Drifted,
+        OverallState::Blocked => DiagnosticState::Blocked,
+        OverallState::Applying => DiagnosticState::Applying,
+        OverallState::Degraded => DiagnosticState::Degraded,
+        OverallState::Offline => DiagnosticState::Offline,
+    }
 }
 
 async fn health() -> StatusCode {
