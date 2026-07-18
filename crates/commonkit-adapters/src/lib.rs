@@ -4,6 +4,8 @@ mod apm;
 mod artifacts;
 mod chezmoi;
 mod files;
+mod native;
+mod planning;
 mod provider;
 mod resources;
 
@@ -11,6 +13,8 @@ pub use apm::{ApmProvider, ApmProviderConfig};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
 pub use chezmoi::ChezmoiProvider;
 pub use files::{FileAdapter, FileAdapterError, FileIntent, ManagedRelativePath};
+pub use native::NativeProvider;
+pub use planning::{ProviderPlanError, ProviderPlanRequest, build_provider_plan};
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,
     ProviderContext, ProviderContractError, ProviderFailure, ProviderInputs, ProviderWorkspace,

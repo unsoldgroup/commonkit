@@ -268,9 +268,6 @@ impl FileAdapter {
         intent: FilesystemIntent,
     ) -> Result<Operation, FileAdapterError> {
         validate_semantic_intent(&intent)?;
-        if matches!(intent, FilesystemIntent::File { .. }) {
-            return Err(FileAdapterError::UnsupportedResource);
-        }
         let observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())?;
         let before_digest = semantic_digest(&observed)?;
         let expected = match &intent {
@@ -305,7 +302,7 @@ impl FileAdapter {
             FilesystemIntent::Directory { .. } => "directory",
             FilesystemIntent::Symlink { .. } => "symlink",
             FilesystemIntent::Remove { .. } => "removal",
-            FilesystemIntent::File { .. } => unreachable!(),
+            FilesystemIntent::File { .. } => "filesystem-file",
         };
         let operation = finalize_operation(OperationDraft {
             adapter_id: self.id.clone(),
@@ -337,6 +334,21 @@ impl FileAdapter {
         )?;
         self.resources.insert(operation.id.clone(), intent);
         Ok(operation)
+    }
+
+    /// Registers provider output after copying and verifying its content in the
+    /// adapter's durable artifact store. Planning never writes the live target.
+    pub fn register_materialized_resource(
+        &mut self,
+        id: StableId,
+        mut intent: FilesystemIntent,
+        provider_artifacts: &ArtifactStore,
+    ) -> Result<Operation, FileAdapterError> {
+        if let FilesystemIntent::File { content, .. } = &mut intent {
+            let bytes = provider_artifacts.load(content)?;
+            *content = self.artifacts.put(&bytes, content.sensitivity)?;
+        }
+        self.register_resource(id, intent)
     }
 
     fn semantic(&mut self, operation: &Operation) -> Result<FilesystemIntent, AdapterFailure> {
@@ -380,7 +392,7 @@ impl FileAdapter {
     fn is_semantic(operation: &Operation) -> bool {
         matches!(
             operation.resource.resource_type.as_str(),
-            "directory" | "symlink" | "removal"
+            "filesystem-file" | "directory" | "symlink" | "removal"
         )
     }
 }
@@ -417,14 +429,45 @@ impl FileAdapter {
         validate_no_symlink_ancestors(&self.target_root, intent.path().as_str())
             .map_err(|_| failure("unsafe_path", "managed resource has a symlink ancestor"))?;
         let path = self.target_root.join(intent.path().as_str());
+        if let FilesystemIntent::File { content, mode, .. } = &intent {
+            let bytes = self.artifacts.load(content).map_err(|_| {
+                failure(
+                    "artifact_invalid",
+                    "resource content artifact is missing or invalid",
+                )
+            })?;
+            remove_entry(&path)
+                .map_err(|_| failure("apply_failed", "could not clear managed resource"))?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|_| failure("apply_failed", "could not create resource parent"))?;
+            }
+            std::fs::write(&path, bytes)
+                .map_err(|_| failure("apply_failed", "could not materialize managed file"))?;
+            set_mode(&path, mode.as_ref().map(FileMode::value))
+                .map_err(|_| failure("apply_failed", "could not set managed file mode"))?;
+            return Ok(());
+        }
         apply_intent(&path, &intent)
             .map_err(|_| failure("apply_failed", "could not materialize managed resource"))
     }
 
     fn verify_semantic(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
         let intent = self.semantic(operation)?;
-        let actual = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
+        let mut actual = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
             .map_err(|_| failure("verify_failed", "could not inspect managed resource"))?;
+        if matches!(
+            &intent,
+            FilesystemIntent::File { mode: None, .. }
+                | FilesystemIntent::Directory { mode: None, .. }
+        ) {
+            match &mut actual {
+                ResourcePreimage::File { mode, .. } | ResourcePreimage::Directory { mode } => {
+                    *mode = None;
+                }
+                _ => {}
+            }
+        }
         let digest = semantic_digest(&actual)
             .map_err(|_| failure("verify_failed", "could not digest managed resource"))?;
         if digest == operation.after_digest {
@@ -794,10 +837,19 @@ fn apply_intent(path: &Path, intent: &FilesystemIntent) -> Result<(), std::io::E
             create_symlink(target.as_str(), path)
         }
         FilesystemIntent::Remove { .. } => remove_entry(path),
-        FilesystemIntent::File { .. } => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "semantic file registration is not implemented",
-        )),
+        FilesystemIntent::File { content, mode, .. } => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            remove_entry(path)?;
+            // The reference was integrity-checked and copied during registration;
+            // actual bytes are written by `apply_semantic`, which has store access.
+            let _ = (content, mode);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "file content requires adapter artifact access",
+            ))
+        }
     }
 }
 

@@ -328,6 +328,142 @@ pub struct RelayServerConfig {
     pub managed_by: ManagedBy,
 }
 
+/// Narrow, provider-neutral representation of resolved portable MCP declarations.
+///
+/// APM integrations may populate this DTO from documented manifest and lockfile
+/// fields. CommonKit deliberately does not import or expose provider internals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolvedMcpDeclarations {
+    pub contract_version: String,
+    pub declarations: Vec<PortableMcpDeclaration>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortableMcpDeclaration {
+    pub id: String,
+    pub name: String,
+    pub enabled: bool,
+    pub resolution: PortableMcpResolution,
+    pub provenance: McpDeclarationProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PortableMcpResolution {
+    StreamableHttp {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+    /// APM 0.25.0 does not document enough resolved registry state to safely
+    /// translate these entries without depending on Python internals.
+    RegistryReference { reference: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpDeclarationProvenance {
+    pub provider_id: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RelayClientConfig {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub transport_type: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConvergedRelayState {
+    pub relay: RelayConfig,
+    pub client: RelayClientConfig,
+    pub provenance: BTreeMap<RelayServerId, McpDeclarationProvenance>,
+}
+
+impl ConvergedRelayState {
+    /// Relay mutations always travel through CommonKit's plan-bound consent path.
+    pub fn requires_confirmation(&self) -> bool {
+        true
+    }
+}
+
+pub fn converge_provider_mcp(
+    resolved: ResolvedMcpDeclarations,
+) -> Result<ConvergedRelayState, RelayConvergenceError> {
+    if resolved.contract_version != "commonkit.resolved-mcp.v1" {
+        return Err(RelayConvergenceError::UnsupportedContractVersion);
+    }
+    let listen = RelayListenConfig {
+        host: "127.0.0.1".into(),
+        port: DEFAULT_PORT,
+        path: DEFAULT_MCP_PATH.into(),
+    };
+    let mut servers = Vec::with_capacity(resolved.declarations.len());
+    let mut provenance = BTreeMap::new();
+    for declaration in resolved.declarations {
+        if declaration.provenance.provider_id.trim().is_empty()
+            || declaration.provenance.source.trim().is_empty()
+        {
+            return Err(RelayConvergenceError::MissingProvenance);
+        }
+        let id = RelayServerId::parse(declaration.id)?;
+        let (url, headers) = match declaration.resolution {
+            PortableMcpResolution::StreamableHttp { url, headers } => (url, headers),
+            PortableMcpResolution::RegistryReference { .. } => {
+                return Err(RelayConvergenceError::ResolvedMcpInterfaceUnsupported);
+            }
+        };
+        validate_remote_url(&url)?;
+        if headers.values().any(|value| !is_secret_reference(value)) {
+            return Err(RelayConvergenceError::Config(
+                RelayConfigError::LiteralHeaderSecret,
+            ));
+        }
+        if provenance
+            .insert(id.clone(), declaration.provenance)
+            .is_some()
+        {
+            return Err(RelayConvergenceError::Config(
+                RelayConfigError::DuplicateServerId,
+            ));
+        }
+        servers.push(RelayServerConfig {
+            id,
+            name: declaration.name,
+            description: String::new(),
+            category: String::new(),
+            enabled: declaration.enabled,
+            mode: RelayMode::GenericCached,
+            remote: RelayRemoteConfig {
+                transport_type: "streamable_http".into(),
+                url,
+                headers,
+            },
+            env_file: None,
+            cache: RelayCacheConfig {
+                tools_ttl_ms: DEFAULT_TOOLS_TTL_MS,
+                auto_refresh_ms: DEFAULT_TOOLS_TTL_MS,
+            },
+            menu: None,
+            managed_by: ManagedBy::CommonKit,
+        });
+    }
+    servers.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(ConvergedRelayState {
+        relay: RelayConfig { listen, servers },
+        client: RelayClientConfig {
+            name: "commonkit-relay".into(),
+            transport_type: "streamable_http".into(),
+            url: format!("http://127.0.0.1:{DEFAULT_PORT}{DEFAULT_MCP_PATH}"),
+        },
+        provenance,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RelayConfig {
@@ -763,6 +899,20 @@ pub enum RelayConfigError {
     InvalidMenuAction,
     #[error("relay menu URL must be loopback HTTP or a display-only file URL")]
     NonLocalMenuUrl,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RelayConvergenceError {
+    #[error("resolved MCP declaration contract version is unsupported")]
+    UnsupportedContractVersion,
+    #[error("resolved MCP declaration provenance is required")]
+    MissingProvenance,
+    #[error(
+        "resolved_mcp_interface_unsupported: registry MCP entries require a documented provider export"
+    )]
+    ResolvedMcpInterfaceUnsupported,
+    #[error(transparent)]
+    Config(#[from] RelayConfigError),
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
