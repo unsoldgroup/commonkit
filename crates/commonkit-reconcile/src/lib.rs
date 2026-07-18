@@ -5,9 +5,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use commonkit_contracts::{
-    CONTRACT_VERSION, ContractError, ReceiptState, ReceiptTransition, RunReceipt, SCHEMA_VERSION,
-    SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
+    CONTRACT_VERSION, ContractError, Operation, Plan, ReceiptState, ReceiptTransition, RunReceipt,
+    SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
 };
+use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -97,6 +98,187 @@ impl ReceiptJournal {
 /// complete transition or the next complete transition, never a torn update.
 pub struct ReceiptStore {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterFailure {
+    pub code: String,
+    pub message: String,
+}
+
+impl AdapterFailure {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+}
+
+pub trait Adapter {
+    fn id(&self) -> &StableId;
+    fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
+    fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
+    fn verify(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
+    fn rollback(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileOutcome {
+    Succeeded,
+    Canceled,
+    RolledBack,
+    RollbackFailed,
+}
+
+impl ReconcileOutcome {
+    pub fn receipt_state(self) -> ReceiptState {
+        match self {
+            Self::Succeeded => ReceiptState::Succeeded,
+            Self::Canceled => ReceiptState::Canceled,
+            Self::RolledBack => ReceiptState::RolledBack,
+            Self::RollbackFailed => ReceiptState::RollbackFailed,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct Reconciler<'a> {
+    store: Option<&'a ReceiptStore>,
+}
+
+impl<'a> Reconciler<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_store(store: &'a ReceiptStore) -> Self {
+        Self { store: Some(store) }
+    }
+
+    pub fn execute(
+        &self,
+        plan: &Plan,
+        run_id: StableId,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        validate_plan(plan)?;
+        let mut journal = ReceiptJournal::new(
+            run_id,
+            plan.id.clone(),
+            plan.target_id.clone(),
+            plan.desired_digest.clone(),
+            plan.observed_digest.clone(),
+            plan.policy_digest.clone(),
+        )?;
+        self.persist(&journal)?;
+
+        for operation in &plan.operations {
+            let adapter = adapter_for(adapters, &operation.adapter_id)?;
+            if adapter.prepare(operation).is_err() {
+                journal.transition(ReceiptState::Canceled)?;
+                self.persist(&journal)?;
+                return Ok(ReconcileOutcome::Canceled);
+            }
+        }
+
+        journal.transition(ReceiptState::Applying)?;
+        self.persist(&journal)?;
+        let mut applied = Vec::new();
+        for operation in &plan.operations {
+            let adapter = adapter_for(adapters, &operation.adapter_id)?;
+            if adapter.apply(operation).is_err() {
+                return self.recover(&mut journal, &applied, adapters);
+            }
+            applied.push(operation.clone());
+        }
+
+        journal.transition(ReceiptState::Verifying)?;
+        self.persist(&journal)?;
+        for operation in &plan.operations {
+            let adapter = adapter_for(adapters, &operation.adapter_id)?;
+            if adapter.verify(operation).is_err() {
+                return self.recover(&mut journal, &applied, adapters);
+            }
+        }
+
+        journal.transition(ReceiptState::Succeeded)?;
+        self.persist(&journal)?;
+        Ok(ReconcileOutcome::Succeeded)
+    }
+
+    fn recover(
+        &self,
+        journal: &mut ReceiptJournal,
+        applied: &[Operation],
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        journal.transition(ReceiptState::RecoveryRequired)?;
+        self.persist(journal)?;
+        journal.transition(ReceiptState::RollingBack)?;
+        self.persist(journal)?;
+
+        let mut rollback_failed = false;
+        for operation in applied.iter().rev() {
+            let adapter = adapter_for(adapters, &operation.adapter_id)?;
+            if adapter.rollback(operation).is_err() {
+                rollback_failed = true;
+            }
+        }
+        let outcome = if rollback_failed {
+            ReconcileOutcome::RollbackFailed
+        } else {
+            ReconcileOutcome::RolledBack
+        };
+        journal.transition(outcome.receipt_state())?;
+        self.persist(journal)?;
+        Ok(outcome)
+    }
+
+    fn persist(&self, journal: &ReceiptJournal) -> Result<(), ReconcileError> {
+        if let Some(store) = self.store {
+            store.persist(journal)?;
+        }
+        Ok(())
+    }
+}
+
+fn adapter_for<'a>(
+    adapters: &'a mut [Box<dyn Adapter>],
+    id: &StableId,
+) -> Result<&'a mut (dyn Adapter + 'a), ReconcileError> {
+    for adapter in adapters {
+        if adapter.id() == id {
+            return Ok(adapter.as_mut());
+        }
+    }
+    Err(ReconcileError::AdapterNotFound(id.clone()))
+}
+
+fn validate_plan(plan: &Plan) -> Result<(), ReconcileError> {
+    let rebuilt = build_plan(PlanDraft {
+        target_id: plan.target_id.clone(),
+        desired_digest: plan.desired_digest.clone(),
+        observed_digest: plan.observed_digest.clone(),
+        policy_digest: plan.policy_digest.clone(),
+        operations: plan.operations.clone(),
+    })?;
+    if rebuilt != *plan {
+        return Err(ReconcileError::PlanMismatch);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum ReconcileError {
+    #[error(transparent)]
+    Receipt(#[from] ReceiptError),
+    #[error(transparent)]
+    Plan(#[from] PlanBuildError),
+    #[error("plan content does not match its content-addressed identity")]
+    PlanMismatch,
+    #[error("adapter is not registered: {0}")]
+    AdapterNotFound(StableId),
 }
 
 impl ReceiptStore {
