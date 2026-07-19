@@ -27,8 +27,6 @@ struct Args {
     object_root: PathBuf,
     #[arg(long, default_value = "diagnostics")]
     diagnostic_root: PathBuf,
-    #[arg(long)]
-    process_group: bool,
     #[arg(long, default_value = "execution-policy.json")]
     policy: PathBuf,
 }
@@ -83,14 +81,8 @@ async fn main() -> anyhow::Result<()> {
         }
         let worker_state = state.clone();
         let workspace = args.workspace_root.clone();
-        let supervisor = ProcessSupervisor::new(
-            if args.process_group {
-                SupervisorMode::ProcessGroup
-            } else {
-                SupervisorMode::SystemdScope
-            },
-            args.diagnostic_root,
-        )?;
+        let supervisor =
+            ProcessSupervisor::new(SupervisorMode::SystemdScope, args.diagnostic_root)?;
         tokio::spawn(async move {
             loop {
                 if let Err(error) = run_once(

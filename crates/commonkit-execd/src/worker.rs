@@ -31,6 +31,26 @@ pub async fn run_once(
         return Ok(None);
     };
     let snapshot = state.scheduler.lock().unwrap().snapshot(&lease.job_id)?;
+    if state
+        .policy
+        .as_deref()
+        .is_some_and(|policy| policy.validate(&snapshot.job.manifest).is_err())
+    {
+        let _ = state.scheduler.lock().unwrap().audit(
+            now_ms(),
+            target.id.as_str(),
+            "execute",
+            &lease.job_id,
+            false,
+            "runtime_policy_denied",
+        );
+        state
+            .scheduler
+            .lock()
+            .unwrap()
+            .complete(&lease, JobState::Failed, None, now_ms())?;
+        return Err(WorkerError::RuntimePolicyDenied);
+    }
     let preparing = state.scheduler.lock().unwrap().transition(
         &lease.attempt_id,
         snapshot.attempt.revision,
@@ -63,8 +83,19 @@ pub async fn run_once(
         .collect();
     let _ = running;
     let outcome = loop {
-        if let Some(status) = process.try_wait()? {
-            break process.finish(status, &secret_values)?;
+        match process.try_wait() {
+            Ok(Some(status)) => break process.finish(status, &secret_values)?,
+            Ok(None) => {}
+            Err(error @ (SupervisorError::TimedOut | SupervisorError::DiskLimitExceeded)) => {
+                state.scheduler.lock().unwrap().complete(
+                    &lease,
+                    JobState::Failed,
+                    None,
+                    now_ms(),
+                )?;
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
         }
         let current = state
             .scheduler
@@ -140,4 +171,6 @@ pub enum WorkerError {
     Execution(#[from] ExecutionError),
     #[error("supervisor failed")]
     Supervisor(#[from] SupervisorError),
+    #[error("current execution policy denied the leased manifest")]
+    RuntimePolicyDenied,
 }

@@ -8,6 +8,7 @@ use commonkit_execution::supervisor::{ProcessSupervisor, SupervisorMode};
 use commonkit_execution::{LocalObjectStore, Scheduler};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
+use std::process::Command;
 use tower::ServiceExt;
 
 fn digest(seed: char) -> Sha256Digest {
@@ -67,6 +68,40 @@ fn target() -> ExecutionTarget {
     }
 }
 
+fn init_repository(root: &std::path::Path) -> GitRevision {
+    std::fs::write(root.join(".fixture"), "commonkit execution fixture").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "tests@commonkit.invalid"],
+        vec!["config", "user.name", "CommonKit Tests"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ],
+        vec!["add", "."],
+        vec!["commit", "-qm", "fixture"],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    GitRevision::parse(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
+}
+
 #[tokio::test]
 async fn submitted_job_runs_after_client_disconnect_and_returns_artifacts() {
     let directory = tempfile::tempdir().unwrap();
@@ -82,7 +117,9 @@ async fn submitted_job_runs_after_client_disconnect_and_returns_artifacts() {
         false,
     )
     .with_object_store(objects.clone(), "artifact-signing-key");
-    let body = json!({"manifest":manifest(),"idempotencyKey":"offline-client"}).to_string();
+    let mut submitted_manifest = manifest();
+    submitted_manifest.repository_revision = init_repository(&directory.path().join("workspace"));
+    let body = json!({"manifest":submitted_manifest,"idempotencyKey":"offline-client"}).to_string();
     let response = router(state.clone())
         .oneshot(
             Request::builder()

@@ -1,5 +1,7 @@
 use commonkit_contracts::*;
 use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Command;
 pub fn digest(seed: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", seed.to_string().repeat(64))).unwrap()
 }
@@ -37,4 +39,38 @@ pub fn manifest() -> ExecutionManifest {
         repository_write: false,
         browser: None,
     }
+}
+
+#[allow(dead_code)]
+pub fn init_repository(root: &Path) -> GitRevision {
+    std::fs::write(root.join(".fixture"), "commonkit execution fixture").unwrap();
+    std::fs::write(root.join(".gitignore"), "diagnostics/\nlate-marker\n").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.email", "tests@commonkit.invalid"],
+        vec!["config", "user.name", "CommonKit Tests"],
+        vec![
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ],
+        vec!["add", "."],
+        vec!["commit", "-qm", "fixture"],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    let output = Command::new("git")
+        .args(["-C", root.to_str().unwrap(), "rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    GitRevision::parse(String::from_utf8(output.stdout).unwrap().trim()).unwrap()
 }
