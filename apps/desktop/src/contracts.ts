@@ -27,3 +27,14 @@ export interface ManagementSnapshot {
   schedule: unknown;
   diagnostics: unknown;
 }
+
+export interface TargetRecord {
+  id: string;
+  transport: { type: "local" } | { type: "ssh"; host: string; user: string; port: number };
+  identityDigest: string;
+}
+
+export interface TargetInventorySnapshot {
+  targets: TargetRecord[];
+  selected: string[];
+}

@@ -6,6 +6,10 @@ main { padding: 64px clamp(28px, 7vw, 100px); } .panel { max-width: 720px; } .ey
 h1 { font-size: clamp(34px, 5vw, 56px); line-height: 1.05; letter-spacing: -.04em; margin: 10px 0 18px; } p { color: #59635e; font-size: 18px; }
 dl { margin: 38px 0; display: grid; grid-template-columns: 120px 1fr; border-top: 1px solid #d7ddd8; } dt, dd { margin: 0; padding: 12px 0; border-bottom: 1px solid #d7ddd8; } dt { color: #69736e; } dd { font-weight: 600; }
 .primary { display: inline-block; background: #1f6548; color: white; text-decoration: none; padding: 11px 18px; border-radius: 9px; }
+.onboarding-panel form { display: grid; gap: 15px; margin-top: 28px; }
+.onboarding-panel label { display: grid; gap: 6px; color: #37443e; font-weight: 650; }
+.onboarding-panel input, .onboarding-panel select { width: 100%; padding: 10px 12px; border: 1px solid #c9d1cc; border-radius: 8px; background: white; font: inherit; }
+.onboarding-panel button { border: 0; cursor: pointer; justify-self: start; font: inherit; }
 .update-panel button { border: 0; border-radius: 9px; background: #1f6548; color: white; padding: 11px 18px; font: inherit; font-weight: 700; cursor: pointer; }
 .update-panel button:disabled { cursor: wait; opacity: .6; }
 .update-available { margin-top: 30px; padding: 22px; border: 1px solid #d7ddd8; border-radius: 12px; background: white; }

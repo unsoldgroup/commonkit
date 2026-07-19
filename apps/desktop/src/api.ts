@@ -1,12 +1,17 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { DesktopSnapshot, ManagementSnapshot } from "./contracts.ts";
+import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } from "./contracts.ts";
 import type { UpdateSummary } from "./updater-view.ts";
 
 export const desktopApi = {
+  onboardingInitialize: (request: Record<string, unknown>) => invoke<unknown>("onboarding_initialize", { request }),
   snapshot: () => invoke<DesktopSnapshot>("desktop_snapshot"),
   managementSnapshot: () => invoke<ManagementSnapshot>("desktop_management_snapshot"),
+  targets: () => invoke<TargetInventorySnapshot>("targets_list"),
+  selectTargets: (targets: string[], confirmationId: string) => invoke<TargetInventorySnapshot>("targets_select", { targets, confirmationId }),
   applyPlan: (planId: string, confirmationId: string) => invoke("apply_plan", { planId, confirmationId }),
   verify: () => invoke<unknown>("desktop_verify"),
+  targetsList: () => invoke<TargetInventorySnapshot>("targets_list"),
+  targetsSelect: (targetId: string, confirmationId: string) => invoke<TargetInventorySnapshot>("targets_select", { targets: [targetId], confirmationId }),
   snapshotCreate: (databaseId: string, confirmationId: string) => invoke<unknown>("snapshot_create", { databaseId, confirmationId }),
   snapshotRestore: (snapshotId: string, confirmationId: string) => invoke<unknown>("snapshot_restore", { snapshotId, confirmationId }),
   snapshotPromote: (databaseId: string, targetId: string, confirmationId: string) => invoke<unknown>("snapshot_promote", { databaseId, targetId, confirmationId }),

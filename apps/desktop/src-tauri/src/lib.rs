@@ -89,6 +89,192 @@ struct UpdateSummary {
     published_at: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OnboardingRequest {
+    mode: String,
+    repository: String,
+    kit_directory: PathBuf,
+    loadout: String,
+    target: String,
+    target_root: PathBuf,
+    provider: String,
+    provider_executable: Option<PathBuf>,
+    provider_version: Option<String>,
+    apm_manifest: Option<PathBuf>,
+    apm_lockfile: Option<PathBuf>,
+    apm_policy: Option<PathBuf>,
+    chezmoi_source: Option<PathBuf>,
+    chezmoi_config: Option<PathBuf>,
+}
+
+fn onboarding_arguments(request: &OnboardingRequest) -> Result<Vec<String>, DesktopError> {
+    if !matches!(request.mode.as_str(), "create" | "connect")
+        || request.repository.split('/').count() != 2
+        || !request.kit_directory.is_absolute()
+        || !request.target_root.is_absolute()
+    {
+        return Err(DesktopError::InvalidInput);
+    }
+    validate_id(&request.loadout)?;
+    validate_id(&request.target)?;
+    let mut args = vec![
+        "init".into(),
+        request.mode.clone(),
+        "--repository".into(),
+        request.repository.clone(),
+        "--kit-directory".into(),
+        path_string(&request.kit_directory)?,
+        "--loadout".into(),
+        request.loadout.clone(),
+        "--target".into(),
+        request.target.clone(),
+        "--target-root".into(),
+        path_string(&request.target_root)?,
+        "--provider".into(),
+        request.provider.clone(),
+    ];
+    match request.provider.as_str() {
+        "native" if request.provider_executable.is_none() && request.provider_version.is_none() => {
+        }
+        "apm" => {
+            require_onboarding_version(request, "0.25.0")?;
+            args.extend(["--provider-version".into(), "0.25.0".into()]);
+            push_provider_path(
+                &mut args,
+                "--provider-executable",
+                request.provider_executable.as_ref(),
+                true,
+            )?;
+            push_provider_path(
+                &mut args,
+                "--apm-manifest",
+                request.apm_manifest.as_ref(),
+                false,
+            )?;
+            push_provider_path(
+                &mut args,
+                "--apm-lockfile",
+                request.apm_lockfile.as_ref(),
+                false,
+            )?;
+            push_provider_path(
+                &mut args,
+                "--apm-policy",
+                request.apm_policy.as_ref(),
+                false,
+            )?;
+        }
+        "chezmoi" => {
+            require_onboarding_version(request, "2.70.4")?;
+            args.extend(["--provider-version".into(), "2.70.4".into()]);
+            push_provider_path(
+                &mut args,
+                "--provider-executable",
+                request.provider_executable.as_ref(),
+                true,
+            )?;
+            push_provider_path(
+                &mut args,
+                "--chezmoi-source",
+                request.chezmoi_source.as_ref(),
+                false,
+            )?;
+            push_provider_path(
+                &mut args,
+                "--chezmoi-config",
+                request.chezmoi_config.as_ref(),
+                false,
+            )?;
+        }
+        _ => return Err(DesktopError::InvalidInput),
+    }
+    Ok(args)
+}
+
+fn require_onboarding_version(
+    request: &OnboardingRequest,
+    expected: &str,
+) -> Result<(), DesktopError> {
+    if request.provider_version.as_deref() != Some(expected) {
+        return Err(DesktopError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn push_provider_path(
+    args: &mut Vec<String>,
+    flag: &str,
+    value: Option<&PathBuf>,
+    absolute: bool,
+) -> Result<(), DesktopError> {
+    let value = value.ok_or(DesktopError::InvalidInput)?;
+    if absolute != value.is_absolute()
+        || (!absolute
+            && value
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir)))
+    {
+        return Err(DesktopError::InvalidInput);
+    }
+    args.extend([flag.into(), path_string(value)?]);
+    Ok(())
+}
+
+fn path_string(path: &std::path::Path) -> Result<String, DesktopError> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or(DesktopError::InvalidInput)
+}
+
+#[tauri::command]
+fn onboarding_initialize(request: OnboardingRequest) -> Result<serde_json::Value, DesktopError> {
+    let _ = onboarding_arguments(&request)?;
+    use commonkit_cli::onboarding::{
+        InitMode, InitRequest, ProcessRunner, ProviderSelection, initialize,
+    };
+    let paths = AppPaths::discover().map_err(|_| DesktopError::OnboardingFailed)?;
+    let provider = match request.provider.as_str() {
+        "native" => ProviderSelection::Native,
+        "apm" => ProviderSelection::Apm {
+            executable: request
+                .provider_executable
+                .ok_or(DesktopError::InvalidInput)?,
+            manifest: request.apm_manifest.ok_or(DesktopError::InvalidInput)?,
+            lockfile: request.apm_lockfile.ok_or(DesktopError::InvalidInput)?,
+            policy: request.apm_policy.ok_or(DesktopError::InvalidInput)?,
+        },
+        "chezmoi" => ProviderSelection::Chezmoi {
+            executable: request
+                .provider_executable
+                .ok_or(DesktopError::InvalidInput)?,
+            source: request.chezmoi_source.ok_or(DesktopError::InvalidInput)?,
+            config: request.chezmoi_config.ok_or(DesktopError::InvalidInput)?,
+        },
+        _ => return Err(DesktopError::InvalidInput),
+    };
+    let result = initialize(
+        &InitRequest {
+            mode: if request.mode == "create" {
+                InitMode::Create
+            } else {
+                InitMode::Connect
+            },
+            repository: request.repository,
+            kit_directory: request.kit_directory,
+            loadout: request.loadout,
+            target: request.target,
+            target_root: request.target_root,
+            config_directory: paths.config,
+            state_directory: paths.state,
+            provider,
+        },
+        &ProcessRunner::from_path(),
+    )
+    .map_err(|_| DesktopError::OnboardingFailed)?;
+    serde_json::to_value(result).map_err(Into::into)
+}
+
 impl ServiceClient {
     fn discover() -> Result<Self, DesktopError> {
         let paths = AppPaths::discover().map_err(|_| DesktopError::ServiceUnavailable)?;
@@ -230,6 +416,10 @@ enum DesktopError {
     InvalidControlState,
     #[error("input is invalid")]
     InvalidInput,
+    #[error(
+        "CommonKit onboarding failed; review the selected provider inputs and local CLI diagnostics"
+    )]
+    OnboardingFailed,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -387,6 +577,32 @@ async fn desktop_verify(
             Some(serde_json::json!({"targetId": null, "pointer": null})),
         )
         .await
+}
+
+#[tauri::command]
+async fn targets_list(
+    client: tauri::State<'_, ServiceClient>,
+) -> Result<serde_json::Value, DesktopError> {
+    client.json(reqwest::Method::GET, "/targets", None).await
+}
+
+#[tauri::command]
+async fn targets_select(
+    client: tauri::State<'_, ServiceClient>,
+    targets: Vec<String>,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    for target in &targets {
+        validate_id(target)?;
+    }
+    post_confirmed(
+        &client,
+        "/targets/select",
+        serde_json::json!({"targets": targets}),
+        &confirmation_id,
+    )
+    .await?;
+    client.json(reqwest::Method::GET, "/targets", None).await
 }
 
 #[tauri::command]
@@ -637,9 +853,12 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
+            onboarding_initialize,
             desktop_management_snapshot,
             apply_plan,
             desktop_verify,
+            targets_list,
+            targets_select,
             snapshot_create,
             snapshot_restore,
             snapshot_promote,
@@ -729,5 +948,56 @@ mod tests {
         assert!(authorize_update_install(false, "0.2.0", "0.2.0").is_err());
         assert!(authorize_update_install(true, "0.2.0", "0.3.0").is_err());
         assert!(authorize_update_install(true, "0.2.0", "0.2.0").is_ok());
+    }
+    #[test]
+    fn onboarding_binds_pinned_provider_to_fixed_cli_arguments() {
+        let request = OnboardingRequest {
+            mode: "connect".into(),
+            repository: "owner/kit".into(),
+            kit_directory: PathBuf::from("/tmp/kit"),
+            loadout: "personal".into(),
+            target: "workstation".into(),
+            target_root: PathBuf::from("/tmp/home"),
+            provider: "apm".into(),
+            provider_executable: Some(PathBuf::from("/opt/apm")),
+            provider_version: Some("0.25.0".into()),
+            apm_manifest: Some("apm.yml".into()),
+            apm_lockfile: Some("apm.lock.yaml".into()),
+            apm_policy: Some("apm-policy.yml".into()),
+            chezmoi_source: None,
+            chezmoi_config: None,
+        };
+        let arguments = onboarding_arguments(&request).unwrap();
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--provider-version", "0.25.0"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--apm-lockfile", "apm.lock.yaml"])
+        );
+    }
+
+    #[test]
+    fn onboarding_rejects_unpinned_or_traversing_provider_inputs() {
+        let request = OnboardingRequest {
+            mode: "connect".into(),
+            repository: "owner/kit".into(),
+            kit_directory: PathBuf::from("/tmp/kit"),
+            loadout: "personal".into(),
+            target: "workstation".into(),
+            target_root: PathBuf::from("/tmp/home"),
+            provider: "chezmoi".into(),
+            provider_executable: Some(PathBuf::from("/opt/chezmoi")),
+            provider_version: Some("latest".into()),
+            apm_manifest: None,
+            apm_lockfile: None,
+            apm_policy: None,
+            chezmoi_source: Some("../home".into()),
+            chezmoi_config: Some("chezmoi.toml".into()),
+        };
+        assert!(onboarding_arguments(&request).is_err());
     }
 }

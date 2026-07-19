@@ -2,14 +2,18 @@ import "./style.css";
 import { desktopApi } from "./api.ts";
 import { navigation, routeFromHash, type Route } from "./navigation.ts";
 import { statusView } from "./view-model.ts";
-import type { DesktopSnapshot, ManagementSnapshot } from "./contracts.ts";
+import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } from "./contracts.ts";
 import { updatePanel, type UpdateUiState } from "./updater-view.ts";
 import { managementPanel } from "./management-view.ts";
+import { onboardingPanel, type OnboardingProvider } from "./onboarding-view.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
 let management: ManagementSnapshot | null = null;
+let targets: TargetInventorySnapshot | null = null;
 let updateState: UpdateUiState = { kind: "idle" };
+let onboardingProvider: OnboardingProvider = "native";
+let onboardingMessage = "";
 
 function placeholder(route: Route): string {
   const copy: Record<Route, [string, string]> = {
@@ -29,13 +33,51 @@ function placeholder(route: Route): string {
 
 function render(): void {
   const route = routeFromHash(location.hash);
-  const body = route === "settings" ? updatePanel(updateState) : route === "status" && snapshot ? (() => {
+  const body = route === "onboarding" ? onboardingPanel(onboardingProvider, onboardingMessage) : route === "settings" ? updatePanel(updateState) : route === "status" && snapshot ? (() => {
     const view = statusView(snapshot.status);
-    return `<section class="panel"><p class="eyebrow">Local target</p><h1>${view.heading}</h1><p>${view.detail}</p><dl><dt>Target</dt><dd>${snapshot.status.activeTarget ?? "Not selected"}</dd><dt>Loadout</dt><dd>${snapshot.status.activeLoadout ?? "Not selected"}</dd><dt>Runtime</dt><dd>${snapshot.status.runtimeVersion}</dd></dl>${view.primaryRoute !== "status" ? `<a class="primary" href="#${view.primaryRoute}">Continue</a>` : ""}</section>`;
+    const inventory = targets ? `<fieldset><legend>Managed targets</legend>${targets.targets.map((target) => `<label><input type="checkbox" name="managed-target" value="${target.id}" ${targets?.selected.includes(target.id) ? "checked" : ""}> ${target.id} · ${target.transport.type}</label>`).join("")}<button id="save-target-selection" type="button">Save target selection</button></fieldset>` : "";
+    return `<section class="panel"><p class="eyebrow">Selected targets</p><h1>${view.heading}</h1><p>${view.detail}</p><dl><dt>Active target</dt><dd>${snapshot.status.activeTarget ?? "Multiple or not selected"}</dd><dt>Loadout</dt><dd>${snapshot.status.activeLoadout ?? "Not selected"}</dd><dt>Runtime</dt><dd>${snapshot.status.runtimeVersion}</dd></dl>${inventory}${view.primaryRoute !== "status" ? `<a class="primary" href="#${view.primaryRoute}">Continue</a>` : ""}</section>`;
   })() : management && route in management ? managementPanel(route, management) : placeholder(route);
   app.innerHTML = `<aside><div class="brand">CommonKit</div><nav>${navigation.map(({ route: id, label }) => `<a class="${route === id ? "active" : ""}" href="#${id}">${label}</a>`).join("")}</nav></aside><main>${body}</main>`;
-  if (route === "settings") bindUpdateActions();
+  if (route === "onboarding") bindOnboardingActions();
+  else if (route === "settings") bindUpdateActions();
+  else if (route === "status") bindTargetActions();
   else if (management && route in management) bindManagementActions(route);
+}
+
+function bindTargetActions(): void {
+  document.querySelector<HTMLButtonElement>("#save-target-selection")?.addEventListener("click", async () => {
+    const selected = [...document.querySelectorAll<HTMLInputElement>('input[name="managed-target"]:checked')].map((input) => input.value);
+    if (!window.confirm(`Run read-only checks for ${selected.length} selected target(s)? Future mutations still require per-target confirmation.`)) return;
+    try {
+      targets = await desktopApi.selectTargets(selected, confirmationId("target-select"));
+    } catch (error) {
+      window.alert(errorMessage(error));
+    }
+    render();
+  });
+}
+
+function bindOnboardingActions(): void {
+  document.querySelector<HTMLSelectElement>("#onboarding-provider")?.addEventListener("change", (event) => {
+    onboardingProvider = (event.currentTarget as HTMLSelectElement).value as OnboardingProvider;
+    onboardingMessage = "";
+    render();
+  });
+  document.querySelector<HTMLFormElement>("#onboarding-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(new FormData(event.currentTarget as HTMLFormElement).entries());
+    onboardingMessage = "Validating pinned provider and materializing…";
+    render();
+    try {
+      const result = await desktopApi.onboardingInitialize(values);
+      const plan = (result as { firstPlanId?: string }).firstPlanId ?? "ready";
+      onboardingMessage = `First plan ${plan} is ready for review.`;
+    } catch (error) {
+      onboardingMessage = errorMessage(error);
+    }
+    render();
+  });
 }
 
 function errorMessage(error: unknown): string {
@@ -161,3 +203,4 @@ addEventListener("hashchange", render);
 render();
 desktopApi.snapshot().then((value) => { snapshot = value; render(); }).catch(() => render());
 desktopApi.managementSnapshot().then((value) => { management = value; render(); }).catch(() => render());
+desktopApi.targets().then((value) => { targets = value; render(); }).catch(() => render());
