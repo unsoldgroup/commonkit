@@ -40,6 +40,34 @@ struct ChezmoiInputSnapshot {
     config: PathBuf,
 }
 
+impl ChezmoiInputSnapshot {
+    fn verify(&self, approved: &ProviderInputs) -> Result<(), ProviderFailure> {
+        let executable = fs::read(&self.executable)
+            .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
+        let executable_digest = digest_domain_json("commonkit.provider-executable.v1", &executable)
+            .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
+        require_snapshot_digest(
+            "chezmoi executable",
+            &executable_digest,
+            &approved.input_digests["providerExecutable"],
+        )?;
+        let config = fs::read(&self.config)
+            .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
+        let config_digest = digest_domain_json("commonkit.chezmoi-config.v1", &config)
+            .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
+        require_snapshot_digest(
+            "chezmoi config",
+            &config_digest,
+            &approved.input_digests["config"],
+        )?;
+        require_snapshot_digest(
+            "chezmoi source",
+            &digest_source_tree(&self.source)?,
+            &approved.input_digests["source"],
+        )
+    }
+}
+
 impl ChezmoiProvider {
     pub fn new(
         executable: impl AsRef<Path>,
@@ -352,8 +380,10 @@ impl DesiredStateProvider for ChezmoiProvider {
         self.preflight()?;
         let inputs = self.inputs(context)?;
         let snapshot = self.snapshot_inputs(workspace.scratch_root(), &inputs)?;
+        snapshot.verify(&inputs)?;
         self.preflight_paths(&snapshot.source, &snapshot.config)?;
         self.validate_version_at(&snapshot.executable, Some(workspace.staging_root()))?;
+        snapshot.verify(&inputs)?;
         let root = context.declared_roots.first().ok_or_else(|| {
             ProviderFailure::Materialize("chezmoi requires one declared target root".into())
         })?;
@@ -431,6 +461,7 @@ impl DesiredStateProvider for ChezmoiProvider {
                 "chezmoi failed while materializing the isolated destination".into(),
             ));
         }
+        snapshot.verify(&inputs)?;
         let resources = scan_destination(&destination, root, &inputs, artifacts)?;
         MaterializedState::finalize(inputs, resources, Vec::new(), Vec::new()).map_err(Into::into)
     }

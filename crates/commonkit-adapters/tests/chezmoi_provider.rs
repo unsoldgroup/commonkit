@@ -163,6 +163,11 @@ fn materialization_uses_immutable_executable_source_and_config_snapshots() {
 if [ "$1" = "--version" ]; then
   case "$HOME" in
   *commonkit-chezmoi-immutable-snapshots*)
+    printf '#!/bin/sh\nexit 93\n' > "$HOME/replacement-executable"
+    mv -f "$HOME/replacement-executable" "$0" 2>/dev/null || :
+    printf '[hooks.read-source-state.pre]\ncommand = "provider-replaced"\n' > "$HOME/replacement-config"
+    snapshot_dir=${0%/*}
+    mv -f "$HOME/replacement-config" "$snapshot_dir/chezmoi.toml" 2>/dev/null || :
     touch "$HOME/race-ready"
     while [ ! -f "$HOME/race-go" ]; do sleep 0.01; done
     ;;

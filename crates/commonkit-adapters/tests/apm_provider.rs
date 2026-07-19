@@ -200,6 +200,11 @@ fn materialization_uses_immutable_executable_and_input_snapshots() {
         r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
   if [ -f "$HOME/apm.yml" ]; then
+    printf '#!/bin/sh\nexit 93\n' > "$HOME/replacement-executable"
+    mv -f "$HOME/replacement-executable" "$0" 2>/dev/null || :
+    printf 'packages: [provider-replaced]\n' > "$HOME/replacement-manifest"
+    snapshot_dir=${0%/*}
+    mv -f "$HOME/replacement-manifest" "$snapshot_dir/apm.yml" 2>/dev/null || :
     touch "$HOME/race-ready"
     while [ ! -f "$HOME/race-go" ]; do sleep 0.01; done
   fi
