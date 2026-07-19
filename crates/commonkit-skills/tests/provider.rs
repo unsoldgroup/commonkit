@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,6 +26,7 @@ fn digest(value: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", value.to_string().repeat(64))).expect("digest")
 }
 
+#[cfg(target_os = "macos")]
 fn compile_detached_forger(path: &std::path::Path) {
     let source = path.with_extension("c");
     fs::write(
@@ -60,6 +62,7 @@ int main(int argc, char **argv) {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn provider_is_version_pinned_staged_and_never_adopts_live_source() {
     let root = std::env::temp_dir().join(format!(
         "commonkit-provider-{}-{}",

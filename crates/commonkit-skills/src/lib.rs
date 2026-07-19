@@ -2330,6 +2330,25 @@ int main(int argc, char **argv) {
     }
 }
 
+#[cfg(all(test, not(target_os = "macos")))]
+mod unsupported_provider_isolation_tests {
+    use super::{SkillError, isolated_command};
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    #[test]
+    fn provider_execution_fails_closed_without_a_proven_isolation_backend() {
+        let error = isolated_command(
+            Path::new("/nonexistent/provider"),
+            Path::new("/nonexistent/staging"),
+            &[],
+            &BTreeSet::new(),
+        )
+        .expect_err("unsupported platforms must not execute the provider unsandboxed");
+        assert!(matches!(error, SkillError::ProviderIsolationUnavailable));
+    }
+}
+
 fn validate_reviewed_tasks_shape(path: &Path) -> Result<Value, SkillError> {
     let bytes = read_bounded(path, 8 * 1024 * 1024)?;
     let value: Value = serde_json::from_slice(&bytes)?;
