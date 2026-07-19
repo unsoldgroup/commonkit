@@ -43,41 +43,6 @@ fn declares_fail_closed_security_capabilities_for_every_supported_platform() {
     assert!(windows.contains(&SecurityCapability::ProcessSandbox));
 }
 
-#[test]
-fn windows_acl_audit_rejects_inherited_and_broad_grants() {
-    use commonkit_platform::{windows_acl_listing_is_private, windows_private_acl_args};
-    assert_eq!(
-        windows_private_acl_args("alice").unwrap(),
-        [
-            "/inheritance:r",
-            "/remove:g",
-            "*S-1-1-0",
-            "*S-1-5-11",
-            "*S-1-5-32-545",
-            "*S-1-15-2-1",
-            "/grant:r",
-            "alice:(F)"
-        ]
-    );
-    assert!(windows_private_acl_args("alice\nEveryone:(F)").is_err());
-    assert!(windows_acl_listing_is_private(
-        r"C:\state DESKTOP\alice:(F)\nSuccessfully processed 1 files",
-        "alice"
-    ));
-    assert!(!windows_acl_listing_is_private(
-        r"C:\state DESKTOP\alice:(F) BUILTIN\Users:(RX)",
-        "alice"
-    ));
-    assert!(!windows_acl_listing_is_private(
-        r"C:\state DESKTOP\alice:(I)(F)",
-        "alice"
-    ));
-    assert!(!windows_acl_listing_is_private(
-        r"C:\state NT AUTHORITY\SYSTEM:(F)",
-        "alice"
-    ));
-}
-
 #[cfg(windows)]
 #[test]
 fn native_windows_private_path_acl_is_enforced_and_verified() {
@@ -85,6 +50,37 @@ fn native_windows_private_path_acl_is_enforced_and_verified() {
     let file = temp.path().join("private-token");
     commonkit_platform::ensure_private_path(&file, PrivatePathKind::File).unwrap();
     commonkit_platform::verify_private_path(&file, PrivatePathKind::File).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_acl_rejects_unrelated_full_control_ace() {
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join("private-token");
+    commonkit_platform::ensure_private_path(&file, PrivatePathKind::File).unwrap();
+    let status = std::process::Command::new("icacls.exe")
+        .arg(&file)
+        .args(["/grant", "*S-1-1-0:(F)"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(commonkit_platform::verify_private_path(&file, PrivatePathKind::File).is_err());
+}
+
+#[cfg(windows)]
+#[test]
+fn native_windows_acl_does_not_treat_username_in_path_as_an_ace() {
+    let username = std::env::var("USERNAME").unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let file = temp.path().join(format!("{username}-private-token"));
+    commonkit_platform::ensure_private_path(&file, PrivatePathKind::File).unwrap();
+    let status = std::process::Command::new("icacls.exe")
+        .arg(&file)
+        .args(["/remove:g", username.as_str(), "/grant", "*S-1-1-0:(F)"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    assert!(commonkit_platform::verify_private_path(&file, PrivatePathKind::File).is_err());
 }
 
 #[cfg(unix)]

@@ -223,32 +223,7 @@ fn verify_private_permissions(
 
 #[cfg(windows)]
 fn set_private_permissions(path: &Path, _kind: PrivatePathKind) -> Result<(), PlatformError> {
-    let user = std::env::var("USERNAME").map_err(|_| PlatformError::IdentityUnavailable)?;
-    let arguments = windows_private_acl_args(&user)?;
-    let status = std::process::Command::new("icacls.exe")
-        .arg(path)
-        .args(arguments)
-        .status()?;
-    if !status.success() {
-        return Err(PlatformError::AclFailed(path.to_path_buf()));
-    }
-    Ok(())
-}
-
-pub fn windows_private_acl_args(user: &str) -> Result<Vec<String>, PlatformError> {
-    if user.is_empty() || user.contains(['\r', '\n', ':']) {
-        return Err(PlatformError::IdentityUnavailable);
-    }
-    Ok(vec![
-        "/inheritance:r".into(),
-        "/remove:g".into(),
-        "*S-1-1-0".into(),
-        "*S-1-5-11".into(),
-        "*S-1-5-32-545".into(),
-        "*S-1-15-2-1".into(),
-        "/grant:r".into(),
-        format!("{user}:(F)"),
-    ])
+    windows_acl::set_current_user_only(path)
 }
 
 #[cfg(windows)]
@@ -257,38 +232,168 @@ fn verify_private_permissions(
     _metadata: &std::fs::Metadata,
     _kind: PrivatePathKind,
 ) -> Result<(), PlatformError> {
-    let user = std::env::var("USERNAME").map_err(|_| PlatformError::IdentityUnavailable)?;
-    let output = std::process::Command::new("icacls.exe")
-        .arg(path)
-        .output()?;
-    if !output.status.success()
-        || !windows_acl_listing_is_private(&String::from_utf8_lossy(&output.stdout), &user)
-    {
-        return Err(PlatformError::AclFailed(path.to_path_buf()));
-    }
-    Ok(())
+    windows_acl::verify_current_user_only(path)
 }
 
-/// Validates the security-relevant subset of `icacls <path>` output. `/verify`
-/// only checks canonical ACL structure; it does not reject broad or inherited grants.
-pub fn windows_acl_listing_is_private(listing: &str, user: &str) -> bool {
-    if user.is_empty() || user.contains(['\r', '\n', ':']) || listing.is_empty() {
-        return false;
+#[cfg(windows)]
+mod windows_acl {
+    use super::PlatformError;
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        SET_ACCESS, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+        GetSecurityDescriptorControl, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE,
+        ACCESS_ALLOWED_ACE_TYPE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
+        INHERITED_ACE, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
+        TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct Token(HANDLE);
+    impl Drop for Token {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
     }
-    let normalized = listing.to_ascii_lowercase();
-    let user = user.to_ascii_lowercase();
-    let broad = [
-        "everyone:",
-        "builtin\\users:",
-        "authenticated users:",
-        "all application packages:",
-        "todos:",
-        "utilisateurs authentifiés:",
-    ];
-    normalized.contains(&user)
-        && normalized.contains("(f)")
-        && !normalized.contains("(i)")
-        && !broad.iter().any(|identity| normalized.contains(identity))
+
+    fn current_user_sid() -> Result<Vec<u8>, PlatformError> {
+        let mut handle = null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut handle) } == 0 {
+            return Err(PlatformError::IdentityUnavailable);
+        }
+        let token = Token(handle);
+        let mut length = 0;
+        unsafe { GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut length) };
+        if length == 0 {
+            return Err(PlatformError::IdentityUnavailable);
+        }
+        let mut token_user = vec![0_u8; length as usize];
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                token_user.as_mut_ptr().cast(),
+                length,
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(PlatformError::IdentityUnavailable);
+        }
+        let sid = unsafe { (*(token_user.as_ptr().cast::<TOKEN_USER>())).User.Sid };
+        let sid_length = unsafe { GetLengthSid(sid) } as usize;
+        if sid.is_null() || sid_length == 0 {
+            return Err(PlatformError::IdentityUnavailable);
+        }
+        Ok(unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), sid_length) }.to_vec())
+    }
+
+    pub(super) fn set_current_user_only(path: &Path) -> Result<(), PlatformError> {
+        let mut sid = current_user_sid()?;
+        let mut trustee = unsafe { zeroed() };
+        unsafe { BuildTrusteeWithSidW(&mut trustee, sid.as_mut_ptr().cast()) };
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: NO_INHERITANCE,
+            Trustee: trustee,
+        };
+        let mut dacl: *mut ACL = null_mut();
+        let result = unsafe { SetEntriesInAclW(1, &entry, null(), &mut dacl) };
+        if result != 0 || dacl.is_null() {
+            if !dacl.is_null() {
+                unsafe { LocalFree(dacl.cast()) };
+            }
+            return Err(PlatformError::AclFailed(path.to_path_buf()));
+        }
+        let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let result = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_mut_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null_mut(),
+            )
+        };
+        unsafe { LocalFree(dacl.cast()) };
+        if result != 0 {
+            return Err(PlatformError::AclFailed(path.to_path_buf()));
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_current_user_only(path: &Path) -> Result<(), PlatformError> {
+        use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+
+        let sid = current_user_sid()?;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor: *mut c_void = null_mut();
+        let result = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if result != 0 || dacl.is_null() {
+            if !descriptor.is_null() {
+                unsafe { LocalFree(descriptor) };
+            }
+            return Err(PlatformError::AclFailed(path.to_path_buf()));
+        }
+        let mut control = 0;
+        let mut revision = 0;
+        let protected =
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } != 0
+                && control & SE_DACL_PROTECTED != 0;
+        let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+        let valid = protected
+            && unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            } != 0
+            && info.AceCount == 1;
+        let mut ace: *mut c_void = null_mut();
+        let valid = valid && unsafe { GetAce(dacl, 0, &mut ace) } != 0 && !ace.is_null();
+        let valid = valid
+            && unsafe {
+                let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
+                allowed.Header.AceType == ACCESS_ALLOWED_ACE_TYPE
+                    && allowed.Header.AceFlags & INHERITED_ACE == 0
+                    && allowed.Mask == FILE_ALL_ACCESS
+                    && EqualSid(
+                        (&allowed.SidStart as *const u32).cast_mut().cast(),
+                        sid.as_ptr().cast(),
+                    ) != 0
+            };
+        unsafe { LocalFree(descriptor) };
+        if !valid {
+            return Err(PlatformError::AclFailed(path.to_path_buf()));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error)]
