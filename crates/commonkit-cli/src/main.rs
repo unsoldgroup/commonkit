@@ -2,8 +2,9 @@ use std::error::Error;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use commonkit_config::{LayerSet, MergeRules, compose_layers};
-use commonkit_contracts::{LayerDocument, assert_no_embedded_secrets};
+use commonkit_config::{LayerSet, compose_layers, v1_merge_rules};
+use commonkit_contracts::{LayerDocument, LayerKind, SecurityPolicy, assert_no_embedded_secrets};
+use commonkit_core::enforce_policy_floor;
 use commonkit_platform::AppPaths;
 use commonkit_skills::{PromotionPlan, PromotionReceipt, ProviderUpgradeReport, ScheduleKind};
 use serde_json::{Value, json};
@@ -1388,5 +1389,20 @@ fn compose(paths: &[PathBuf]) -> Result<commonkit_config::CompositionResult, Box
         layers.push(serde_json::from_value::<LayerDocument>(value)?);
     }
     let layers = LayerSet::new(layers)?;
-    Ok(compose_layers(&layers, &MergeRules::new())?)
+    let result = compose_layers(&layers, &v1_merge_rules())?;
+    let organization = layers
+        .iter()
+        .find(|layer| layer.kind == LayerKind::OrganizationPolicy)
+        .and_then(|layer| layer.spec.get("securityPolicy"))
+        .map(|value| serde_json::from_value::<SecurityPolicy>(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    let effective = result
+        .spec
+        .get("securityPolicy")
+        .map(|value| serde_json::from_value::<SecurityPolicy>(value.clone()))
+        .transpose()?
+        .unwrap_or_default();
+    enforce_policy_floor(&organization, &effective)?;
+    Ok(result)
 }

@@ -17,12 +17,12 @@ use commonkit_adapters::{
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
     materialize_mcp_client_state, validate_ownership,
 };
-use commonkit_config::{LayerSet, MergeRules, compose_layers};
+use commonkit_config::{LayerSet, compose_layers, v1_merge_rules};
 use commonkit_contracts::{
-    LayerDocument, Plan, ReceiptState, Sha256Digest, StableId, assert_no_embedded_secrets,
-    digest_domain_json,
+    LayerDocument, LayerKind, Plan, ReceiptState, SecurityPolicy, Sha256Digest, StableId,
+    assert_no_embedded_secrets, digest_domain_json,
 };
-use commonkit_core::{PlanDraft, build_plan};
+use commonkit_core::{PlanDraft, build_plan, enforce_policy_floor};
 use commonkit_reconcile::{
     Adapter, PlanStore, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
 };
@@ -977,7 +977,26 @@ impl ProductionCompositionDomain {
             );
         }
         let layers = LayerSet::new(layers).map_err(|_| DomainFailure::OperationFailed)?;
-        compose_layers(&layers, &MergeRules::new()).map_err(|_| DomainFailure::OperationFailed)
+        let result = compose_layers(&layers, &v1_merge_rules())
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let organization = layers
+            .iter()
+            .find(|layer| layer.kind == LayerKind::OrganizationPolicy)
+            .and_then(|layer| layer.spec.get("securityPolicy"))
+            .map(|value| serde_json::from_value::<SecurityPolicy>(value.clone()))
+            .transpose()
+            .map_err(|_| DomainFailure::OperationFailed)?
+            .unwrap_or_default();
+        let effective = result
+            .spec
+            .get("securityPolicy")
+            .map(|value| serde_json::from_value::<SecurityPolicy>(value.clone()))
+            .transpose()
+            .map_err(|_| DomainFailure::OperationFailed)?
+            .unwrap_or_default();
+        enforce_policy_floor(&organization, &effective)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(result)
     }
 }
 

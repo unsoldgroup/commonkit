@@ -59,12 +59,13 @@ pub fn compose_layers(
         .into_iter()
         .filter_map(|(pointer, contributions)| {
             contributions.last().cloned().map(|winner| {
+                let governing_rules = rules.governing_rules(&pointer);
                 (
                     pointer,
                     TraceEntry {
                         winner,
                         contributions,
-                        governing_rules: Vec::new(),
+                        governing_rules,
                     },
                 )
             })
@@ -208,6 +209,49 @@ impl MergeRules {
             }
         })
     }
+
+    fn governing_rules(&self, pointer: &str) -> Vec<String> {
+        let mut governing = Vec::new();
+        if let Some(strategy) = self.strategies.get(pointer) {
+            governing.push(format!(
+                "schema:{pointer}:{}",
+                match strategy {
+                    MergeStrategy::Replace => "replace".to_owned(),
+                    MergeStrategy::RecursiveMap => "recursive_map".to_owned(),
+                    MergeStrategy::SetUnion => "set_union".to_owned(),
+                    MergeStrategy::MergeById { id_key } => {
+                        format!("merge_by_id({id_key})")
+                    }
+                }
+            ));
+        }
+        if pointer == "/securityPolicy" || pointer.starts_with("/securityPolicy/") {
+            governing.push("organization-security-floor:non-overridable".to_owned());
+        }
+        governing
+    }
+}
+
+/// The merge contract for the version-one CommonKit schema.
+///
+/// Keeping this constructor in the composition crate gives the CLI and service
+/// one authoritative rule set instead of letting entry points infer collection
+/// behavior independently.
+pub fn v1_merge_rules() -> MergeRules {
+    let mut rules =
+        MergeRules::new().with_strategy("/securityPolicy/deniedPaths", MergeStrategy::SetUnion);
+    for pointer in ["/requirements", "/denials"] {
+        rules = rules.with_strategy(pointer, MergeStrategy::SetUnion);
+    }
+    for pointer in ["/adapters", "/hooks", "/plugins", "/targets"] {
+        rules = rules.with_strategy(
+            pointer,
+            MergeStrategy::MergeById {
+                id_key: "id".to_owned(),
+            },
+        );
+    }
+    rules
 }
 
 pub fn merge_specs(base: &Value, overlay: &Value, rules: &MergeRules) -> Result<Value, MergeError> {
@@ -229,6 +273,9 @@ fn merge_value(
                 pointer: pointer.into(),
             })
         };
+    }
+    if base.is_null() {
+        return Ok(Some(overlay.clone()));
     }
 
     match rules.strategy(pointer, base, overlay) {

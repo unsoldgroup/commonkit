@@ -15,6 +15,7 @@ clap.workspace = true
 commonkit-config = { path = "../commonkit-config" }
 commonkit-adapters = { path = "../commonkit-adapters" }
 commonkit-contracts = { path = "../commonkit-contracts" }
+commonkit-core = { path = "../commonkit-core" }
 commonkit-platform = { path = "../commonkit-platform" }
 commonkit-reconcile = { path = "../commonkit-reconcile" }
 commonkit-service = { path = "../commonkit-service" }

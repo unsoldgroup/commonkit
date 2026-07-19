@@ -143,6 +143,49 @@ fn composes_layers_and_explains_the_winning_value() {
 }
 
 #[test]
+fn compose_rejects_a_personal_policy_that_widens_the_organization_allowlist() {
+    let directory = temporary_directory("cli-policy-floor");
+    fs::create_dir_all(&directory).expect("directory");
+    let policy = |allowed: &[&str]| {
+        json!({
+            "deniedPaths": ["**/.env"],
+            "requiredControls": {"secret_scan": true},
+            "allowlists": {"git_hosts": allowed},
+            "minimums": {"backup_count": 1},
+            "maximums": {"snapshot_age_hours": 24}
+        })
+    };
+    let documents = [
+        ("base", "public_base", json!({})),
+        (
+            "organization",
+            "organization_policy",
+            json!({"securityPolicy": policy(&["github.com"])}),
+        ),
+        (
+            "personal",
+            "personal_kit",
+            json!({"securityPolicy": policy(&["github.com", "evil.example"])}),
+        ),
+    ];
+    let paths = documents.map(|(id, kind, spec)| {
+        let path = directory.join(format!("{id}.json"));
+        fs::write(&path, serde_json::to_vec(&layer(id, kind, spec)).unwrap()).unwrap();
+        path
+    });
+    let mut command = Command::new(env!("CARGO_BIN_EXE_commonkit"));
+    command.arg("compose");
+    for path in &paths {
+        command.arg("--layer").arg(path);
+    }
+
+    let output = command.output().expect("compose");
+
+    assert!(!output.status.success());
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
 fn publishes_the_complete_v1_command_surface() {
     let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
         .arg("--help")

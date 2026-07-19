@@ -394,6 +394,7 @@ dependencies = [
  "commonkit-adapters",
  "commonkit-config",
  "commonkit-contracts",
+ "commonkit-core",
  "commonkit-platform",
  "commonkit-reconcile",
  "commonkit-service",
