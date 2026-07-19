@@ -54,7 +54,10 @@ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 mod production_domains;
 mod skill_canary;
-pub use production_domains::{ProductionDomainError, ProductionDomainRegistry};
+pub use production_domains::{
+    ProductionDomainError, ProductionDomainRegistry, ProductionSshTarget,
+    ProductionSshTransportFactory,
+};
 
 pub const API_VERSION: &str = "v1";
 
@@ -804,6 +807,46 @@ pub struct ExecutionResult {
 
 pub trait PlanExecutor: Send + Sync + 'static {
     fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult;
+}
+
+pub struct TargetDispatchPlanExecutor {
+    local: Arc<dyn PlanExecutor>,
+    ssh: Option<Arc<dyn PlanExecutor>>,
+}
+
+impl TargetDispatchPlanExecutor {
+    pub fn new(local: Arc<dyn PlanExecutor>, ssh: Option<Arc<dyn PlanExecutor>>) -> Self {
+        Self { local, ssh }
+    }
+}
+
+impl PlanExecutor for TargetDispatchPlanExecutor {
+    fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult {
+        let has_ssh = plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() == "ssh-files");
+        let has_local = plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() != "ssh-files");
+        if has_ssh && has_local {
+            return ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("mixed_target_plan")),
+            };
+        }
+        if has_ssh {
+            return self.ssh.as_ref().map_or(
+                ExecutionResult {
+                    status: ApplyStatus::Failed,
+                    failure_code: Some(stable_code("ssh_executor_unavailable")),
+                },
+                |executor| executor.execute(plan, confirmation_id),
+            );
+        }
+        self.local.execute(plan, confirmation_id)
+    }
 }
 
 /// Executes approved local plans through CommonKit's durable reconciliation
@@ -2655,24 +2698,31 @@ impl BoundServer {
             token.expose_for_client().into(),
             paths.config.join("relay.json"),
         ));
-        let executor = LocalPlanExecutor::open(
-            plan_store.clone(),
-            &paths.receipts,
-            &paths.config,
-            paths.state.join("filesystem"),
-        )
-        .map_err(|_| ServiceError::UnsafeDiscoveryPath)?
-        .with_relay(
-            paths.config.join("relay.json"),
-            paths.state.join("relay"),
-            relay_runtime.clone(),
+        let local_executor = Arc::new(
+            LocalPlanExecutor::open(
+                plan_store.clone(),
+                &paths.receipts,
+                &paths.config,
+                paths.state.join("filesystem"),
+            )
+            .map_err(|_| ServiceError::UnsafeDiscoveryPath)?
+            .with_relay(
+                paths.config.join("relay.json"),
+                paths.state.join("relay"),
+                relay_runtime.clone(),
+            ),
         );
-        let control = ControlPlane::with_plan_store(Arc::new(executor), plan_store.clone());
         let production_domains = ProductionDomainRegistry::load_optional(
             &paths.config.join("headless.json"),
-            plan_store,
+            plan_store.clone(),
             paths.receipts.clone(),
         )?;
+        let ssh_executor = production_domains.ssh_executor(plan_store.clone(), &paths.receipts)?;
+        let executor = Arc::new(TargetDispatchPlanExecutor::new(
+            local_executor,
+            ssh_executor,
+        ));
+        let control = ControlPlane::with_plan_store(executor, plan_store);
         let drift_checker = Arc::new(SyncDomainDriftChecker::new(production_domains.sync.clone()));
         let skill_canary = production_domains.skill_canary.clone();
         let skills = skill_canary.as_ref().map(|runtime| runtime.engine());

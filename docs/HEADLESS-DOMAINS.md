@@ -65,3 +65,11 @@ Example shape (digests abbreviated here must be full valid `sha256:` values in r
 ```
 
 The file itself contains references and paths, never secret values. CommonKit's private-path enforcement remains responsible for its permissions.
+
+For an SSH target, set `sync.targetTransport` to `type: "ssh"` with a stable root ID,
+host, user, port, pinned `knownHosts` file, and SHA-256 host-key fingerprint. The daemon routes
+plans containing `ssh-files` operations to a restart-safe typed SSH executor; provider code still
+runs only in controller staging. The v1 remote helper can prove regular-file writes and removals,
+so those resource types support inspect, plan, apply, verify, recovery, and rollback. Remote
+directory and symlink intents fail closed until the helper protocol can inspect their type, mode,
+and target without following links; CommonKit never approximates them as files or shell commands.

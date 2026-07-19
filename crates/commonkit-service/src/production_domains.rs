@@ -17,9 +17,10 @@ use commonkit_adapters::{
 };
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{
-    LayerDocument, Plan, Sha256Digest, StableId, assert_no_embedded_secrets, digest_domain_json,
+    LayerDocument, Plan, ReceiptState, Sha256Digest, StableId, assert_no_embedded_secrets,
+    digest_domain_json,
 };
-use commonkit_reconcile::{Adapter, PlanStore, ReceiptStore, Reconciler};
+use commonkit_reconcile::{Adapter, PlanStore, ReceiptStore, ReconcileOutcome, Reconciler};
 use commonkit_snapshots::{
     AuthenticatedCipher, Authority, AuthorityStore, DatabaseId, DatabaseLifecycle, DurableRestore,
     ObjectStore, ProcessObjectCommandRunner, PromotionPlan, RestoreFailpoint, RestorePlan,
@@ -33,8 +34,8 @@ use thiserror::Error;
 
 use crate::skill_canary::{SkillCanaryConfig, SkillCanaryRuntime};
 use crate::{
-    CompositionDomain, CredentialDomain, DomainFailure, HeadlessDomainRegistry, SnapshotDomain,
-    SyncDomain,
+    ApplyStatus, CompositionDomain, CredentialDomain, DomainFailure, ExecutionResult,
+    HeadlessDomainRegistry, PlanExecutor, SnapshotDomain, SyncDomain,
 };
 
 #[derive(Deserialize)]
@@ -77,10 +78,12 @@ struct SyncConfig {
 enum SyncTargetTransport {
     Local,
     Ssh {
+        #[serde(rename = "rootId")]
         root_id: StableId,
         host: String,
         user: String,
         port: u16,
+        #[serde(rename = "knownHosts")]
         known_hosts: PathBuf,
         fingerprint: String,
     },
@@ -204,9 +207,182 @@ pub struct ProductionDomainRegistry {
     pub credentials: Option<Arc<dyn CredentialDomain>>,
     pub snapshots: Option<Arc<dyn SnapshotDomain>>,
     pub(crate) skill_canary: Option<Arc<SkillCanaryRuntime>>,
+    ssh_execution: Option<(PathBuf, ProductionSshTarget)>,
+}
+
+pub trait ProductionSshTransportFactory: Send + Sync + 'static {
+    fn open(
+        &self,
+        config: &ProductionSshTarget,
+    ) -> Result<Box<dyn commonkit_adapters::SshFilesystemTransport + Send>, DomainFailure>;
+}
+
+#[derive(Clone)]
+pub struct ProductionSshTarget {
+    root_id: StableId,
+    host: String,
+    user: String,
+    port: u16,
+    known_hosts: PathBuf,
+    fingerprint: String,
+}
+
+struct ProcessSshTransportFactory;
+impl ProductionSshTransportFactory for ProcessSshTransportFactory {
+    fn open(
+        &self,
+        config: &ProductionSshTarget,
+    ) -> Result<Box<dyn commonkit_adapters::SshFilesystemTransport + Send>, DomainFailure> {
+        let transport = OpenSshTransport::new(
+            OpenSshConfig::new(
+                &config.host,
+                &config.user,
+                config.port,
+                config.known_hosts.clone(),
+                &config.fingerprint,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?,
+            ProcessRemoteRunner,
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(Box::new(transport))
+    }
+}
+
+pub struct ProductionSshPlanExecutor {
+    plan_store: Arc<PlanStore>,
+    receipts: ReceiptStore,
+    adapter_state: PathBuf,
+    target: ProductionSshTarget,
+    factory: Arc<dyn ProductionSshTransportFactory>,
+    lock: Mutex<()>,
+}
+
+impl ProductionSshPlanExecutor {
+    pub fn with_factory(
+        plan_store: Arc<PlanStore>,
+        receipt_root: impl AsRef<Path>,
+        adapter_state: PathBuf,
+        target: ProductionSshTarget,
+        factory: Arc<dyn ProductionSshTransportFactory>,
+    ) -> Result<Self, ProductionDomainError> {
+        Ok(Self {
+            plan_store,
+            receipts: ReceiptStore::open(receipt_root)
+                .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+            adapter_state,
+            target,
+            factory,
+            lock: Mutex::new(()),
+        })
+    }
+
+    fn adapter(&self) -> Result<Vec<Box<dyn Adapter>>, DomainFailure> {
+        let transport = self.factory.open(&self.target)?;
+        Ok(vec![Box::new(
+            SshFileAdapter::open(self.target.root_id.clone(), &self.adapter_state, transport)
+                .map_err(|_| DomainFailure::OperationFailed)?,
+        )])
+    }
+
+    fn execute_inner(
+        &self,
+        plan: &Plan,
+        confirmation: &StableId,
+    ) -> Result<ReconcileOutcome, DomainFailure> {
+        let durable = self
+            .plan_store
+            .load(&plan.id)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        if durable != *plan {
+            return Err(DomainFailure::StalePlan);
+        }
+        let run_digest =
+            digest_domain_json("commonkit.production-ssh-run.v1", &(&plan.id, confirmation))
+                .map_err(|_| DomainFailure::OperationFailed)?;
+        let run_id = StableId::parse(format!("run-{}", &run_digest.as_str()[7..55]))
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let mut adapters = self.adapter()?;
+        match self.receipts.load(run_id.clone()) {
+            Ok(receipt) if matches!(receipt.receipt().state, ReceiptState::Succeeded) => {
+                Ok(ReconcileOutcome::Succeeded)
+            }
+            Ok(receipt)
+                if matches!(
+                    receipt.receipt().state,
+                    ReceiptState::RolledBack | ReceiptState::Canceled
+                ) =>
+            {
+                Ok(ReconcileOutcome::RolledBack)
+            }
+            Ok(_) => Reconciler::with_store(&self.receipts)
+                .recover_run(run_id, &durable, &mut adapters)
+                .map_err(|_| DomainFailure::OperationFailed),
+            Err(_) => Reconciler::with_store(&self.receipts)
+                .execute(&durable, run_id, &mut adapters)
+                .map_err(|_| DomainFailure::OperationFailed),
+        }
+    }
+}
+
+impl PlanExecutor for ProductionSshPlanExecutor {
+    fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult {
+        let result = self
+            .lock
+            .lock()
+            .map_err(|_| DomainFailure::OperationFailed)
+            .and_then(|_| self.execute_inner(plan, confirmation_id));
+        match result {
+            Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
+                status: ApplyStatus::Succeeded,
+                failure_code: None,
+            },
+            Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
+                status: ApplyStatus::RolledBack,
+                failure_code: None,
+            },
+            Ok(ReconcileOutcome::RollbackFailed) | Err(_) => ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(StableId::parse("remote_execution_failed").expect("static ID")),
+            },
+        }
+    }
 }
 
 impl ProductionDomainRegistry {
+    pub fn ssh_executor(
+        &self,
+        plan_store: Arc<PlanStore>,
+        receipt_root: impl AsRef<Path>,
+    ) -> Result<Option<Arc<dyn PlanExecutor>>, ProductionDomainError> {
+        self.ssh_executor_with_factory(
+            plan_store,
+            receipt_root,
+            Arc::new(ProcessSshTransportFactory),
+        )
+    }
+
+    pub fn ssh_executor_with_factory(
+        &self,
+        plan_store: Arc<PlanStore>,
+        receipt_root: impl AsRef<Path>,
+        factory: Arc<dyn ProductionSshTransportFactory>,
+    ) -> Result<Option<Arc<dyn PlanExecutor>>, ProductionDomainError> {
+        self.ssh_execution
+            .as_ref()
+            .map(|(state, target)| {
+                ProductionSshPlanExecutor::with_factory(
+                    plan_store,
+                    receipt_root,
+                    state.clone(),
+                    target.clone(),
+                    factory,
+                )
+                .map(|executor| Arc::new(executor) as Arc<dyn PlanExecutor>)
+            })
+            .transpose()
+    }
+
     pub fn load_optional(
         config_path: &Path,
         plan_store: Arc<PlanStore>,
@@ -219,6 +395,7 @@ impl ProductionDomainRegistry {
                 credentials: None,
                 snapshots: None,
                 skill_canary: None,
+                ssh_execution: None,
             });
         }
         Self::load(config_path, plan_store, receipt_root)
@@ -228,11 +405,50 @@ impl ProductionDomainRegistry {
         plan_store: Arc<PlanStore>,
         receipt_root: PathBuf,
     ) -> Result<Self, ProductionDomainError> {
+        Self::load_with_ssh_factory(
+            config_path,
+            plan_store,
+            receipt_root,
+            Arc::new(ProcessSshTransportFactory),
+        )
+    }
+
+    pub fn load_with_ssh_factory(
+        config_path: &Path,
+        plan_store: Arc<PlanStore>,
+        receipt_root: PathBuf,
+        ssh_factory: Arc<dyn ProductionSshTransportFactory>,
+    ) -> Result<Self, ProductionDomainError> {
         let metadata = fs::symlink_metadata(config_path)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(ProductionDomainError::UnsafeConfig);
         }
         let config: ProductionConfig = serde_json::from_slice(&fs::read(config_path)?)?;
+        let ssh_execution =
+            config
+                .sync
+                .as_ref()
+                .and_then(|sync| match sync.target_transport.as_ref() {
+                    Some(SyncTargetTransport::Ssh {
+                        root_id,
+                        host,
+                        user,
+                        port,
+                        known_hosts,
+                        fingerprint,
+                    }) => Some((
+                        sync.adapter_state.clone(),
+                        ProductionSshTarget {
+                            root_id: root_id.clone(),
+                            host: host.clone(),
+                            user: user.clone(),
+                            port: *port,
+                            known_hosts: known_hosts.clone(),
+                            fingerprint: fingerprint.clone(),
+                        },
+                    )),
+                    _ => None,
+                });
         let composition = config
             .composition
             .map(
@@ -272,6 +488,7 @@ impl ProductionDomainRegistry {
                         config,
                         plan_store: plan_store.clone(),
                         receipt_root: receipt_root.clone(),
+                        ssh_factory: ssh_factory.clone(),
                     }))
                 },
             )
@@ -349,6 +566,7 @@ impl ProductionDomainRegistry {
             credentials,
             snapshots,
             skill_canary,
+            ssh_execution,
         })
     }
     pub fn into_headless(self) -> HeadlessDomainRegistry {
@@ -476,6 +694,7 @@ struct ProductionSyncDomain {
     config: SyncConfig,
     plan_store: Arc<PlanStore>,
     receipt_root: PathBuf,
+    ssh_factory: Arc<dyn ProductionSshTransportFactory>,
 }
 impl ProductionSyncDomain {
     fn states(&self) -> Result<Vec<MaterializedState>, DomainFailure> {
@@ -704,7 +923,8 @@ impl ProductionSyncDomain {
                 self.finish_plan(&states, &artifacts, &rules, observed, &mut files)?
             }
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
-                let mut ssh = open_ssh_transport(transport)?;
+                let target = production_ssh_target(transport)?;
+                let mut ssh = self.ssh_factory.open(&target)?;
                 for state in &states {
                     let suffix = &state.digest.as_str()[7..39];
                     RemoteProviderStager::new(&mut ssh)
@@ -759,26 +979,28 @@ impl ProductionSyncDomain {
     }
 }
 
-fn open_ssh_transport(
+fn production_ssh_target(
     config: &SyncTargetTransport,
-) -> Result<OpenSshTransport<ProcessRemoteRunner>, DomainFailure> {
+) -> Result<ProductionSshTarget, DomainFailure> {
     let SyncTargetTransport::Ssh {
+        root_id,
         host,
         user,
         port,
         known_hosts,
         fingerprint,
-        ..
     } = config
     else {
         return Err(DomainFailure::OperationFailed);
     };
-    OpenSshTransport::new(
-        OpenSshConfig::new(host, user, *port, known_hosts.clone(), fingerprint)
-            .map_err(|_| DomainFailure::OperationFailed)?,
-        ProcessRemoteRunner,
-    )
-    .map_err(|_| DomainFailure::OperationFailed)
+    Ok(ProductionSshTarget {
+        root_id: root_id.clone(),
+        host: host.clone(),
+        user: user.clone(),
+        port: *port,
+        known_hosts: known_hosts.clone(),
+        fingerprint: fingerprint.clone(),
+    })
 }
 
 fn path_text(path: &Path) -> Result<&str, DomainFailure> {
@@ -882,7 +1104,7 @@ impl SyncDomain for ProductionSyncDomain {
                 let mut adapter = SshFileAdapter::open(
                     root_id.clone(),
                     &self.config.adapter_state,
-                    open_ssh_transport(transport)?,
+                    self.ssh_factory.open(&production_ssh_target(transport)?)?,
                 )
                 .map_err(|_| DomainFailure::OperationFailed)?;
                 for operation in &plan.operations {
@@ -926,7 +1148,7 @@ impl SyncDomain for ProductionSyncDomain {
                 SshFileAdapter::open(
                     root_id.clone(),
                     &self.config.adapter_state,
-                    open_ssh_transport(transport)?,
+                    self.ssh_factory.open(&production_ssh_target(transport)?)?,
                 )
                 .map_err(|_| DomainFailure::OperationFailed)?,
             )],

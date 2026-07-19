@@ -205,6 +205,15 @@ pub trait SshFilesystemTransport {
     ) -> Result<SshFilesystemResponse, TargetFilesystemError>;
 }
 
+impl<T: SshFilesystemTransport + ?Sized> SshFilesystemTransport for Box<T> {
+    fn perform(
+        &mut self,
+        request: SshFilesystemRequest,
+    ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+        (**self).perform(request)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TargetFilesystemError {
     #[error("target capability root must be an absolute, real directory")]
