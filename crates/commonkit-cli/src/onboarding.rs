@@ -4,10 +4,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use commonkit_adapters::{ArtifactStore, ExactProviderVersion, MaterializedState, ProviderInputs};
+use commonkit_adapters::{
+    ArtifactStore, ContentSensitivity, DesiredStateProvider, ExactProviderVersion,
+    FilesystemIntent, NativeProvider, NormalizedManagedPath, NormalizedResource, ProviderContext,
+    ProviderInputs, ProviderWorkspace, ResourceProvenance,
+};
 use commonkit_contracts::{LayerDocument, StableId, digest_domain_json};
 use commonkit_platform::{PrivatePathKind, ensure_private_path};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use thiserror::Error;
 
@@ -322,7 +326,7 @@ fn write_runtime_state(
     ensure_target_root(&request.target_root)?;
     let artifacts = request.state_directory.join("provider-artifacts");
     ensure_private_path(&artifacts, PrivatePathKind::Directory)?;
-    ArtifactStore::open(&artifacts)?;
+    let artifact_store = ArtifactStore::open(&artifacts)?;
     let layer_bytes = layer_paths
         .iter()
         .map(fs::read)
@@ -332,10 +336,82 @@ fn write_runtime_state(
         StableId::parse("native")?,
         ExactProviderVersion::parse(env!("CARGO_PKG_VERSION"))?,
         "1".to_owned(),
-        BTreeMap::from([("loadout".to_owned(), layer_digest.clone())]),
+        BTreeMap::from([
+            ("loadout".to_owned(), layer_digest.clone()),
+            (
+                "repositoryRevision".to_owned(),
+                digest_domain_json("commonkit.onboarding.repository-revision.v1", &revision)?,
+            ),
+        ]),
         vec!["files".to_owned()],
     )?;
-    let materialized = MaterializedState::finalize(inputs, vec![], vec![], vec![])?;
+    let mut resources = Vec::new();
+    for path in layer_paths {
+        let document: LayerDocument = serde_json::from_slice(&fs::read(path)?)?;
+        let declarations = document
+            .spec
+            .get("files")
+            .cloned()
+            .map(serde_json::from_value::<Vec<NativeFileDeclaration>>)
+            .transpose()?
+            .unwrap_or_default();
+        for declaration in declarations {
+            let managed_path = NormalizedManagedPath::parse(&declaration.path)?;
+            let source_path = NormalizedManagedPath::parse(&declaration.source)?;
+            let source = request.kit_directory.join(source_path.as_str());
+            let metadata = fs::symlink_metadata(&source)
+                .map_err(|_| OnboardingError::MissingProviderSource(declaration.source.clone()))?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(OnboardingError::UnsafeProviderSource(declaration.source));
+            }
+            let canonical_kit = request.kit_directory.canonicalize()?;
+            let canonical_source = source.canonicalize()?;
+            if !canonical_source.starts_with(&canonical_kit) {
+                return Err(OnboardingError::UnsafeProviderSource(declaration.source));
+            }
+            let content = artifact_store.put(
+                &fs::read(&canonical_source)?,
+                ContentSensitivity::Portable,
+            )?;
+            resources.push((managed_path, content, declaration.source));
+        }
+    }
+    let resources = resources
+        .into_iter()
+        .map(|(path, content, source)| NormalizedResource {
+            intent: FilesystemIntent::File {
+                path,
+                content,
+                mode: None,
+                expected_before: None,
+            },
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id.clone(),
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest.clone(),
+                source,
+            },
+        })
+        .collect();
+    let provider = NativeProvider::new(inputs, resources)?;
+    let staging = request.state_directory.join("provider-workspaces/native");
+    ensure_private_path(&staging, PrivatePathKind::Directory)?;
+    let workspace = ProviderWorkspace::open(
+        &staging,
+        &[request.target_root.clone(), request.kit_directory.clone()],
+    )?;
+    let context = ProviderContext {
+        target_id: target.clone(),
+        platform: std::env::consts::OS.to_owned(),
+        architecture: std::env::consts::ARCH.to_owned(),
+        policy_digest: digest_domain_json(
+            "commonkit.onboarding.policy.v1",
+            &json!({"organizationFloor": "required"}),
+        )?,
+        declared_roots: vec![NormalizedManagedPath::parse("portable")?],
+        observed_fact_digests: BTreeMap::new(),
+    };
+    let materialized = provider.materialize(&context, &workspace, &artifact_store)?;
     let provider_state = request.state_directory.join("providers/native.json");
     ensure_private_path(provider_state.parent().unwrap(), PrivatePathKind::Directory)?;
     write_private_json(&provider_state, &materialized)?;
@@ -364,6 +440,13 @@ fn write_runtime_state(
     let path = request.config_directory.join("headless.json");
     write_private_json(&path, &config)?;
     Ok(path)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeFileDeclaration {
+    path: String,
+    source: String,
 }
 
 fn write_new_json(path: &Path, value: &impl Serialize) -> Result<(), OnboardingError> {
@@ -448,6 +531,10 @@ pub enum OnboardingError {
     PortableFileExists(PathBuf),
     #[error("Git returned an invalid HEAD revision")]
     InvalidGitRevision,
+    #[error("native provider source is missing: {0}")]
+    MissingProviderSource(String),
+    #[error("native provider source must be a regular non-symlink file: {0}")]
+    UnsafeProviderSource(String),
     #[error("required tool {tool} is unavailable: {detail}")]
     ToolUnavailable { tool: String, detail: String },
     #[error(
@@ -464,6 +551,10 @@ pub enum OnboardingError {
     Contract(#[from] commonkit_contracts::ContractError),
     #[error(transparent)]
     Provider(#[from] commonkit_adapters::ProviderContractError),
+    #[error(transparent)]
+    ProviderFailure(#[from] commonkit_adapters::ProviderFailure),
+    #[error(transparent)]
+    Resource(#[from] commonkit_adapters::ResourceError),
     #[error(transparent)]
     Artifact(#[from] commonkit_adapters::ArtifactError),
     #[error(transparent)]

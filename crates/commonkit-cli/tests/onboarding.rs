@@ -39,7 +39,9 @@ case "$1 $2" in
     mkdir -p "$4/layers"
     printf '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/public-base.json"
     printf '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/organization-policy.json"
-    printf '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/personal.json"
+    mkdir -p "$4/portable"
+    printf 'managed from git\n' > "$4/portable/editor.conf"
+    printf '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"files":[{"path":"portable/editor.conf","source":"portable/editor.conf"}]}}' > "$4/layers/personal.json"
     exit 0 ;;
 esac
 exit 91
@@ -92,13 +94,17 @@ exit 92
     )
     .unwrap();
     let composition = registry.composition.unwrap().compose().unwrap();
-    assert_eq!(composition["spec"], serde_json::json!({}));
+    assert_eq!(composition["spec"]["files"].as_array().unwrap().len(), 1);
     let plan = registry
         .sync
         .unwrap()
         .plan(serde_json::json!({"confirmed":true,"confirmationId":"first-diff"}))
         .unwrap();
-    assert_eq!(plan["operations"], serde_json::json!([]));
+    assert_eq!(plan["operations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        plan["operations"][0]["resource"]["managedPath"],
+        "portable/editor.conf"
+    );
     assert_eq!(
         std::fs::metadata(temporary.path().join("target"))
             .unwrap()
@@ -135,6 +141,43 @@ fn create_provisions_a_private_repository_and_pushes_only_portable_files() {
     assert!(commands.contains("git -C"));
     assert!(commands.contains("push --set-upstream origin HEAD"));
     assert!(!commands.to_ascii_lowercase().contains("token"));
+}
+
+#[test]
+fn connect_rejects_native_sources_that_escape_the_git_checkout() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(temporary.path().join("outside"), b"must not import").unwrap();
+    test_support::write_tool(
+        &bin,
+        "gh",
+        r#"
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers"
+    printf '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/public-base.json"
+    printf '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/organization-policy.json"
+    printf '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"files":[{"path":"portable/escape","source":"portable/escape"}]}}' > "$4/layers/personal.json"
+    mkdir "$4/portable"
+    ln -s "../../outside" "$4/portable/escape"
+    exit 0 ;;
+esac
+exit 91
+"#,
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        "[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' && exit 0\nexit 92",
+    );
+    let error = initialize(
+        &request(temporary.path(), InitMode::Connect, "owner/kit"),
+        &ProcessRunner::new(&bin),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("regular non-symlink file"));
 }
 
 #[test]
