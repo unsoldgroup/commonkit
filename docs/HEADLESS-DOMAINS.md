@@ -6,6 +6,17 @@ The configuration has three independent sections:
 
 - `sync` identifies the target root, adapter state, declared and protected portable roots, composed-loadout and policy bindings, and a provider artifact store. Production loadouts use `providerPipeline`: CommonKit fetches and validates the trusted Git remote and exact pinned revision, runs configured native/APM/chezmoi providers in isolated controller workspaces, validates the combined ownership map, and persists digest-addressed `MaterializedState` records before planning. `materializedStates` remains a migration path and is mutually exclusive with `providerPipeline`. Provider code never runs during apply, recovery, or rollback.
 - `credentials` maps stable destination IDs to a credential reference and a relative path below a capability-rooted private directory. Requests name destination IDs only. Secret bytes are resolved at apply or verify time and never enter configuration responses, plans, receipts, logs, or portable metadata. The production registry currently accepts local `env://` and `file://` references; other schemes fail closed until their resolver is explicitly wired.
+
+Relay reconciliation is a two-step review contract described by
+`schemas/relay-reconcile.schema.json`. A proposal names only a configured
+`targetId`, a future `confirmationId`, and an idempotency key. CommonKit loads
+and integrity-checks that target's provider materialization, rejects capability
+ownership collisions, and returns its recomputed declaration, provider-input,
+ownership, artifact-set, and plan digests. Consent resubmits those exact digests
+with `confirmed: true`. Caller-supplied resolved declarations or binding digests
+are rejected. The confirmation ID is embedded in the immutable relay operation
+payload and checked again by the durable executor, so a stale or replayed
+confirmation cannot authorize a different reviewed state.
 - `snapshots` maps database IDs to configured local database paths, source formats, and target identities. Use `sqlite` for SQLite databases so planning uses the online backup API and consumes WAL state consistently; `file` is reserved for stores whose own lifecycle guarantees a consistent single-file image. Both manifests and objects are authenticated and encrypted with a target-local key reference. The production `s3` backend uses the AWS CLI credential chain, keeping credentials outside CommonKit configuration; `local` is an explicit test/development backend. Authoritative-writer assignments are durable and list responses contain decrypted metadata only.
 
 Example shape (digests abbreviated here must be full valid `sha256:` values in real configuration):

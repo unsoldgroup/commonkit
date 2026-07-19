@@ -108,6 +108,14 @@ fn validates_registered_plans_and_executes_each_idempotency_key_once() {
     assert_eq!(first.status, ApplyStatus::Succeeded);
     assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
 
+    let replayed_confirmation = StableId::parse("different-review").unwrap();
+    assert!(
+        control
+            .apply(&plan.id, &replayed_confirmation, "request-001")
+            .is_err(),
+        "an idempotency key cannot replay a different confirmation authority"
+    );
+
     let mut tampered = plan;
     tampered.target_id = StableId::parse("other").expect("target");
     assert!(control.register_plan(tampered).is_err());
@@ -183,4 +191,35 @@ async fn apply_endpoint_requires_explicit_confirmation_and_idempotency() {
         .await
         .expect("response");
     assert_eq!(confirmed.status(), StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn relay_endpoint_rejects_caller_supplied_resolved_declarations() {
+    let token = ControlToken::generate();
+    let application = router_with_control(
+        token.clone(),
+        Arc::new(RwLock::new(ServiceStatus::default())),
+        "127.0.0.1:3764",
+        EventHub::new(8),
+        ControlPlane::new(Arc::new(SuccessfulExecutor {
+            calls: AtomicUsize::new(0),
+        })),
+    );
+    let response = application
+        .oneshot(
+            Request::post("/control/v1/relay/reconcile")
+                .header(header::HOST, "127.0.0.1:3764")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose_for_client()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"targetId":"local","confirmed":false,"confirmationId":"relay-review","idempotencyKey":"relay-1","review":null,"resolved":{"contractVersion":"commonkit.resolved-mcp.v1","declarations":[]}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }

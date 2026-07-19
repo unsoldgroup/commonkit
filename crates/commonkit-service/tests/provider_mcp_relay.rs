@@ -85,3 +85,15 @@ fn manifest_input_change_changes_durable_materialization_binding() {
     );
     assert_ne!(before.digest, after.digest);
 }
+
+#[test]
+fn tampered_materialized_capability_is_rejected_before_relay_planning() {
+    let mut materialized = state("apm", "docs", 'a');
+    let ProviderCapability::McpStreamableHttp { name, .. } =
+        &mut materialized.capabilities[0].capability;
+    *name = "tampered".into();
+    assert_eq!(
+        resolved_mcp_from_materialized(&[materialized]).unwrap_err(),
+        ProviderMcpError::InvalidMaterialization
+    );
+}

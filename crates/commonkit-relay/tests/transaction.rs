@@ -36,6 +36,11 @@ fn relay_operation_is_content_addressed_bound_and_requires_confirmation() {
             provider_inputs_digest: digest("a"),
             policy_digest: digest("b"),
             target_digest: digest("c"),
+            declaration_digest: digest("d"),
+            ownership_map_digest: digest("e"),
+            artifact_set_digest: digest("f"),
+            approved_confirmation_id: StableId::parse("relay-review-one").unwrap(),
+            approval_idempotency_key: "relay-request-one".into(),
         },
     };
 
@@ -48,6 +53,16 @@ fn relay_operation_is_content_addressed_bound_and_requires_confirmation() {
     assert_eq!(first, repeat);
     assert!(first.requires_confirmation);
     assert_eq!(first.kind, OperationKind::Create);
+    assert!(
+        adapter
+            .validate_confirmation(&first, &StableId::parse("relay-review-one").unwrap())
+            .is_ok()
+    );
+    assert!(
+        adapter
+            .validate_confirmation(&first, &StableId::parse("relay-review-replayed").unwrap())
+            .is_err()
+    );
 
     let mut changed = request;
     changed.inputs.policy_digest = digest("d");
@@ -74,6 +89,11 @@ fn relay_adapter_applies_verifies_and_rolls_back_from_a_fresh_process() {
                 provider_inputs_digest: digest("a"),
                 policy_digest: digest("b"),
                 target_digest: digest("c"),
+                declaration_digest: digest("d"),
+                ownership_map_digest: digest("e"),
+                artifact_set_digest: digest("f"),
+                approved_confirmation_id: StableId::parse("relay-review-two").unwrap(),
+                approval_idempotency_key: "relay-request-two".into(),
             },
         },
     )
@@ -91,6 +111,11 @@ fn relay_adapter_applies_verifies_and_rolls_back_from_a_fresh_process() {
                     provider_inputs_digest: digest("a"),
                     policy_digest: digest("b"),
                     target_digest: digest("c"),
+                    declaration_digest: digest("d"),
+                    ownership_map_digest: digest("e"),
+                    artifact_set_digest: digest("f"),
+                    approved_confirmation_id: StableId::parse("relay-review-two").unwrap(),
+                    approval_idempotency_key: "relay-request-two".into(),
                 },
             },
         )

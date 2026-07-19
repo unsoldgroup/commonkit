@@ -160,16 +160,21 @@ pub struct TargetConsentInput {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RelayReconcileInput {
+    pub target_id: String,
     pub confirmed: bool,
     pub confirmation_id: String,
     pub idempotency_key: String,
-    pub resolved: Value,
-    pub target_identity_digest: String,
-    pub composed_loadout_digest: String,
+    pub review: Option<RelayReviewInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RelayReviewInput {
+    pub declaration_digest: String,
     pub provider_inputs_digest: String,
-    pub policy_digest: String,
     pub ownership_map_digest: String,
     pub artifact_set_digest: String,
+    pub plan_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -536,13 +541,10 @@ impl CommonKitMcp {
         &self,
         Parameters(input): Parameters<RelayReconcileInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        if !input.confirmed {
-            return Ok(input_error(
-                "confirmation_required",
-                "Explicit user confirmation is required",
-            ));
-        }
-        if input.confirmation_id.is_empty() || input.idempotency_key.is_empty() {
+        if input.target_id.is_empty()
+            || input.confirmation_id.is_empty()
+            || input.idempotency_key.is_empty()
+        {
             return Ok(input_error(
                 "invalid_input",
                 "Confirmation fields are invalid",
@@ -554,10 +556,10 @@ impl CommonKitMcp {
                 "Relay request exceeds the safe size",
             ));
         }
-        if input.resolved.is_null() {
+        if input.confirmed != input.review.is_some() {
             return Ok(input_error(
                 "invalid_input",
-                "Resolved MCP declarations are required",
+                "A reviewed digest binding is required exactly when confirming",
             ));
         }
         tool_result(
@@ -584,10 +586,7 @@ impl CommonKitMcp {
         let path = format!("/control/v1/targets/{}/sync/plan", input.target_id);
         tool_result(
             self.backend
-                .post(
-                    &path,
-                    serde_json::to_value(&input).unwrap_or(Value::Null),
-                )
+                .post(&path, serde_json::to_value(&input).unwrap_or(Value::Null))
                 .await,
         )
     }

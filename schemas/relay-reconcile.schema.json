@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://commonkit.dev/schemas/relay-reconcile.schema.json",
+  "title": "Relay reconciliation proposal or consent",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "targetId",
+    "confirmed",
+    "confirmationId",
+    "idempotencyKey",
+    "review"
+  ],
+  "properties": {
+    "targetId": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,62}$" },
+    "confirmed": { "type": "boolean" },
+    "confirmationId": { "type": "string", "pattern": "^[a-z][a-z0-9_-]{0,62}$" },
+    "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "review": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "declarationDigest",
+            "providerInputsDigest",
+            "ownershipMapDigest",
+            "artifactSetDigest",
+            "planDigest"
+          ],
+          "properties": {
+            "declarationDigest": { "$ref": "#/$defs/sha256" },
+            "providerInputsDigest": { "$ref": "#/$defs/sha256" },
+            "ownershipMapDigest": { "$ref": "#/$defs/sha256" },
+            "artifactSetDigest": { "$ref": "#/$defs/sha256" },
+            "planDigest": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "confirmed": { "const": true } } },
+      "then": { "properties": { "review": { "type": "object" } } },
+      "else": { "properties": { "review": { "type": "null" } } }
+    }
+  ]
+}

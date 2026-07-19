@@ -11,9 +11,10 @@ use commonkit_adapters::{
     LocalSensitiveFileStore, MaterializedState, NativeProvider, NormalizedManagedPath,
     NormalizedResource, OpenSshConfig, OpenSshTransport, OwnershipRules, PlatformKeychain,
     PlatformKeychainCredentialResolver, ProcessBwsRunner, ProcessGitRunner,
-    ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderContext, ProviderInputs,
-    ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner, RemoteProviderStager,
-    ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan, validate_ownership,
+    ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
+    ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
+    RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
+    validate_ownership,
 };
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{
@@ -37,7 +38,7 @@ use thiserror::Error;
 use crate::skill_canary::{SkillCanaryConfig, SkillCanaryRuntime};
 use crate::{
     ApplyStatus, CompositionDomain, CredentialDomain, DomainFailure, ExecutionResult,
-    HeadlessDomainRegistry, PlanExecutor, SnapshotDomain, SyncDomain,
+    HeadlessDomainRegistry, PlanExecutor, RelayProviderAuthority, SnapshotDomain, SyncDomain,
 };
 
 #[derive(Deserialize)]
@@ -1249,6 +1250,69 @@ struct RollbackRequest {
     idempotency_key: Option<String>,
 }
 impl SyncDomain for ProductionSyncDomain {
+    fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
+        let states = self.states()?;
+        let artifact_store = ArtifactStore::open(&self.config.provider_artifacts)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        for state in &states {
+            state.verify().map_err(|_| DomainFailure::OperationFailed)?;
+            for resource in &state.resources {
+                if let FilesystemIntent::File { content, .. } = &resource.intent {
+                    artifact_store
+                        .load(content)
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                }
+            }
+        }
+        let mut provider_inputs = states
+            .iter()
+            .map(|state| state.inputs.input_set_digest.clone())
+            .collect::<Vec<_>>();
+        provider_inputs.sort();
+        let mut artifacts = states
+            .iter()
+            .map(|state| state.digest.clone())
+            .collect::<Vec<_>>();
+        artifacts.sort();
+        let mut ownership = states
+            .iter()
+            .flat_map(|state| state.capabilities.iter())
+            .map(|resource| {
+                let ProviderCapability::McpStreamableHttp { id, .. } = &resource.capability;
+                (
+                    id.clone(),
+                    resource.provenance.provider_id.clone(),
+                    resource.provenance.source.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        ownership.sort();
+        if ownership.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+            return Err(DomainFailure::OperationFailed);
+        }
+        Ok(RelayProviderAuthority {
+            materialized_states: states,
+            target_identity_digest: self.config.target_identity_digest.clone(),
+            composed_loadout_digest: self.config.composed_loadout_digest.clone(),
+            provider_inputs_digest: digest_domain_json(
+                "commonkit.relay-provider-inputs.v1",
+                &provider_inputs,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?,
+            policy_digest: self.config.policy_digest.clone(),
+            ownership_map_digest: digest_domain_json(
+                "commonkit.relay-capability-ownership.v1",
+                &ownership,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?,
+            artifact_set_digest: digest_domain_json(
+                "commonkit.relay-materialized-set.v1",
+                &artifacts,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?,
+        })
+    }
+
     fn plan(&self, request: Value) -> Result<Value, DomainFailure> {
         let request: PlanRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;

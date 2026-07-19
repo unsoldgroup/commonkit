@@ -1,8 +1,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use commonkit_contracts::{
     Operation, OperationKind, ResourceRef, Risk, Sha256Digest, StableId, digest_domain_json,
@@ -23,6 +23,11 @@ pub struct RelayMutationInputs {
     pub provider_inputs_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
     pub target_digest: Sha256Digest,
+    pub declaration_digest: Sha256Digest,
+    pub ownership_map_digest: Sha256Digest,
+    pub artifact_set_digest: Sha256Digest,
+    pub approved_confirmation_id: StableId,
+    pub approval_idempotency_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -136,6 +141,24 @@ impl RelayAdapter {
         }
         Ok(record.payload)
     }
+
+    /// Checks that execution uses the exact confirmation reviewed when the
+    /// content-addressed relay operation was created. The binding lives in the
+    /// immutable operation record, so it survives daemon restarts.
+    pub fn validate_confirmation(
+        &self,
+        operation: &Operation,
+        confirmation_id: &StableId,
+    ) -> Result<(), AdapterFailure> {
+        let payload = self.payload(operation)?;
+        if &payload.inputs.approved_confirmation_id != confirmation_id {
+            return Err(failure(
+                "relay_confirmation_mismatch",
+                "confirmation does not authorize the reviewed relay operation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub fn plan_relay_operation(
@@ -239,9 +262,9 @@ impl Adapter for RelayAdapter {
             )
         })?;
         if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.reload(&payload.desired).map_err(|_| {
-                failure("relay_reload_failed", "could not reload relay runtime")
-            })?;
+            lifecycle
+                .reload(&payload.desired)
+                .map_err(|_| failure("relay_reload_failed", "could not reload relay runtime"))?;
         }
         Ok(())
     }
@@ -306,9 +329,9 @@ impl Adapter for RelayAdapter {
             )
         })?;
         if let Some(lifecycle) = &self.lifecycle {
-            lifecycle.restart().map_err(|_| {
-                failure("relay_rollback_failed", "could not restore relay runtime")
-            })?;
+            lifecycle
+                .restart()
+                .map_err(|_| failure("relay_rollback_failed", "could not restore relay runtime"))?;
         }
         Ok(())
     }

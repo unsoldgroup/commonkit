@@ -1016,6 +1016,18 @@ impl LocalPlanExecutor {
         if durable != *plan {
             return Err(LocalExecutionError::PlanMismatch);
         }
+        if let Some(relay) = &self.relay {
+            let adapter = RelayAdapter::open(stable_code("relay"), &relay.live, &relay.state)?;
+            for operation in plan
+                .operations
+                .iter()
+                .filter(|operation| operation.adapter_id.as_str() == "relay")
+            {
+                adapter
+                    .validate_confirmation(operation, confirmation_id)
+                    .map_err(|_| LocalExecutionError::PlanMismatch)?;
+            }
+        }
         let run_id = durable_run_id(&plan.id, confirmation_id)?;
         match self.receipt_store.load(run_id.clone()) {
             Ok(receipt) => match receipt.receipt().state {
@@ -1113,6 +1125,12 @@ impl RelayPlanExecutor {
         let durable = self.plan_store.load(&plan.id)?;
         if durable != *plan {
             return Err(LocalExecutionError::PlanMismatch);
+        }
+        let relay = self.adapter()?;
+        for operation in &plan.operations {
+            relay
+                .validate_confirmation(operation, confirmation_id)
+                .map_err(|_| LocalExecutionError::PlanMismatch)?;
         }
         let run_id = durable_run_id(&plan.id, confirmation_id)?;
         let mut adapter: Vec<Box<dyn Adapter>> = vec![Box::new(self.adapter()?)];
@@ -1237,6 +1255,20 @@ pub trait SyncDomain: Send + Sync + 'static {
     fn plan(&self, request: Value) -> Result<Value, DomainFailure>;
     fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
     fn rollback(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayProviderAuthority {
+    pub materialized_states: Vec<MaterializedState>,
+    pub target_identity_digest: Sha256Digest,
+    pub composed_loadout_digest: Sha256Digest,
+    pub provider_inputs_digest: Sha256Digest,
+    pub policy_digest: Sha256Digest,
+    pub ownership_map_digest: Sha256Digest,
+    pub artifact_set_digest: Sha256Digest,
 }
 
 pub struct SyncDomainDriftChecker {
@@ -1390,7 +1422,7 @@ struct ControlPlaneInner {
     plans: std::sync::RwLock<BTreeMap<Sha256Digest, Plan>>,
     plan_store: Option<Arc<PlanStore>>,
     operations: std::sync::RwLock<BTreeMap<Sha256Digest, ApplyOperation>>,
-    idempotency: std::sync::Mutex<BTreeMap<String, (Sha256Digest, Sha256Digest)>>,
+    idempotency: std::sync::Mutex<BTreeMap<String, (Sha256Digest, StableId, Sha256Digest)>>,
     executor: Arc<dyn PlanExecutor>,
     scheduler_store: std::sync::RwLock<Option<Arc<SchedulerStore>>>,
     domains: std::sync::RwLock<HeadlessDomainRegistry>,
@@ -1597,8 +1629,8 @@ impl ControlPlane {
 
         {
             let mut keys = self.inner.idempotency.lock().expect("idempotency lock");
-            if let Some((bound_plan, existing_id)) = keys.get(idempotency_key) {
-                if bound_plan != plan_id {
+            if let Some((bound_plan, bound_confirmation, existing_id)) = keys.get(idempotency_key) {
+                if bound_plan != plan_id || bound_confirmation != confirmation_id {
                     return Err(ControlError::IdempotencyConflict);
                 }
                 return self
@@ -1619,7 +1651,11 @@ impl ControlPlane {
                 .insert(operation_id.clone(), running);
             keys.insert(
                 idempotency_key.into(),
-                (plan_id.clone(), operation_id.clone()),
+                (
+                    plan_id.clone(),
+                    confirmation_id.clone(),
+                    operation_id.clone(),
+                ),
             );
         }
         Ok((
@@ -2733,18 +2769,21 @@ async fn restart_relay(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RelayReconcileRequest {
+    target_id: StableId,
     confirmed: bool,
     confirmation_id: StableId,
     idempotency_key: String,
-    resolved: Option<ResolvedMcpDeclarations>,
-    #[serde(default)]
-    materialized_states: Vec<MaterializedState>,
-    target_identity_digest: Sha256Digest,
-    composed_loadout_digest: Sha256Digest,
+    review: Option<RelayReviewBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RelayReviewBinding {
+    declaration_digest: Sha256Digest,
     provider_inputs_digest: Sha256Digest,
-    policy_digest: Sha256Digest,
     ownership_map_digest: Sha256Digest,
     artifact_set_digest: Sha256Digest,
+    plan_digest: Sha256Digest,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -2800,20 +2839,22 @@ pub fn resolved_mcp_from_materialized(
 async fn plan_relay_reconcile(
     State(state): State<ApiState>,
     Json(request): Json<RelayReconcileRequest>,
-) -> Result<(StatusCode, Json<Plan>), ApiError> {
-    if !request.confirmed {
-        return Err(ApiError::conflict("confirmation_required"));
-    }
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     if request.idempotency_key.is_empty() || request.idempotency_key.len() > 128 {
         return Err(ApiError::bad_request("invalid_idempotency_key"));
     }
-    let _confirmation_id = request.confirmation_id;
-    let resolved = match (request.resolved, request.materialized_states.is_empty()) {
-        (Some(resolved), true) => resolved,
-        (None, false) => resolved_mcp_from_materialized(&request.materialized_states)
-            .map_err(|_| ApiError::bad_request("relay_provider_output_invalid"))?,
-        _ => return Err(ApiError::bad_request("relay_provider_source_ambiguous")),
-    };
+    let domain = state
+        .control
+        .target_sync_domain(&request.target_id)
+        .map_err(ApiError::from)?;
+    let authority = domain
+        .relay_provider_authority()
+        .map_err(|_| ApiError::conflict("relay_provider_authority_invalid"))?;
+    let resolved = resolved_mcp_from_materialized(&authority.materialized_states)
+        .map_err(|_| ApiError::conflict("relay_provider_output_invalid"))?;
+    let declaration_digest =
+        digest_domain_json("commonkit.resolved-mcp-declarations.v1", &resolved)
+            .map_err(|_| ApiError::internal("relay_plan_failed"))?;
     let converged = converge_provider_mcp(resolved)
         .map_err(|_| ApiError::bad_request("relay_declarations_invalid"))?;
     let paths = commonkit_platform::AppPaths::discover()
@@ -2832,9 +2873,14 @@ async fn plan_relay_reconcile(
         RelayPlanRequest {
             desired: converged.relay.clone(),
             inputs: RelayMutationInputs {
-                provider_inputs_digest: request.provider_inputs_digest.clone(),
-                policy_digest: request.policy_digest.clone(),
-                target_digest: request.target_identity_digest.clone(),
+                provider_inputs_digest: authority.provider_inputs_digest.clone(),
+                policy_digest: authority.policy_digest.clone(),
+                target_digest: authority.target_identity_digest.clone(),
+                declaration_digest: declaration_digest.clone(),
+                ownership_map_digest: authority.ownership_map_digest.clone(),
+                artifact_set_digest: authority.artifact_set_digest.clone(),
+                approved_confirmation_id: request.confirmation_id.clone(),
+                approval_idempotency_key: request.idempotency_key,
             },
         },
     )
@@ -2846,22 +2892,46 @@ async fn plan_relay_reconcile(
         .and_then(|value| value.before_digest.clone())
         .unwrap_or_else(|| desired_digest.clone());
     let plan = build_plan(PlanDraft {
-        target_id: StableId::parse("local").expect("static stable identifier"),
+        target_id: request.target_id,
         desired_digest,
         observed_digest,
-        policy_digest: request.policy_digest.clone(),
+        policy_digest: authority.policy_digest.clone(),
         bindings: PlanBindings {
-            target_identity_digest: request.target_identity_digest,
-            composed_loadout_digest: request.composed_loadout_digest,
-            provider_inputs_digest: request.provider_inputs_digest,
-            ownership_map_digest: request.ownership_map_digest,
-            artifact_set_digest: request.artifact_set_digest,
+            target_identity_digest: authority.target_identity_digest,
+            composed_loadout_digest: authority.composed_loadout_digest,
+            provider_inputs_digest: authority.provider_inputs_digest.clone(),
+            ownership_map_digest: authority.ownership_map_digest.clone(),
+            artifact_set_digest: authority.artifact_set_digest.clone(),
         },
         operations: operation.into_iter().collect(),
     })
     .map_err(|_| ApiError::internal("relay_plan_failed"))?;
+    let computed_review = RelayReviewBinding {
+        declaration_digest,
+        provider_inputs_digest: authority.provider_inputs_digest,
+        ownership_map_digest: authority.ownership_map_digest,
+        artifact_set_digest: authority.artifact_set_digest,
+        plan_digest: plan.id.clone(),
+    };
+    if !request.confirmed {
+        if request.review.is_some() {
+            return Err(ApiError::bad_request(
+                "relay_review_not_allowed_for_proposal",
+            ));
+        }
+        return Ok((
+            StatusCode::OK,
+            Json(serde_json::json!({"plan": plan, "review": computed_review})),
+        ));
+    }
+    if request.review.as_ref() != Some(&computed_review) {
+        return Err(ApiError::conflict("relay_review_stale_or_tampered"));
+    }
     let plan = state.control.register_plan(plan)?;
-    Ok((StatusCode::CREATED, Json(plan)))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({"plan": plan, "review": computed_review})),
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq)]

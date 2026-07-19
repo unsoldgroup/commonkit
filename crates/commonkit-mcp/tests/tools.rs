@@ -3,9 +3,8 @@ use std::sync::{Arc, Mutex};
 use commonkit_mcp::{
     ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend,
     ProposeSkillCanaryApplyInput, ProposeSkillCanaryRollbackInput, ProposeSkillPromotionInput,
-    ReadInput, RelayReconcileInput, ShowSkillCandidateInput, SkillEvidencePreviewInput,
-    SkillOpportunitiesInput,
-    TargetConsentInput,
+    ReadInput, RelayReconcileInput, RelayReviewInput, ShowSkillCandidateInput,
+    SkillEvidencePreviewInput, SkillOpportunitiesInput, TargetConsentInput,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
@@ -242,7 +241,10 @@ async fn verify_rejects_an_omitted_target_before_contacting_the_backend() {
         .await
         .expect("structured rejection");
     assert_eq!(result.is_error, Some(true));
-    assert_eq!(result.structured_content.expect("content")["code"], "target_required");
+    assert_eq!(
+        result.structured_content.expect("content")["code"],
+        "target_required"
+    );
     assert!(backend.posts.lock().expect("posts").is_empty());
 }
 
@@ -251,7 +253,9 @@ async fn every_mutation_tool_requires_consent_before_backend_execution() {
     let backend = Arc::new(FakeBackend::default());
     let server = CommonKitMcp::new(backend.clone());
     for result in [
-        server.plan_sync(Parameters(TargetConsentInput::denied("local"))).await,
+        server
+            .plan_sync(Parameters(TargetConsentInput::denied("local")))
+            .await,
         server
             .snapshot_create(Parameters(ConsentInput::denied()))
             .await,
@@ -269,25 +273,54 @@ async fn every_mutation_tool_requires_consent_before_backend_execution() {
     }
     let denied = server
         .relay_reconcile(Parameters(RelayReconcileInput {
+            target_id: "local".into(),
             confirmed: false,
-            confirmation_id: "not-confirmed".into(),
-            idempotency_key: "not-confirmed".into(),
-            resolved: json!({}),
-            target_identity_digest: String::new(),
-            composed_loadout_digest: String::new(),
-            provider_inputs_digest: String::new(),
-            policy_digest: String::new(),
-            ownership_map_digest: String::new(),
-            artifact_set_digest: String::new(),
+            confirmation_id: String::new(),
+            idempotency_key: String::new(),
+            review: None,
         }))
         .await
         .expect("relay denial");
     assert_eq!(
         denied.structured_content.expect("structured")["code"],
-        "confirmation_required"
+        "invalid_input"
     );
     assert!(backend.applies.lock().expect("applies").is_empty());
     assert!(backend.posts.lock().expect("posts").is_empty());
+}
+
+#[tokio::test]
+async fn relay_proposal_and_consent_forward_only_target_owned_review_authority() {
+    let backend = Arc::new(FakeBackend::default());
+    let server = CommonKitMcp::new(backend.clone());
+    server
+        .relay_reconcile(Parameters(RelayReconcileInput {
+            target_id: "local".into(),
+            confirmed: false,
+            confirmation_id: "relay-review-one".into(),
+            idempotency_key: "relay-request-one".into(),
+            review: None,
+        }))
+        .await
+        .expect("proposal");
+    let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    server
+        .relay_reconcile(Parameters(RelayReconcileInput {
+            target_id: "local".into(),
+            confirmed: true,
+            confirmation_id: "relay-review-one".into(),
+            idempotency_key: "relay-request-one".into(),
+            review: Some(RelayReviewInput {
+                declaration_digest: digest.into(),
+                provider_inputs_digest: digest.into(),
+                ownership_map_digest: digest.into(),
+                artifact_set_digest: digest.into(),
+                plan_digest: digest.into(),
+            }),
+        }))
+        .await
+        .expect("consent");
+    assert_eq!(backend.posts.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

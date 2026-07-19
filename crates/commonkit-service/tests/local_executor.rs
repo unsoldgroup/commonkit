@@ -157,6 +157,11 @@ fn one_durable_run_dispatches_filesystem_and_relay_operations() {
                 provider_inputs_digest: digest(8),
                 policy_digest: digest(3),
                 target_digest: digest(9),
+                declaration_digest: digest(12),
+                ownership_map_digest: digest(13),
+                artifact_set_digest: digest(14),
+                approved_confirmation_id: StableId::parse("mixed-confirmation").unwrap(),
+                approval_idempotency_key: "mixed-idempotency".into(),
             },
         },
     )
@@ -182,7 +187,7 @@ fn one_durable_run_dispatches_filesystem_and_relay_operations() {
     .with_relay(&relay_live, &relay_state, Arc::new(NoopRelayLifecycle));
     assert_eq!(
         executor
-            .execute(&mixed, &StableId::parse("mixed-approved").unwrap())
+            .execute(&mixed, &StableId::parse("mixed-confirmation").unwrap())
             .status,
         ApplyStatus::Succeeded
     );
