@@ -17,4 +17,19 @@ dl { margin: 38px 0; display: grid; grid-template-columns: 120px 1fr; border-top
 .update-date { font-size: 14px; }
 .release-notes { max-height: 260px; overflow: auto; white-space: pre-wrap; font: 14px/1.5 ui-monospace, monospace; color: #303a35; background: #f4f6f2; padding: 14px; border-radius: 8px; }
 .update-error { color: #9a2d2d; }
+.summary-card { margin: 24px 0; padding: 20px; border: 1px solid #d7ddd8; border-radius: 12px; background: white; }
+.summary-card h2 { margin: 4px 0; } .summary-card p { margin: 4px 0; font-size: 14px; overflow-wrap: anywhere; }
+.risk { display: inline-block; padding: 3px 8px; border-radius: 999px; background: #e8eee9; font-size: 12px; font-weight: 750; text-transform: capitalize; }
+.risk-high, .risk-critical { color: #862828; background: #f9dddd; }
+.progress { padding: 12px 16px; border-left: 4px solid #1f6548; background: #e8f0eb; font-size: 15px; }
+.inventory { display: grid; gap: 8px; padding: 0; list-style: none; }
+.inventory li { display: grid; grid-template-columns: minmax(130px, 1fr) 1fr; gap: 3px 16px; padding: 13px 15px; border: 1px solid #d7ddd8; border-radius: 9px; background: white; }
+.inventory small { grid-column: 1 / -1; color: #69736e; overflow-wrap: anywhere; }
+.management-panel label { display: grid; gap: 5px; margin: 18px 0; font-weight: 650; }
+.management-panel input, .management-panel select { width: 100%; padding: 9px 11px; border: 1px solid #c9d1cc; border-radius: 8px; background: white; font: inherit; }
+.control-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 24px; }
+.actions button { border: 0; border-radius: 8px; padding: 10px 14px; background: #1f6548; color: white; font: inherit; font-weight: 700; cursor: pointer; }
+.domain-error { color: #862828; background: #f9dddd; padding: 12px 15px; border-radius: 8px; }
+.empty { font-size: 15px; font-style: italic; }
 @media (max-width: 700px) { #app { grid-template-columns: 1fr; } aside { padding: 16px; } nav { display: flex; overflow-x: auto; } .brand { padding-bottom: 12px; } main { padding-top: 38px; } }

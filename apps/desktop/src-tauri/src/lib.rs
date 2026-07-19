@@ -208,6 +208,7 @@ struct DesktopSnapshot {
     status: ServiceStatus,
     capabilities: Vec<CapabilityState>,
     last_event_id: Option<u64>,
+    events: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +227,9 @@ struct ManagementSnapshot {
 struct TraySummary {
     health: String,
     loadout: String,
+    git_sync: String,
+    policy: String,
+    drift: String,
     relay: String,
     snapshots: String,
 }
@@ -234,6 +238,9 @@ struct TraySummary {
 struct TrayItems {
     health: MenuItem<tauri::Wry>,
     loadout: MenuItem<tauri::Wry>,
+    git_sync: MenuItem<tauri::Wry>,
+    policy: MenuItem<tauri::Wry>,
+    drift: MenuItem<tauri::Wry>,
     relay: MenuItem<tauri::Wry>,
     snapshots: MenuItem<tauri::Wry>,
 }
@@ -243,6 +250,7 @@ impl TraySummary {
         status: &ServiceStatus,
         relay: Option<&serde_json::Value>,
         snapshots: Option<&serde_json::Value>,
+        diagnostics: Option<&serde_json::Value>,
     ) -> Self {
         let target = status.active_target.as_deref().unwrap_or("no target");
         let loadout = status.active_loadout.as_deref().unwrap_or("not selected");
@@ -254,9 +262,29 @@ impl TraySummary {
             .and_then(|value| value.get("snapshots"))
             .and_then(serde_json::Value::as_array)
             .map(Vec::len);
+        let git = diagnostics.and_then(|value| value.get("gitSync"));
+        let git_state = git
+            .and_then(|value| value.get("state"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unavailable");
+        let ahead = git.and_then(|value| value.get("ahead")).and_then(serde_json::Value::as_u64);
+        let behind = git.and_then(|value| value.get("behind")).and_then(serde_json::Value::as_u64);
+        let git_sync = match (ahead, behind) {
+            (Some(ahead), Some(behind)) => format!("Git: {git_state} · {ahead} ahead · {behind} behind"),
+            _ => format!("Git: {git_state}"),
+        };
+        let violations = diagnostics
+            .and_then(|value| value.get("organizationPolicyViolations"))
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
         Self {
             health: format!("Health: {}", status.state),
             loadout: format!("Loadout: {loadout} · {target}"),
+            git_sync,
+            policy: format!("Policy: {violations} violation{}", if violations == 1 { "" } else { "s" }),
+            drift: status.last_drift_check_unix_ms
+                .map(|value| format!("Last drift check: {value} ms since epoch"))
+                .unwrap_or_else(|| "Last drift check: never".into()),
             relay: format!("Relay: {relay}"),
             snapshots: snapshots
                 .map(|count| format!("Snapshots: {count} available"))
@@ -721,10 +749,15 @@ async fn desktop_snapshot(
         .status()
         .await
         .unwrap_or_else(|_| ServiceStatus::offline());
+    let event_snapshot = client
+        .json(reqwest::Method::GET, "/events/snapshot", None)
+        .await
+        .unwrap_or_else(|_| serde_json::json!({"events": []}));
     let online = status.state != "offline";
     Ok(DesktopSnapshot {
         status,
-        last_event_id: None,
+        last_event_id: event_snapshot.get("lastEventId").and_then(serde_json::Value::as_u64),
+        events: event_snapshot.get("events").and_then(serde_json::Value::as_array).cloned().unwrap_or_default(),
         capabilities: vec![
             CapabilityState {
                 id: "status",
@@ -1234,6 +1267,33 @@ fn show_route(app: tauri::AppHandle, route: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+async fn tray_plan(app: tauri::AppHandle) {
+    let client = app.state::<ServiceClient>().inner().clone();
+    if let Ok(status) = client.status().await {
+        if let Some(target) = status.active_target {
+            let path = target_convergence_route(&target, "sync/plan");
+            if let Ok(path) = path {
+                let confirmation = format!("desktop-tray-plan-{}", std::process::id());
+                let _ = post_confirmed(&client, &path, serde_json::json!({}), &confirmation).await;
+            }
+        }
+    }
+    let _ = show_route(app.clone(), "plans");
+    refresh_tray(app).await;
+}
+
+async fn tray_verify(app: tauri::AppHandle) {
+    let client = app.state::<ServiceClient>().inner().clone();
+    if let Ok(status) = client.status().await {
+        if let Some(target) = status.active_target {
+            if let Ok(path) = target_convergence_route(&target, "verify") {
+                let _ = client.json(reqwest::Method::POST, &path, Some(serde_json::json!({"targetId": target, "pointer": null}))).await;
+            }
+        }
+    }
+    refresh_tray(app).await;
+}
+
 async fn refresh_tray(app: tauri::AppHandle) {
     let client = app.state::<ServiceClient>().inner().clone();
     let status = client
@@ -1245,10 +1305,17 @@ async fn refresh_tray(app: tauri::AppHandle) {
         .json(reqwest::Method::GET, "/snapshots", None)
         .await
         .ok();
-    let summary = TraySummary::from_observed(&status, relay.as_ref(), snapshots.as_ref());
+    let diagnostics = client
+        .json(reqwest::Method::GET, "/diagnostics", None)
+        .await
+        .ok();
+    let summary = TraySummary::from_observed(&status, relay.as_ref(), snapshots.as_ref(), diagnostics.as_ref());
     let items = app.state::<TrayItems>();
     let _ = items.health.set_text(&summary.health);
     let _ = items.loadout.set_text(&summary.loadout);
+    let _ = items.git_sync.set_text(&summary.git_sync);
+    let _ = items.policy.set_text(&summary.policy);
+    let _ = items.drift.set_text(&summary.drift);
     let _ = items.relay.set_text(&summary.relay);
     let _ = items.snapshots.set_text(&summary.snapshots);
 
@@ -1339,7 +1406,13 @@ pub fn run() {
                 false,
                 None::<&str>,
             )?;
+            let git_sync = MenuItem::with_id(app, "git-status", "Git: loading", false, None::<&str>)?;
+            let policy = MenuItem::with_id(app, "policy-status", "Policy: loading", false, None::<&str>)?;
+            let drift = MenuItem::with_id(app, "drift-status", "Last drift check: loading", false, None::<&str>)?;
             let refresh = MenuItem::with_id(app, "refresh", "Refresh health", true, None::<&str>)?;
+            let plan_now = MenuItem::with_id(app, "quick-plan", "Plan selected target", true, None::<&str>)?;
+            let verify_now = MenuItem::with_id(app, "quick-verify", "Verify selected target", true, None::<&str>)?;
+            let snapshot_review = MenuItem::with_id(app, "quick-snapshot", "Create snapshot…", true, None::<&str>)?;
             let review = MenuItem::with_id(app, "review", "Review plan…", true, None::<&str>)?;
             let manage_relay =
                 MenuItem::with_id(app, "manage-relay", "Manage relay…", true, None::<&str>)?;
@@ -1355,6 +1428,9 @@ pub fn run() {
             app.manage(TrayItems {
                 health: health.clone(),
                 loadout: loadout.clone(),
+                git_sync: git_sync.clone(),
+                policy: policy.clone(),
+                drift: drift.clone(),
                 relay: relay.clone(),
                 snapshots: snapshots.clone(),
             });
@@ -1363,9 +1439,15 @@ pub fn run() {
                 &[
                     &health,
                     &loadout,
+                    &git_sync,
+                    &policy,
+                    &drift,
                     &relay,
                     &snapshots,
                     &refresh,
+                    &plan_now,
+                    &verify_now,
+                    &snapshot_review,
                     &review,
                     &manage_relay,
                     &manage_snapshots,
@@ -1387,6 +1469,15 @@ pub fn run() {
                     }
                     "refresh" => {
                         tauri::async_runtime::spawn(refresh_tray(app.clone()));
+                    }
+                    "quick-plan" => {
+                        tauri::async_runtime::spawn(tray_plan(app.clone()));
+                    }
+                    "quick-verify" => {
+                        tauri::async_runtime::spawn(tray_verify(app.clone()));
+                    }
+                    "quick-snapshot" => {
+                        let _ = show_route(app.clone(), "snapshots");
                     }
                     "review" => {
                         let _ = show_route(app.clone(), "plans");
@@ -1525,11 +1616,18 @@ mod tests {
             &status,
             Some(&serde_json::json!({"state":"healthy"})),
             Some(&serde_json::json!({"snapshots":[{}, {}]})),
+            Some(&serde_json::json!({
+                "gitSync": {"state":"diverged", "ahead":2, "behind":1},
+                "organizationPolicyViolations": [{"code":"policy_required"}]
+            })),
         );
         assert_eq!(summary.health, "Health: degraded");
         assert_eq!(summary.loadout, "Loadout: personal · macbook");
         assert_eq!(summary.relay, "Relay: healthy");
         assert_eq!(summary.snapshots, "Snapshots: 2 available");
+        assert_eq!(summary.git_sync, "Git: diverged · 2 ahead · 1 behind");
+        assert_eq!(summary.policy, "Policy: 1 violation");
+        assert_eq!(summary.drift, "Last drift check: never");
     }
     #[test]
     fn management_snapshot_uses_only_fixed_read_only_service_routes() {

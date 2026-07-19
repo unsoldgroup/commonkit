@@ -8,6 +8,7 @@ import { managementPanel } from "./management-view.ts";
 import { onboardingPanel, type OnboardingProvider } from "./onboarding-view.ts";
 import { open } from "@tauri-apps/plugin-dialog";
 import { assertPlanTarget, convergenceTarget } from "./target-selection.ts";
+import { refreshDesktopState } from "./live-refresh.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
@@ -134,6 +135,11 @@ function required(promptText: string): string | null {
   return value || null;
 }
 
+function controlValue(name: string): string | null {
+  const value = document.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`)?.value.trim();
+  return value || null;
+}
+
 async function showResult(route: Route, action: () => Promise<unknown>): Promise<void> {
   try {
     const value = await action();
@@ -167,7 +173,7 @@ function bindManagementActions(route: Route): void {
     }
   });
   document.querySelector("#apply-plan")?.addEventListener("click", () => {
-    const planId = required("Reviewed plan digest");
+    const planId = controlValue("plan-id");
     if (!planId) return;
     try {
       const targetId = convergenceTarget(targets);
@@ -178,18 +184,18 @@ function bindManagementActions(route: Route): void {
     }
   });
   document.querySelector("#snapshot-create")?.addEventListener("click", () => {
-    const databaseId = required("Database ID to snapshot");
+    const databaseId = controlValue("database-id");
     if (!databaseId || !window.confirm(`Create an encrypted snapshot of ${databaseId}?`)) return;
     void showResult(route, () => desktopApi.snapshotCreate(databaseId, confirmationId("snapshot-create")));
   });
   document.querySelector("#snapshot-restore")?.addEventListener("click", () => {
-    const snapshotId = required("Snapshot ID to restore");
+    const snapshotId = controlValue("snapshot-id");
     if (!snapshotId || !window.confirm(`Restore ${snapshotId}? The current database will be backed up first.`)) return;
     void showResult(route, () => desktopApi.snapshotRestore(snapshotId, confirmationId("snapshot-restore")));
   });
   document.querySelector("#snapshot-promote")?.addEventListener("click", () => {
-    const databaseId = required("Database ID");
-    const targetId = databaseId ? required("Target ID shown as observable in promotionEvidence") : null;
+    const databaseId = controlValue("database-id");
+    const targetId = databaseId ? controlValue("promotion-target") : null;
     if (!databaseId || !targetId || !window.confirm(`Promote ${targetId} as writer for ${databaseId}?`)) return;
     void showResult(route, () => desktopApi.snapshotPromote(databaseId, targetId, confirmationId("snapshot-promote")));
   });
@@ -198,16 +204,9 @@ function bindManagementActions(route: Route): void {
     void showResult(route, () => desktopApi.relayRestart(confirmationId("relay-restart")));
   });
   document.querySelector("#relay-reconcile")?.addEventListener("click", () => {
-    const source = required("Paste the reviewed relay reconciliation request JSON");
-    if (!source) return;
-    try {
-      const request: unknown = JSON.parse(source);
-      if (!window.confirm("Apply this reviewed relay desired state?")) return;
-      void showResult(route, () => desktopApi.relayReconcile(request, confirmationId("relay-reconcile")));
-    } catch {
-      if (management) (management as unknown as Record<string, unknown>)[route] = { error: "invalid_relay_request" };
-      render();
-    }
+    const request = management?.relay;
+    if (!request || !window.confirm("Reconcile the configured relay inventory shown above?")) return;
+    void showResult(route, () => desktopApi.relayReconcile(request, confirmationId("relay-reconcile")));
   });
   document.querySelector("#schedule-enable")?.addEventListener("click", () => {
     const raw = required("Drift-check interval in seconds");
@@ -246,6 +245,25 @@ function bindManagementActions(route: Route): void {
 
 addEventListener("hashchange", render);
 render();
-desktopApi.snapshot().then((value) => { snapshot = value; render(); }).catch(() => render());
-desktopApi.managementSnapshot().then((value) => { management = value; render(); }).catch(() => render());
-desktopApi.targets().then((value) => { targets = value; render(); }).catch(() => render());
+let refreshRunning = false;
+async function refreshLiveState(): Promise<void> {
+  if (refreshRunning) return;
+  refreshRunning = true;
+  try {
+    const state = await refreshDesktopState(desktopApi, {
+      ...(snapshot ? { snapshot } : {}), ...(management ? { management } : {}), ...(targets ? { targets } : {}),
+    });
+    snapshot = state.snapshot;
+    management = state.management;
+    targets = state.targets;
+    const operation = [...snapshot.events].reverse().find((event) => event.event === "operation.updated")?.data;
+    if (operation && management) {
+      management.plans = { ...(typeof management.plans === "object" && management.plans ? management.plans : {}), operation };
+    }
+    render();
+  } catch { render(); }
+  finally { refreshRunning = false; }
+}
+void refreshLiveState();
+const liveRefreshTimer = window.setInterval(() => void refreshLiveState(), 2_000);
+addEventListener("beforeunload", () => window.clearInterval(liveRefreshTimer));

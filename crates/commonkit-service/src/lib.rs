@@ -659,6 +659,7 @@ fn router_with_control_and_relay(
             get(domain_reload_preflight).post(reload_domains),
         )
         .route("/control/v1/events", get(get_events))
+        .route("/control/v1/events/snapshot", get(get_events_snapshot))
         .route("/control/v1/diagnostics", get(get_diagnostics))
         .route("/control/v1/compose", get(compose_state))
         .route("/control/v1/explain", post(explain_state))
@@ -3387,6 +3388,26 @@ pub struct Replay {
 #[derive(Debug, Deserialize)]
 struct EventQuery {
     after: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EventSnapshot {
+    expired: bool,
+    last_event_id: Option<u64>,
+    events: Vec<ControlEvent>,
+}
+
+async fn get_events_snapshot(
+    State(state): State<ApiState>,
+    Query(query): Query<EventQuery>,
+) -> Json<EventSnapshot> {
+    let replay = state.events.replay_after(query.after);
+    Json(EventSnapshot {
+        expired: replay.expired,
+        last_event_id: replay.events.last().map(|event| event.id).or(query.after),
+        events: replay.events,
+    })
 }
 
 async fn get_events(

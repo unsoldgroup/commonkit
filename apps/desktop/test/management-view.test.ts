@@ -29,3 +29,42 @@ test("operator panels expose explicit fixed actions without rendering secret inp
   assert.match(managementPanel("diagnostics", { diagnostics: { status: "healthy" } }), /id="diagnostics-export"/);
   assert.doesNotMatch(managementPanel("credentials", { credentials: {} }), /type="password"/);
 });
+
+test("plan review is human-readable and selects a bound digest without raw JSON", () => {
+  const html = managementPanel("plans", { plans: {
+    plan: {
+      id: `sha256:${"a".repeat(64)}`,
+      risk: "high",
+      operations: [{ kind: "write_file", path: ".config/tool.json", provenance: { layer: "team" } }],
+    },
+    operation: { state: "running", completedOperations: 1, totalOperations: 3 },
+  } });
+  assert.match(html, /High risk/i);
+  assert.match(html, /write file/i);
+  assert.match(html, /team/i);
+  assert.match(html, /1 of 3/i);
+  assert.match(html, /name="plan-id"/);
+  assert.doesNotMatch(html, /<pre>/);
+});
+
+test("snapshot, relay, and diagnostics panels expose typed inventory controls", () => {
+  const snapshots = managementPanel("snapshots", { snapshots: {
+    authoritativeWriter: { databaseId: "catalog", targetId: "macbook" },
+    snapshots: [{ id: "snap-1", databaseId: "catalog", createdAt: "2026-07-19T10:00:00Z" }],
+  } });
+  assert.match(snapshots, /Authoritative writer/i);
+  assert.match(snapshots, /value="snap-1"/);
+  assert.doesNotMatch(snapshots, /<pre>/);
+
+  const relay = managementPanel("relay", { relay: {
+    state: "healthy", upstreams: [{ id: "docs", state: "ready", transport: "stdio" }],
+  } });
+  assert.match(relay, /docs/);
+  assert.match(relay, /ready/);
+
+  const diagnostics = managementPanel("diagnostics", { diagnostics: {
+    adapters: [{ id: "filesystem", state: "healthy", detail: "3 managed paths" }],
+  } });
+  assert.match(diagnostics, /filesystem/);
+  assert.match(diagnostics, /3 managed paths/);
+});

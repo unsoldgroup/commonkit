@@ -1,5 +1,9 @@
-use commonkit_service::EventHub;
+use std::sync::Arc;
+use axum::{body::{Body, to_bytes}, http::{Request, header}};
+use commonkit_service::{ControlToken, EventHub, ServiceStatus, router_with_events};
 use serde_json::json;
+use tokio::sync::RwLock;
+use tower::ServiceExt;
 
 #[test]
 fn replays_events_after_a_cursor_and_signals_expired_history() {
@@ -31,6 +35,22 @@ fn replays_events_after_a_cursor_and_signals_expired_history() {
             .collect::<Vec<_>>(),
         [2, 3]
     );
+}
+
+#[tokio::test]
+async fn authenticated_snapshot_exposes_the_shared_event_cursor_without_holding_a_stream() {
+    let token = ControlToken::generate();
+    let events = EventHub::new(4);
+    events.publish("operation.updated", json!({"state":"running"}));
+    let app = router_with_events(token.clone(), Arc::new(RwLock::new(ServiceStatus::default())), "127.0.0.1:3764", events);
+    let response = app.oneshot(Request::get("/control/v1/events/snapshot")
+        .header(header::HOST, "127.0.0.1:3764")
+        .header(header::AUTHORIZATION, format!("Bearer {}", token.expose_for_client()))
+        .body(Body::empty()).unwrap()).await.unwrap();
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["lastEventId"], 1);
+    assert_eq!(value["events"][0]["event"], "operation.updated");
 }
 
 #[test]

@@ -17,6 +17,7 @@ export interface DesktopSnapshot {
   status: ServiceStatus;
   capabilities: CapabilityState[];
   lastEventId: number | null;
+  events: Array<{ id?: number; event?: string; data?: unknown }>;
 }
 
 export interface ManagementSnapshot {
