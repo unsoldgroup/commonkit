@@ -1,158 +1,116 @@
 # CommonKit
 
-**Your best development setup, everywhere.**
+CommonKit is a cross-platform desired-state runtime for complete developer
+environments. It composes a public base, a non-overridable organization
+security floor, a personal kit, a project loadout, and target overrides; then
+it inspects, plans, applies, verifies, and can roll back changes on local and
+SSH targets.
 
-CommonKit gives every coding agent your proven instructions, skills, hooks,
-tools, and policies. Define the setup once. Preview changes before they land.
-Apply them across local machines, remote hosts, and projects.
+CommonKit is not an agent-package manager or a dotfile engine. Version-pinned
+providers compute normalized desired resources in isolation. CommonKit alone
+owns target policy, mutation, receipts, verification, recovery, services,
+credentials, the persistent MCP relay, and mutable-state snapshots.
 
-```text
-use → learn → review → improve once → benefit everywhere
-```
+## V1 architecture
 
-CommonKit is for AI-native developers and small engineering teams tired of
-rebuilding agent setups one machine, project, and tool at a time.
+- Microsoft APM is the preferred agent-context provider.
+- Chezmoi is the preferred home-configuration provider for the supported,
+  side-effect-free subset.
+- Native providers remain available for migration and fallback.
+- Provider output is staged in a content-addressed artifact store; providers
+  never apply directly to a managed live target.
+- Filesystem, service, credential, relay, and snapshot adapters perform the
+  approved operations.
+- Plans bind desired, observed, policy, provider-input, ownership, and artifact
+  digests. A changed input rejects an approved plan as stale.
 
-## Why CommonKit
+## Clean-machine source install
 
-### Start capable
-
-Carry your working agent setup to every target. New environments start with
-the capabilities and guardrails you already trust.
-
-### Stay consistent
-
-Treat shared developer configuration as versioned desired state. CommonKit
-finds drift, shows the plan, applies approved changes, and verifies the result.
-
-### Improve once. Benefit everywhere.
-
-CommonKit's native skill-optimization lifecycle turns evaluations and approved,
-redacted usage evidence into reviewable improvement candidates. SkillOpt runs
-in isolation. It cannot rewrite an active skill. A human approves the change
-before CommonKit promotes and distributes it.
-
-> Skill optimization is under active development and is not part of the
-> current TypeScript CLI release.
-
-### Change safely
-
-Dry runs, explicit approval, secret scanning, staged writes, backups, and
-structural configuration merges make changes inspectable and recoverable.
-
-### Provision secrets safely
-
-Portable configuration contains references, not secret values. Password-manager
-providers provision credentials independently on each target. Bitwarden Secrets
-Manager is the first native provider.
-
-## How it works
-
-1. Define a **Loadout**: the capabilities and overrides a target should have.
-2. Run `commonkit doctor` to check prerequisites.
-3. Run `commonkit diff` or a dry run to inspect drift.
-4. Apply the approved plan.
-5. Verify the target matches the desired state.
+Requirements are Rust 1.85+, Node.js 24+, pnpm 10.28.2, Git, and SSH. APM and
+chezmoi are optional until a loadout selects them; CommonKit validates their
+exact configured versions before use.
 
 ```sh
-commonkit doctor
-commonkit diff
-commonkit apply --dry-run
-commonkit apply --yes
-commonkit plugins --yes
+git clone https://github.com/unsoldgroup/commonkit.git
+cd commonkit
+corepack enable
+pnpm install --frozen-lockfile
+cargo install --locked --path crates/commonkit-cli
+cargo install --locked --path crates/commonkit-service
+commonkit --version
+commonkitd --port 0
+```
+
+The daemon creates private, platform-native config and state roots plus a
+0600/ACL-protected control token. In a second terminal, create or connect a kit:
+
+```sh
+commonkit init create \
+  --repository unsoldgroup/my-commonkit \
+  --kit-directory "$HOME/.config/my-commonkit" \
+  --loadout personal \
+  --target local \
+  --target-root "$HOME"
+
+commonkit status
+commonkit sync
+commonkit diff <plan-id>
+commonkit apply <plan-id> --confirmed
 commonkit verify
 ```
 
-CommonKit is intentionally one-way and declarative. Portable configuration is
-versioned. Credentials are provisioned independently on each target, while
-runtime-specific state stays outside the portable manifest.
+`init connect` uses the same arguments for an existing repository. `sync`
+creates a plan; it does not mutate the target. Review `diff` before applying.
+Mutating CLI commands require explicit confirmation.
 
-## What it manages today
+## Transactions and rollback
 
-- global Claude and Codex instructions;
-- Claude agents and active or library skills;
-- Claude hooks, permissions, plugins, and marketplace declarations;
-- Codex configuration, hooks, rules, review checklists, and templates;
-- the target user's Codex home and Orca's isolated Codex runtime home;
-- Orca agent hooks and native Linear connectivity;
-- context-mode content databases, excluding live session state;
-- root-only service environment references already available on the target;
-- generated Claude and Codex agent and skill symlinks;
-- optional `mcp-local-relay` state.
-
-Repository-level `AGENTS.md`, `CLAUDE.md`, manifests, `CONTEXT.md`, and ADRs
-remain Git-owned. CommonKit verifies them after clone or pull instead of
-overlaying them.
-
-## What CommonKit is—and is not
-
-CommonKit is the desired-state control plane for a complete agentic development
-setup. It composes specialized providers instead of replacing them:
-
-- APM resolves and compiles versioned agent context.
-- Chezmoi can materialize compatible home configuration.
-- SkillOpt produces skill-improvement candidates.
-- Password managers provide secrets; Bitwarden Secrets Manager is native first.
-- `mcp-local-relay` keeps MCP upstreams warm as an independent data plane.
-
-The alternative is fragmented manual setup—not any one of these tools.
-
-## Safety model
-
-CommonKit excludes known authentication files, `.env` files, histories,
-sessions, memories, device identities, E2EE keys, sockets, private keys, and
-live orchestration databases from portable state. Generated configuration is
-scanned for secret-like keys and inline credentials before it is written.
-
-Single-file changes use a staged file and atomic rename. Tree and context
-updates use per-file rsync backups. Every apply creates a timestamped backup
-under `~/.local/state/commonkit/backups`. Recovery from these backups is manual
-today; apply is not yet a transactional rollback.
-
-Before reconciling plugin removals, CommonKit saves the remote Claude and Codex
-plugin inventories. These inventories act as reinstall manifests for manual
-recovery.
-
-`apply --dry-run` uses the same semantic comparison as `diff`. It reports
-changed, missing, synchronized, or unreachable resources without running
-bootstrap, plugin, service-environment, or restart actions.
-
-## Get started
-
-Requirements: Node.js 24+, SSH, rsync, and pnpm.
+Every operation has a deterministic identity and runs through
+prepare → apply → verify. Receipts transition durably and are hash-chain
+validated. Filesystem preimages and provider payloads are content-addressed,
+integrity-checked artifacts, so a fresh process can recover without rerunning a
+provider, downloading content, resolving templates, or looking up secrets.
 
 ```sh
-pnpm install
-cp commonkit.example.json commonkit.json
+commonkit rollback <run-id> --confirmed
+commonkit verify
+commonkit diagnostics
 ```
 
-Edit `commonkit.json` for the target, then run:
+Rollback executes verified operations in reverse order and restores supported
+file bytes, resource types, permissions, symlink targets, and removals. If an
+artifact is absent or has the wrong digest, recovery fails closed and preserves
+an explicit recoverable receipt instead of guessing. Secret plaintext is never
+stored in plans, receipts, logs, diagnostics, or portable artifact metadata.
+
+Snapshot restore similarly stages and authenticates the snapshot and target
+preimage, coordinates configured service stop/start commands, and resumes or
+rolls back an interrupted transaction on daemon restart.
+
+## Persistent MCP relay
+
+The Rust daemon owns a loopback-only, bearer-authenticated MCP endpoint at
+`http://127.0.0.1:3764/mcp`. APM owns portable MCP declarations and generated
+client configuration; CommonKit translates those declarations into persistent
+relay desired state and applies relay changes transactionally. The legacy Node
+`mcp-local-relay` package remains in `packages/mcp-local-relay` during
+migration, with shared black-box compatibility fixtures covering initialization,
+tool listing and calls, errors, bounded responses, health, and legacy config.
+
+## Development and verification
 
 ```sh
-commonkit doctor
-commonkit apply --dry-run
-```
-
-For another configuration file, pass `--config <file>`. Secret values never
-belong in the manifest.
-
-Run the workspace checks with:
-
-```sh
-pnpm test
+cargo test --workspace --all-features --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 pnpm typecheck
+pnpm test
 ```
 
-## Open-source customization
+CI runs the Rust workspace, Node package, desktop, provider isolation gates, and
+an unsigned installed CLI/daemon lifecycle on macOS, Linux, and Windows. Signed
+release workflows additionally require Apple notarization, Windows signing,
+Tauri updater signing, and the configured HTTPS update channel; they fail closed
+when those external credentials are absent.
 
-Change the SSH host, remote home, service name, required commands, secret
-variable names, and provider configuration in your local manifest.
-
-The current plugin policy is `exact`: the local installed set and enabled state
-become desired state. Apply reconciles managed remote additions and removals but
-does not mutate local plugins. Claude does not expose arbitrary version pinning,
-so a remote update may resolve to the marketplace's current version. Verification
-fails closed when that state differs from local.
-
-CommonKit is a pnpm workspace and owns the independently publishable
-[`mcp-local-relay`](packages/mcp-local-relay) package.
+See [CONTEXT.md](CONTEXT.md), [ADR 0005](docs/adr/0005-use-apm-for-agent-context.md),
+and [the v1 scope](docs/scopes/commonkit-tauri-v1.md) for the product contract.

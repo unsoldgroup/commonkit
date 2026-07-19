@@ -16,7 +16,8 @@ commonkit-core = { path = "../commonkit-core" }
 commonkit-reconcile = { path = "../commonkit-reconcile" }
 sha2.workspace = true
 serde_jcs.workspace = true
-reqwest = { workspace = true, features = ["blocking"] }
+reqwest.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

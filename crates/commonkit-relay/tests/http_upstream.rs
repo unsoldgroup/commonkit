@@ -3,9 +3,7 @@ use std::net::TcpListener;
 use std::thread;
 use std::time::Duration;
 
-use commonkit_relay::{
-    HttpUpstreamManager, RelayConfig, RelayHealth, UpstreamManager,
-};
+use commonkit_relay::{HttpUpstreamManager, RelayConfig, RelayHealth, UpstreamManager};
 use serde_json::json;
 
 #[test]
@@ -27,7 +25,10 @@ fn bounded_http_upstream_discovers_tools_and_tracks_health() {
     });
     let mut server = RelayConfig::normalize(json!({"servers": [{
         "id": "local", "remote": {"type": "streamable_http", "url": format!("http://{address}/mcp")}
-    }]})).expect("config").servers.remove(0);
+    }]}))
+    .expect("config")
+    .servers
+    .remove(0);
     server.remote.url = format!("http://{address}/mcp");
     let manager = HttpUpstreamManager::new(Duration::from_secs(2)).expect("manager");
     let tools = manager.discover(&server).expect("tools");
@@ -40,4 +41,10 @@ fn bounded_http_upstream_discovers_tools_and_tracks_health() {
 #[test]
 fn http_upstream_rejects_unbounded_timeout_configuration() {
     assert!(HttpUpstreamManager::new(Duration::from_secs(121)).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn http_upstream_manager_can_be_created_and_dropped_inside_tokio() {
+    let manager = HttpUpstreamManager::new(Duration::from_secs(1)).expect("manager");
+    drop(manager);
 }

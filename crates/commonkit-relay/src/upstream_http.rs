@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use reqwest::blocking::{Client, Response};
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use reqwest::{Client, Response};
 use serde_json::{Value, json};
 
 use crate::{RelayHealth, RelayServerConfig, RelayTool, UpstreamError, UpstreamManager};
@@ -39,16 +38,29 @@ impl HttpUpstreamManager {
 
     fn request(&self, server: &RelayServerConfig, body: Value) -> Result<Value, UpstreamError> {
         let headers = resolve_headers(server)?;
-        let response = self
-            .client
-            .post(&server.remote.url)
-            .headers(headers)
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json, text/event-stream")
-            .json(&body)
-            .send()
-            .map_err(|_| self.failed(server))?;
-        let value = decode_bounded(response).map_err(|_| self.failed(server))?;
+        let client = self.client.clone();
+        let url = server.remote.url.clone();
+        let value = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| unavailable())?;
+            runtime.block_on(async move {
+                let response = client
+                    .post(url)
+                    .headers(headers)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(ACCEPT, "application/json, text/event-stream")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|_| unavailable())?;
+                decode_bounded(response).await
+            })
+        })
+        .join()
+        .map_err(|_| self.failed(server))?
+        .map_err(|_| self.failed(server))?;
         self.health
             .lock()
             .expect("relay health lock")
@@ -126,7 +138,7 @@ fn resolve_headers(server: &RelayServerConfig) -> Result<HeaderMap, UpstreamErro
     Ok(headers)
 }
 
-fn decode_bounded(response: Response) -> Result<Value, UpstreamError> {
+async fn decode_bounded(mut response: Response) -> Result<Value, UpstreamError> {
     if !response.status().is_success() {
         return Err(unavailable());
     }
@@ -137,12 +149,11 @@ fn decode_bounded(response: Response) -> Result<Value, UpstreamError> {
         return Err(unavailable());
     }
     let mut bytes = Vec::new();
-    response
-        .take(MAX_RESPONSE_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| unavailable())?;
-    if bytes.len() as u64 > MAX_RESPONSE_BYTES {
-        return Err(unavailable());
+    while let Some(chunk) = response.chunk().await.map_err(|_| unavailable())? {
+        if bytes.len().saturating_add(chunk.len()) as u64 > MAX_RESPONSE_BYTES {
+            return Err(unavailable());
+        }
+        bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| unavailable())
 }

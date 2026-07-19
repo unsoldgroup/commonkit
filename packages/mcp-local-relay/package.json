@@ -58,6 +58,7 @@
     "prepublishOnly": "pnpm build",
     "pretest": "pnpm build",
     "test": "node --test dist/test/*.test.js",
+    "test:compatibility": "pnpm build && node --test --test-name-pattern=relay-compatibility dist/test/compatibility.test.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

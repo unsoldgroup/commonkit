@@ -131,6 +131,21 @@ test("release lifecycle matrix exercises install update and uninstall", async ()
   assert.match(workflow, /Start-Process.*\/S/);
 });
 
+test("CI exercises an unsigned installed CLI and daemon lifecycle on every OS", async () => {
+  const workflow = await read(".github/workflows/ci.yml");
+
+  assert.match(workflow, /unsigned-installed-lifecycle/);
+  assert.match(workflow, /cargo install --locked --path crates\/commonkit-cli/);
+  assert.match(workflow, /cargo install --locked --path crates\/commonkit-service/);
+  assert.match(workflow, /commonkitd/);
+  assert.match(workflow, /commonkit status/);
+  assert.match(workflow, /commonkit verify/);
+  assert.match(workflow, /commonkit-snapshots --test durable_restore/);
+  assert.match(workflow, /registry_startup_recovers_snapshot/);
+  assert.match(workflow, /local_executor/);
+  assert.match(workflow, /test:compatibility/);
+});
+
 test("release and third-party notice policies are explicit", async () => {
   const [release, notices, migration, support] = await Promise.all([
     read("docs/RELEASING.md"),
