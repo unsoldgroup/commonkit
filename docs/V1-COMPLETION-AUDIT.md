@@ -1,71 +1,60 @@
 # CommonKit v1 completion audit
 
-Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `589c5e7`. Active, uncommitted SkillOpt work is excluded. Component tests establish their named contracts; they do not by themselves establish an installed, cross-platform product flow.
+Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `5c6777e`. The five pre-existing formatting-only worktree changes were excluded from this audit. “Met locally” means the production Rust path and its focused contracts pass on the audit host; it does not stand in for production signing, notarization, published updater, or hosted multi-OS evidence.
 
 ## Twelve-flow matrix
 
-| # | Flow | Status | Current evidence | Actual remaining gate |
+| # | Flow | Implementation status | Current evidence | Remaining gate |
 | --- | --- | --- | --- | --- |
-| 1 | Initialize a target | Partial | `commonkit init create|connect` now checks GitHub CLI authentication, creates or clones a repository, writes the required composition layers and target registration, creates private runtime roots, and writes production `headless.json`. `commonkit-cli/tests/onboarding.rs` covers both modes and production composition/plan loading. | Connected loadouts are represented by an empty native `MaterializedState`; initialization does not run the selected APM, chezmoi, or native provider pipeline. A clean machine therefore cannot yet reproduce a non-empty loadout end to end. Desktop onboarding is absent. |
-| 2 | Preview drift | Partial | Production compose/explain domains and durable plan retrieval are wired through daemon and CLI. Plans bind live observed state and reject stale preimages. | `sync` does not fetch Git or materialize providers. Production planning consumes materialized-state files prepared out of band, so fetch → compose → provider materialize → explain → diff is not one production flow. |
-| 3 | Apply safely | Partial | Content-bound plans, confirmation, idempotency, deterministic adapters, receipts, stale-target rejection, verification, and rollback are implemented and tested. Desktop can submit a reviewed plan ID. | The clean-machine/provider gap prevents a complete loadout-to-apply flow. Installed-app reconciliation is not exercised on the three-OS release matrix. |
-| 4 | Verify parity | Partial | Filesystem, provider, service, CLI, and MCP verification contracts exist. | Desktop has no verification command/view, no shared cross-interface result contract proves parity, and installed-platform parity has not run. |
-| 5 | Provision credential references | Partial | Credential readiness/apply/verify service routes and CLI commands exist. Env/file, BWS, macOS Keychain, Linux Secret Service, and Windows Credential Manager adapters have focused tests. | The production headless resolver wires env/file only; BWS and platform stores are not selectable there. Desktop is read-only for credential readiness. |
-| 6 | Recover or roll back | Partial | Reconciliation recovery is durable and plan-bound. Snapshot restore and writer promotion now have authenticated durable plans/receipts, encrypted preimages, fresh-process recovery, startup discovery, lifecycle stop/start coordination, tamper rejection, and SQLite integrity tests. | The CLI has no snapshot command group. Installed daemon/CLI recovery and snapshot restore have not run on macOS, Linux, and Windows release artifacts. |
-| 7 | Multiple targets and five-layer composition | Partial | Composition order, policy floor, provenance, target inventory, local execution, typed SSH transport, and controller-side portable-artifact staging are tested. Production composition is available through the daemon. | Production `headless.json` selects one local target. The SSH stager is not connected to a real provider → remote plan/apply flow, and no declared remote combination has completed the support matrix. |
-| 8 | Scheduled read-only drift checks | Partial | `commonkitd` now constructs and runs `DriftScheduler`; persistence, overlap suppression, read-only verification, and degraded-state reporting are tested. | The general CLI `schedule` command is status-only despite the scoped `enable|disable|status` surface. Desktop exposes schedule state but no mutation. Installed unattended execution is unproven. |
-| 9 | Optional MCP relay state | Partial | Rust relay configuration, runtime, lifecycle, transaction, provider convergence, HTTP upstream, service routes, stable endpoint, and legacy normalization/migration fixtures exist. | The required shared black-box suite has not run Node and Rust through tool discovery, calls, notifications, lifecycle, failure, and redaction equivalence. Desktop relay management is read-only; installed lifecycle remains a release gate. |
-| 10 | Coding-agent adapters | Partial | Pinned APM 0.25.0 and chezmoi 2.70.4 isolation contracts, native fallback, provider artifacts, ownership validation, transactional apply, and checksum-pinned CI gates exist. Portable provider artifacts can be staged over typed SSH. | Production onboarding/service does not invoke providers; it reads pre-materialized JSON. Windows chezmoi CI verifies the binary version but not the isolation fixture. Real remote provider staging/reconciliation is not exercised. |
-| 11 | Redacted diagnostics | Partial | Schema-bound redaction, service diagnostics, CLI export, and MCP export are tested. Desktop reads the diagnostics domain. | Desktop does not perform a diagnostic export, and no installed-platform malicious-input test proves the complete export path. |
-| 12 | OSS onboarding, schemas, threat model, CI, packaging, and releases | Partial | Schemas, threat model, support/migration/release docs, three-OS Rust/Node/Tauri CI, provider gates, release packaging, signatures, SBOM, updater fixtures, and an install/update/uninstall workflow exist. | `README.md` remains the legacy Node-era onboarding and contradicts current transactional recovery. Production signing/notarization identities and two published signed versions have not exercised the lifecycle workflow. That workflow checks installation, upgrade, CLI version, and uninstall, but not reconciliation or snapshots through each installed product. |
+| 1 | Initialize a target | Partial | `commonkit init create|connect` authenticates with GitHub CLI, creates or clones the kit, writes all composition layers and target registration, creates private runtime roots, materializes native declarations, and writes production `headless.json`. The onboarding suite passes. | First-run onboarding does not select and configure APM or chezmoi from a loadout, and desktop onboarding remains an informational panel. |
+| 2 | Preview drift | Met locally | Production Git-backed provider materialization, composition/explanation, live observation, durable plan retrieval, deterministic diff, stale-input rejection, and local/SSH planning are wired. Service, CLI, provider-pipeline, and SSH suites pass. | Hosted platform and declared remote support-matrix evidence. |
+| 3 | Apply safely | Met locally | Content-bound plans, confirmation, deterministic adapters, idempotency, receipts, stale-target rejection, verification, rollback, typed-SSH dispatch, and fresh-process recovery pass focused tests. | Installed reconciliation through signed artifacts on all three OSes. |
+| 4 | Verify parity | Met locally | Service, CLI, MCP, and desktop all expose production verification. Provider integrity and target parity are checked through the same domain. | Installed three-OS interface-parity evidence. |
+| 5 | Provision credential references | Met locally | Credential readiness/apply/verify are exposed through service, CLI, and desktop. Production env/file and BWS resolution is tested without leaking values; native platform credential adapters have focused contracts. | Hosted execution of native platform stores and installed products. |
+| 6 | Recover or roll back | Met locally | Reconciliation and snapshot restore/promote use authenticated durable plans and receipts, encrypted preimages, lifecycle coordination, tamper rejection, startup discovery, and fresh-process recovery. CLI and desktop operator surfaces are present. | Installed daemon/CLI recovery on macOS, Linux, and Windows artifacts. |
+| 7 | Multiple targets and five-layer composition | Partial | Five-layer composition, monotonic organization policy, provenance, target inventory, local execution, controller-side provider materialization, portable artifact staging, and semantic typed-SSH plan/apply/recovery pass. | Production `headless.json` still represents one active sync target at a time; no multi-target selection/iteration surface or recorded remote support-matrix run exists. |
+| 8 | Scheduled read-only drift checks | Met locally | `commonkitd` constructs `DriftScheduler`; persistence, enable/disable/status, overlap suppression, read-only verification, degraded reporting, and CLI/desktop mutation surfaces pass focused tests. | Installed unattended execution evidence. |
+| 9 | Optional MCP relay state | Met locally | Rust relay lifecycle, transactional reconciliation, stable endpoint, HTTP upstreams, migration, failure behavior, and redaction are implemented. The shared Node/Rust black-box compatibility suite passed against the current `commonkitd` binary. | Installed lifecycle on the release matrix; legacy retirement remains a later decision. |
+| 10 | Coding-agent adapters and SkillOpt | Partial | Pinned APM 0.25.0, chezmoi 2.70.4 safe isolation, native fallback, provider artifacts, ownership validation, production Git-provider materialization, local/SSH planning, and authenticated SkillOpt canary recovery exist. | The full SkillOpt suite produced one `ProviderIsolationBreached` failure and then passed in isolation, making the isolation gate order/environment-sensitive. First-run provider selection and hosted provider matrices also remain. |
+| 11 | Redacted diagnostics | Met locally | Schema-bound diagnostics are exposed by service, CLI, MCP, and desktop; focused redaction and secret-scanning contracts pass. | Installed malicious-input export evidence on all supported platforms. |
+| 12 | OSS onboarding, schemas, threat model, CI, packaging, and releases | Partial | README now documents the Rust v1 flow. Schemas, threat model, support/migration/release docs, three-OS CI, provider gates, packaging, signatures, SBOM, updater fixtures, and installed unsigned lifecycle automation exist. | Production signing/notarization identities, two published signed versions, lifecycle workflow evidence, and installed reconciliation/snapshot coverage are external release gates. |
 
-No flow is fully met under the scope's product-level, cross-platform acceptance rule. Several underlying cores are complete; their remaining status is driven by missing production wiring or release evidence, not missing reconciliation primitives.
+## Focused verification run
 
-## Stale claims closed since the prior audit
+- Production service domains, credentials, scheduler, and typed-SSH end to end: 10 tests passed.
+- CLI onboarding and headless operator surface: 8 tests passed.
+- Provider pipeline, remote staging, and SSH filesystem recovery: 5 tests passed.
+- Durable snapshot restore/promotion: 9 tests passed.
+- Desktop management and update behavior: 13 tests passed.
+- Shared relay compatibility: passed with both legacy Node and the current Rust daemon.
+- Skill deployment/canary recovery: 7 tests passed.
+- Release-readiness contracts: 7 tests passed.
+- SkillOpt: the full crate run failed one real provider-isolation test with `ProviderIsolationBreached`; the same test passed immediately when rerun alone. This is a release-blocking flaky safety gate until diagnosed and made deterministic.
 
-- GitHub-backed create/connect onboarding, required layer creation, target registration, private roots, and `headless.json` generation now exist.
-- Daemon composition and explanation, durable CLI diff, credential CLI commands, and production scheduler execution are wired.
-- Snapshot restore and authoritative-writer promotion now support authenticated durable recovery across restart and lifecycle coordination.
-- Portable provider artifacts can be integrity-checked and staged through the typed SSH boundary.
-- Desktop management reads real plan, credential, snapshot, relay, schedule, and diagnostic domain state, and plan apply is daemon-authorized.
-- Three-OS CI, signed release assembly, updater consent fixtures, and a published-release lifecycle workflow exist.
+## Priority findings
 
-## Acceptance checklist
+### P0
 
-| Criterion | Result |
-| --- | --- |
-| All 12 flow contract suites | Not met: component suites exist, but no twelve-flow product suite covers provider materialization, all interfaces, and installed platforms. |
-| macOS/Linux/Windows installation, reconciliation, snapshot, update, uninstall | Not met: automation covers install/update/version/uninstall only; production signed runs and installed reconciliation/snapshot coverage are absent. |
-| Declared remote target combinations | Not met: typed SSH staging passes; production provider/reconciliation integration and remote support-matrix runs are absent. |
-| Organization policy weakening rejected with provenance | Met at composition/core contract level. |
-| Deterministic, redacted, input/observed-bound plans | Met for the implemented local provider/filesystem and relay planning paths. |
-| Idempotent apply and failure recovery | Met for reconciliation and local filesystem operations; installed-platform evidence remains part of the release gate. |
-| No secret or live SQLite in Git/diagnostics | Partial: focused scanners, redaction, and snapshot separation pass; a complete malicious-repository installed-flow gate is absent. |
-| Snapshot restore integrity and rollback safety | Met at core/service contract level, including restart recovery and tamper rejection; installed-platform proof remains. |
-| Rust relay black-box parity/migration | Not met: migration/configuration parity exists, not the required dual-runtime behavior suite. |
-| Desktop/headless same domain state | Not met: desktop reads most domain state and applies plans, but verification, onboarding, and management mutations are missing. |
-| Signed installers and updates verified | Not met in production: fail-closed automation and local updater fixtures exist without production identities, notarization, or a published two-version run. |
-| Threat model, schemas, onboarding, support, migration docs | Partial: required reference documents exist; public onboarding remains stale. |
+None found in the audited committed paths.
 
-## Remaining implementation versus external release gates
+### P1
 
-Implementation work:
+1. Make the SkillOpt real isolation test deterministic. A safety boundary that passes only in isolation cannot be used as release evidence.
+2. Finish first-run provider selection/configuration so a user can choose an APM or chezmoi-backed loadout without manually authoring `headless.json`.
+3. Add a production multi-target selection/iteration model; one configured sync target is not the complete multiple-target flow.
+4. Exercise installed reconciliation, verification, snapshot, recovery, update, and uninstall on macOS, Linux, and Windows. The current unsigned CI lifecycle and signed release workflow do not yet provide that complete evidence.
 
-1. Connect Git fetch and pinned provider materialization to onboarding/service planning, then use the same pipeline for local and SSH targets.
-2. Add production multi-target selection and exercise remote provider staging through semantic CommonKit plans and adapters.
-3. Complete the scoped CLI surface for snapshots and drift-schedule enable/disable.
-4. Wire BWS and platform credential resolvers into the production credential domain.
-5. Complete desktop onboarding, verification, credential/snapshot/relay/schedule mutations, and diagnostics export.
-6. Run one shared Node/Rust relay black-box contract suite across the full required behavior matrix.
-7. Replace the legacy README with the Rust v1 installation and clean-machine workflow.
-8. Extend installed-release tests to reconcile, verify, snapshot, restore, and recover—not only install and report a version.
+## Local implementation versus external release gates
 
-External release evidence:
+Locally implemented and evidenced: composition/policy, Git-backed provider materialization, deterministic plan/diff, local and typed-SSH apply, verification, credentials, receipts/recovery, snapshots, scheduler, relay parity, diagnostics, operator CLI, desktop mutations, SkillOpt lifecycle contracts, packaging automation, and fail-closed updater fixtures.
 
-1. Supply production macOS signing/notarization and Windows signing identities.
-2. Publish two signed versions and pass the lifecycle workflow on macOS, Linux, and Windows.
-3. Record the declared remote-target support-matrix runs.
+External or hosted evidence still required:
+
+1. Production Apple signing/notarization, Windows signing, and Tauri updater identities.
+2. Two published signed versions and a successful install → reconcile → verify → snapshot/restore → recover → update → uninstall run on macOS, Linux, and Windows.
+3. Recorded declared remote-target support-matrix runs.
+4. Hosted provider isolation gates for every supported OS/architecture combination available upstream.
 
 ## Conclusion
 
-Do not mark CommonKit v1 complete or release-ready. The differentiated reconciliation, policy, provider isolation, relay, snapshot, and service foundations are credible. Completion is now concentrated in provider-to-production wiring, full operator surfaces, cross-runtime relay parity, current onboarding documentation, and executable release evidence.
+Do not mark CommonKit v1 fully release-ready yet. Seven of the twelve flows are implemented and pass local production-path contracts; five remain partial because of first-run provider selection, multi-target product wiring, the flaky SkillOpt isolation gate, or external signed/platform evidence. The remaining work is no longer a reconciliation-core rewrite.
