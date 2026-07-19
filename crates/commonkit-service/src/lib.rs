@@ -1406,6 +1406,24 @@ pub trait SyncDomain: Send + Sync + 'static {
     ) -> Result<PlanExecutionAuthority, DomainFailure> {
         Err(DomainFailure::OperationFailed)
     }
+    /// Seals the exact reviewed plan and already-materialized provider state.
+    /// This is called for plans (notably relay-only plans) assembled outside
+    /// the filesystem provider planner.
+    fn persist_plan_execution_authority(
+        &self,
+        _plan: &Plan,
+        _states: &[MaterializedState],
+    ) -> Result<(), DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    /// Loads relay authority from the same authenticated plan record used by
+    /// general execution validation. It must never invoke a provider.
+    fn relay_execution_authority(
+        &self,
+        _approved: &Plan,
+    ) -> Result<RelayProviderAuthority, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
     fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
         Err(DomainFailure::OperationFailed)
     }
@@ -1415,6 +1433,11 @@ pub trait SyncDomain: Send + Sync + 'static {
 pub struct PlanExecutionAuthority {
     pub policy_digest: Sha256Digest,
     pub bindings: commonkit_contracts::PlanBindings,
+    /// Digest of the complete canonical plan, including desired state and the
+    /// ordered operation identity set. Binding-only validation is insufficient
+    /// because an otherwise valid operation can be injected under the same
+    /// provider bindings.
+    pub plan_digest: Sha256Digest,
 }
 
 #[derive(Debug, Clone)]
@@ -1950,7 +1973,10 @@ impl ControlPlane {
         let authority = domain
             .plan_execution_authority(plan)
             .map_err(|_| ControlError::PlanAuthorityChanged)?;
-        if plan.policy_digest != authority.policy_digest || plan.bindings != authority.bindings {
+        if plan.policy_digest != authority.policy_digest
+            || plan.bindings != authority.bindings
+            || plan.id != authority.plan_digest
+        {
             return Err(ControlError::PlanAuthorityChanged);
         }
         Ok(())
@@ -1972,7 +1998,7 @@ impl ControlPlane {
         }
         let domain = self.target_sync_domain(&plan.target_id)?;
         let authority = domain
-            .relay_provider_authority()
+            .relay_execution_authority(plan)
             .map_err(|_| ControlError::RelayAuthorityChanged)?;
         if !authority.relay_is_target_local {
             return Err(ControlError::RelayAuthorityChanged);
@@ -2543,6 +2569,10 @@ struct SkillOptimizeRequest {
     corpus: PathBuf,
     backend: String,
     model: Option<String>,
+    #[serde(default)]
+    provider_executables: BTreeSet<PathBuf>,
+    #[serde(default)]
+    harness_executables: BTreeSet<PathBuf>,
 }
 
 async fn skill_optimize(
@@ -2566,6 +2596,8 @@ async fn skill_optimize(
         tasks_file: request.tasks,
         harness_executable: request.harness,
         harness_corpus: request.corpus,
+        provider_executables: request.provider_executables,
+        harness_executables: request.harness_executables,
         environment: BTreeMap::new(),
         timeout_seconds: request.manifest.limits.timeout_seconds,
     })
@@ -3226,6 +3258,7 @@ async fn plan_relay_reconcile(
     let authority = domain
         .relay_provider_authority()
         .map_err(|_| ApiError::conflict("relay_provider_authority_invalid"))?;
+    let authority_states = authority.materialized_states.clone();
     if !authority.relay_is_target_local {
         return Err(ApiError::conflict("relay_requires_target_resident_daemon"));
     }
@@ -3306,6 +3339,9 @@ async fn plan_relay_reconcile(
     if request.review.as_ref() != Some(&computed_review) {
         return Err(ApiError::conflict("relay_review_stale_or_tampered"));
     }
+    domain
+        .persist_plan_execution_authority(&plan, &authority_states)
+        .map_err(|_| ApiError::internal("relay_authority_persist_failed"))?;
     let plan = state.control.register_plan(plan)?;
     Ok((
         StatusCode::CREATED,

@@ -136,6 +136,13 @@ test("release lifecycle matrix exercises install update and uninstall", async ()
   assert.match(workflow, /COMMONKIT_DESKTOP_UPDATE_REPORT/);
   assert.match(workflow, /COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION/);
   assert.match(workflow, /updatedByTauri/);
+  assert.match(workflow, /desktopVersion/);
+  assert.match(workflow, /desktopExecutable/);
+  assert.match(workflow, /previous_hash/);
+  assert.match(workflow, /updated_hash/);
+  assert.match(workflow, /CommonKit\.AppImage[\s\S]*COMMONKIT_DESKTOP_SMOKE_REPORT/);
+  assert.doesNotMatch(workflow, /installedVersion/);
+  assert.doesNotMatch(workflow, /dpkg -L[^\n]*commonkit-desktop/);
   assert.doesNotMatch(workflow, /Update macOS by installing current signed release/);
   assert.doesNotMatch(workflow, /Update Linux by installing current signed Debian release/);
   assert.doesNotMatch(workflow, /Update Windows by installing current signed NSIS release/);

@@ -112,6 +112,64 @@ fn registry_startup_recovers_snapshot_transactions_with_configured_service_lifec
     );
 }
 
+fn snapshot_git_authority(repository: &std::path::Path) -> serde_json::Value {
+    fn git(repository: &std::path::Path, args: &[&str]) -> String {
+        let executable = git_executable();
+        let output = std::process::Command::new(executable)
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+    let executable = git_executable();
+    git(repository, &["init", "--initial-branch=main"]);
+    git(repository, &["config", "user.name", "CommonKit Test"]);
+    git(
+        repository,
+        &["config", "user.email", "commonkit-test@localhost"],
+    );
+    std::fs::write(repository.join(".commonkit-git-seed"), b"seed\n").unwrap();
+    git(repository, &["add", ".commonkit-git-seed"]);
+    git(repository, &["commit", "-m", "seed snapshot authority"]);
+    let remote = repository.join(".snapshot-authority-remote.git");
+    std::fs::create_dir(&remote).unwrap();
+    git(&remote, &["init", "--bare", "--initial-branch=main"]);
+    git(
+        repository,
+        &[
+            "remote",
+            "add",
+            "snapshot-authority",
+            remote.to_str().unwrap(),
+        ],
+    );
+    git(repository, &["push", "snapshot-authority", "main"]);
+    serde_json::json!({
+        "executable": executable,
+        "repository": repository,
+        "trustedRemoteUrl": remote,
+        "branch": "main",
+        "stagingRoot": repository.join("snapshot-git-staging")
+    })
+}
+
+fn git_executable() -> std::path::PathBuf {
+    let name = if cfg!(windows) { "git.exe" } else { "git" };
+    std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|directory| directory.join(name))
+        .find(|candidate| candidate.is_file())
+        .and_then(|path| path.canonicalize().ok())
+        .expect("absolute git executable")
+}
+
 fn write_json(path: &std::path::Path, value: &impl serde::Serialize) {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
@@ -180,6 +238,7 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
     std::fs::write(&source_secret, b"never serialize me").unwrap();
     let database = root.join("context.sqlite");
     std::fs::write(&database, b"database-v1").unwrap();
+    let git_authority = snapshot_git_authority(root);
     let config = serde_json::json!({
       "sync": {
         "targetId": "local", "targetRoot": target, "adapterState": state.join("filesystem"),
@@ -194,6 +253,7 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
       }]},
       "snapshots": { "root": root.join("snapshots"), "portableState": root.join("kit"), "keyReference": format!("file://{}", source_secret.display()),
         "objectStore": {"type":"local"},
+        "gitAuthority": git_authority,
         "databases": [{"id":"context-mode", "path": database, "targetId":"local", "observedPaths":{"workstation-b":root.join("context-candidate.db")}, "format":"file", "lifecycle": lifecycle_config()}] }
     });
     let config_path = root.join("headless.json");
@@ -216,6 +276,42 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         "home/config.txt"
     );
     let plan_contract: commonkit_contracts::Plan = serde_json::from_value(plan).unwrap();
+    sync.plan_execution_authority(&plan_contract)
+        .expect("authenticated exact plan authority");
+    let authority_path = state.join("filesystem/provider-authority").join(format!(
+        "{}.json",
+        plan_contract.id.as_str().trim_start_matches("sha256:")
+    ));
+    let authority_bytes = std::fs::read(&authority_path).unwrap();
+    let mut tampered: serde_json::Value = serde_json::from_slice(&authority_bytes).unwrap();
+    let first = tampered["ciphertext"][0].as_u64().unwrap();
+    tampered["ciphertext"][0] = serde_json::json!(first ^ 1);
+    write_json(&authority_path, &tampered);
+    assert_eq!(
+        sync.plan_execution_authority(&plan_contract),
+        Err(commonkit_service::DomainFailure::OperationFailed),
+        "an unauthenticated authority rewrite must fail before execution"
+    );
+    std::fs::write(&authority_path, authority_bytes).unwrap();
+    let replayed_plan = commonkit_core::build_plan(commonkit_core::PlanDraft {
+        target_id: plan_contract.target_id.clone(),
+        desired_digest: digest_domain_json("test", &"replayed-desired").unwrap(),
+        observed_digest: plan_contract.observed_digest.clone(),
+        policy_digest: plan_contract.policy_digest.clone(),
+        bindings: plan_contract.bindings.clone(),
+        operations: plan_contract.operations.clone(),
+    })
+    .unwrap();
+    let replay_path = state.join("filesystem/provider-authority").join(format!(
+        "{}.json",
+        replayed_plan.id.as_str().trim_start_matches("sha256:")
+    ));
+    std::fs::copy(&authority_path, replay_path).unwrap();
+    assert_eq!(
+        sync.plan_execution_authority(&replayed_plan),
+        Err(commonkit_service::DomainFailure::OperationFailed),
+        "an authenticated envelope cannot be replayed under another plan"
+    );
     let receipts = ReceiptStore::open(root.join("receipts")).unwrap();
     let run_id = StableId::parse("production-run").unwrap();
     let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(
@@ -379,6 +475,7 @@ fn snapshot_promotion_rejects_unsnapshotted_authoritative_changes_and_missing_ob
     std::fs::write(&candidate, b"snapshot-state").unwrap();
     let key_path = root.join("snapshot-key");
     std::fs::write(&key_path, b"snapshot-test-key").unwrap();
+    let git_authority = snapshot_git_authority(root);
     let config = root.join("headless.json");
     write_json(
         &config,
@@ -390,6 +487,7 @@ fn snapshot_promotion_rejects_unsnapshotted_authoritative_changes_and_missing_ob
                 "portableState": root.join("kit"),
                 "keyReference": format!("file://{}", key_path.display()),
                 "objectStore": {"type":"local"},
+                "gitAuthority": git_authority,
                 "databases": [{
                     "id":"context-mode",
                     "path": database,
@@ -448,6 +546,7 @@ fn promoted_writer_is_the_only_source_allowed_to_advance_snapshot_history() {
     std::fs::write(&writer_b, b"state-v1").unwrap();
     let key_path = root.join("snapshot-key");
     std::fs::write(&key_path, b"snapshot-test-key").unwrap();
+    let git_authority = snapshot_git_authority(root);
     let config = root.join("headless.json");
     write_json(
         &config,
@@ -459,6 +558,7 @@ fn promoted_writer_is_the_only_source_allowed_to_advance_snapshot_history() {
                 "portableState": root.join("kit"),
                 "keyReference": format!("file://{}", key_path.display()),
                 "objectStore": {"type":"local"},
+                "gitAuthority": git_authority,
                 "databases": [{
                     "id":"context-mode",
                     "path":writer_a,
@@ -695,6 +795,11 @@ fn configured_git_provider_pipeline_materializes_native_state_before_local_plann
         plan["operations"][0]["resource"]["managedPath"],
         "home/editor.conf"
     );
+    let reviewed: commonkit_contracts::Plan = serde_json::from_value(plan.clone()).unwrap();
+    std::fs::rename(checkout.join(".git"), checkout.join(".git-disabled")).unwrap();
+    sync.plan_execution_authority(&reviewed)
+        .expect("apply authority uses only sealed local facts, never Git inspection");
+    std::fs::rename(checkout.join(".git-disabled"), checkout.join(".git")).unwrap();
     let states = std::fs::read_dir(root.join("pipeline/states"))
         .unwrap()
         .collect::<Result<Vec<_>, _>>()

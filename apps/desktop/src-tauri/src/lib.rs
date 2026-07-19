@@ -44,12 +44,10 @@ impl RuntimeBinaryLayout {
         }
         #[cfg(debug_assertions)]
         {
-            let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../../target/debug");
-            let development = Self::beside(&workspace.join(format!(
-                "commonkit-desktop{}",
-                std::env::consts::EXE_SUFFIX
-            )));
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/debug");
+            let development = Self::beside(
+                &workspace.join(format!("commonkit-desktop{}", std::env::consts::EXE_SUFFIX)),
+            );
             development.validate()?;
             return Ok(development);
         }
@@ -59,8 +57,8 @@ impl RuntimeBinaryLayout {
 
     fn validate(&self) -> Result<(), DesktopError> {
         for path in [&self.cli, &self.daemon, &self.target_helper] {
-            let metadata = std::fs::symlink_metadata(path)
-                .map_err(|_| DesktopError::RuntimeBinaryMissing)?;
+            let metadata =
+                std::fs::symlink_metadata(path).map_err(|_| DesktopError::RuntimeBinaryMissing)?;
             if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
                 return Err(DesktopError::RuntimeBinaryMissing);
             }
@@ -107,7 +105,10 @@ impl ServiceSupervisor {
     }
 
     fn child_exited(&self) -> Result<bool, DesktopError> {
-        let mut child = self.child.lock().map_err(|_| DesktopError::ServiceLaunchFailed)?;
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| DesktopError::ServiceLaunchFailed)?;
         Ok(match child.as_mut() {
             Some(child) => child.try_wait()?.is_some(),
             None => false,
@@ -137,7 +138,9 @@ impl ServiceSupervisor {
     }
 
     fn stop(&self) {
-        let Ok(mut slot) = self.child.lock() else { return };
+        let Ok(mut slot) = self.child.lock() else {
+            return;
+        };
         if let Some(mut child) = slot.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -677,9 +680,13 @@ enum DesktopError {
     RuntimeBinaryMissing,
     #[error("the bundled CommonKit service could not be started")]
     ServiceLaunchFailed,
-    #[error("CommonKit saved the new configuration, but the independently managed service must be restarted by its service manager before continuing")]
+    #[error(
+        "CommonKit saved the new configuration, but the independently managed service must be restarted by its service manager before continuing"
+    )]
     ExternalServiceReloadRequired,
-    #[error("CommonKit saved the new configuration, but its managed service could not reload it; reopen CommonKit and retry")]
+    #[error(
+        "CommonKit saved the new configuration, but its managed service could not reload it; reopen CommonKit and retry"
+    )]
     ServiceReloadFailed,
     #[error("local control state is invalid")]
     InvalidControlState,
@@ -1124,21 +1131,26 @@ async fn run_automated_update_lifecycle(app: tauri::AppHandle, report: PathBuf, 
         Ok::<_, String>(serde_json::json!({
             "schemaVersion": 1,
             "previousVersion": env!("CARGO_PKG_VERSION"),
-            "installedVersion": expected,
             "updatedByTauri": true,
         }))
     }
     .await;
     let (exit_code, payload) = match result {
         Ok(payload) => (0, payload),
-        Err(error) => (70, serde_json::json!({
-            "schemaVersion": 1,
-            "previousVersion": env!("CARGO_PKG_VERSION"),
-            "updatedByTauri": false,
-            "error": error,
-        })),
+        Err(error) => (
+            70,
+            serde_json::json!({
+                "schemaVersion": 1,
+                "previousVersion": env!("CARGO_PKG_VERSION"),
+                "updatedByTauri": false,
+                "error": error,
+            }),
+        ),
     };
-    let _ = std::fs::write(report, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+    let _ = std::fs::write(
+        report,
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    );
     app.exit(exit_code);
 }
 
@@ -1197,8 +1209,11 @@ async fn refresh_tray(app: tauri::AppHandle) {
         });
         if runtime.is_ok()
             && status.state != "offline"
-            && std::fs::write(&report, serde_json::to_vec_pretty(&payload).unwrap_or_default())
-                .is_ok()
+            && std::fs::write(
+                &report,
+                serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+            )
+            .is_ok()
         {
             app.exit(0);
         } else {
@@ -1253,13 +1268,28 @@ pub fn run() {
             let supervisor = ServiceSupervisor::ensure_started(&client)?;
             app.manage(supervisor);
             let health = MenuItem::with_id(app, "health", "Health: starting", false, None::<&str>)?;
-            let loadout = MenuItem::with_id(app, "loadout", "Loadout: loading", false, None::<&str>)?;
-            let relay = MenuItem::with_id(app, "relay-status", "Relay: loading", false, None::<&str>)?;
-            let snapshots = MenuItem::with_id(app, "snapshot-status", "Snapshots: loading", false, None::<&str>)?;
+            let loadout =
+                MenuItem::with_id(app, "loadout", "Loadout: loading", false, None::<&str>)?;
+            let relay =
+                MenuItem::with_id(app, "relay-status", "Relay: loading", false, None::<&str>)?;
+            let snapshots = MenuItem::with_id(
+                app,
+                "snapshot-status",
+                "Snapshots: loading",
+                false,
+                None::<&str>,
+            )?;
             let refresh = MenuItem::with_id(app, "refresh", "Refresh health", true, None::<&str>)?;
             let review = MenuItem::with_id(app, "review", "Review plan…", true, None::<&str>)?;
-            let manage_relay = MenuItem::with_id(app, "manage-relay", "Manage relay…", true, None::<&str>)?;
-            let manage_snapshots = MenuItem::with_id(app, "manage-snapshots", "Manage snapshots…", true, None::<&str>)?;
+            let manage_relay =
+                MenuItem::with_id(app, "manage-relay", "Manage relay…", true, None::<&str>)?;
+            let manage_snapshots = MenuItem::with_id(
+                app,
+                "manage-snapshots",
+                "Manage snapshots…",
+                true,
+                None::<&str>,
+            )?;
             let open = MenuItem::with_id(app, "open", "Open CommonKit", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             app.manage(TrayItems {
@@ -1268,14 +1298,29 @@ pub fn run() {
                 relay: relay.clone(),
                 snapshots: snapshots.clone(),
             });
-            let menu = Menu::with_items(app, &[
-                &health, &loadout, &relay, &snapshots, &refresh, &review,
-                &manage_relay, &manage_snapshots, &open, &quit,
-            ])?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &health,
+                    &loadout,
+                    &relay,
+                    &snapshots,
+                    &refresh,
+                    &review,
+                    &manage_relay,
+                    &manage_snapshots,
+                    &open,
+                    &quit,
+                ],
+            )?;
             TrayIconBuilder::new()
                 .menu(&menu)
                 .tooltip("CommonKit")
-                .icon(app.default_window_icon().ok_or("desktop icon unavailable")?.clone())
+                .icon(
+                    app.default_window_icon()
+                        .ok_or("desktop icon unavailable")?
+                        .clone(),
+                )
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => {
                         let _ = show_main_window(app.clone());
@@ -1283,9 +1328,15 @@ pub fn run() {
                     "refresh" => {
                         tauri::async_runtime::spawn(refresh_tray(app.clone()));
                     }
-                    "review" => { let _ = show_route(app.clone(), "plans"); }
-                    "manage-relay" => { let _ = show_route(app.clone(), "relay"); }
-                    "manage-snapshots" => { let _ = show_route(app.clone(), "snapshots"); }
+                    "review" => {
+                        let _ = show_route(app.clone(), "plans");
+                    }
+                    "manage-relay" => {
+                        let _ = show_route(app.clone(), "relay");
+                    }
+                    "manage-snapshots" => {
+                        let _ = show_route(app.clone(), "snapshots");
+                    }
                     "quit" => {
                         app.state::<ServiceSupervisor>().stop();
                         app.exit(0);
@@ -1353,19 +1404,46 @@ mod tests {
         let attached = ServiceSupervisor {
             child: Mutex::new(None),
         };
-        assert!(!attached
-            .replace_owned_child(|| panic!("an externally managed daemon must not be replaced"))
-            .unwrap());
+        assert!(
+            !attached
+                .replace_owned_child(|| panic!("an externally managed daemon must not be replaced"))
+                .unwrap()
+        );
     }
 
     #[test]
     fn packaged_runtime_binaries_are_resolved_only_beside_the_installed_desktop() {
-        let executable = if cfg!(windows) { "commonkit-desktop.exe" } else { "commonkit-desktop" };
+        let executable = if cfg!(windows) {
+            "commonkit-desktop.exe"
+        } else {
+            "commonkit-desktop"
+        };
         let root = Path::new("/Applications/CommonKit.app/Contents/MacOS");
         let layout = RuntimeBinaryLayout::beside(&root.join(executable));
-        assert_eq!(layout.cli, root.join(if cfg!(windows) { "commonkit.exe" } else { "commonkit" }));
-        assert_eq!(layout.daemon, root.join(if cfg!(windows) { "commonkitd.exe" } else { "commonkitd" }));
-        assert_eq!(layout.target_helper, root.join(if cfg!(windows) { "commonkit-target-helper.exe" } else { "commonkit-target-helper" }));
+        assert_eq!(
+            layout.cli,
+            root.join(if cfg!(windows) {
+                "commonkit.exe"
+            } else {
+                "commonkit"
+            })
+        );
+        assert_eq!(
+            layout.daemon,
+            root.join(if cfg!(windows) {
+                "commonkitd.exe"
+            } else {
+                "commonkitd"
+            })
+        );
+        assert_eq!(
+            layout.target_helper,
+            root.join(if cfg!(windows) {
+                "commonkit-target-helper.exe"
+            } else {
+                "commonkit-target-helper"
+            })
+        );
     }
 
     #[test]

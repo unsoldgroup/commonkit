@@ -21,7 +21,7 @@ mod target;
 
 pub use apm::{ApmProvider, ApmProviderConfig};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
-pub use chezmoi::ChezmoiProvider;
+pub use chezmoi::{ChezmoiProvider, TESTED_CHEZMOI_VERSION};
 pub use credentials::{
     BwsCommandError, BwsCommandRunner, BwsCredentialResolver, CredentialReadiness,
     CredentialReadinessInspector, CredentialReference, CredentialReferenceError,

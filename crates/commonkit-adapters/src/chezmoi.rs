@@ -15,7 +15,7 @@ use super::resources::{
     SafeSymlinkTarget,
 };
 
-const CHEZMOI_VERSION: &str = "2.70.4";
+pub const TESTED_CHEZMOI_VERSION: &str = "2.70.4";
 
 #[derive(Debug, Clone)]
 pub struct ChezmoiProvider {
@@ -145,9 +145,9 @@ impl ChezmoiProvider {
             .strip_prefix("chezmoi version ")
             .and_then(|rest| rest.split_whitespace().next())
             .map(|word| word.trim_start_matches('v').trim_end_matches(','));
-        if !output.status.success() || reported_version != Some(CHEZMOI_VERSION) {
+        if !output.status.success() || reported_version != Some(TESTED_CHEZMOI_VERSION) {
             return Err(ProviderFailure::Inspect(format!(
-                "chezmoi {CHEZMOI_VERSION} is required; install the exact pinned release"
+                "chezmoi {TESTED_CHEZMOI_VERSION} is required; install the exact pinned release"
             )));
         }
         Ok(())
@@ -162,7 +162,7 @@ impl ChezmoiProvider {
             .map_err(|error| ProviderFailure::Inspect(error.to_string()))?;
         ProviderInputs::new(
             self.id.clone(),
-            ExactProviderVersion::parse(CHEZMOI_VERSION)?,
+            ExactProviderVersion::parse(TESTED_CHEZMOI_VERSION)?,
             "commonkit.chezmoi-provider.v1".into(),
             BTreeMap::from([
                 ("config".into(), config_digest),
@@ -353,7 +353,7 @@ fn scan_destination(
             intent,
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
-                provider_version: CHEZMOI_VERSION.into(),
+                provider_version: TESTED_CHEZMOI_VERSION.into(),
                 input_digest: inputs.input_set_digest.clone(),
                 source: format!("chezmoi-stage:{portable}"),
             },

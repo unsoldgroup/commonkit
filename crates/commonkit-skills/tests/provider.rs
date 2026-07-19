@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -80,10 +81,10 @@ while [ "$#" -gt 0 ]; do
   elif [ "$1" = "--target-skill-path" ]; then skill="$2"; shift 2
   else shift; fi
 done
-if grep -R 'held' "$project/input" >/dev/null 2>&1; then exit 71; fi
+if /usr/bin/grep -R 'held' "$project/input" >/dev/null 2>&1; then exit 71; fi
 if [ -e "$project/harness-suite-manifest.json" ]; then exit 72; fi
-"$(dirname "$0")/detach-forger" "$project"
-mkdir -p "$project/.skillopt-sleep/staging/run-1"
+"$(/usr/bin/dirname "$0")/detach-forger" "$project"
+/bin/mkdir -p "$project/.skillopt-sleep/staging/run-1"
 printf '# Review\n\nImproved safely.\n' > "$project/.skillopt-sleep/staging/run-1/proposed_SKILL.md"
 printf '{"live_skill_path":"%s","live_memory_path":"","has_skill":true,"has_memory":false,"accepted":true}' "$skill" > "$project/.skillopt-sleep/staging/run-1/manifest.json"
 printf '{"night":1,"accepted":true,"gate_action":"accept","no_edits_reason":"","baseline":0.5,"candidate":0.7,"n_tasks":1,"n_sessions":0,"n_accepted_edits":1,"n_rejected_edits":0,"edits":[{"target":"skill","op":"add","content":"safe","anchor":"","rationale":"fixture"}],"rejected_edits":[],"notes":[],"staging_dir":"%s/.skillopt-sleep/staging/run-1","adopted":[],"tasks_file":"reviewed-tasks.json","tasks_reviewed":true}' "$project"
@@ -135,8 +136,11 @@ while [ "$#" -gt 0 ]; do
     *) shift;;
   esac
 done
-sleep 2
-grep -q 'Improved safely' "$candidate_path" || exit 73
+found=''
+while IFS= read -r line; do
+  case "$line" in *'Improved safely'*) found=yes;; esac
+done < "$candidate_path"
+[ "$found" = yes ] || exit 73
 printf '{"schemaVersion":1,"suiteDigest":"%s","skillId":"%s","baselineDigest":"%s","candidateDigest":"%s","policyDigest":"%s","policyPassed":true,"evaluation":{"schemaVersion":1,"baselineBasisPoints":5000,"candidateBasisPoints":7000,"heldOutBaselineBasisPoints":5000,"heldOutCandidateBasisPoints":7000,"requiredCases":{"held":"passed"},"costMicros":1,"harness":{"kind":"skillopt-sleep","version":"0.2.0","environmentDigest":"%s"},"scorerDigest":"%s"}}' "$suite" "$skill" "$baseline" "$candidate" "$policy" "$environment" "$scorer"
 "#,
     )
@@ -236,6 +240,19 @@ printf '{"schemaVersion":1,"suiteDigest":"%s","skillId":"%s","baselineDigest":"%
         tasks_file: tasks,
         harness_executable: harness.clone(),
         harness_corpus: corpus,
+        provider_executables: BTreeSet::from([
+            PathBuf::from("/bin/sh"),
+            PathBuf::from("/bin/mkdir"),
+            PathBuf::from("/bin/sleep"),
+            PathBuf::from("/usr/bin/dirname"),
+            PathBuf::from("/usr/bin/grep"),
+            bin.join("detach-forger"),
+        ]),
+        harness_executables: BTreeSet::from([
+            PathBuf::from("/bin/sh"),
+            PathBuf::from("/bin/sleep"),
+            PathBuf::from("/usr/bin/grep"),
+        ]),
         environment: BTreeMap::new(),
         timeout_seconds: 5,
     };
@@ -315,6 +332,8 @@ fn provider_rejects_reviewed_task_files_without_tasks() {
         tasks_file: tasks,
         harness_executable: root.join("tool/bin/skillopt-sleep"),
         harness_corpus: root.clone(),
+        provider_executables: BTreeSet::new(),
+        harness_executables: BTreeSet::new(),
         environment: BTreeMap::new(),
         timeout_seconds: 5,
     });

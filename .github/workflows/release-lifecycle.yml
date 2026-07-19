@@ -107,10 +107,14 @@ jobs:
           set -euo pipefail
           report="$RUNNER_TEMP/commonkit-tauri-update.json"
           expected="${{ inputs.current_tag }}"; expected="${expected#v}"
+          previous="${{ inputs.previous_tag }}"; previous="${previous#v}"
+          previous_hash=$(shasum -a 256 /Applications/CommonKit.app/Contents/MacOS/commonkit-desktop | cut -d' ' -f1)
           COMMONKIT_DESKTOP_UPDATE_REPORT="$report" \
             COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION="$expected" \
             /Applications/CommonKit.app/Contents/MacOS/commonkit-desktop
-          node -e 'const r=require(process.argv[1]);if(!r.updatedByTauri||r.installedVersion!==process.argv[2])process.exit(1)' "$report" "$expected"
+          node -e 'const r=require(process.argv[1]);if(!r.updatedByTauri||r.previousVersion!==process.argv[2])process.exit(1)' "$report" "$previous"
+          updated_hash=$(shasum -a 256 /Applications/CommonKit.app/Contents/MacOS/commonkit-desktop | cut -d' ' -f1)
+          test "$updated_hash" != "$previous_hash"
           codesign --verify --deep --strict /Applications/CommonKit.app
           spctl --assess --type execute --verbose /Applications/CommonKit.app
       - name: Launch installed macOS desktop and verify its managed daemon
@@ -119,13 +123,14 @@ jobs:
         run: |
           set -euo pipefail
           report="$RUNNER_TEMP/commonkit-desktop-smoke.json"
+          expected="${{ inputs.current_tag }}"; expected="${expected#v}"
           COMMONKIT_DESKTOP_SMOKE_REPORT="$report" \
             /Applications/CommonKit.app/Contents/MacOS/commonkit-desktop &
           desktop_pid=$!
           for _ in $(seq 1 200); do test -s "$report" && break; sleep 0.1; done
           test -s "$report"
           wait "$desktop_pid"
-          node -e 'const r=require(process.argv[1]);if(r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon||!r.bundledTargetHelper)process.exit(1)' "$report"
+          node -e 'const r=require(process.argv[1]);if(r.desktopVersion!==process.argv[2]||!String(r.desktopExecutable).includes("/Applications/CommonKit.app/")||r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon||!r.bundledTargetHelper)process.exit(1)' "$report" "$expected"
       - name: Install previous signed Debian release
         if: runner.os == 'Linux'
         shell: bash
@@ -151,24 +156,28 @@ jobs:
           chmod +x "$RUNNER_TEMP/CommonKit.AppImage"
           report="$RUNNER_TEMP/commonkit-tauri-update.json"
           expected="${{ inputs.current_tag }}"; expected="${expected#v}"
+          previous="${{ inputs.previous_tag }}"; previous="${previous#v}"
+          previous_hash=$(shasum -a 256 "$RUNNER_TEMP/CommonKit.AppImage" | cut -d' ' -f1)
           COMMONKIT_DESKTOP_UPDATE_REPORT="$report" \
             COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION="$expected" \
             xvfb-run -a "$RUNNER_TEMP/CommonKit.AppImage"
-          node -e 'const r=require(process.argv[1]);if(!r.updatedByTauri||r.installedVersion!==process.argv[2])process.exit(1)' "$report" "$expected"
+          node -e 'const r=require(process.argv[1]);if(!r.updatedByTauri||r.previousVersion!==process.argv[2])process.exit(1)' "$report" "$previous"
+          updated_hash=$(shasum -a 256 "$RUNNER_TEMP/CommonKit.AppImage" | cut -d' ' -f1)
+          test "$updated_hash" != "$previous_hash"
       - name: Launch installed Linux desktop and verify its managed daemon
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           report="$RUNNER_TEMP/commonkit-desktop-smoke.json"
-          desktop=$(dpkg -L "$COMMONKIT_DEB_PACKAGE" | grep -E '/commonkit-desktop$' | head -1)
-          test -x "$desktop"
-          COMMONKIT_DESKTOP_SMOKE_REPORT="$report" xvfb-run -a "$desktop" &
+          expected="${{ inputs.current_tag }}"; expected="${expected#v}"
+          test -x "$RUNNER_TEMP/CommonKit.AppImage"
+          COMMONKIT_DESKTOP_SMOKE_REPORT="$report" xvfb-run -a "$RUNNER_TEMP/CommonKit.AppImage" &
           desktop_pid=$!
           for _ in $(seq 1 200); do test -s "$report" && break; sleep 0.1; done
           test -s "$report"
           wait "$desktop_pid"
-          node -e 'const r=require(process.argv[1]);if(r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon||!r.bundledTargetHelper)process.exit(1)' "$report"
+          node -e 'const r=require(process.argv[1]);if(r.desktopVersion!==process.argv[2]||!String(r.desktopExecutable).includes("/tmp/.mount_")||r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon||!r.bundledTargetHelper)process.exit(1)' "$report" "$expected"
       - name: Install previous signed NSIS release
         if: runner.os == 'Windows'
         shell: pwsh
@@ -188,12 +197,16 @@ jobs:
           if (-not (Test-Path $desktop)) { throw 'Installed CommonKit desktop path is unavailable' }
           $report = Join-Path $env:RUNNER_TEMP 'commonkit-tauri-update.json'
           $expected = '${{ inputs.current_tag }}'.TrimStart('v')
+          $previous = '${{ inputs.previous_tag }}'.TrimStart('v')
+          $previous_hash = (Get-FileHash -Algorithm SHA256 $desktop).Hash
           $env:COMMONKIT_DESKTOP_UPDATE_REPORT = $report
           $env:COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION = $expected
           $process = Start-Process -FilePath $desktop -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Tauri updater failed: $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.updatedByTauri -or $result.installedVersion -ne $expected) { throw 'Tauri updater did not install the expected signed release' }
+          if (-not $result.updatedByTauri -or $result.previousVersion -ne $previous) { throw 'Tauri updater did not run from the previous signed release' }
+          $updated_hash = (Get-FileHash -Algorithm SHA256 $desktop).Hash
+          if ($updated_hash -eq $previous_hash) { throw 'Tauri updater left the installed desktop unchanged' }
       - name: Launch installed Windows desktop and verify its managed daemon
         if: runner.os == 'Windows'
         shell: pwsh
@@ -204,6 +217,7 @@ jobs:
           $desktop = ($entry.DisplayIcon -split ',')[0].Trim('"')
           if (-not (Test-Path $desktop)) { throw "Installed desktop is missing: $desktop" }
           $report = Join-Path $env:RUNNER_TEMP 'commonkit-desktop-smoke.json'
+          $expected = '${{ inputs.current_tag }}'.TrimStart('v')
           $env:COMMONKIT_DESKTOP_SMOKE_REPORT = $report
           $process = Start-Process -FilePath $desktop -PassThru
           foreach ($attempt in 1..200) {
@@ -214,7 +228,7 @@ jobs:
           $process.WaitForExit()
           if ($process.ExitCode -ne 0) { throw "Installed desktop smoke failed: $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if ($result.serviceState -ne 'healthy' -or -not $result.bundledCli -or -not $result.bundledDaemon -or -not $result.bundledTargetHelper) {
+          if ($result.desktopVersion -ne $expected -or $result.desktopExecutable -ne $desktop -or $result.serviceState -ne 'healthy' -or -not $result.bundledCli -or -not $result.bundledDaemon -or -not $result.bundledTargetHelper) {
             throw 'Installed desktop did not launch a healthy bundled runtime'
           }
       - name: Verify current standalone CLI

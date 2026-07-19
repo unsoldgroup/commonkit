@@ -109,11 +109,24 @@ impl SyncDomain for MutableRelayDomain {
         Err(DomainFailure::OperationFailed)
     }
     fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
+        panic!("apply must not re-run or inspect the provider")
+    }
+    fn persist_plan_execution_authority(
+        &self,
+        _: &commonkit_contracts::Plan,
+        _: &[MaterializedState],
+    ) -> Result<(), DomainFailure> {
+        Ok(())
+    }
+    fn relay_execution_authority(
+        &self,
+        _: &commonkit_contracts::Plan,
+    ) -> Result<RelayProviderAuthority, DomainFailure> {
         Ok(self.0.lock().unwrap().clone())
     }
     fn plan_execution_authority(
         &self,
-        _: &commonkit_contracts::Plan,
+        approved: &commonkit_contracts::Plan,
     ) -> Result<PlanExecutionAuthority, DomainFailure> {
         let authority = self.0.lock().unwrap();
         Ok(PlanExecutionAuthority {
@@ -125,6 +138,7 @@ impl SyncDomain for MutableRelayDomain {
                 ownership_map_digest: authority.ownership_map_digest.clone(),
                 artifact_set_digest: authority.artifact_set_digest.clone(),
             },
+            plan_digest: approved.id.clone(),
         })
     }
 }
@@ -163,6 +177,7 @@ async fn filesystem_apply_recomputes_provider_authority_and_rejects_stale_plan_b
     let domain = Arc::new(MutablePlanDomain(Mutex::new(PlanExecutionAuthority {
         policy_digest: reviewed.policy_digest.clone(),
         bindings: reviewed.bindings.clone(),
+        plan_digest: reviewed.id.clone(),
     })));
     control
         .set_target_sync_domains(BTreeMap::from([(
@@ -210,6 +225,38 @@ async fn filesystem_apply_recomputes_provider_authority_and_rejects_stale_plan_b
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
     assert_eq!(fs::read(&managed).unwrap(), b"reviewed-bytes");
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn apply_rejects_a_canonical_plan_not_named_by_execution_authority() {
+    let executor = Arc::new(SuccessfulExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let control = ControlPlane::new(executor.clone());
+    let approved = plan();
+    let authority = PlanExecutionAuthority {
+        policy_digest: approved.policy_digest.clone(),
+        bindings: approved.bindings.clone(),
+        plan_digest: digest('9'),
+    };
+    control
+        .set_target_sync_domains(BTreeMap::from([(
+            approved.target_id.clone(),
+            Arc::new(MutablePlanDomain(Mutex::new(authority))) as Arc<dyn SyncDomain>,
+        )]))
+        .unwrap();
+    let approved = control.register_plan(approved).unwrap();
+
+    assert!(
+        control
+            .apply(
+                &approved.id,
+                &StableId::parse("canonical-review").unwrap(),
+                "canonical-apply",
+            )
+            .is_err()
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
 }
 
 fn relay_authority() -> RelayProviderAuthority {

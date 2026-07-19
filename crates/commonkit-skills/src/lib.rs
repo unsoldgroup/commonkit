@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,6 +128,12 @@ pub struct SkillOptProviderConfig {
     /// and receives the held-out corpus separately from provider staging.
     pub harness_executable: PathBuf,
     pub harness_corpus: PathBuf,
+    /// Exact executables the pinned provider may launch in addition to its
+    /// own entry point and interpreter.
+    pub provider_executables: BTreeSet<PathBuf>,
+    /// Exact executables the measured harness may launch in addition to its
+    /// own entry point and interpreter.
+    pub harness_executables: BTreeSet<PathBuf>,
     pub environment: BTreeMap<String, String>,
     pub timeout_seconds: u32,
 }
@@ -399,6 +405,8 @@ impl SkillOptProviderManager {
             timeout_seconds: 60,
             harness_executable: harness_executable.clone(),
             harness_corpus: harness_corpus.clone(),
+            provider_executables: BTreeSet::new(),
+            harness_executables: BTreeSet::new(),
         })?;
         let output = optimizer.optimize(&manifest, &suite, &plan.fixture_skill)?;
         let source_unchanged = fs::read(&skill_path)? == plan.fixture_skill;
@@ -502,6 +510,10 @@ impl SkillOptSleepOptimizer {
         config.environment_root = root.clone();
         config.harness_executable = config.harness_executable.canonicalize()?;
         config.harness_corpus = config.harness_corpus.canonicalize()?;
+        config.provider_executables =
+            canonical_executable_declarations(std::mem::take(&mut config.provider_executables))?;
+        config.harness_executables =
+            canonical_executable_declarations(std::mem::take(&mut config.harness_executables))?;
         let executable = root.join("bin/skillopt-sleep");
         let python = root.join("bin/python");
         for path in [&executable, &python] {
@@ -584,11 +596,13 @@ impl SkillOptSleepOptimizer {
         fs::create_dir_all(&home)?;
         set_private_directory(&home)?;
 
-        let mut command =
-            isolated_command(&self.executable, staging, &[&self.config.environment_root])?;
+        let mut command = isolated_command(
+            &self.executable,
+            staging,
+            &[&self.config.environment_root],
+            &self.config.provider_executables,
+        )?;
         command
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", home.join(".config"))
             .env("XDG_STATE_HOME", home.join(".local/state"))
@@ -703,14 +717,20 @@ impl SkillOptSleepOptimizer {
         }
         let harness_stdout = harness_private.path().join("evaluation.json");
         let harness_stderr = harness_private.path().join("stderr.log");
+        let harness_executable = harness_private.path().join("harness-executable");
+        fs::copy(&self.config.harness_executable, &harness_executable)?;
+        if digest_bytes(&read_ordinary_file(&harness_executable)?)?
+            != digest_bytes(&read_ordinary_file(&self.config.harness_executable)?)?
+        {
+            return Err(SkillError::HarnessIntegrityMismatch);
+        }
         let mut harness = isolated_command(
-            &self.config.harness_executable,
+            &harness_executable,
             staging,
             &[&self.config.harness_corpus, harness_private.path()],
+            &self.config.harness_executables,
         )?;
         harness
-            .env_clear()
-            .env("PATH", "/usr/bin:/bin")
             .arg("evaluate")
             .arg("--baseline")
             .arg(&harness_baseline_path)
@@ -2172,21 +2192,43 @@ mod provider_requirement_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod provider_sandbox_tests {
     use super::{create_private_staging, isolated_command};
+    use std::collections::BTreeSet;
     use std::path::Path;
     use std::process::Command;
 
     #[test]
-    fn narrow_profile_can_start_the_system_shell_from_staging() {
+    fn narrow_profile_allows_an_explicitly_declared_interpreter() {
         let staging = create_private_staging().expect("staging");
-        let mut command =
-            isolated_command(Path::new("/bin/sh"), &staging, &[]).expect("sandbox command");
+        let shell = Path::new("/bin/sh").canonicalize().expect("shell");
+        let mut command = isolated_command(&shell, &staging, &[], &BTreeSet::from([shell.clone()]))
+            .expect("sandbox command");
         let status = command
-            .arg("-c")
-            .arg("true")
+            .args(["-c", "true"])
             .status()
             .expect("execute sandboxed shell");
         let _ = std::fs::remove_dir_all(staging);
-        assert!(status.success());
+        assert!(status.success(), "declared executable must remain runnable");
+    }
+
+    #[test]
+    fn narrow_profile_allows_only_an_explicitly_declared_utility() {
+        let staging = create_private_staging().expect("staging");
+        let shell = Path::new("/bin/sh").canonicalize().expect("shell");
+        let mkdir = Path::new("/bin/mkdir").canonicalize().expect("mkdir");
+        let mut command = isolated_command(
+            &shell,
+            &staging,
+            &[],
+            &BTreeSet::from([shell.clone(), mkdir]),
+        )
+        .expect("sandbox command");
+        let status = command
+            .args(["-c", "/bin/mkdir declared"])
+            .status()
+            .expect("execute sandboxed utility");
+        assert!(status.success(), "declared utility must remain runnable");
+        assert!(staging.join("declared").is_dir());
+        let _ = std::fs::remove_dir_all(staging);
     }
 
     #[test]
@@ -2210,8 +2252,9 @@ mod provider_sandbox_tests {
 #include <unistd.h>
 extern char **environ;
 int main(int argc, char **argv) {
-  if (argc != 3) return 2;
+  if (argc != 5) return 2;
   if (open(argv[2], O_CREAT | O_WRONLY, 0600) >= 0) return 10;
+  if (open("/private/etc/passwd", O_RDONLY) >= 0) return 14;
   int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (socket_fd >= 0) {
     struct sockaddr_in address = {0};
@@ -2222,6 +2265,18 @@ int main(int argc, char **argv) {
   pid_t pid = 0; char *args[] = { "/usr/bin/true", NULL };
   if (posix_spawn(&pid, args[0], NULL, NULL, args, environ) == 0) {
     waitpid(pid, NULL, 0); return 12;
+  }
+  char *shell_args[] = { "/bin/sh", "-c", "true", NULL };
+  if (posix_spawn(&pid, shell_args[0], NULL, NULL, shell_args, environ) == 0) {
+    waitpid(pid, NULL, 0); return 15;
+  }
+  char *bash_args[] = { "/bin/bash", "-c", "true", NULL };
+  if (posix_spawn(&pid, bash_args[0], NULL, NULL, bash_args, environ) == 0) {
+    waitpid(pid, NULL, 0); return 16;
+  }
+  char *sibling_args[] = { argv[3], NULL };
+  if (posix_spawn(&pid, sibling_args[0], NULL, NULL, sibling_args, environ) == 0) {
+    waitpid(pid, NULL, 0); return 17;
   }
   FILE *proof = fopen(argv[1], "w");
   if (!proof) return 13;
@@ -2238,10 +2293,14 @@ int main(int argc, char **argv) {
         assert!(compiled.success());
         let proof = staging.join("proof.txt");
         let outside = root.join("outside.txt");
-        let status = isolated_command(&executable, &staging, &[])
+        let sibling = root.join("sibling");
+        std::fs::copy("/usr/bin/true", &sibling).expect("sibling executable");
+        let status = isolated_command(&executable, &staging, &[&root], &BTreeSet::new())
             .expect("sandbox command")
             .arg(&proof)
             .arg(&outside)
+            .arg(&sibling)
+            .arg("unused")
             .status()
             .expect("run adversary");
         assert!(
@@ -2415,6 +2474,47 @@ fn run_bounded_child(
     }
 }
 
+fn canonical_executable_declarations(
+    executables: BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>, SkillError> {
+    executables
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.is_file() {
+                return Err(SkillError::InvalidProviderConfiguration);
+            }
+            path.canonicalize().map_err(SkillError::from)
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn declared_interpreter(executable: &Path) -> Result<Option<PathBuf>, SkillError> {
+    let mut file = OpenOptions::new().read(true).open(executable)?;
+    let mut bytes = vec![0; 4096];
+    let count = file.read(&mut bytes)?;
+    bytes.truncate(count);
+    let Some(line) = bytes
+        .strip_prefix(b"#!")
+        .and_then(|value| value.split(|byte| *byte == b'\n' || *byte == b'\r').next())
+    else {
+        return Ok(None);
+    };
+    let interpreter = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or(SkillError::ProviderIsolationUnavailable)?;
+    let interpreter =
+        std::str::from_utf8(interpreter).map_err(|_| SkillError::ProviderIsolationUnavailable)?;
+    let path = PathBuf::from(interpreter);
+    if !path.is_absolute() || !path.is_file() {
+        return Err(SkillError::ProviderIsolationUnavailable);
+    }
+    Ok(Some(path.canonicalize()?))
+}
+
 #[cfg(unix)]
 fn terminate_process_group(child: &mut std::process::Child, process_group: u32) {
     // The child is always placed in a fresh process group by isolated_command.
@@ -2439,6 +2539,7 @@ fn isolated_command(
     executable: &Path,
     staging: &Path,
     extra_read_roots: &[&Path],
+    declared_executables: &BTreeSet<PathBuf>,
 ) -> Result<Command, SkillError> {
     fn quoted(path: &Path) -> Result<String, SkillError> {
         let value = path
@@ -2450,16 +2551,8 @@ fn isolated_command(
         Ok(format!("\"{value}\""))
     }
     let mut reads = vec![
-        "/System".to_owned(),
-        "/usr".to_owned(),
-        "/bin".to_owned(),
-        "/private/etc".to_owned(),
-        "/dev".to_owned(),
-        executable
-            .parent()
-            .ok_or(SkillError::ProviderIsolationUnavailable)?
-            .to_string_lossy()
-            .into_owned(),
+        "/System/Library".to_owned(),
+        "/usr/lib".to_owned(),
         staging.to_string_lossy().into_owned(),
     ];
     reads.extend(
@@ -2467,10 +2560,26 @@ fn isolated_command(
             .iter()
             .map(|path| path.to_string_lossy().into_owned()),
     );
-    let mut literal_reads = vec!["/".to_owned(), "/private/var/select/sh".to_owned()];
+    let mut exact_executables = declared_executables.clone();
+    exact_executables.insert(executable.canonicalize()?);
+    if let Some(interpreter) = declared_interpreter(executable)? {
+        exact_executables.insert(interpreter);
+    }
+    if exact_executables.contains(Path::new("/bin/sh")) {
+        let selected = Path::new("/private/var/select/sh");
+        if selected.exists() {
+            exact_executables.insert(selected.canonicalize()?);
+        }
+    }
+    let mut literal_reads = vec![
+        "/".to_owned(),
+        "/dev/null".to_owned(),
+        "/private/var/select/sh".to_owned(),
+    ];
     for root in std::iter::once(staging)
         .chain(std::iter::once(executable))
         .chain(extra_read_roots.iter().copied())
+        .chain(exact_executables.iter().map(PathBuf::as_path))
     {
         literal_reads.extend(
             root.ancestors()
@@ -2491,26 +2600,10 @@ fn isolated_command(
         )
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
-    let mut exec_rules = std::iter::once(
-        executable
-            .parent()
-            .ok_or(SkillError::ProviderIsolationUnavailable)?,
-    )
-    .chain(extra_read_roots.iter().copied())
-    .map(|path| quoted(path).map(|path| format!("(subpath {path})")))
-    .collect::<Result<Vec<_>, _>>()?;
-    // Console scripts may use the system shell as their pinned interpreter;
-    // every other executable must reside in a measured provider root.
-    for interpreter_or_utility in [
-        "/bin/sh",
-        "/bin/bash",
-        "/bin/mkdir",
-        "/bin/sleep",
-        "/usr/bin/dirname",
-        "/usr/bin/grep",
-    ] {
-        exec_rules.push(format!("(literal \"{interpreter_or_utility}\")"));
-    }
+    let exec_rules = exact_executables
+        .iter()
+        .map(|path| quoted(path).map(|path| format!("(literal {path})")))
+        .collect::<Result<Vec<_>, _>>()?;
     let exec_rules = exec_rules.join(" ");
     let profile = format!(
         "(version 1) (deny default) (allow process-fork) \
@@ -2530,7 +2623,9 @@ fn isolated_command(
         .arg("-p")
         .arg(profile)
         .arg(executable)
-        .current_dir(staging);
+        .current_dir(staging)
+        .env_clear()
+        .env("PATH", "/nonexistent");
     Ok(command)
 }
 
@@ -2539,6 +2634,7 @@ fn isolated_command(
     _executable: &Path,
     _staging: &Path,
     _extra_read_roots: &[&Path],
+    _declared_executables: &BTreeSet<PathBuf>,
 ) -> Result<Command, SkillError> {
     Err(SkillError::ProviderIsolationUnavailable)
 }
