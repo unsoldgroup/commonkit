@@ -18,6 +18,8 @@ export interface DesktopSnapshot {
   capabilities: CapabilityState[];
   lastEventId: number | null;
   events: Array<{ id?: number; event?: string; data?: unknown }>;
+  gitSync: { state?: string; branch?: string; revision?: string; upstreamRevision?: string; fetched?: boolean };
+  policy: { state?: string; violations?: Array<{ code?: string; detail?: string }> };
 }
 
 export interface ManagementSnapshot {

@@ -4,7 +4,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, header};
 use commonkit_contracts::StableId;
 use commonkit_service::{
-    ApplyStatus, ControlPlane, ControlToken, CredentialDomain, DomainFailure, EventHub,
+    ApplyStatus, CompositionDomain, ControlPlane, ControlToken, CredentialDomain, DomainFailure, EventHub,
     ExecutionResult, HeadlessDomainRegistry, PlanExecutor, ServiceStatus, SnapshotDomain,
     SyncDomain, router, router_with_control,
 };
@@ -86,6 +86,13 @@ impl PlanExecutor for UnusedExecutor {
 }
 
 struct EchoDomains;
+impl CompositionDomain for EchoDomains {
+    fn compose(&self) -> Result<Value, DomainFailure> { Ok(serde_json::json!({"spec":{}})) }
+    fn explain(&self, _: &str) -> Result<Value, DomainFailure> { Err(DomainFailure::InvalidRequest) }
+    fn policy_summary(&self) -> Result<Value, DomainFailure> {
+        Ok(serde_json::json!({"state":"valid","violations":[]}))
+    }
+}
 impl SyncDomain for EchoDomains {
     fn plan(&self, _: Value) -> Result<Value, DomainFailure> {
         Ok(serde_json::json!({"domain":"sync","action":"plan"}))
@@ -126,7 +133,7 @@ async fn configured_domains_receive_authenticated_consent_checked_requests() {
     let control = ControlPlane::new(Arc::new(UnusedExecutor));
     let domains = Arc::new(EchoDomains);
     control.set_headless_domains(HeadlessDomainRegistry {
-        composition: None,
+        composition: Some(domains.clone()),
         sync: Some(domains.clone()),
         credentials: Some(domains.clone()),
         snapshots: Some(domains),
@@ -162,6 +169,10 @@ async fn configured_domains_receive_authenticated_consent_checked_requests() {
         )
         .await["action"],
         "verify"
+    );
+    assert_eq!(
+        call(app.clone(), &token, "GET", "/control/v1/policy/summary", serde_json::json!({})).await,
+        serde_json::json!({"state":"valid","violations":[]})
     );
     assert_eq!(
         call(

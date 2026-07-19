@@ -1021,6 +1021,11 @@ impl CompositionDomain for ProductionCompositionDomain {
             .map(|entry| serde_json::json!(entry))
             .ok_or(DomainFailure::InvalidRequest)
     }
+
+    fn policy_summary(&self) -> Result<Value, DomainFailure> {
+        self.result()?;
+        Ok(serde_json::json!({"state":"valid", "violations":[]}))
+    }
 }
 
 struct ProductionSyncDomain {
@@ -1830,6 +1835,32 @@ struct RollbackRequest {
     idempotency_key: Option<String>,
 }
 impl SyncDomain for ProductionSyncDomain {
+    fn git_sync(&self, fetch: bool) -> Result<Value, DomainFailure> {
+        let source = self.config.provider_pipeline.as_ref()
+            .map(|pipeline| &pipeline.source)
+            .ok_or(DomainFailure::OperationFailed)?;
+        let mut repository = GitRepository::new(
+            ProcessGitRunner::new(&source.repository),
+            source.trusted_remote_url.clone(),
+            "origin",
+        );
+        let status = repository.inspect(fetch).map_err(|_| DomainFailure::OperationFailed)?;
+        let state = match status.disposition {
+            GitSyncDisposition::Clean => "clean",
+            GitSyncDisposition::Dirty => "dirty",
+            GitSyncDisposition::Ahead => "ahead",
+            GitSyncDisposition::Behind => "behind",
+            GitSyncDisposition::Diverged => "diverged",
+        };
+        Ok(serde_json::json!({
+            "state": state,
+            "branch": status.branch,
+            "revision": status.revision.as_str(),
+            "upstreamRevision": status.upstream_revision.as_str(),
+            "remoteUrl": status.remote_url,
+            "fetched": fetch
+        }))
+    }
     fn persist_plan_execution_authority(
         &self,
         plan: &Plan,

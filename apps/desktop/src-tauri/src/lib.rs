@@ -49,7 +49,7 @@ impl RuntimeBinaryLayout {
                 &workspace.join(format!("commonkit-desktop{}", std::env::consts::EXE_SUFFIX)),
             );
             development.validate()?;
-            return Ok(development);
+            Ok(development)
         }
         #[cfg(not(debug_assertions))]
         Err(DesktopError::RuntimeBinaryMissing)
@@ -119,6 +119,7 @@ impl ServiceSupervisor {
     ///
     /// An empty slot means Desktop attached to an independently managed daemon;
     /// callers must never terminate or replace that process.
+    #[cfg(test)]
     fn replace_owned_child(
         &self,
         spawn: impl FnOnce() -> Result<Child, DesktopError>,
@@ -209,6 +210,8 @@ struct DesktopSnapshot {
     capabilities: Vec<CapabilityState>,
     last_event_id: Option<u64>,
     events: Vec<serde_json::Value>,
+    git_sync: serde_json::Value,
+    policy: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -644,6 +647,7 @@ fn target_apply_route(target_id: &str, plan_id: &str) -> Result<String, DesktopE
     ))
 }
 
+#[cfg(test)]
 fn management_routes() -> [(&'static str, &'static str); 6] {
     [
         ("plans", "/compose"),
@@ -655,6 +659,7 @@ fn management_routes() -> [(&'static str, &'static str); 6] {
     ]
 }
 
+#[cfg(test)]
 fn operator_routes() -> [(&'static str, &'static str); 12] {
     [
         ("plan", "/targets/{target}/sync/plan"),
@@ -709,10 +714,6 @@ enum DesktopError {
     #[error("the bundled CommonKit service could not be started")]
     ServiceLaunchFailed,
     #[error(
-        "CommonKit saved the new configuration, but the independently managed service must be restarted by its service manager before continuing"
-    )]
-    ExternalServiceReloadRequired,
-    #[error(
         "CommonKit saved the new configuration, but its managed service could not reload it; reopen CommonKit and retry"
     )]
     ServiceReloadFailed,
@@ -753,11 +754,18 @@ async fn desktop_snapshot(
         .json(reqwest::Method::GET, "/events/snapshot", None)
         .await
         .unwrap_or_else(|_| serde_json::json!({"events": []}));
+    let git_sync = match status.active_target.as_deref() {
+        Some(target) => client.json(reqwest::Method::GET, &format!("/targets/{target}/git"), None).await.unwrap_or_else(unavailable),
+        None => serde_json::json!({"state":"unavailable"}),
+    };
+    let policy = client.json(reqwest::Method::GET, "/policy/summary", None).await.unwrap_or_else(unavailable);
     let online = status.state != "offline";
     Ok(DesktopSnapshot {
         status,
         last_event_id: event_snapshot.get("lastEventId").and_then(serde_json::Value::as_u64),
         events: event_snapshot.get("events").and_then(serde_json::Value::as_array).cloned().unwrap_or_default(),
+        git_sync,
+        policy,
         capabilities: vec![
             CapabilityState {
                 id: "status",
@@ -1141,6 +1149,7 @@ fn write_update_report(path: &Path, payload: &serde_json::Value) -> std::io::Res
     Ok(())
 }
 
+#[cfg(any(target_os = "windows", test))]
 fn install_after_durable_handoff<T, Handoff, Install>(
     verified_bytes: T,
     persist_handoff: Handoff,
@@ -1294,6 +1303,16 @@ async fn tray_verify(app: tauri::AppHandle) {
     refresh_tray(app).await;
 }
 
+async fn tray_fetch(app: tauri::AppHandle) {
+    let client = app.state::<ServiceClient>().inner().clone();
+    if let Ok(status) = client.status().await {
+        if let Some(target) = status.active_target {
+            let _ = client.json(reqwest::Method::POST, &format!("/targets/{target}/git"), Some(serde_json::json!({}))).await;
+        }
+    }
+    refresh_tray(app).await;
+}
+
 async fn refresh_tray(app: tauri::AppHandle) {
     let client = app.state::<ServiceClient>().inner().clone();
     let status = client
@@ -1305,11 +1324,16 @@ async fn refresh_tray(app: tauri::AppHandle) {
         .json(reqwest::Method::GET, "/snapshots", None)
         .await
         .ok();
-    let diagnostics = client
-        .json(reqwest::Method::GET, "/diagnostics", None)
-        .await
-        .ok();
-    let summary = TraySummary::from_observed(&status, relay.as_ref(), snapshots.as_ref(), diagnostics.as_ref());
+    let git_sync = match status.active_target.as_deref() {
+        Some(target) => client.json(reqwest::Method::GET, &format!("/targets/{target}/git"), None).await.ok(),
+        None => None,
+    };
+    let policy = client.json(reqwest::Method::GET, "/policy/summary", None).await.ok();
+    let peer = serde_json::json!({
+        "gitSync": git_sync,
+        "organizationPolicyViolations": policy.as_ref().and_then(|value| value.get("violations")).cloned().unwrap_or_else(|| serde_json::json!([]))
+    });
+    let summary = TraySummary::from_observed(&status, relay.as_ref(), snapshots.as_ref(), Some(&peer));
     let items = app.state::<TrayItems>();
     let _ = items.health.set_text(&summary.health);
     let _ = items.loadout.set_text(&summary.loadout);
@@ -1410,6 +1434,7 @@ pub fn run() {
             let policy = MenuItem::with_id(app, "policy-status", "Policy: loading", false, None::<&str>)?;
             let drift = MenuItem::with_id(app, "drift-status", "Last drift check: loading", false, None::<&str>)?;
             let refresh = MenuItem::with_id(app, "refresh", "Refresh health", true, None::<&str>)?;
+            let fetch_now = MenuItem::with_id(app, "quick-fetch", "Fetch trusted Git remote", true, None::<&str>)?;
             let plan_now = MenuItem::with_id(app, "quick-plan", "Plan selected target", true, None::<&str>)?;
             let verify_now = MenuItem::with_id(app, "quick-verify", "Verify selected target", true, None::<&str>)?;
             let snapshot_review = MenuItem::with_id(app, "quick-snapshot", "Create snapshot…", true, None::<&str>)?;
@@ -1445,6 +1470,7 @@ pub fn run() {
                     &relay,
                     &snapshots,
                     &refresh,
+                    &fetch_now,
                     &plan_now,
                     &verify_now,
                     &snapshot_review,
@@ -1472,6 +1498,9 @@ pub fn run() {
                     }
                     "quick-plan" => {
                         tauri::async_runtime::spawn(tray_plan(app.clone()));
+                    }
+                    "quick-fetch" => {
+                        tauri::async_runtime::spawn(tray_fetch(app.clone()));
                     }
                     "quick-verify" => {
                         tauri::async_runtime::spawn(tray_verify(app.clone()));

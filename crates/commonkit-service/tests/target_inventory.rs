@@ -138,6 +138,9 @@ impl SyncDomain for TargetEcho {
     fn rollback(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
         Err(DomainFailure::InvalidRequest)
     }
+    fn git_sync(&self, fetch: bool) -> Result<serde_json::Value, DomainFailure> {
+        Ok(serde_json::json!({"targetId":self.0,"state":"behind","fetched":fetch}))
+    }
 }
 
 #[tokio::test]
@@ -289,6 +292,20 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(plan.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["targetId"], "remote");
+
+    for (method, fetched) in [("GET", false), ("POST", true)] {
+        let response = app.clone().oneshot(
+            Request::builder().method(method).uri("/control/v1/targets/remote/git")
+                .header(header::HOST, "127.0.0.1:3764")
+                .header(header::AUTHORIZATION, format!("Bearer {}", token.expose_for_client()))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}")).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(&to_bytes(response.into_body(), 4096).await.unwrap()).unwrap();
+        assert_eq!(body["state"], "behind");
+        assert_eq!(body["fetched"], fetched);
+    }
 
     let mismatch = app
         .oneshot(

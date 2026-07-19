@@ -668,6 +668,8 @@ fn router_with_control_and_relay(
         .route("/control/v1/targets/select", post(select_targets))
         .route("/control/v1/targets/{id}/sync/plan", post(target_sync_plan))
         .route("/control/v1/targets/{id}/verify", post(target_verify))
+        .route("/control/v1/targets/{id}/git", get(target_git_inspect).post(target_git_fetch))
+        .route("/control/v1/policy/summary", get(policy_summary))
         .route(
             "/control/v1/targets/{target}/plans/{plan}/apply",
             post(target_apply_plan),
@@ -1419,6 +1421,11 @@ pub trait SyncDomain: Send + Sync + 'static {
     fn plan(&self, request: Value) -> Result<Value, DomainFailure>;
     fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
     fn rollback(&self, request: Value) -> Result<Value, DomainFailure>;
+    /// Inspects the configured, trusted provider repository. When `fetch` is true,
+    /// only remote refs may be updated; managed content is never merged or applied.
+    fn git_sync(&self, _fetch: bool) -> Result<Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
     /// Recomputes the provider-backed authority bound into an approved plan.
     /// Implementations must validate provider artifacts and policy inputs and
     /// must not mutate the managed target.
@@ -1604,6 +1611,9 @@ impl DriftChecker for SyncDomainDriftChecker {
 pub trait CompositionDomain: Send + Sync + 'static {
     fn compose(&self) -> Result<Value, DomainFailure>;
     fn explain(&self, pointer: &str) -> Result<Value, DomainFailure>;
+    fn policy_summary(&self) -> Result<Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
 }
 
 pub trait CredentialDomain: Send + Sync + 'static {
@@ -2209,6 +2219,33 @@ async fn target_verify(
         .target_sync_domain(&target)
         .map_err(ApiError::from)?;
     safe_domain_result(domain.verify(request))
+}
+
+async fn target_git_inspect(
+    State(state): State<ApiState>,
+    AxumPath(target): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    target_git(state, target, false).await
+}
+
+async fn target_git_fetch(
+    State(state): State<ApiState>,
+    AxumPath(target): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    target_git(state, target, true).await
+}
+
+async fn target_git(state: ApiState, target: String, fetch: bool) -> Result<Json<Value>, ApiError> {
+    let target = StableId::parse(target).map_err(|_| ApiError::bad_request("invalid_target_id"))?;
+    let domain = state.control.target_sync_domain(&target).map_err(ApiError::from)?;
+    safe_domain_result(domain.git_sync(fetch))
+}
+
+async fn policy_summary(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let domain = state.control.inner.runtime.read().expect("control runtime lock")
+        .domains.composition.clone()
+        .ok_or_else(|| ApiError::unavailable_code("composition_domain_unconfigured"))?;
+    safe_domain_result(domain.policy_summary())
 }
 
 async fn target_apply_plan(
