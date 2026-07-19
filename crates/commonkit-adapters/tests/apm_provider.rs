@@ -43,6 +43,14 @@ fn write_executable(path: &Path, body: &str) {
 }
 
 fn configured(root: &Path, executable: PathBuf) -> ApmProvider {
+    configured_with_bound_source(root, executable, None)
+}
+
+fn configured_with_bound_source(
+    root: &Path,
+    executable: PathBuf,
+    bound_source: Option<PathBuf>,
+) -> ApmProvider {
     let manifest = root.join("apm.yml");
     let lockfile = root.join("apm.lock.yaml");
     let policy = root.join("apm-policy.yml");
@@ -57,6 +65,7 @@ fn configured(root: &Path, executable: PathBuf) -> ApmProvider {
         policy,
         targets: vec!["claude".into(), "codex".into()],
         managed_root: NormalizedManagedPath::parse("home").unwrap(),
+        bound_source,
     })
     .unwrap()
 }
@@ -241,6 +250,14 @@ fn project_sources_are_digest_bound_and_symlinks_fail_closed() {
         first.input_digests["projectSources"],
         second.input_digests["projectSources"]
     );
+    let promoted = root.join("promoted-SKILL.md");
+    fs::write(&promoted, "candidate one\n").unwrap();
+    let bound = configured_with_bound_source(&root, root.join("apm"), Some(promoted.clone()));
+    let bound_first = bound.inspect_inputs(&context()).unwrap();
+    assert!(bound_first.input_digests.contains_key("promotedSource"));
+    fs::write(&promoted, "candidate two\n").unwrap();
+    let bound_second = bound.inspect_inputs(&context()).unwrap();
+    assert_ne!(bound_first.digest(), bound_second.digest());
 
     #[cfg(unix)]
     {
@@ -279,6 +296,7 @@ fn real_apm_025_release_materializes_only_in_disposable_staging_when_enabled() {
         policy: root.join("apm-policy.yml"),
         targets: vec!["claude".into(), "codex".into()],
         managed_root: NormalizedManagedPath::parse("home").unwrap(),
+        bound_source: None,
     })
     .unwrap();
     let workspace = ProviderWorkspace::open(&stage, &[live.clone()]).unwrap();

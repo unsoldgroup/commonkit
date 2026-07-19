@@ -261,6 +261,22 @@ enum SkillsCommand {
         #[arg(long)]
         confirmed: bool,
     },
+    CanaryApply {
+        #[arg(long)]
+        deployment: PathBuf,
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    CanaryRollback {
+        #[arg(long)]
+        run_id: String,
+        #[arg(long)]
+        deployment_receipt_id: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
@@ -718,6 +734,42 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
                 Some(
                     json!({"confirmed":true,"confirmationId":nonce("skill-rollback"),"receipt":read_json_file::<PromotionReceipt>(&receipt)?}),
                 ),
+                None,
+            )?)?;
+        }
+        SkillsCommand::CanaryApply {
+            deployment,
+            run_id,
+            confirmed,
+        } => {
+            require_skill_confirmation(confirmed)?;
+            print_daemon(daemon_control(
+                "POST",
+                "/control/v1/skills/canary/apply",
+                Some(json!({
+                    "confirmed": true,
+                    "confirmationId": nonce("skill-canary-apply"),
+                    "runId": run_id,
+                    "deployment": read_json_file::<serde_json::Value>(&deployment)?,
+                })),
+                None,
+            )?)?;
+        }
+        SkillsCommand::CanaryRollback {
+            run_id,
+            deployment_receipt_id,
+            confirmed,
+        } => {
+            require_skill_confirmation(confirmed)?;
+            print_daemon(daemon_control(
+                "POST",
+                "/control/v1/skills/canary/rollback",
+                Some(json!({
+                    "confirmed": true,
+                    "confirmationId": nonce("skill-canary-rollback"),
+                    "runId": run_id,
+                    "deploymentReceiptId": deployment_receipt_id,
+                })),
                 None,
             )?)?;
         }

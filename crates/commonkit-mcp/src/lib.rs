@@ -204,6 +204,20 @@ pub struct ProposeSkillPromotionInput {
     pub confirmation_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProposeSkillCanaryApplyInput {
+    pub run_id: String,
+    pub deployment: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProposeSkillCanaryRollbackInput {
+    pub run_id: String,
+    pub deployment_receipt_id: String,
+}
+
 impl ConsentInput {
     pub fn denied() -> Self {
         Self {
@@ -364,6 +378,40 @@ impl CommonKitMcp {
             "repositoryRevision": input.repository_revision,
             "approval": {"approver": input.approver, "approvedAtUnixMs": input.approved_at_unix_ms, "reason": input.reason}
         })).await)
+    }
+
+    #[tool(
+        name = "commonkit_propose_skill_canary_apply",
+        description = "Create a proposal for canary apply. Proposal-only: this tool never mutates; an operator must review it and use the authenticated CLI or desktop confirmation path."
+    )]
+    pub async fn propose_skill_canary_apply(
+        &self,
+        Parameters(input): Parameters<ProposeSkillCanaryApplyInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(CallToolResult::structured(json!({
+            "proposalOnly": true,
+            "mutationAuthority": "authenticated_operator_surface",
+            "method": "POST",
+            "path": "/control/v1/skills/canary/apply",
+            "body": {"runId": input.run_id, "deployment": input.deployment}
+        })))
+    }
+
+    #[tool(
+        name = "commonkit_propose_skill_canary_rollback",
+        description = "Create a proposal for canary rollback. Proposal-only: this tool never mutates; an operator must review it and use the authenticated CLI or desktop confirmation path."
+    )]
+    pub async fn propose_skill_canary_rollback(
+        &self,
+        Parameters(input): Parameters<ProposeSkillCanaryRollbackInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        Ok(CallToolResult::structured(json!({
+            "proposalOnly": true,
+            "mutationAuthority": "authenticated_operator_surface",
+            "method": "POST",
+            "path": "/control/v1/skills/canary/rollback",
+            "body": {"runId": input.run_id, "deploymentReceiptId": input.deployment_receipt_id}
+        })))
     }
 
     #[tool(

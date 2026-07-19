@@ -5,7 +5,8 @@ mod skill_deployment;
 pub use skill_deployment::{
     ApmCompilation, ApmCompiler, AuthenticatedSkillPromotion, CanaryStateObserver,
     DeploymentTrustStore, PreparedSkillDeployment, SkillDeploymentError, SkillDeploymentLineage,
-    SkillDeploymentReceipt, SkillDeploymentRequest, SkillDeploymentRollbackReceipt,
+    SkillDeploymentReceipt, SkillDeploymentRecovery, SkillDeploymentRecoveryReceipt,
+    SkillDeploymentRequest, SkillDeploymentRollbackFailureReceipt, SkillDeploymentRollbackReceipt,
     SkillDeploymentState, SkillDeploymentWorkflow, SkillPromotionAuthority,
 };
 
@@ -671,7 +672,8 @@ pub enum ReconcileError {
 }
 
 impl ReceiptStore {
-    pub(crate) fn root(&self) -> &Path {
+    /// Root of the capability-scoped durable receipt store.
+    pub fn root(&self) -> &Path {
         &self.root
     }
 

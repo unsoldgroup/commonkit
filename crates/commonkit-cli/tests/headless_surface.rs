@@ -73,3 +73,29 @@ fn snapshot_and_drift_schedule_mutations_require_explicit_consent() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("daemon_unavailable"));
     }
 }
+
+#[test]
+fn skill_canary_mutations_require_operator_confirmation_before_daemon_contact() {
+    for arguments in [
+        vec![
+            "skills",
+            "canary-apply",
+            "--deployment",
+            "missing.json",
+            "--run-id",
+            "run-1",
+        ],
+        vec![
+            "skills",
+            "canary-rollback",
+            "--run-id",
+            "run-1",
+            "--deployment-receipt-id",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ],
+    ] {
+        let output = command(&arguments);
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("confirmation_required"));
+    }
+}

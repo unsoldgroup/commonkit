@@ -3,8 +3,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use commonkit_contracts::{
-    ContractError, Operation, Plan, PlanBindings, Sha256Digest, StableId, canonical_json,
-    digest_domain_json,
+    ContractError, Operation, Plan, PlanBindings, ReceiptState, Sha256Digest, StableId,
+    canonical_json, digest_domain_json,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use rand::RngCore;
@@ -57,6 +57,33 @@ pub struct DeploymentTrustStore {
 }
 
 impl DeploymentTrustStore {
+    /// Explicit disaster-recovery path for a lost key. Existing anchors are
+    /// atomically archived to a caller-selected, non-existing location before
+    /// a fresh trust domain is created; they are never silently re-signed.
+    pub fn archive_and_rotate_missing_key(
+        root: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+        archive: impl AsRef<Path>,
+    ) -> Result<Self, SkillDeploymentError> {
+        let root = root.as_ref();
+        let key_path = key_path.as_ref();
+        let archive = archive.as_ref();
+        if key_path.exists()
+            || !root.is_dir()
+            || fs::read_dir(root)?.next().is_none()
+            || archive.exists()
+        {
+            return Err(SkillDeploymentError::InvalidTrustRotation);
+        }
+        if let Some(parent) = archive.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(root, archive)?;
+        sync_directory(archive.parent().unwrap_or_else(|| Path::new(".")))?;
+        fs::create_dir_all(root)?;
+        Self::open_or_create(root, key_path)
+    }
+
     pub fn open_or_create(
         root: impl AsRef<Path>,
         key_path: impl AsRef<Path>,
@@ -85,6 +112,9 @@ impl DeploymentTrustStore {
                     .map_err(|_| SkillDeploymentError::UnsafeTrustKey)?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if root.as_ref().exists() && fs::read_dir(root.as_ref())?.next().is_some() {
+                    return Err(SkillDeploymentError::MissingTrustKeyForExistingAnchors);
+                }
                 let mut key = [0_u8; 32];
                 rand::rng().fill_bytes(&mut key);
                 let mut options = OpenOptions::new();
@@ -181,6 +211,30 @@ pub struct PreparedSkillDeployment {
     pub lineage: SkillDeploymentLineage,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillDeploymentIntent {
+    run_id: StableId,
+    plan: Plan,
+    lineage: SkillDeploymentLineage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillDeploymentRecoveryReceipt {
+    pub id: Sha256Digest,
+    pub run_id: StableId,
+    pub plan_id: Sha256Digest,
+    pub outcome: ReconcileOutcome,
+    pub restored_digest: Option<Sha256Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillDeploymentRecovery {
+    Finalized(SkillDeploymentReceipt),
+    Recovered(SkillDeploymentRecoveryReceipt),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillDeploymentState {
@@ -216,6 +270,17 @@ pub struct SkillDeploymentRollbackReceipt {
     pub restored_digest: Sha256Digest,
     pub state: SkillDeploymentState,
     pub operation_ids: Vec<Sha256Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SkillDeploymentRollbackFailureReceipt {
+    pub id: Sha256Digest,
+    pub deployment_receipt_id: Sha256Digest,
+    pub run_id: StableId,
+    pub state: SkillDeploymentState,
+    pub operation_ids: Vec<Sha256Digest>,
+    pub error_code: String,
 }
 
 pub struct SkillDeploymentWorkflow<'a> {
@@ -287,11 +352,12 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         run_id: StableId,
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<SkillDeploymentReceipt, SkillDeploymentError> {
-        let intent = canonical_json(&serde_json::json!({
-            "runId": &run_id,
-            "plan": &prepared.plan,
-            "lineage": &prepared.lineage,
-        }))?;
+        let intent_record = SkillDeploymentIntent {
+            run_id: run_id.clone(),
+            plan: prepared.plan.clone(),
+            lineage: prepared.lineage.clone(),
+        };
+        let intent = canonical_json(&intent_record)?;
         let run_directory = self.store.root().join(run_id.as_str());
         fs::create_dir_all(&run_directory)?;
         persist_receipt(
@@ -322,6 +388,89 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         persist_receipt(&deployment_path(self.store, &receipt.run_id), &bytes)?;
         self.trust.anchor(&receipt.run_id, "receipt", &bytes)?;
         Ok(receipt)
+    }
+
+    pub fn recover(
+        &self,
+        run_id: &StableId,
+        adapters: &mut [Box<dyn Adapter>],
+        observer: &mut dyn CanaryStateObserver,
+    ) -> Result<SkillDeploymentRecovery, SkillDeploymentError> {
+        let intent_bytes = read_receipt_bytes(
+            &self
+                .store
+                .root()
+                .join(run_id.as_str())
+                .join("skill-deployment-intent.receipt"),
+        )?;
+        self.trust.verify(run_id, "intent", &intent_bytes)?;
+        let intent: SkillDeploymentIntent = serde_json::from_slice(&intent_bytes)?;
+        if &intent.run_id != run_id {
+            return Err(SkillDeploymentError::DeploymentReceiptMismatch);
+        }
+        let journal = self.store.load(run_id.clone())?;
+        if journal.receipt().state == ReceiptState::Succeeded {
+            let draft = SkillDeploymentReceiptDraft {
+                run_id: run_id.clone(),
+                candidate_id: intent.lineage.candidate_id,
+                candidate_digest: intent.lineage.candidate_digest,
+                promotion_receipt_id: intent.lineage.promotion_receipt_id,
+                apm_provider_inputs_digest: intent.lineage.apm_provider_inputs_digest,
+                canary_loadout: intent.lineage.canary_loadout,
+                reconcile_receipt_id: journal.receipt().receipt_id.clone(),
+                reconcile_outcome: ReconcileOutcome::Succeeded,
+                state: SkillDeploymentState::Verified,
+                plan: intent.plan,
+            };
+            let receipt = draft.into_receipt()?;
+            let bytes = canonical_json(&receipt)?;
+            persist_receipt(&deployment_path(self.store, run_id), &bytes)?;
+            self.trust.anchor(run_id, "receipt", &bytes)?;
+            return Ok(SkillDeploymentRecovery::Finalized(receipt));
+        }
+        let outcome = match journal.receipt().state {
+            ReceiptState::RolledBack => ReconcileOutcome::RolledBack,
+            ReceiptState::RollbackFailed => ReconcileOutcome::RollbackFailed,
+            ReceiptState::Canceled => ReconcileOutcome::Canceled,
+            _ => Reconciler::with_store(self.store).recover_run(
+                run_id.clone(),
+                &intent.plan,
+                adapters,
+            )?,
+        };
+        let restored_digest = match outcome {
+            ReconcileOutcome::RolledBack => {
+                let observed = observer
+                    .observe_digest(&intent.plan.target_id, &intent.plan.operations)
+                    .map_err(SkillDeploymentError::Observe)?;
+                if observed != intent.plan.observed_digest {
+                    return Err(SkillDeploymentError::RollbackVerificationFailed);
+                }
+                Some(observed)
+            }
+            ReconcileOutcome::Canceled => None,
+            ReconcileOutcome::RollbackFailed => None,
+            other => return Err(SkillDeploymentError::UnexpectedRollbackOutcome(other)),
+        };
+        let draft = (run_id, &intent.plan.id, outcome, &restored_digest);
+        let receipt = SkillDeploymentRecoveryReceipt {
+            id: digest_domain_json("commonkit.skill-deployment-recovery.v1", &draft)?,
+            run_id: run_id.clone(),
+            plan_id: intent.plan.id,
+            outcome,
+            restored_digest,
+        };
+        let bytes = canonical_json(&receipt)?;
+        persist_receipt(
+            &self
+                .store
+                .root()
+                .join(run_id.as_str())
+                .join("skill-deployment-recovery.receipt"),
+            &bytes,
+        )?;
+        self.trust.anchor(run_id, "recovery", &bytes)?;
+        Ok(SkillDeploymentRecovery::Recovered(receipt))
     }
 
     pub fn load(
@@ -371,6 +520,34 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         let state = match outcome {
             ReconcileOutcome::RolledBack => SkillDeploymentState::RolledBack,
             ReconcileOutcome::RollbackFailed => {
+                let operation_ids = deployment
+                    .plan
+                    .operations
+                    .iter()
+                    .rev()
+                    .map(|operation| operation.id.clone())
+                    .collect::<Vec<_>>();
+                let draft = (
+                    &deployment.id,
+                    run_id,
+                    SkillDeploymentState::RollbackFailed,
+                    &operation_ids,
+                    "skill_deployment_rollback_failed",
+                );
+                let failure = SkillDeploymentRollbackFailureReceipt {
+                    id: digest_domain_json(
+                        "commonkit.skill-deployment-rollback-failure.v1",
+                        &draft,
+                    )?,
+                    deployment_receipt_id: deployment.id,
+                    run_id: run_id.clone(),
+                    state: SkillDeploymentState::RollbackFailed,
+                    operation_ids,
+                    error_code: "skill_deployment_rollback_failed".into(),
+                };
+                let bytes = canonical_json(&failure)?;
+                persist_receipt(&rollback_failure_path(self.store, run_id), &bytes)?;
+                self.trust.anchor(run_id, "rollback-failure", &bytes)?;
                 return Err(SkillDeploymentError::CanaryRollbackFailed);
             }
             _ => return Err(SkillDeploymentError::UnexpectedRollbackOutcome(outcome)),
@@ -398,10 +575,34 @@ impl<'a> SkillDeploymentWorkflow<'a> {
             operation_ids,
         };
         let receipt = draft.into_receipt()?;
-        persist_receipt(
-            &rollback_path(self.store, run_id),
-            &canonical_json(&receipt)?,
-        )?;
+        let bytes = canonical_json(&receipt)?;
+        persist_receipt(&rollback_path(self.store, run_id), &bytes)?;
+        self.trust.anchor(run_id, "rollback", &bytes)?;
+        Ok(receipt)
+    }
+
+    pub fn load_rollback(
+        &self,
+        run_id: &StableId,
+        expected_id: &Sha256Digest,
+    ) -> Result<SkillDeploymentRollbackReceipt, SkillDeploymentError> {
+        let bytes = read_receipt_bytes(&rollback_path(self.store, run_id))?;
+        self.trust.verify(run_id, "rollback", &bytes)?;
+        let receipt: SkillDeploymentRollbackReceipt = serde_json::from_slice(&bytes)?;
+        let draft = SkillDeploymentRollbackDraft {
+            deployment_receipt_id: receipt.deployment_receipt_id.clone(),
+            candidate_id: receipt.candidate_id.clone(),
+            promotion_receipt_id: receipt.promotion_receipt_id.clone(),
+            canary_loadout: receipt.canary_loadout.clone(),
+            restored_digest: receipt.restored_digest.clone(),
+            state: receipt.state,
+            operation_ids: receipt.operation_ids.clone(),
+        };
+        if &receipt.id != expected_id
+            || digest_domain_json("commonkit.skill-deployment-rollback.v1", &draft)? != receipt.id
+        {
+            return Err(SkillDeploymentError::DeploymentReceiptMismatch);
+        }
         Ok(receipt)
     }
 }
@@ -506,6 +707,13 @@ fn rollback_path(store: &ReceiptStore, run_id: &StableId) -> std::path::PathBuf 
         .join("skill-deployment-rollback.receipt")
 }
 
+fn rollback_failure_path(store: &ReceiptStore, run_id: &StableId) -> std::path::PathBuf {
+    store
+        .root()
+        .join(run_id.as_str())
+        .join("skill-deployment-rollback-failure.receipt")
+}
+
 fn persist_receipt(path: &Path, bytes: &[u8]) -> Result<(), SkillDeploymentError> {
     if path.exists() {
         return if fs::read(path)? == bytes {
@@ -576,6 +784,14 @@ pub enum SkillDeploymentError {
     DeploymentAnchorMismatch,
     #[error("deployment trust key is not a protected ordinary 32-byte file")]
     UnsafeTrustKey,
+    #[error(
+        "deployment anchors exist but their trust key is missing; archive the run state and explicitly rotate trust before retrying"
+    )]
+    MissingTrustKeyForExistingAnchors,
+    #[error(
+        "trust rotation requires a missing key, non-empty anchor root, and new archive destination"
+    )]
+    InvalidTrustRotation,
     #[error("durable promotion receipt or candidate state did not authenticate")]
     PromotionAuthorityMismatch,
     #[error("canary restored-state observation failed: {0:?}")]
@@ -612,6 +828,8 @@ impl SkillDeploymentError {
             Self::DeploymentReceiptMismatch => "skill_deployment_receipt_mismatch",
             Self::DeploymentAnchorMismatch => "skill_deployment_anchor_mismatch",
             Self::UnsafeTrustKey => "skill_deployment_trust_key_invalid",
+            Self::MissingTrustKeyForExistingAnchors => "skill_deployment_trust_key_missing",
+            Self::InvalidTrustRotation => "skill_deployment_trust_rotation_invalid",
             Self::PromotionAuthorityMismatch => "skill_promotion_authority_mismatch",
             Self::Observe(_) => "skill_deployment_observation_failed",
             Self::RollbackVerificationFailed => "skill_deployment_rollback_verification_failed",

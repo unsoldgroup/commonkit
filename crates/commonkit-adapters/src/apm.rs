@@ -28,6 +28,8 @@ pub struct ApmProviderConfig {
     pub policy: PathBuf,
     pub targets: Vec<String>,
     pub managed_root: NormalizedManagedPath,
+    /// Promoted source whose exact bytes must be part of provider inputs.
+    pub bound_source: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,6 +65,12 @@ impl ApmProvider {
         let manifest = read_input(&self.config.manifest, "manifest")?;
         let lockfile = read_input(&self.config.lockfile, "lockfile")?;
         let policy = read_input(&self.config.policy, "package policy")?;
+        let bound_source = self
+            .config
+            .bound_source
+            .as_ref()
+            .map(|path| read_input(path, "bound promoted source"))
+            .transpose()?;
         if manifest.is_empty() || lockfile.is_empty() || policy.is_empty() {
             return Err(ProviderFailure::Inspect(
                 "APM manifest, lockfile, and package policy must be non-empty committed inputs"
@@ -73,27 +81,31 @@ impl ApmProvider {
         // deliberately not a portable provider input.
         let _ = executable;
 
+        let mut input_digests = BTreeMap::from([
+            ("manifest".into(), digest_bytes(&manifest)?),
+            ("lockfile".into(), digest_bytes(&lockfile)?),
+            ("packagePolicy".into(), digest_bytes(&policy)?),
+            (
+                "projectSources".into(),
+                digest_optional_tree(
+                    &self
+                        .config
+                        .manifest
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(".apm"),
+                )?,
+            ),
+            ("targetPolicy".into(), context.policy_digest.clone()),
+        ]);
+        if let Some(bytes) = bound_source {
+            input_digests.insert("promotedSource".into(), digest_bytes(&bytes)?);
+        }
         ProviderInputs::new(
             self.id.clone(),
             self.config.version.clone(),
             CONTRACT_VERSION.into(),
-            BTreeMap::from([
-                ("manifest".into(), digest_bytes(&manifest)?),
-                ("lockfile".into(), digest_bytes(&lockfile)?),
-                ("packagePolicy".into(), digest_bytes(&policy)?),
-                (
-                    "projectSources".into(),
-                    digest_optional_tree(
-                        &self
-                            .config
-                            .manifest
-                            .parent()
-                            .unwrap_or_else(|| Path::new("."))
-                            .join(".apm"),
-                    )?,
-                ),
-                ("targetPolicy".into(), context.policy_digest.clone()),
-            ]),
+            input_digests,
             vec!["agent-context".into(), "claude".into(), "codex".into()],
         )
         .map_err(ProviderFailure::Contract)

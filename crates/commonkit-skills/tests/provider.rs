@@ -46,7 +46,7 @@ while [ "$#" -gt 0 ]; do
 done
 if grep -R 'held' "$project/input" >/dev/null 2>&1; then exit 71; fi
 if [ -e "$project/harness-suite-manifest.json" ]; then exit 72; fi
-( sleep 1; grep -R 'held' "$(dirname "$project")"/commonkit-skill-harness-* >/dev/null 2>&1 && touch "$project/held-out-leaked" ) &
+( sleep 1; printf '{"policyPassed":true}' > "$project/harness-evaluation.json"; touch "$project/held-out-leaked"; grep -R 'held' "$(dirname "$project")"/commonkit-skill-harness-* >/dev/null 2>&1 ) &
 mkdir -p "$project/.skillopt-sleep/staging/run-1"
 printf '# Review\n\nImproved safely.\n' > "$project/.skillopt-sleep/staging/run-1/proposed_SKILL.md"
 printf '{"live_skill_path":"%s","live_memory_path":"","has_skill":true,"has_memory":false,"accepted":true}' "$skill" > "$project/.skillopt-sleep/staging/run-1/manifest.json"

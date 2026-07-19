@@ -8,13 +8,14 @@ use commonkit_adapters::{
     FileAdapter, NormalizedManagedPath, OwnershipRules, ProviderContext, ProviderPlanRequest,
     ProviderWorkspace, build_provider_plan,
 };
+use commonkit_contracts::digest_domain_json;
 use commonkit_contracts::{Operation, Sha256Digest, StableId};
 use commonkit_reconcile::{
     Adapter, AdapterFailure, ApmCompilation, ApmCompiler, CanaryStateObserver,
     DeploymentTrustStore, ReceiptStore, SkillDeploymentError, SkillDeploymentReceipt,
     SkillDeploymentRequest, SkillDeploymentRollbackReceipt, SkillDeploymentWorkflow,
 };
-use commonkit_skills::{SkillEngine, digest_bytes};
+use commonkit_skills::SkillEngine;
 use serde::Deserialize;
 
 #[derive(Clone, Deserialize)]
@@ -68,14 +69,16 @@ impl SkillCanaryRuntime {
         )?;
         let target_root = config.target_root.clone();
         let adapter_state = config.adapter_state.clone();
-        Ok(Self {
+        let runtime = Self {
             engine,
             receipts,
             trust,
             compiler: Mutex::new(ProductionApmCompiler { config }),
             target_root,
             adapter_state,
-        })
+        };
+        runtime.recover_unfinished()?;
+        Ok(runtime)
     }
 
     pub(crate) fn engine(&self) -> Arc<SkillEngine> {
@@ -113,6 +116,31 @@ impl SkillCanaryRuntime {
             adapter_state: self.adapter_state.clone(),
         };
         workflow.rollback(run_id, receipt_id, &mut adapters, &mut observer)
+    }
+
+    fn recover_unfinished(&self) -> Result<(), SkillDeploymentError> {
+        for run_id in self.receipts.run_ids()? {
+            let run_root = self.receipts.root().join(run_id.as_str());
+            if run_root.join("skill-deployment.receipt").exists()
+                || run_root.join("skill-deployment-recovery.receipt").exists()
+                || !run_root.join("skill-deployment-intent.receipt").exists()
+            {
+                continue;
+            }
+            let files = FileAdapter::open(&self.target_root, &self.adapter_state)
+                .map_err(|error| SkillDeploymentError::Observe(fail(error)))?;
+            let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(files)];
+            let mut observer = FilesystemCanaryObserver {
+                target_root: self.target_root.clone(),
+                adapter_state: self.adapter_state.clone(),
+            };
+            SkillDeploymentWorkflow::new(&self.receipts, &self.trust).recover(
+                &run_id,
+                &mut adapters,
+                &mut observer,
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -168,6 +196,7 @@ impl ProductionApmCompiler {
             policy: self.config.policy.clone(),
             targets: vec!["claude".into(), "codex".into()],
             managed_root: self.config.managed_root.clone(),
+            bound_source: Some(self.config.promoted_source.clone()),
         })
         .map_err(fail)?;
         let context = ProviderContext {
@@ -190,6 +219,12 @@ impl ProductionApmCompiler {
         let state = provider
             .materialize(&context, &workspace, &artifacts)
             .map_err(fail)?;
+        let source_digest = state
+            .inputs
+            .input_digests
+            .get("promotedSource")
+            .cloned()
+            .ok_or_else(|| fail("APM materialization omitted promotedSource input binding"))?;
         let mut files = FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
             .map_err(fail)?;
         let observed_digest = files
@@ -216,15 +251,18 @@ impl ProductionApmCompiler {
             &mut files,
         )
         .map_err(fail)?;
-        let source_digest =
-            digest_bytes(&fs::read(&self.config.promoted_source).map_err(fail)?).map_err(fail)?;
+        let bound_artifact_set_digest = digest_domain_json(
+            "commonkit.skill-canary-artifact-set.v1",
+            &(&plan.bindings.artifact_set_digest, &source_digest),
+        )
+        .map_err(fail)?;
         Ok(ApmCompilation {
             source_digest,
             provider_inputs_digest: plan.bindings.provider_inputs_digest.clone(),
             composed_loadout_digest: plan.bindings.composed_loadout_digest.clone(),
             target_identity_digest: plan.bindings.target_identity_digest.clone(),
             ownership_map_digest: plan.bindings.ownership_map_digest.clone(),
-            artifact_set_digest: plan.bindings.artifact_set_digest.clone(),
+            artifact_set_digest: bound_artifact_set_digest,
             desired_digest: plan.desired_digest,
             observed_digest: plan.observed_digest,
             operations: plan.operations,

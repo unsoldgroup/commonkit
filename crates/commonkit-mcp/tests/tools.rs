@@ -2,8 +2,9 @@ use std::sync::{Arc, Mutex};
 
 use commonkit_mcp::{
     ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend,
-    ProposeSkillPromotionInput, ReadInput, RelayReconcileInput, ShowSkillCandidateInput,
-    SkillEvidencePreviewInput, SkillOpportunitiesInput,
+    ProposeSkillCanaryApplyInput, ProposeSkillCanaryRollbackInput, ProposeSkillPromotionInput,
+    ReadInput, RelayReconcileInput, ShowSkillCandidateInput, SkillEvidencePreviewInput,
+    SkillOpportunitiesInput,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
@@ -49,6 +50,8 @@ fn publishes_stable_initial_tool_names() {
             "commonkit_list_skills",
             "commonkit_plan_sync",
             "commonkit_preview_skill_evidence",
+            "commonkit_propose_skill_canary_apply",
+            "commonkit_propose_skill_canary_rollback",
             "commonkit_propose_skill_promotion",
             "commonkit_relay_reconcile",
             "commonkit_relay_status",
@@ -69,6 +72,36 @@ fn publishes_stable_initial_tool_names() {
             | "commonkit_apply_skill_promotion"
             | "commonkit_rollback_skill_promotion"
     )));
+}
+
+#[tokio::test]
+async fn skill_canary_tools_are_proposal_only_and_never_contact_mutation_backend() {
+    let backend = Arc::new(FakeBackend::default());
+    let server = CommonKitMcp::new(backend.clone());
+    let apply = server
+        .propose_skill_canary_apply(Parameters(ProposeSkillCanaryApplyInput {
+            run_id: "run-1".into(),
+            deployment: json!({"candidateId":"candidate-1"}),
+        }))
+        .await
+        .expect("proposal");
+    assert_eq!(
+        apply.structured_content.expect("structured")["proposalOnly"],
+        true
+    );
+    let rollback = server
+        .propose_skill_canary_rollback(Parameters(ProposeSkillCanaryRollbackInput {
+            run_id: "run-1".into(),
+            deployment_receipt_id: "sha256:receipt".into(),
+        }))
+        .await
+        .expect("proposal");
+    assert_eq!(
+        rollback.structured_content.expect("structured")["proposalOnly"],
+        true
+    );
+    assert!(backend.posts.lock().expect("posts").is_empty());
+    assert!(backend.applies.lock().expect("applies").is_empty());
 }
 
 #[tokio::test]

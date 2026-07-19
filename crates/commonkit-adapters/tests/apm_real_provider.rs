@@ -44,6 +44,7 @@ fn checksum_pinned_apm_release_materializes_without_touching_live_target() {
         policy: root.join("apm-policy.yml"),
         targets: vec!["claude".into(), "codex".into()],
         managed_root: NormalizedManagedPath::parse("home").unwrap(),
+        bound_source: None,
     })
     .unwrap();
     let context = ProviderContext {

@@ -619,6 +619,7 @@ impl SkillOptSleepOptimizer {
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .spawn()?;
+        let provider_group = child.id();
         let deadline = Instant::now() + Duration::from_secs(self.config.timeout_seconds.into());
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -627,17 +628,19 @@ impl SkillOptSleepOptimizer {
             if file_exceeds(&stdout_path, 2 * 1024 * 1024)?
                 || file_exceeds(&stderr_path, 2 * 1024 * 1024)?
             {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child, provider_group);
                 return Err(SkillError::ProviderOutputIncompatible);
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child, provider_group);
                 return Err(SkillError::ProviderTimedOut);
             }
             thread::sleep(Duration::from_millis(25));
         };
+        // The direct provider may exit while daemonized descendants remain.
+        // Terminate and reap the entire isolated job before any held-out state
+        // or trusted harness output path is created.
+        terminate_process_group(&mut child, provider_group);
         if !status.success() {
             return Err(SkillError::ProviderExecutionFailed);
         }
@@ -690,8 +693,8 @@ impl SkillOptSleepOptimizer {
         let harness_private = PrivateStaging::new("commonkit-skill-harness")?;
         let harness_suite_path = harness_private.path().join("suite-manifest.json");
         fs::write(&harness_suite_path, canonical_json(suite)?)?;
-        let harness_stdout = staging.join("harness-evaluation.json");
-        let harness_stderr = staging.join("harness-stderr.log");
+        let harness_stdout = harness_private.path().join("evaluation.json");
+        let harness_stderr = harness_private.path().join("stderr.log");
         let mut harness = isolated_command(
             &self.config.harness_executable,
             staging,
@@ -2306,27 +2309,47 @@ fn run_bounded_child(
     timeout_seconds: u32,
 ) -> Result<(), SkillError> {
     let mut child = command.spawn()?;
+    let process_group = child.id();
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds.into());
     loop {
         if let Some(status) = child.try_wait()? {
-            return if status.success() {
+            let result = if status.success() {
                 Ok(())
             } else {
                 Err(SkillError::HarnessExecutionFailed)
             };
+            terminate_process_group(&mut child, process_group);
+            return result;
         }
         if file_exceeds(stdout, 2 * 1024 * 1024)? || file_exceeds(stderr, 2 * 1024 * 1024)? {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_group(&mut child, process_group);
             return Err(SkillError::HarnessOutputIncompatible);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_process_group(&mut child, process_group);
             return Err(SkillError::ProviderTimedOut);
         }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+#[cfg(unix)]
+fn terminate_process_group(child: &mut std::process::Child, process_group: u32) {
+    // The child is always placed in a fresh process group by isolated_command.
+    // A negative kill target reaches descendants even after the leader exits.
+    let _ = Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{process_group}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(child: &mut std::process::Child, _process_group: u32) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(target_os = "macos")]
@@ -2397,6 +2420,8 @@ fn isolated_command(
         return Err(SkillError::ProviderIsolationUnavailable);
     }
     let mut command = Command::new(sandbox);
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
     command
         .arg("-p")
         .arg(profile)

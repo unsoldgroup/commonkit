@@ -3,8 +3,8 @@ use commonkit_core::{OperationDraft, finalize_operation};
 use commonkit_reconcile::{
     Adapter, AdapterFailure, ApmCompilation, ApmCompiler, AuthenticatedSkillPromotion,
     CanaryStateObserver, DeploymentTrustStore, ReceiptStore, ReconcileOutcome,
-    SkillDeploymentError, SkillDeploymentRequest, SkillDeploymentState, SkillDeploymentWorkflow,
-    SkillPromotionAuthority,
+    SkillDeploymentError, SkillDeploymentRecovery, SkillDeploymentRequest, SkillDeploymentState,
+    SkillDeploymentWorkflow, SkillPromotionAuthority,
 };
 
 fn temporary_directory(label: &str) -> std::path::PathBuf {
@@ -119,6 +119,26 @@ impl Adapter for FailingRollbackAdapter {
     }
     fn rollback(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
         Err(AdapterFailure::new("rollback_failed", "fixture"))
+    }
+}
+
+struct FailingVerifyAdapter;
+impl Adapter for FailingVerifyAdapter {
+    fn id(&self) -> &StableId {
+        static ID: std::sync::OnceLock<StableId> = std::sync::OnceLock::new();
+        ID.get_or_init(|| id("files"))
+    }
+    fn prepare(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    fn apply(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    fn verify(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
+        Err(AdapterFailure::new("verify_failed", "fixture"))
+    }
+    fn rollback(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
     }
 }
 
@@ -271,6 +291,21 @@ fn compiles_apm_applies_named_canary_and_links_receipts() {
     assert_eq!(rollback.state, SkillDeploymentState::RolledBack);
     assert_eq!(rollback.deployment_receipt_id, receipt.id);
     assert_eq!(rollback.restored_digest, digest('c'));
+    assert_eq!(
+        restarted_workflow
+            .load_rollback(&id("canary-run-1"), &rollback.id)
+            .expect("authenticated rollback"),
+        rollback
+    );
+    std::fs::write(anchors.join("canary-run-1.rollback.anchor"), b"forged")
+        .expect("tamper rollback anchor");
+    assert_eq!(
+        restarted_workflow
+            .load_rollback(&id("canary-run-1"), &rollback.id)
+            .expect_err("tampered rollback anchor")
+            .code(),
+        "skill_deployment_anchor_mismatch"
+    );
     std::fs::remove_dir_all(temporary).expect("cleanup");
     std::fs::remove_dir_all(anchors).expect("cleanup anchors");
 }
@@ -289,6 +324,31 @@ fn trust_store_rejects_group_readable_existing_keys() {
         Err(error) => error,
     };
     assert_eq!(error.code(), "skill_deployment_trust_key_invalid");
+    std::fs::remove_dir_all(temporary).expect("cleanup");
+}
+
+#[test]
+fn trust_store_never_replaces_a_missing_key_for_existing_anchors() {
+    let temporary = temporary_directory("skill-deployment-missing-key");
+    let anchors = temporary.join("anchors");
+    std::fs::create_dir_all(&anchors).expect("anchors");
+    std::fs::write(anchors.join("run.intent.anchor"), b"authenticated-state").expect("anchor");
+    let error = match DeploymentTrustStore::open_or_create(&anchors, temporary.join("trust.key")) {
+        Ok(_) => panic!("missing key must not be replaced"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "skill_deployment_trust_key_missing");
+    assert!(!temporary.join("trust.key").exists());
+    let archive = temporary.join("archived-anchors");
+    DeploymentTrustStore::archive_and_rotate_missing_key(
+        &anchors,
+        temporary.join("trust.key"),
+        &archive,
+    )
+    .expect("explicit archive and trust rotation");
+    assert!(archive.join("run.intent.anchor").is_file());
+    assert!(temporary.join("trust.key").is_file());
+    assert!(anchors.is_dir());
     std::fs::remove_dir_all(temporary).expect("cleanup");
 }
 
@@ -379,11 +439,73 @@ fn rollback_failure_never_persists_a_restored_deployment_receipt() {
         )
         .expect_err("rollback failure");
     assert_eq!(error.code(), "skill_deployment_rollback_failed");
+    let failure =
+        temporary.join("canary-run-rollback-failure/skill-deployment-rollback-failure.receipt");
+    assert!(failure.is_file());
     assert!(
-        !temporary
-            .join("canary-run-rollback-failure/skill-deployment-rollback.receipt")
-            .exists()
+        anchors
+            .join("canary-run-rollback-failure.rollback-failure.anchor")
+            .is_file()
     );
+    let value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(failure).expect("failure receipt")).expect("json");
+    assert_eq!(value["state"], "rollback_failed");
     std::fs::remove_dir_all(temporary).expect("cleanup");
     std::fs::remove_dir_all(anchors).expect("cleanup anchors");
+}
+
+#[test]
+fn recovery_authenticates_intent_and_deterministically_finalizes_or_records_rollback() {
+    let temporary = temporary_directory("skill-deployment-recovery");
+    let anchors = temporary_directory("skill-deployment-recovery-anchors");
+    let store = ReceiptStore::open(&temporary).expect("store");
+    let trust = DeploymentTrustStore::open(&anchors, [8; 32]).expect("trust");
+    let workflow = SkillDeploymentWorkflow::new(&store, &trust);
+    let authority = authority(&temporary);
+    let mut compiler = Compiler {
+        source_digest: digest('b'),
+    };
+    let prepared = workflow
+        .prepare(request(), &mut compiler, &authority)
+        .expect("prepare");
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(RecordingAdapter::default())];
+    let receipt = workflow
+        .apply(prepared, id("recover-success"), &mut adapters)
+        .expect("apply");
+    std::fs::remove_file(temporary.join("recover-success/skill-deployment.receipt"))
+        .expect("simulate crash before deployment receipt");
+    let recovered = workflow
+        .recover(
+            &id("recover-success"),
+            &mut adapters,
+            &mut Observer(digest('c')),
+        )
+        .expect("finalize successful generic receipt");
+    assert!(
+        matches!(recovered, SkillDeploymentRecovery::Finalized(value) if value.id == receipt.id)
+    );
+
+    let mut compiler = Compiler {
+        source_digest: digest('b'),
+    };
+    let prepared = workflow
+        .prepare(request(), &mut compiler, &authority)
+        .expect("prepare");
+    let mut failing: Vec<Box<dyn Adapter>> = vec![Box::new(FailingVerifyAdapter)];
+    workflow
+        .apply(prepared, id("recover-rollback"), &mut failing)
+        .expect_err("verify failure rolls generic run back");
+    let recovered = workflow
+        .recover(
+            &id("recover-rollback"),
+            &mut failing,
+            &mut Observer(digest('c')),
+        )
+        .expect("record authenticated recovered rollback");
+    assert!(
+        matches!(recovered, SkillDeploymentRecovery::Recovered(value) if value.outcome == ReconcileOutcome::RolledBack && value.restored_digest == Some(digest('c')))
+    );
+    assert!(anchors.join("recover-rollback.recovery.anchor").is_file());
+    std::fs::remove_dir_all(temporary).expect("cleanup");
+    std::fs::remove_dir_all(anchors).expect("cleanup");
 }
