@@ -1,5 +1,7 @@
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use commonkit_platform::AppPaths;
 use serde::{Deserialize, Serialize};
@@ -15,6 +17,118 @@ struct ServiceClient {
     discovery: PathBuf,
     token: PathBuf,
     http: reqwest::Client,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeBinaryLayout {
+    cli: PathBuf,
+    daemon: PathBuf,
+}
+
+impl RuntimeBinaryLayout {
+    fn beside(desktop: &Path) -> Self {
+        let directory = desktop.parent().unwrap_or_else(|| Path::new("."));
+        let extension = std::env::consts::EXE_SUFFIX;
+        Self {
+            cli: directory.join(format!("commonkit{extension}")),
+            daemon: directory.join(format!("commonkitd{extension}")),
+        }
+    }
+
+    fn discover() -> Result<Self, DesktopError> {
+        let installed = Self::beside(&std::env::current_exe()?);
+        if installed.validate().is_ok() {
+            return Ok(installed);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../../target/debug");
+            let development = Self::beside(&workspace.join(format!(
+                "commonkit-desktop{}",
+                std::env::consts::EXE_SUFFIX
+            )));
+            development.validate()?;
+            return Ok(development);
+        }
+        #[cfg(not(debug_assertions))]
+        Err(DesktopError::RuntimeBinaryMissing)
+    }
+
+    fn validate(&self) -> Result<(), DesktopError> {
+        for path in [&self.cli, &self.daemon] {
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|_| DesktopError::RuntimeBinaryMissing)?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(DesktopError::RuntimeBinaryMissing);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct ServiceSupervisor {
+    child: Mutex<Option<Child>>,
+}
+
+impl ServiceSupervisor {
+    fn ensure_started(client: &ServiceClient) -> Result<Self, DesktopError> {
+        if service_is_authenticated(client) {
+            return Ok(Self {
+                child: Mutex::new(None),
+            });
+        }
+        let runtime = RuntimeBinaryLayout::discover()?;
+        let child = Command::new(runtime.daemon)
+            .args(["--port", "0", "--relay-port", "0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|_| DesktopError::ServiceLaunchFailed)?;
+        let supervisor = Self {
+            child: Mutex::new(Some(child)),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if service_is_authenticated(client) {
+                return Ok(supervisor);
+            }
+            if supervisor.child_exited()? {
+                return Err(DesktopError::ServiceLaunchFailed);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        supervisor.stop();
+        Err(DesktopError::ServiceLaunchFailed)
+    }
+
+    fn child_exited(&self) -> Result<bool, DesktopError> {
+        let mut child = self.child.lock().map_err(|_| DesktopError::ServiceLaunchFailed)?;
+        Ok(match child.as_mut() {
+            Some(child) => child.try_wait()?.is_some(),
+            None => false,
+        })
+    }
+
+    fn stop(&self) {
+        let Ok(mut slot) = self.child.lock() else { return };
+        if let Some(mut child) = slot.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for ServiceSupervisor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn service_is_authenticated(client: &ServiceClient) -> bool {
+    tauri::async_runtime::block_on(client.status()).is_ok()
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +192,50 @@ struct ManagementSnapshot {
     relay: serde_json::Value,
     schedule: serde_json::Value,
     diagnostics: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TraySummary {
+    health: String,
+    loadout: String,
+    relay: String,
+    snapshots: String,
+}
+
+#[derive(Clone)]
+struct TrayItems {
+    health: MenuItem<tauri::Wry>,
+    loadout: MenuItem<tauri::Wry>,
+    relay: MenuItem<tauri::Wry>,
+    snapshots: MenuItem<tauri::Wry>,
+}
+
+impl TraySummary {
+    fn from_observed(
+        status: &ServiceStatus,
+        relay: Option<&serde_json::Value>,
+        snapshots: Option<&serde_json::Value>,
+    ) -> Self {
+        let target = status.active_target.as_deref().unwrap_or("no target");
+        let loadout = status.active_loadout.as_deref().unwrap_or("not selected");
+        let relay = relay
+            .and_then(|value| value.get("state"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unavailable");
+        let snapshots = snapshots
+            .and_then(|value| value.get("snapshots"))
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len);
+        Self {
+            health: format!("Health: {}", status.state),
+            loadout: format!("Loadout: {loadout} · {target}"),
+            relay: format!("Relay: {relay}"),
+            snapshots: snapshots
+                .map(|count| format!("Snapshots: {count} available"))
+                .unwrap_or_else(|| "Snapshots: unavailable".into()),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -433,6 +591,10 @@ fn validate_id(value: &str) -> Result<(), DesktopError> {
 enum DesktopError {
     #[error("CommonKit service is unavailable")]
     ServiceUnavailable,
+    #[error("the installed CommonKit runtime binaries are missing or unsafe")]
+    RuntimeBinaryMissing,
+    #[error("the bundled CommonKit service could not be started")]
+    ServiceLaunchFailed,
     #[error("local control state is invalid")]
     InvalidControlState,
     #[error("input is invalid")]
@@ -868,6 +1030,60 @@ fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     window.set_focus().map_err(|error| error.to_string())
 }
 
+fn show_route(app: tauri::AppHandle, route: &str) -> Result<(), String> {
+    if !matches!(route, "status" | "plans" | "relay" | "snapshots") {
+        return Err("invalid desktop route".into());
+    }
+    show_main_window(app.clone())?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or("main window unavailable")?;
+    window
+        .eval(format!("window.location.hash = '#{route}'"))
+        .map_err(|error| error.to_string())
+}
+
+async fn refresh_tray(app: tauri::AppHandle) {
+    let client = app.state::<ServiceClient>().inner().clone();
+    let status = client
+        .status()
+        .await
+        .unwrap_or_else(|_| ServiceStatus::offline());
+    let relay = client.json(reqwest::Method::GET, "/relay", None).await.ok();
+    let snapshots = client
+        .json(reqwest::Method::GET, "/snapshots", None)
+        .await
+        .ok();
+    let summary = TraySummary::from_observed(&status, relay.as_ref(), snapshots.as_ref());
+    let items = app.state::<TrayItems>();
+    let _ = items.health.set_text(&summary.health);
+    let _ = items.loadout.set_text(&summary.loadout);
+    let _ = items.relay.set_text(&summary.relay);
+    let _ = items.snapshots.set_text(&summary.snapshots);
+
+    if let Some(report) = std::env::var_os("COMMONKIT_DESKTOP_SMOKE_REPORT") {
+        let runtime = RuntimeBinaryLayout::discover();
+        let payload = serde_json::json!({
+            "schemaVersion": 1,
+            "desktopExecutable": std::env::current_exe().ok(),
+            "serviceState": status.state,
+            "runtimeVersion": status.runtime_version,
+            "bundledCli": runtime.as_ref().ok().map(|value| &value.cli),
+            "bundledDaemon": runtime.as_ref().ok().map(|value| &value.daemon),
+            "tray": summary,
+        });
+        if runtime.is_ok()
+            && status.state != "offline"
+            && std::fs::write(&report, serde_json::to_vec_pretty(&payload).unwrap_or_default())
+                .is_ok()
+        {
+            app.exit(0);
+        } else {
+            app.exit(70);
+        }
+    }
+}
+
 pub fn run() {
     let client = ServiceClient::discover().unwrap_or_else(|_| ServiceClient {
         discovery: PathBuf::new(),
@@ -875,7 +1091,7 @@ pub fn run() {
         http: reqwest::Client::new(),
     });
     tauri::Builder::default()
-        .manage(client)
+        .manage(client.clone())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             let _ = show_main_window(app.clone());
         }))
@@ -910,21 +1126,57 @@ pub fn run() {
             install_update,
             show_main_window
         ])
-        .setup(|app| {
+        .setup(move |app| {
+            let supervisor = ServiceSupervisor::ensure_started(&client)?;
+            app.manage(supervisor);
+            let health = MenuItem::with_id(app, "health", "Health: starting", false, None::<&str>)?;
+            let loadout = MenuItem::with_id(app, "loadout", "Loadout: loading", false, None::<&str>)?;
+            let relay = MenuItem::with_id(app, "relay-status", "Relay: loading", false, None::<&str>)?;
+            let snapshots = MenuItem::with_id(app, "snapshot-status", "Snapshots: loading", false, None::<&str>)?;
+            let refresh = MenuItem::with_id(app, "refresh", "Refresh health", true, None::<&str>)?;
+            let review = MenuItem::with_id(app, "review", "Review plan…", true, None::<&str>)?;
+            let manage_relay = MenuItem::with_id(app, "manage-relay", "Manage relay…", true, None::<&str>)?;
+            let manage_snapshots = MenuItem::with_id(app, "manage-snapshots", "Manage snapshots…", true, None::<&str>)?;
             let open = MenuItem::with_id(app, "open", "Open CommonKit", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            app.manage(TrayItems {
+                health: health.clone(),
+                loadout: loadout.clone(),
+                relay: relay.clone(),
+                snapshots: snapshots.clone(),
+            });
+            let menu = Menu::with_items(app, &[
+                &health, &loadout, &relay, &snapshots, &refresh, &review,
+                &manage_relay, &manage_snapshots, &open, &quit,
+            ])?;
             TrayIconBuilder::new()
                 .menu(&menu)
                 .tooltip("CommonKit")
+                .icon(app.default_window_icon().ok_or("desktop icon unavailable")?.clone())
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => {
                         let _ = show_main_window(app.clone());
                     }
-                    "quit" => app.exit(0),
+                    "refresh" => {
+                        tauri::async_runtime::spawn(refresh_tray(app.clone()));
+                    }
+                    "review" => { let _ = show_route(app.clone(), "plans"); }
+                    "manage-relay" => { let _ = show_route(app.clone(), "relay"); }
+                    "manage-snapshots" => { let _ = show_route(app.clone(), "snapshots"); }
+                    "quit" => {
+                        app.state::<ServiceSupervisor>().stop();
+                        app.exit(0);
+                    }
                     _ => {}
                 })
                 .build(app)?;
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    refresh_tray(app_handle.clone()).await;
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                }
+            });
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -940,6 +1192,33 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn packaged_runtime_binaries_are_resolved_only_beside_the_installed_desktop() {
+        let executable = if cfg!(windows) { "commonkit-desktop.exe" } else { "commonkit-desktop" };
+        let root = Path::new("/Applications/CommonKit.app/Contents/MacOS");
+        let layout = RuntimeBinaryLayout::beside(&root.join(executable));
+        assert_eq!(layout.cli, root.join(if cfg!(windows) { "commonkit.exe" } else { "commonkit" }));
+        assert_eq!(layout.daemon, root.join(if cfg!(windows) { "commonkitd.exe" } else { "commonkitd" }));
+    }
+
+    #[test]
+    fn tray_summary_is_derived_from_observed_daemon_state() {
+        let status = ServiceStatus {
+            state: "degraded".into(),
+            active_target: Some("macbook".into()),
+            active_loadout: Some("personal".into()),
+            ..ServiceStatus::offline()
+        };
+        let summary = TraySummary::from_observed(
+            &status,
+            Some(&serde_json::json!({"state":"healthy"})),
+            Some(&serde_json::json!({"snapshots":[{}, {}]})),
+        );
+        assert_eq!(summary.health, "Health: degraded");
+        assert_eq!(summary.loadout, "Loadout: personal · macbook");
+        assert_eq!(summary.relay, "Relay: healthy");
+        assert_eq!(summary.snapshots, "Snapshots: 2 available");
+    }
     #[test]
     fn management_snapshot_uses_only_fixed_read_only_service_routes() {
         assert_eq!(

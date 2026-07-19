@@ -18,6 +18,23 @@ test("desktop is single-window, CSP-bound, and emits updater artifacts", async (
   assert.match(config.app.security.csp, /default-src 'self'/);
   assert.equal(config.bundle.createUpdaterArtifacts, true);
   assert.equal(config.app.withGlobalTauri, false);
+  assert.deepEqual(config.bundle.externalBin, ["binaries/commonkit", "binaries/commonkitd"]);
+});
+
+test("published installer lifecycle launches the installed desktop and waits for daemon health", async () => {
+  const workflow = await readFile(new URL("../../../.github/workflows/release-lifecycle.yml", import.meta.url), "utf8");
+  assert.match(workflow, /COMMONKIT_DESKTOP_SMOKE_REPORT/);
+  assert.match(workflow, /Applications\/CommonKit\.app\/Contents\/MacOS\/commonkit-desktop/);
+  assert.match(workflow, /commonkit-desktop-smoke\.json/);
+  assert.match(workflow, /serviceState/);
+});
+
+test("release builds bundle target-matched CLI and daemon before Tauri packaging", async () => {
+  const workflow = await readFile(new URL("../../../.github/workflows/release.yml", import.meta.url), "utf8");
+  const bundle = workflow.indexOf("Stage desktop sidecars");
+  const tauri = workflow.indexOf("Build signed and notarized desktop bundles");
+  assert.ok(bundle >= 0 && tauri > bundle, "sidecars must be staged before the installer is built");
+  assert.match(workflow, /scripts\/stage-desktop-sidecars\.sh/);
 });
 
 test("updater commands separate inspection from explicitly confirmed installation", async () => {

@@ -115,13 +115,26 @@ jobs:
           hdiutil detach "$RUNNER_TEMP/commonkit-update-mount"
           codesign --verify --deep --strict /Applications/CommonKit.app
           spctl --assess --type execute --verbose /Applications/CommonKit.app
+      - name: Launch installed macOS desktop and verify its managed daemon
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/commonkit-desktop-smoke.json"
+          COMMONKIT_DESKTOP_SMOKE_REPORT="$report" \
+            /Applications/CommonKit.app/Contents/MacOS/commonkit-desktop &
+          desktop_pid=$!
+          for _ in $(seq 1 200); do test -s "$report" && break; sleep 0.1; done
+          test -s "$report"
+          wait "$desktop_pid"
+          node -e 'const r=require(process.argv[1]);if(r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon)process.exit(1)' "$report"
       - name: Install previous signed Debian release
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-0 libappindicator3-1 librsvg2-2
+          sudo apt-get install -y libwebkit2gtk-4.1-0 libappindicator3-1 librsvg2-2 xvfb
           deb=$(find previous -maxdepth 1 -name '*.deb' -print -quit)
           test -n "$deb"
           package=$(dpkg-deb --field "$deb" Package)
@@ -139,6 +152,20 @@ jobs:
           test "$(dpkg-deb --field "$deb" Package)" = "$COMMONKIT_DEB_PACKAGE"
           sudo dpkg -i "$deb"
           dpkg-query --show "$COMMONKIT_DEB_PACKAGE"
+      - name: Launch installed Linux desktop and verify its managed daemon
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/commonkit-desktop-smoke.json"
+          desktop=$(dpkg -L "$COMMONKIT_DEB_PACKAGE" | grep -E '/commonkit-desktop$' | head -1)
+          test -x "$desktop"
+          COMMONKIT_DESKTOP_SMOKE_REPORT="$report" xvfb-run -a "$desktop" &
+          desktop_pid=$!
+          for _ in $(seq 1 200); do test -s "$report" && break; sleep 0.1; done
+          test -s "$report"
+          wait "$desktop_pid"
+          node -e 'const r=require(process.argv[1]);if(r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon)process.exit(1)' "$report"
       - name: Install previous signed NSIS release
         if: runner.os == 'Windows'
         shell: pwsh
@@ -157,6 +184,29 @@ jobs:
           if ((Get-AuthenticodeSignature $installer.FullName).Status -ne 'Valid') { throw 'Current NSIS signature is not valid' }
           $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Current NSIS update failed: $($process.ExitCode)" }
+      - name: Launch installed Windows desktop and verify its managed daemon
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $entry = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'CommonKit' } | Select-Object -First 1
+          if (-not $entry.DisplayIcon) { throw 'Installed CommonKit desktop path is unavailable' }
+          $desktop = ($entry.DisplayIcon -split ',')[0].Trim('"')
+          if (-not (Test-Path $desktop)) { throw "Installed desktop is missing: $desktop" }
+          $report = Join-Path $env:RUNNER_TEMP 'commonkit-desktop-smoke.json'
+          $env:COMMONKIT_DESKTOP_SMOKE_REPORT = $report
+          $process = Start-Process -FilePath $desktop -PassThru
+          foreach ($attempt in 1..200) {
+            if ((Test-Path $report) -and (Get-Item $report).Length -gt 0) { break }
+            Start-Sleep -Milliseconds 100
+          }
+          if (-not (Test-Path $report)) { throw 'Installed desktop did not publish its health report' }
+          $process.WaitForExit()
+          if ($process.ExitCode -ne 0) { throw "Installed desktop smoke failed: $($process.ExitCode)" }
+          $result = Get-Content $report -Raw | ConvertFrom-Json
+          if ($result.serviceState -ne 'healthy' -or -not $result.bundledCli -or -not $result.bundledDaemon) {
+            throw 'Installed desktop did not launch a healthy bundled runtime'
+          }
       - name: Verify current standalone CLI
         shell: bash
         run: |

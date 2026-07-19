@@ -120,15 +120,18 @@ jobs:
           "WINDOWS_CERTIFICATE_THUMBPRINT=$($certificate.Thumbprint)" >> $env:GITHUB_ENV
           Remove-Item -Force $certificatePath
       - run: node scripts/prepare-release-config.mjs "${{ inputs.tag || github.ref_name }}"
+      - name: Build standalone CLI and daemon
+        shell: bash
+        run: scripts/build-release-cli.sh "${{ matrix.cli_target }}" release-artifacts
+      - name: Stage desktop sidecars
+        shell: bash
+        run: scripts/stage-desktop-sidecars.sh "${{ matrix.target }}" release-artifacts
       - name: Build signed and notarized desktop bundles
         uses: tauri-apps/tauri-action@v1
         with:
           projectPath: apps/desktop
           tauriScript: pnpm tauri
           args: --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
-      - name: Build standalone CLI
-        shell: bash
-        run: scripts/build-release-cli.sh "${{ matrix.cli_target }}" release-artifacts
       - name: Sign and verify standalone macOS CLI
         if: runner.os == 'macOS'
         shell: bash
