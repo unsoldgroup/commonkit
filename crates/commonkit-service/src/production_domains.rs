@@ -43,11 +43,21 @@ use crate::{
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProductionConfig {
+    targets: Option<TargetInventoryConfig>,
     composition: Option<CompositionConfig>,
     sync: Option<SyncConfig>,
     credentials: Option<CredentialConfig>,
     snapshots: Option<SnapshotConfig>,
     skill_canary: Option<SkillCanaryConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TargetInventoryConfig {
+    state: PathBuf,
+    #[serde(default)]
+    selected: Vec<StableId>,
+    entries: Vec<crate::TargetRecord>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -209,6 +219,7 @@ pub struct ProductionDomainRegistry {
     pub credentials: Option<Arc<dyn CredentialDomain>>,
     pub snapshots: Option<Arc<dyn SnapshotDomain>>,
     pub(crate) skill_canary: Option<Arc<SkillCanaryRuntime>>,
+    pub targets: Option<Arc<crate::TargetInventory>>,
     ssh_execution: Option<(PathBuf, ProductionSshTarget)>,
 }
 
@@ -403,6 +414,7 @@ impl ProductionDomainRegistry {
                 credentials: None,
                 snapshots: None,
                 skill_canary: None,
+                targets: None,
                 ssh_execution: None,
             });
         }
@@ -432,6 +444,48 @@ impl ProductionDomainRegistry {
             return Err(ProductionDomainError::UnsafeConfig);
         }
         let config: ProductionConfig = serde_json::from_slice(&fs::read(config_path)?)?;
+        let targets = if let Some(targets) = config.targets.as_ref() {
+            if !targets.state.is_absolute() {
+                return Err(ProductionDomainError::UnsafeConfig);
+            }
+            Some(
+                crate::TargetInventory::open(
+                    &targets.state,
+                    targets.entries.clone(),
+                    Some(targets.selected.clone()),
+                )
+                .map(Arc::new)
+                .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+            )
+        } else {
+            config
+                .sync
+                .as_ref()
+                .map(|sync| {
+                    let transport = match sync.target_transport.as_ref() {
+                        Some(SyncTargetTransport::Ssh {
+                            host, user, port, ..
+                        }) => crate::TargetTransport::Ssh {
+                            host: host.clone(),
+                            user: user.clone(),
+                            port: *port,
+                        },
+                        _ => crate::TargetTransport::Local,
+                    };
+                    crate::TargetInventory::open(
+                        config_path.with_extension("targets.json"),
+                        vec![crate::TargetRecord {
+                            id: sync.target_id.clone(),
+                            transport,
+                            identity_digest: sync.target_identity_digest.clone(),
+                        }],
+                        None,
+                    )
+                    .map(Arc::new)
+                    .map_err(|_| ProductionDomainError::UnsafeConfig)
+                })
+                .transpose()?
+        };
         let ssh_execution =
             config
                 .sync
@@ -574,6 +628,7 @@ impl ProductionDomainRegistry {
             credentials,
             snapshots,
             skill_canary,
+            targets,
             ssh_execution,
         })
     }

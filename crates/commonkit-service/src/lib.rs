@@ -54,10 +54,12 @@ use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 mod production_domains;
 mod skill_canary;
+mod target_inventory;
 pub use production_domains::{
     ProductionDomainError, ProductionDomainRegistry, ProductionSshTarget,
     ProductionSshTransportFactory,
 };
+pub use target_inventory::{TargetInventory, TargetInventoryError, TargetRecord, TargetTransport};
 
 pub const API_VERSION: &str = "v1";
 
@@ -635,6 +637,8 @@ fn router_with_control_and_relay(
         .route("/control/v1/compose", get(compose_state))
         .route("/control/v1/explain", post(explain_state))
         .route("/control/v1/sync/plan", post(sync_plan))
+        .route("/control/v1/targets", get(list_targets))
+        .route("/control/v1/targets/select", post(select_targets))
         .route("/control/v1/verify", post(verify_target))
         .route(
             "/control/v1/credentials/readiness",
@@ -1262,6 +1266,7 @@ struct ControlPlaneInner {
     executor: Arc<dyn PlanExecutor>,
     scheduler_store: std::sync::RwLock<Option<Arc<SchedulerStore>>>,
     domains: std::sync::RwLock<HeadlessDomainRegistry>,
+    targets: std::sync::RwLock<Option<Arc<TargetInventory>>>,
 }
 
 impl ControlPlane {
@@ -1275,6 +1280,7 @@ impl ControlPlane {
                 executor,
                 scheduler_store: std::sync::RwLock::new(None),
                 domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
+                targets: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -1289,6 +1295,7 @@ impl ControlPlane {
                 executor,
                 scheduler_store: std::sync::RwLock::new(None),
                 domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
+                targets: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -1303,6 +1310,23 @@ impl ControlPlane {
 
     pub fn set_headless_domains(&self, domains: HeadlessDomainRegistry) {
         *self.inner.domains.write().expect("domain registry lock") = domains;
+    }
+
+    pub fn set_target_inventory(&self, inventory: Arc<TargetInventory>) {
+        *self.inner.targets.write().expect("target inventory lock") = Some(inventory);
+    }
+
+    pub fn targets(&self) -> Result<(Vec<TargetRecord>, Vec<StableId>), ControlError> {
+        let targets = self.inner.targets.read().expect("target inventory lock");
+        let inventory = targets.as_ref().ok_or(ControlError::TargetsUnavailable)?;
+        Ok((inventory.targets(), inventory.selected()))
+    }
+
+    pub fn select_targets(&self, selected: Vec<StableId>) -> Result<Vec<StableId>, ControlError> {
+        let targets = self.inner.targets.read().expect("target inventory lock");
+        let inventory = targets.as_ref().ok_or(ControlError::TargetsUnavailable)?;
+        inventory.select(selected)?;
+        Ok(inventory.selected())
     }
 
     pub fn scheduler_configuration(&self) -> Result<SchedulerConfig, SchedulerError> {
@@ -1498,6 +1522,10 @@ pub enum ControlError {
     InvalidIdempotencyKey,
     #[error("idempotency key is already bound to another plan")]
     IdempotencyConflict,
+    #[error("target inventory is unavailable")]
+    TargetsUnavailable,
+    #[error(transparent)]
+    TargetInventory(#[from] TargetInventoryError),
     #[error(transparent)]
     Contract(#[from] commonkit_contracts::ContractError),
     #[error(transparent)]
@@ -1509,6 +1537,33 @@ pub enum ControlError {
 struct ApplyRequest {
     confirmed: bool,
     confirmation_id: StableId,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SelectTargetsRequest {
+    targets: Vec<StableId>,
+    confirmed: bool,
+    confirmation_id: StableId,
+}
+
+async fn list_targets(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let (targets, selected) = state.control.targets().map_err(ApiError::from)?;
+    Ok(Json(
+        serde_json::json!({ "targets": targets, "selected": selected }),
+    ))
+}
+
+async fn select_targets(
+    State(state): State<ApiState>,
+    Json(request): Json<SelectTargetsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let selected = state
+        .control
+        .select_targets(request.targets)
+        .map_err(ApiError::from)?;
+    Ok(Json(serde_json::json!({ "selected": selected })))
 }
 
 async fn register_plan(
@@ -1652,6 +1707,8 @@ impl From<ControlError> for ApiError {
                 Self::bad_request("invalid_plan")
             }
             ControlError::PlanStore(_) => Self::internal("plan_store_failed"),
+            ControlError::TargetsUnavailable => Self::unavailable_code("targets_unavailable"),
+            ControlError::TargetInventory(_) => Self::bad_request("invalid_target_selection"),
         }
     }
 }
@@ -2726,6 +2783,9 @@ impl BoundServer {
         let drift_checker = Arc::new(SyncDomainDriftChecker::new(production_domains.sync.clone()));
         let skill_canary = production_domains.skill_canary.clone();
         let skills = skill_canary.as_ref().map(|runtime| runtime.engine());
+        if let Some(targets) = production_domains.targets.clone() {
+            control.set_target_inventory(targets);
+        }
         control.set_headless_domains(production_domains.into_headless());
         let scheduler_store = SchedulerStore::open(
             discovery_path

@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{LayerDocument, assert_no_embedded_secrets};
 use commonkit_platform::AppPaths;
@@ -28,6 +28,11 @@ enum Command {
     },
     /// Report local runtime paths and contract versions.
     Status,
+    /// List and select configured local and SSH targets.
+    Targets {
+        #[command(subcommand)]
+        command: TargetCommand,
+    },
     /// Compose ordered layer documents and emit normalized state.
     Compose {
         #[arg(long = "layer")]
@@ -90,6 +95,16 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum TargetCommand {
+    List,
+    Select {
+        targets: Vec<String>,
+        #[arg(long)]
+        confirmed: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum ScheduleCommand {
     Status,
     Enable {
@@ -143,6 +158,31 @@ struct InitArgs {
     target: String,
     #[arg(long)]
     target_root: PathBuf,
+    /// Desired-state provider used by this loadout.
+    #[arg(long, value_enum, default_value = "native")]
+    provider: InitProvider,
+    /// Exact provider version (required for APM and chezmoi).
+    #[arg(long)]
+    provider_version: Option<String>,
+    #[arg(long)]
+    provider_executable: Option<PathBuf>,
+    #[arg(long)]
+    apm_manifest: Option<PathBuf>,
+    #[arg(long)]
+    apm_lockfile: Option<PathBuf>,
+    #[arg(long)]
+    apm_policy: Option<PathBuf>,
+    #[arg(long)]
+    chezmoi_source: Option<PathBuf>,
+    #[arg(long)]
+    chezmoi_config: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum InitProvider {
+    Native,
+    Apm,
+    Chezmoi,
 }
 
 #[derive(Subcommand)]
@@ -431,11 +471,50 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Init {
             command: Some(command),
         } => {
-            use commonkit_cli::onboarding::{InitMode, InitRequest, ProcessRunner, initialize};
+            use commonkit_cli::onboarding::{
+                InitMode, InitRequest, ProcessRunner, ProviderSelection, initialize,
+            };
             let paths = AppPaths::discover()?;
             let (mode, args) = match command {
                 InitCommand::Create(args) => (InitMode::Create, args),
                 InitCommand::Connect(args) => (InitMode::Connect, args),
+            };
+            let provider = match args.provider {
+                InitProvider::Native => {
+                    if let Some(version) = &args.provider_version {
+                        if version != env!("CARGO_PKG_VERSION") {
+                            return Err(format!(
+                                "native provider version must be exactly {}",
+                                env!("CARGO_PKG_VERSION")
+                            )
+                            .into());
+                        }
+                    }
+                    ProviderSelection::Native
+                }
+                InitProvider::Apm => {
+                    require_pin(args.provider_version.as_deref(), "0.25.0", "APM")?;
+                    ProviderSelection::Apm {
+                        executable: required_path(
+                            args.provider_executable,
+                            "--provider-executable",
+                        )?,
+                        manifest: required_path(args.apm_manifest, "--apm-manifest")?,
+                        lockfile: required_path(args.apm_lockfile, "--apm-lockfile")?,
+                        policy: required_path(args.apm_policy, "--apm-policy")?,
+                    }
+                }
+                InitProvider::Chezmoi => {
+                    require_pin(args.provider_version.as_deref(), "2.70.4", "chezmoi")?;
+                    ProviderSelection::Chezmoi {
+                        executable: required_path(
+                            args.provider_executable,
+                            "--provider-executable",
+                        )?,
+                        source: required_path(args.chezmoi_source, "--chezmoi-source")?,
+                        config: required_path(args.chezmoi_config, "--chezmoi-config")?,
+                    }
+                }
             };
             let result = initialize(
                 &InitRequest {
@@ -447,6 +526,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     target_root: args.target_root,
                     config_directory: paths.config,
                     state_directory: paths.state,
+                    provider,
                 },
                 &ProcessRunner::from_path(),
             )?;
@@ -465,6 +545,29 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     "cacheDirectory": paths.cache,
                 }))?
             );
+        }
+        Command::Targets { command } => {
+            match command {
+                TargetCommand::List => {
+                    print_daemon(daemon_control("GET", "/control/v1/targets", None, None)?)?
+                }
+                TargetCommand::Select {
+                    confirmed: false, ..
+                } => {
+                    return Err("confirmation_required: pass --confirmed after reviewing the target selection".into());
+                }
+                TargetCommand::Select {
+                    targets,
+                    confirmed: true,
+                } => print_daemon(daemon_control(
+                    "POST",
+                    "/control/v1/targets/select",
+                    Some(
+                        json!({"targets":targets,"confirmed":true,"confirmationId":"cli-target-select"}),
+                    ),
+                    None,
+                )?)?,
+            }
         }
         Command::Compose { layers } => {
             if layers.is_empty() {
@@ -564,6 +667,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Skills { command } => run_skills(command)?,
     }
     Ok(())
+}
+
+fn required_path(value: Option<PathBuf>, flag: &str) -> Result<PathBuf, Box<dyn Error>> {
+    value.ok_or_else(|| format!("{flag} is required for the selected provider").into())
+}
+
+fn require_pin(found: Option<&str>, expected: &str, provider: &str) -> Result<(), Box<dyn Error>> {
+    match found {
+        Some(version) if version == expected => Ok(()),
+        _ => Err(
+            format!("{provider} provider version must be explicitly pinned to {expected}").into(),
+        ),
+    }
 }
 
 fn require_skill_confirmation(confirmed: bool) -> Result<(), Box<dyn Error>> {
