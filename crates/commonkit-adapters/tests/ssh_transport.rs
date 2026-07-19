@@ -31,6 +31,18 @@ fn content_digest(content: &[u8]) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(content))).unwrap()
 }
 
+fn known_hosts_fixture() -> PathBuf {
+    std::env::current_dir()
+        .expect("test process has an absolute working directory")
+        .join("target")
+        .join("ssh-transport-fixtures")
+        .join("known_hosts")
+}
+
+fn known_hosts_argument() -> String {
+    known_hosts_fixture().to_string_lossy().into_owned()
+}
+
 #[test]
 fn host_key_mismatch_fails_before_contacting_the_target() {
     let mut runner = FakeRunner::default();
@@ -86,7 +98,7 @@ fn unrelated_matching_pin_cannot_authorize_a_wrong_target_key() {
     assert_eq!(calls.len(), 2);
     assert_eq!(
         calls[0].1,
-        vec!["-F", "build.example.com", "-f", "/state/known_hosts"]
+        vec!["-F", "build.example.com", "-f", &known_hosts_argument()]
     );
 }
 
@@ -96,7 +108,7 @@ fn non_default_port_uses_bracketed_known_hosts_identity() {
         "build.example.com",
         "commonkit",
         2222,
-        PathBuf::from("/state/known_hosts"),
+        known_hosts_fixture(),
         "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     )
     .unwrap();
@@ -113,7 +125,12 @@ fn non_default_port_uses_bracketed_known_hosts_identity() {
     });
     assert_eq!(
         transport.into_runner().calls[0].1,
-        vec!["-F", "[build.example.com]:2222", "-f", "/state/known_hosts"]
+        vec![
+            "-F",
+            "[build.example.com]:2222",
+            "-f",
+            &known_hosts_argument(),
+        ]
     );
 }
 
@@ -257,7 +274,7 @@ fn config() -> OpenSshConfig {
         "build.example.com",
         "commonkit",
         22,
-        PathBuf::from("/state/known_hosts"),
+        known_hosts_fixture(),
         "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     )
     .unwrap()
@@ -300,7 +317,7 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
     assert_eq!(runner.calls[0].0, "ssh-keygen");
     assert_eq!(
         runner.calls[0].1,
-        vec!["-F", "build.example.com", "-f", "/state/known_hosts"]
+        vec!["-F", "build.example.com", "-f", &known_hosts_argument()]
     );
     assert_eq!(runner.calls[1].0, "ssh-keygen");
     assert_eq!(runner.calls[1].1, vec!["-lf", "-", "-E", "sha256"]);
@@ -338,6 +355,6 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
     assert!(runner.calls[2].1[10].starts_with("UserKnownHostsFile="));
     assert_ne!(
         runner.calls[2].1[8],
-        "UserKnownHostsFile=/state/known_hosts"
+        format!("UserKnownHostsFile={}", known_hosts_argument())
     );
 }
