@@ -141,6 +141,10 @@ pub enum SnapshotError {
     Interrupted,
     #[error("snapshot service lifecycle operation failed")]
     LifecycleFailed,
+    #[error("portable snapshot authority changed since it was reviewed")]
+    StalePortableAuthority,
+    #[error("portable snapshot authority references missing or rolled-back history")]
+    PortableAuthorityRollback,
 }
 
 /// Lifecycle coordination around database replacement. Implementations must not return from
@@ -215,6 +219,227 @@ pub struct AuthorityStore {
     root: PathBuf,
 }
 
+/// Portable, authenticated source of truth for a mutable database's single writer and accepted
+/// snapshot head. The `revision` returned alongside a record is the compare-and-swap token that a
+/// Git integration must bind to the repository revision it fetched. A push must use the fetched
+/// Git commit as its expected parent; a non-fast-forward push is the repository-level CAS failure.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PortableAuthorityRecord {
+    pub schema: String,
+    pub database: DatabaseId,
+    pub current_writer: String,
+    pub accepted_head: Option<String>,
+    pub accepted_descriptor: Option<String>,
+    pub generation: u64,
+    pub previous_revision: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VersionedPortableAuthority {
+    pub record: PortableAuthorityRecord,
+    pub revision: String,
+}
+
+pub struct PortableAuthorityStore<'a, C: AuthenticatedCipher> {
+    root: PathBuf,
+    cipher: &'a C,
+}
+
+struct PortableAuthorityLock(PathBuf);
+
+impl Drop for PortableAuthorityLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
+    pub fn open(root: impl Into<PathBuf>, cipher: &'a C) -> Result<Self, SnapshotError> {
+        let root = root.into();
+        std::fs::create_dir_all(root.join("authority"))
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        std::fs::create_dir_all(root.join("snapshots"))
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        Ok(Self { root, cipher })
+    }
+
+    fn path(&self, database: &DatabaseId) -> PathBuf {
+        self.root.join("authority").join(format!("{database}.json"))
+    }
+
+    fn lock(&self, database: &DatabaseId) -> Result<PortableAuthorityLock, SnapshotError> {
+        let path = self
+            .root
+            .join("authority")
+            .join(format!(".{database}.lock"));
+        for _ in 0..500 {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(_) => return Ok(PortableAuthorityLock(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => return Err(SnapshotError::ObjectStoreFailed),
+            }
+        }
+        Err(SnapshotError::StalePortableAuthority)
+    }
+
+    fn aad(database: &DatabaseId) -> String {
+        format!("commonkit.portable-snapshot-authority.v1\0{database}")
+    }
+
+    pub fn initialize(
+        &self,
+        database: &DatabaseId,
+        writer: &str,
+    ) -> Result<VersionedPortableAuthority, SnapshotError> {
+        if writer.is_empty() {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        let _lock = self.lock(database)?;
+        if self.path(database).exists() {
+            // The portable record is authoritative. A newly cloned machine commonly has a
+            // different local target ID and must not reinterpret that as initialization input.
+            return self.read_unlocked(database);
+        }
+        // A missing authority beside any portable descriptor is deletion/rollback, not a fresh kit.
+        if std::fs::read_dir(self.root.join("snapshots"))
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?
+            .next()
+            .is_some()
+        {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        let record = PortableAuthorityRecord {
+            schema: "commonkit.portable-snapshot-authority.v1".into(),
+            database: database.clone(),
+            current_writer: writer.into(),
+            accepted_head: None,
+            accepted_descriptor: None,
+            generation: 0,
+            previous_revision: None,
+        };
+        let revision = write_authenticated_envelope(
+            &self.path(database),
+            &record,
+            self.cipher,
+            Self::aad(database).as_bytes(),
+        )?;
+        Ok(VersionedPortableAuthority { record, revision })
+    }
+
+    pub fn read(&self, database: &DatabaseId) -> Result<VersionedPortableAuthority, SnapshotError> {
+        self.read_unlocked(database)
+    }
+
+    fn read_unlocked(
+        &self,
+        database: &DatabaseId,
+    ) -> Result<VersionedPortableAuthority, SnapshotError> {
+        let (record, revision): (PortableAuthorityRecord, String) = read_authenticated_envelope(
+            &self.path(database),
+            self.cipher,
+            Self::aad(database).as_bytes(),
+        )?;
+        if record.schema != "commonkit.portable-snapshot-authority.v1"
+            || record.database != *database
+            || record.current_writer.is_empty()
+            || record.accepted_head.is_some() != record.accepted_descriptor.is_some()
+            || (record.generation == 0 && record.previous_revision.is_some())
+            || (record.generation > 0 && record.previous_revision.is_none())
+        {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        if let Some(head) = &record.accepted_head {
+            validate_digest(head)?;
+        }
+        if let Some(previous_revision) = &record.previous_revision {
+            validate_digest(previous_revision)?;
+        }
+        if let Some(descriptor) = &record.accepted_descriptor {
+            validate_digest(descriptor)?;
+            let bytes = std::fs::read(
+                self.root
+                    .join("snapshots")
+                    .join(format!("{}.json", &descriptor[7..])),
+            )
+            .map_err(|_| SnapshotError::PortableAuthorityRollback)?;
+            if sha256(&bytes) != *descriptor {
+                return Err(SnapshotError::PortableAuthorityRollback);
+            }
+        }
+        Ok(VersionedPortableAuthority { record, revision })
+    }
+
+    pub fn compare_and_swap_writer(
+        &self,
+        database: &DatabaseId,
+        expected_revision: &str,
+        expected_writer: &str,
+        candidate_writer: &str,
+    ) -> Result<VersionedPortableAuthority, SnapshotError> {
+        self.compare_and_swap(database, expected_revision, |record| {
+            if record.current_writer != expected_writer || candidate_writer.is_empty() {
+                return Err(SnapshotError::StalePortableAuthority);
+            }
+            record.current_writer = candidate_writer.into();
+            Ok(())
+        })
+    }
+
+    pub fn compare_and_swap_head(
+        &self,
+        database: &DatabaseId,
+        expected_revision: &str,
+        writer: &str,
+        accepted_head: &str,
+        accepted_descriptor: &str,
+    ) -> Result<VersionedPortableAuthority, SnapshotError> {
+        validate_digest(accepted_head)?;
+        validate_digest(accepted_descriptor)?;
+        self.compare_and_swap(database, expected_revision, |record| {
+            if record.current_writer != writer {
+                return Err(SnapshotError::StalePortableAuthority);
+            }
+            record.accepted_head = Some(accepted_head.into());
+            record.accepted_descriptor = Some(accepted_descriptor.into());
+            Ok(())
+        })
+    }
+
+    fn compare_and_swap(
+        &self,
+        database: &DatabaseId,
+        expected_revision: &str,
+        update: impl FnOnce(&mut PortableAuthorityRecord) -> Result<(), SnapshotError>,
+    ) -> Result<VersionedPortableAuthority, SnapshotError> {
+        let _lock = self.lock(database)?;
+        let current = self.read_unlocked(database)?;
+        if current.revision != expected_revision {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
+        let mut record = current.record;
+        update(&mut record)?;
+        record.generation = record
+            .generation
+            .checked_add(1)
+            .ok_or(SnapshotError::TransactionIntegrity)?;
+        record.previous_revision = Some(current.revision);
+        let revision = write_authenticated_envelope(
+            &self.path(database),
+            &record,
+            self.cipher,
+            Self::aad(database).as_bytes(),
+        )?;
+        Ok(VersionedPortableAuthority { record, revision })
+    }
+}
+
 impl AuthorityStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, SnapshotError> {
         let root = root.into();
@@ -244,6 +469,22 @@ impl AuthorityStore {
 
     pub fn authority(&self, database: &DatabaseId) -> Result<Authority, SnapshotError> {
         read_envelope(&self.root.join(format!("authority-{database}.json"))).map(|pair| pair.0)
+    }
+
+    /// Updates the target-local cache from authenticated portable authority. This cache never
+    /// decides writer ownership; it exists only to preserve legacy promotion receipt recovery.
+    pub fn synchronize_from_portable(
+        &self,
+        database: &DatabaseId,
+        writer: &str,
+    ) -> Result<(), SnapshotError> {
+        write_envelope(
+            &self.root.join(format!("authority-{database}.json")),
+            &Authority::Writer {
+                target: writer.into(),
+            },
+        )
+        .map(|_| ())
     }
 
     pub fn promote(&self, plan: PromotionPlan) -> Result<PromotionReceipt, SnapshotError> {

@@ -26,8 +26,8 @@ use commonkit_reconcile::{
     Adapter, PlanStore, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
 };
 use commonkit_snapshots::{
-    AuthenticatedCipher, Authority, AuthorityStore, ConsistentBackup, DatabaseId,
-    DatabaseLifecycle, DurableRestore, ObjectStore, ProcessObjectCommandRunner, PromotionPlan,
+    AuthenticatedCipher, AuthorityStore, ConsistentBackup, DatabaseId, DatabaseLifecycle,
+    DurableRestore, ObjectStore, PortableAuthorityStore, ProcessObjectCommandRunner, PromotionPlan,
     RestoreFailpoint, RestorePlan, S3CompatibleObjectStore, SnapshotError, SnapshotManifest,
     SnapshotService, SqliteBackup, StaticBackup, XChaCha20Cipher, manifest_digest,
 };
@@ -769,13 +769,6 @@ impl ProductionDomainRegistry {
                         }
                         validate_lifecycle(&database.lifecycle)?;
                     }
-                    let authorities = AuthorityStore::open(config.root.join("authority"))
-                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-                    for database in databases.values() {
-                        authorities
-                            .initialize(&database.id, &database.target_id)
-                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-                    }
                     let domain = ProductionSnapshotDomain {
                         root: config.root,
                         portable_state: config.portable_state,
@@ -784,6 +777,24 @@ impl ProductionDomainRegistry {
                         databases,
                         lock: Mutex::new(()),
                     };
+                    let cipher = domain
+                        .cipher()
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    let portable = PortableAuthorityStore::open(&domain.portable_state, &cipher)
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    let local = AuthorityStore::open(domain.root.join("authority"))
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    for database in domain.databases.values() {
+                        let authority = portable
+                            .initialize(&database.id, &database.target_id)
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        local
+                            .synchronize_from_portable(
+                                &database.id,
+                                &authority.record.current_writer,
+                            )
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    }
                     domain.recover_unfinished()?;
                     Ok(Arc::new(domain))
                 },
@@ -1664,7 +1675,7 @@ impl ObjectStore for SnapshotObjects {
         }
     }
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredSnapshot {
     snapshot_id: StableId,
@@ -1908,14 +1919,66 @@ impl ProductionSnapshotDomain {
             }
             output.insert(stored.snapshot_id.clone(), stored);
         }
-        Ok(output.into_values().collect())
+        let all_manifests = output.into_values().collect::<Vec<_>>();
+        let authority_store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        let mut manifests = Vec::new();
+        for database in self.databases.values() {
+            let authority = authority_store
+                .read(&database.id)
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+            let mut by_content = all_manifests
+                .iter()
+                .filter(|stored| stored.manifest.database == database.id)
+                .map(|stored| (stored.manifest.content_digest.clone(), (*stored).clone()))
+                .collect::<BTreeMap<_, _>>();
+            if by_content.len()
+                != all_manifests
+                    .iter()
+                    .filter(|stored| stored.manifest.database == database.id)
+                    .count()
+            {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            let Some(mut cursor) = authority.record.accepted_head else {
+                // Unaccepted descriptors are interrupted/concurrent object-store or Git orphans,
+                // never history. They become visible only through an authority CAS.
+                continue;
+            };
+            let mut accepted = Vec::new();
+            let mut visited = BTreeSet::new();
+            loop {
+                if !visited.insert(cursor.clone()) {
+                    return Err(DomainFailure::VerificationFailed);
+                }
+                let stored = by_content
+                    .remove(&cursor)
+                    .ok_or(DomainFailure::VerificationFailed)?;
+                let parent = stored.manifest.parent_digest.clone();
+                accepted.push(stored);
+                match parent {
+                    Some(parent) => cursor = parent,
+                    None => break,
+                }
+            }
+            accepted.reverse();
+            manifests.extend(accepted);
+        }
+        if all_manifests.iter().any(|stored| {
+            !self
+                .databases
+                .contains_key(&stored.manifest.database.to_string())
+        }) {
+            return Err(DomainFailure::VerificationFailed);
+        }
+        Ok(manifests)
     }
 
     fn write_portable_descriptor(
         &self,
         stored: &StoredSnapshot,
         encrypted_manifest: &[u8],
-    ) -> Result<(), DomainFailure> {
+    ) -> Result<String, DomainFailure> {
         let encrypted_manifest_digest =
             Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(encrypted_manifest)))
                 .map_err(|_| DomainFailure::OperationFailed)?;
@@ -1940,7 +2003,7 @@ impl ProductionSnapshotDomain {
         }
         if destination.exists() {
             return (fs::read(destination).map_err(|_| DomainFailure::OperationFailed)? == bytes)
-                .then_some(())
+                .then_some(format!("sha256:{descriptor_digest}"))
                 .ok_or(DomainFailure::VerificationFailed);
         }
         let (mut temporary, temporary_path) = (0..16)
@@ -1964,11 +2027,11 @@ impl ProductionSnapshotDomain {
         }
         drop(temporary);
         match fs::rename(&temporary_path, &destination) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(format!("sha256:{descriptor_digest}")),
             Err(_) if destination.exists() => {
                 let _ = fs::remove_file(&temporary_path);
                 (fs::read(destination).map_err(|_| DomainFailure::OperationFailed)? == bytes)
-                    .then_some(())
+                    .then_some(format!("sha256:{descriptor_digest}"))
                     .ok_or(DomainFailure::VerificationFailed)
             }
             Err(_) => {
@@ -1978,19 +2041,15 @@ impl ProductionSnapshotDomain {
         }
     }
     fn writers(&self) -> Result<BTreeMap<String, String>, DomainFailure> {
-        let store = AuthorityStore::open(self.root.join("authority"))
+        let cipher = self.cipher()?;
+        let store = PortableAuthorityStore::open(&self.portable_state, &cipher)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let mut writers = BTreeMap::new();
         for (id, database) in &self.databases {
-            match store
-                .authority(&database.id)
-                .map_err(|_| DomainFailure::VerificationFailed)?
-            {
-                Authority::Writer { target } => {
-                    writers.insert(id.clone(), target);
-                }
-                Authority::Unassigned => return Err(DomainFailure::VerificationFailed),
-            }
+            let authority = store
+                .read(&database.id)
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+            writers.insert(id.clone(), authority.record.current_writer);
         }
         Ok(writers)
     }
@@ -2107,18 +2166,22 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .databases
             .get(&id)
             .ok_or(DomainFailure::InvalidRequest)?;
-        let authority = AuthorityStore::open(self.root.join("authority"))
-            .map_err(|_| DomainFailure::OperationFailed)?
-            .authority(&database.id)
-            .map_err(|_| DomainFailure::VerificationFailed)?;
-        let source_target = match authority {
-            Authority::Writer { target } => target,
-            Authority::Unassigned => return Err(DomainFailure::VerificationFailed),
-        };
-        let source_path = Self::database_path_for_target(database, &source_target)?;
         let cipher = self.cipher()?;
+        let portable_authority = PortableAuthorityStore::open(&self.portable_state, &cipher)
+            .map_err(|_| DomainFailure::OperationFailed)?
+            .read(&database.id)
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        let source_target = portable_authority.record.current_writer.clone();
+        let source_path = Self::database_path_for_target(database, &source_target)?;
         let service = SnapshotService::new(&cipher);
         let head = Self::validated_chain_head(self.manifests()?, &id)?;
+        if portable_authority.record.accepted_head.as_deref()
+            != head
+                .as_ref()
+                .map(|stored| stored.manifest.content_digest.as_str())
+        {
+            return Err(DomainFailure::VerificationFailed);
+        }
         let prior = head
             .as_ref()
             .map(|item| item.manifest.content_digest.clone());
@@ -2166,11 +2229,63 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         self.objects()?
             .put(&encrypted_object_digest, &encrypted_manifest)
             .map_err(|_| DomainFailure::OperationFailed)?;
-        self.write_portable_descriptor(&stored, &encrypted_manifest)?;
-        Ok(serde_json::json!({"snapshotId":snapshot_id,"databaseId":id}))
+        let descriptor_digest = self.write_portable_descriptor(&stored, &encrypted_manifest)?;
+        let authority_store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let updated_authority = match authority_store.compare_and_swap_head(
+            &database.id,
+            &portable_authority.revision,
+            &source_target,
+            &stored.manifest.content_digest,
+            &descriptor_digest,
+        ) {
+            Ok(authority) => authority,
+            Err(_) => {
+                // A descriptor is discoverable only when the authority CAS references it. Remove a
+                // losing local candidate; never remove a descriptor accepted by a concurrent winner.
+                let accepted = authority_store
+                    .read(&database.id)
+                    .ok()
+                    .and_then(|authority| authority.record.accepted_descriptor);
+                if accepted.as_deref() != Some(descriptor_digest.as_str()) {
+                    let _ = fs::remove_file(
+                        self.portable_state
+                            .join("snapshots")
+                            .join(format!("{}.json", &descriptor_digest[7..])),
+                    );
+                }
+                return Err(DomainFailure::VerificationFailed);
+            }
+        };
+        Ok(serde_json::json!({
+            "snapshotId":snapshot_id,
+            "databaseId":id,
+            "authorityRevision":updated_authority.revision,
+            "authorityGeneration":updated_authority.record.generation
+        }))
     }
     fn list(&self) -> Result<Value, DomainFailure> {
         let writers = self.writers()?;
+        let cipher = self.cipher()?;
+        let authority_store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let authority_revisions = self
+            .databases
+            .iter()
+            .map(|(id, database)| {
+                let authority = authority_store
+                    .read(&database.id)
+                    .map_err(|_| DomainFailure::VerificationFailed)?;
+                Ok((
+                    id.clone(),
+                    serde_json::json!({
+                        "revision":authority.revision,
+                        "generation":authority.record.generation,
+                        "acceptedHead":authority.record.accepted_head
+                    }),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, DomainFailure>>()?;
         let promotion_evidence = self
             .databases
             .iter()
@@ -2191,6 +2306,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         Ok(serde_json::json!({
             "snapshots":self.manifests()?,
             "writers":writers,
+            "authority":authority_revisions,
             "promotionEvidence":promotion_evidence
         }))
     }
@@ -2263,12 +2379,28 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         let target = request.target_id.ok_or(DomainFailure::InvalidRequest)?;
         let latest = Self::validated_chain_head(self.manifests()?, &id)?
             .ok_or(DomainFailure::InvalidRequest)?;
-        let current_writer = self
-            .writers()?
-            .remove(&id)
-            .ok_or(DomainFailure::VerificationFailed)?;
+        let cipher = self.cipher()?;
+        let portable_store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let portable_authority = portable_store
+            .read(&database.id)
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        if portable_authority.record.accepted_head.as_deref()
+            != Some(latest.manifest.content_digest.as_str())
+        {
+            return Err(DomainFailure::VerificationFailed);
+        }
+        let current_writer = portable_authority.record.current_writer.clone();
         let current_writer_digest = Self::observed_database_digest(database, &current_writer)?;
         let candidate_digest = Self::observed_database_digest(database, &target)?;
+        let updated_authority = portable_store
+            .compare_and_swap_writer(
+                &database.id,
+                &portable_authority.revision,
+                &current_writer,
+                &target,
+            )
+            .map_err(|_| DomainFailure::VerificationFailed)?;
         let receipt = AuthorityStore::open(self.root.join("authority"))
             .map_err(|_| DomainFailure::OperationFailed)?
             .promote(PromotionPlan {
@@ -2285,7 +2417,13 @@ impl SnapshotDomain for ProductionSnapshotDomain {
                 candidate_digest,
             })
             .map_err(|_| DomainFailure::VerificationFailed)?;
-        Ok(serde_json::json!({"databaseId":id,"writer":target,"receipt":receipt}))
+        Ok(serde_json::json!({
+            "databaseId":id,
+            "writer":target,
+            "authorityRevision":updated_authority.revision,
+            "authorityGeneration":updated_authority.record.generation,
+            "receipt":receipt
+        }))
     }
 }
 
