@@ -11,8 +11,7 @@ use crate::{
 };
 
 const CLIENT_PROVIDER_ID: &str = "commonkit-relay-client";
-const CLIENT_PROVIDER_VERSION: &str = "1.1.0";
-const RELAY_TOKEN_ENV_VAR: &str = "COMMONKIT_RELAY_TOKEN";
+const CLIENT_PROVIDER_VERSION: &str = "2.0.0";
 
 #[derive(Debug, Error)]
 pub enum McpClientMaterializationError {
@@ -42,23 +41,24 @@ struct CapabilityBinding<'a> {
 }
 
 #[derive(Serialize)]
-struct ClaudeClient<'a> {
+struct ClaudeClient {
     #[serde(rename = "mcpServers")]
-    mcp_servers: BTreeMap<&'static str, ClaudeServer<'a>>,
+    mcp_servers: BTreeMap<&'static str, ClaudeServer>,
 }
 
 #[derive(Serialize)]
-struct ClaudeServer<'a> {
+struct ClaudeServer {
     #[serde(rename = "type")]
     transport_type: &'static str,
-    url: &'a str,
-    headers: BTreeMap<&'static str, &'static str>,
+    command: &'static str,
+    args: [&'static str; 1],
 }
 
 /// Converts verified provider MCP capabilities into portable client files.
 ///
-/// These resources deliberately contain only the target-local relay endpoint;
-/// upstream URLs and credential references remain isolated in relay state.
+/// These resources launch CommonKit's local stdio bridge. The bridge discovers
+/// the target-local relay and reads its private installation token at runtime;
+/// no endpoint credentials enter portable client files.
 /// The returned state can be fed directly to the normal provider plan, so its
 /// artifacts, ownership, receipt, verification, and rollback are durable.
 pub fn materialize_mcp_client_state(
@@ -110,16 +110,15 @@ pub fn materialize_mcp_client_state(
         mcp_servers: BTreeMap::from([(
             "commonkit-relay",
             ClaudeServer {
-                transport_type: "streamable-http",
-                url: relay_endpoint,
-                headers: BTreeMap::from([("Authorization", "Bearer ${COMMONKIT_RELAY_TOKEN}")]),
+                transport_type: "stdio",
+                command: "commonkit",
+                args: ["relay-client"],
             },
         )]),
     })?;
-    let codex = format!(
-        "[mcp_servers.\"commonkit-relay\"]\nurl = \"{relay_endpoint}\"\nbearer_token_env_var = \"{RELAY_TOKEN_ENV_VAR}\"\n"
-    )
-    .into_bytes();
+    let codex =
+        b"[mcp_servers.\"commonkit-relay\"]\ncommand = \"commonkit\"\nargs = [\"relay-client\"]\n"
+            .to_vec();
     let resources = [
         (".mcp.json", claude, "provider-mcp -> claude relay client"),
         (

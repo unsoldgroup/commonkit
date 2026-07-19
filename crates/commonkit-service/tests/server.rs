@@ -79,12 +79,18 @@ fn generated_relay_authorization(
         .collect::<BTreeMap<_, _>>();
     let claude: serde_json::Value =
         serde_json::from_slice(files["home/.mcp.json"].as_slice()).unwrap();
-    let template = claude["mcpServers"]["commonkit-relay"]["headers"]["Authorization"]
-        .as_str()
-        .unwrap();
+    assert_eq!(
+        claude["mcpServers"]["commonkit-relay"]["command"],
+        "commonkit"
+    );
+    assert_eq!(
+        claude["mcpServers"]["commonkit-relay"]["args"],
+        serde_json::json!(["relay-client"])
+    );
     let codex = String::from_utf8(files["home/.codex/config.toml"].clone()).unwrap();
-    assert!(codex.contains("bearer_token_env_var = \"COMMONKIT_RELAY_TOKEN\""));
-    template.replace("${COMMONKIT_RELAY_TOKEN}", token)
+    assert!(codex.contains("command = \"commonkit\""));
+    assert!(codex.contains("args = [\"relay-client\"]"));
+    format!("Bearer {token}")
 }
 
 #[tokio::test]

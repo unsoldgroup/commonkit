@@ -22,6 +22,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Internal authenticated stdio bridge used by generated MCP clients.
+    #[command(hide = true)]
+    RelayClient,
     /// Initialize CommonKit's local private runtime directories.
     Init {
         #[command(subcommand)]
@@ -491,6 +494,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
+        Command::RelayClient => run_relay_client()?,
         Command::Init { command: None } => {
             let paths = AppPaths::discover()?;
             paths.create_private_roots()?;
@@ -760,6 +764,100 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Skills { command } => run_skills(command)?,
     }
     Ok(())
+}
+
+fn run_relay_client() -> Result<(), Box<dyn Error>> {
+    use std::io::{Read, Write};
+
+    const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+    let paths = AppPaths::discover()?;
+    let discovery: commonkit_service::DaemonDiscovery = serde_json::from_slice(
+        &std::fs::read(paths.state.join("daemon.json"))
+            .map_err(|_| "relay_unavailable: CommonKit daemon discovery is unavailable")?,
+    )?;
+    let relay_port = discovery
+        .relay_port
+        .ok_or("relay_unavailable: CommonKit relay is not running")?;
+    let token = commonkit_service::ControlToken::load(&paths.config.join("control.token"))?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let endpoint = format!("http://127.0.0.1:{relay_port}/mcp");
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    loop {
+        let Some(message) = read_bounded_line(&mut input, MAX_MESSAGE_BYTES)? else {
+            break;
+        };
+        if message.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        serde_json::from_slice::<Value>(&message)
+            .map_err(|_| "relay_client_invalid_message: stdin must contain JSON-RPC lines")?;
+        let mut response = client
+            .post(&endpoint)
+            .bearer_auth(token.expose_for_client())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json")
+            .body(message)
+            .send()
+            .map_err(|_| "relay_unavailable: authenticated relay request failed")?;
+        if !response.status().is_success() {
+            return Err(format!(
+                "relay_unavailable: relay returned HTTP {}",
+                response.status().as_u16()
+            )
+            .into());
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_MESSAGE_BYTES as u64)
+        {
+            return Err("relay_client_response_too_large".into());
+        }
+        let mut body = Vec::new();
+        response
+            .by_ref()
+            .take((MAX_MESSAGE_BYTES + 1) as u64)
+            .read_to_end(&mut body)?;
+        if body.len() > MAX_MESSAGE_BYTES {
+            return Err("relay_client_response_too_large".into());
+        }
+        output.write_all(&body)?;
+        if !body.ends_with(b"\n") {
+            output.write_all(b"\n")?;
+        }
+        output.flush()?;
+    }
+    Ok(())
+}
+
+fn read_bounded_line(
+    input: &mut impl std::io::BufRead,
+    maximum: usize,
+) -> Result<Option<Vec<u8>>, Box<dyn Error>> {
+    let mut line = Vec::new();
+    loop {
+        let available = input.fill_buf()?;
+        if available.is_empty() {
+            return Ok((!line.is_empty()).then_some(line));
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |position| position + 1);
+        if line.len().saturating_add(take) > maximum {
+            return Err("relay_client_message_too_large".into());
+        }
+        line.extend_from_slice(&available[..take]);
+        input.consume(take);
+        if line.ends_with(b"\n") {
+            return Ok(Some(line));
+        }
+    }
 }
 
 fn run_daemon_lifecycle(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
