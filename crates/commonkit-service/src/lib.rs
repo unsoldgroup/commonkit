@@ -37,8 +37,10 @@ use commonkit_relay::{
     converge_provider_mcp, plan_relay_operation,
 };
 use commonkit_skills::{
-    Approval as SkillApproval, EvidenceImport, PromotionPlan, PromotionReceipt, ScheduleKind,
-    SkillEngine, SkillSchedule,
+    Approval as SkillApproval, EvidenceImport, PromotionPlan, PromotionReceipt,
+    ProviderUpgradeReport, ScheduleKind, SkillEngine, SkillOptBackend, SkillOptProviderConfig,
+    SkillOptProviderManager, SkillOptSleepOptimizer, SkillSchedule, UpgradeApproval,
+    check_skillopt_provider,
 };
 use futures_util::StreamExt;
 use rand::RngCore;
@@ -667,6 +669,19 @@ fn router_with_control_and_relay(
             "/control/v1/skills/opportunities",
             post(skill_opportunities),
         )
+        .route("/control/v1/skills/optimize", post(skill_optimize))
+        .route(
+            "/control/v1/skills/provider/check",
+            post(skill_provider_check),
+        )
+        .route(
+            "/control/v1/skills/provider/upgrade",
+            post(skill_provider_upgrade),
+        )
+        .route(
+            "/control/v1/skills/provider/activate",
+            post(skill_provider_activate),
+        )
         .route(
             "/control/v1/skills/promotions/apply",
             post(skill_promotion_apply),
@@ -1125,7 +1140,7 @@ impl DriftChecker for SyncDomainDriftChecker {
     fn check(&self) -> DriftResult {
         let Some(domain) = &self.domain else {
             return DriftResult {
-                state: OverallState::Error,
+                state: OverallState::Degraded,
                 code: Some("sync_domain_unconfigured".into()),
             };
         };
@@ -1139,7 +1154,7 @@ impl DriftChecker for SyncDomainDriftChecker {
                 code: Some("managed_state_drifted".into()),
             },
             Err(_) => DriftResult {
-                state: OverallState::Error,
+                state: OverallState::Degraded,
                 code: Some("drift_check_failed".into()),
             },
         }
@@ -1760,6 +1775,138 @@ async fn skill_opportunities(
     Ok(Json(serde_json::to_value(opportunities).map_err(|_| {
         ApiError::internal("skill_opportunities_failed")
     })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillOptimizeRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    manifest: commonkit_contracts::SkillOptimizationManifest,
+    suite: commonkit_contracts::SkillEvaluationSuite,
+    environment: PathBuf,
+    tasks: PathBuf,
+    harness: PathBuf,
+    corpus: PathBuf,
+    backend: String,
+    model: Option<String>,
+}
+
+async fn skill_optimize(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillOptimizeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let backend = match request.backend.as_str() {
+        "mock" => SkillOptBackend::Mock,
+        "claude" => SkillOptBackend::Claude,
+        "codex" => SkillOptBackend::Codex,
+        "handoff" => SkillOptBackend::Handoff,
+        "azure_openai" => SkillOptBackend::AzureOpenAi,
+        _ => return Err(ApiError::bad_request("invalid_skillopt_backend")),
+    };
+    let optimizer = SkillOptSleepOptimizer::new(SkillOptProviderConfig {
+        environment_root: request.environment,
+        provider_lock: request.manifest.provider.clone(),
+        backend,
+        model: request.model,
+        tasks_file: request.tasks,
+        harness_executable: request.harness,
+        harness_corpus: request.corpus,
+        environment: BTreeMap::new(),
+        timeout_seconds: request.manifest.limits.timeout_seconds,
+    })
+    .map_err(|_| ApiError::bad_request("skillopt_provider_rejected"))?;
+    let candidate = state
+        .skills
+        .ok_or_else(|| ApiError::unavailable_code("skills_unavailable"))?
+        .optimize(&request.manifest, &request.suite, &optimizer)
+        .map_err(|_| ApiError::conflict("skill_optimization_rejected"))?;
+    Ok(Json(serde_json::to_value(candidate).map_err(|_| {
+        ApiError::internal("skill_optimization_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillProviderCheckRequest {
+    environment: PathBuf,
+    provider_lock: commonkit_contracts::ProviderLock,
+}
+
+async fn skill_provider_check(
+    Json(request): Json<SkillProviderCheckRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let check = check_skillopt_provider(&request.environment, &request.provider_lock)
+        .map_err(|_| ApiError::bad_request("skillopt_provider_rejected"))?;
+    Ok(Json(serde_json::to_value(check).map_err(|_| {
+        ApiError::internal("skillopt_provider_check_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillProviderUpgradeRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    uv: PathBuf,
+    root: PathBuf,
+    provider_lock: commonkit_contracts::ProviderLock,
+    fixtures: PathBuf,
+    harness: PathBuf,
+    corpus: PathBuf,
+}
+
+async fn skill_provider_upgrade(
+    Json(request): Json<SkillProviderUpgradeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let manager = SkillOptProviderManager::open(request.uv, request.root)
+        .and_then(|manager| manager.with_harness(request.harness, request.corpus))
+        .map_err(|_| ApiError::bad_request("skillopt_provider_upgrade_rejected"))?;
+    let plan = manager
+        .plan_upgrade(request.provider_lock, request.fixtures)
+        .map_err(|_| ApiError::bad_request("skillopt_provider_upgrade_rejected"))?;
+    let report = manager
+        .execute_upgrade(&plan)
+        .map_err(|_| ApiError::conflict("skillopt_provider_upgrade_failed"))?;
+    Ok(Json(serde_json::to_value(report).map_err(|_| {
+        ApiError::internal("skillopt_provider_upgrade_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillProviderActivateRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    uv: PathBuf,
+    root: PathBuf,
+    report: ProviderUpgradeReport,
+    approver: StableId,
+    approved_at_unix_ms: u64,
+    reason: String,
+    active_lock: PathBuf,
+}
+
+async fn skill_provider_activate(
+    Json(request): Json<SkillProviderActivateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    SkillOptProviderManager::open(request.uv, request.root)
+        .and_then(|manager| {
+            manager.activate_upgrade(
+                &request.report,
+                UpgradeApproval {
+                    approver: request.approver,
+                    approved_at_unix_ms: request.approved_at_unix_ms,
+                    reason: request.reason,
+                },
+                request.active_lock,
+            )
+        })
+        .map_err(|_| ApiError::conflict("skillopt_provider_activation_rejected"))?;
+    Ok(Json(serde_json::json!({"activated": true})))
 }
 
 #[derive(Deserialize)]

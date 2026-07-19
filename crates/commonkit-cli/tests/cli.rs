@@ -42,6 +42,39 @@ fn reports_versioned_machine_readable_status() {
 }
 
 #[test]
+fn init_exposes_create_connect_and_rejects_malformed_repository_before_gh() {
+    let help = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["init", "--help"])
+        .output()
+        .expect("init help");
+    let help = String::from_utf8(help.stdout).expect("utf8");
+    assert!(help.contains("create"));
+    assert!(help.contains("connect"));
+    let root = temporary_directory("invalid-onboarding");
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args([
+            "init",
+            "create",
+            "--repository",
+            "not/a/valid/repository",
+            "--kit-directory",
+        ])
+        .arg(root.join("kit"))
+        .args([
+            "--loadout",
+            "personal",
+            "--target",
+            "local",
+            "--target-root",
+        ])
+        .arg(root.join("target"))
+        .output()
+        .expect("invalid init");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("repository"));
+}
+
+#[test]
 fn composes_layers_and_explains_the_winning_value() {
     let directory = temporary_directory("cli-compose");
     fs::create_dir_all(&directory).expect("directory");
@@ -156,7 +189,7 @@ fn mutations_require_an_explicit_confirmation_flag() {
 }
 
 #[test]
-fn skill_schedule_is_explicit_and_persistent() {
+fn skill_schedule_mutation_requires_confirmation_and_daemon_authority() {
     let directory = temporary_directory("cli-skill-schedule");
     fs::create_dir_all(directory.join(".agents/skills/review")).expect("skills");
     fs::write(
@@ -198,26 +231,14 @@ fn skill_schedule_is_explicit_and_persistent() {
         ])
         .output()
         .expect("enable");
-    assert!(
-        enabled.status.success(),
-        "{}",
-        String::from_utf8_lossy(&enabled.stderr)
-    );
-    let status = Command::new(env!("CARGO_BIN_EXE_commonkit"))
-        .args(["skills", "schedule", "status", "--repository"])
-        .arg(&directory)
-        .arg("--state")
-        .arg(&state)
-        .output()
-        .expect("status");
-    let status: Value = serde_json::from_slice(&status.stdout).expect("json");
-    assert_eq!(status["schedule"]["kind"], "candidate_generation");
+    assert!(!enabled.status.success());
+    assert!(String::from_utf8_lossy(&enabled.stderr).contains("daemon_unavailable"));
     fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[cfg(unix)]
 #[test]
-fn checks_the_external_skillopt_provider_lock() {
+fn provider_check_converges_through_daemon_authority() {
     let directory = temporary_directory("cli-provider");
     let environment = directory.join("provider");
     fs::create_dir_all(environment.join("bin")).expect("bin");
@@ -245,10 +266,7 @@ fn checks_the_external_skillopt_provider_lock() {
         .arg(&lock_path)
         .output()
         .expect("check");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("daemon_unavailable"));
     fs::remove_dir_all(directory).expect("cleanup");
 }

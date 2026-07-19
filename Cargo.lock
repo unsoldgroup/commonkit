@@ -388,14 +388,18 @@ name = "commonkit-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "commonkit-adapters",
  "commonkit-config",
  "commonkit-contracts",
  "commonkit-platform",
+ "commonkit-reconcile",
  "commonkit-service",
  "commonkit-skills",
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

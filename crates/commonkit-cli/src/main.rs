@@ -5,11 +5,7 @@ use clap::{Parser, Subcommand};
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{LayerDocument, assert_no_embedded_secrets};
 use commonkit_platform::AppPaths;
-use commonkit_skills::{
-    Approval, EvidenceImport, PromotionPlan, PromotionReceipt, ProviderUpgradeReport, ScheduleKind,
-    SkillEngine, SkillOptBackend, SkillOptProviderConfig, SkillOptProviderManager,
-    SkillOptSleepOptimizer, SkillSchedule, UpgradeApproval, check_skillopt_provider,
-};
+use commonkit_skills::{PromotionPlan, PromotionReceipt, ProviderUpgradeReport, ScheduleKind};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -26,7 +22,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Initialize CommonKit's local private runtime directories.
-    Init,
+    Init {
+        #[command(subcommand)]
+        command: Option<InitCommand>,
+    },
     /// Report local runtime paths and contract versions.
     Status,
     /// Compose ordered layer documents and emit normalized state.
@@ -80,6 +79,26 @@ enum Command {
         #[command(subcommand)]
         command: SkillsCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum InitCommand {
+    Create(InitArgs),
+    Connect(InitArgs),
+}
+
+#[derive(clap::Args)]
+struct InitArgs {
+    #[arg(long)]
+    repository: String,
+    #[arg(long)]
+    kit_directory: PathBuf,
+    #[arg(long)]
+    loadout: String,
+    #[arg(long)]
+    target: String,
+    #[arg(long)]
+    target_root: PathBuf,
 }
 
 #[derive(Subcommand)]
@@ -336,7 +355,7 @@ fn main() {
 
 fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     match cli.command {
-        Command::Init => {
+        Command::Init { command: None } => {
             let paths = AppPaths::discover()?;
             paths.create_private_roots()?;
             println!(
@@ -348,6 +367,30 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     "cacheDirectory": paths.cache,
                 }))?
             );
+        }
+        Command::Init {
+            command: Some(command),
+        } => {
+            use commonkit_cli::onboarding::{InitMode, InitRequest, ProcessRunner, initialize};
+            let paths = AppPaths::discover()?;
+            let (mode, args) = match command {
+                InitCommand::Create(args) => (InitMode::Create, args),
+                InitCommand::Connect(args) => (InitMode::Connect, args),
+            };
+            let result = initialize(
+                &InitRequest {
+                    mode,
+                    repository: args.repository,
+                    kit_directory: args.kit_directory,
+                    loadout: args.loadout,
+                    target: args.target,
+                    target_root: args.target_root,
+                    config_directory: paths.config,
+                    state_directory: paths.state,
+                },
+                &ProcessRunner::from_path(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         Command::Status => {
             let paths = AppPaths::discover()?;
@@ -475,28 +518,41 @@ fn require_skill_confirmation(confirmed: bool) -> Result<(), Box<dyn Error>> {
 fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
     match command {
         SkillsCommand::List { repository, state } => {
-            print_json(&SkillEngine::open(repository, state)?.inventory()?)?
+            let _ = (repository, state);
+            print_daemon(daemon_control("GET", "/control/v1/skills", None, None)?)?
         }
         SkillsCommand::Candidate { command } => match command {
             CandidateCommand::List { repository, state } => {
-                print_json(&SkillEngine::open(repository, state)?.candidates()?)?
+                let _ = (repository, state);
+                print_daemon(daemon_control(
+                    "GET",
+                    "/control/v1/skills/candidates",
+                    None,
+                    None,
+                )?)?
             }
             CandidateCommand::Show {
                 repository,
                 state,
                 id,
-            } => print_json(
-                &SkillEngine::open(repository, state)?
-                    .candidate(&commonkit_contracts::StableId::parse(id)?)?,
-            )?,
+            } => {
+                let _ = (repository, state);
+                print_daemon(daemon_control(
+                    "GET",
+                    &format!("/control/v1/skills/candidates/{id}"),
+                    None,
+                    None,
+                )?)?
+            }
         },
         SkillsCommand::Evidence { command } => match command {
             EvidenceCommand::Preview { file } => {
-                let scratch = std::env::temp_dir()
-                    .join(format!("commonkit-evidence-preview-{}", std::process::id()));
-                let engine = SkillEngine::open(std::env::current_dir()?, &scratch)?;
-                print_json(&engine.preview_evidence(&std::fs::read(file)?)?)?;
-                let _ = std::fs::remove_dir_all(scratch);
+                print_daemon(daemon_control(
+                    "POST",
+                    "/control/v1/skills/evidence/preview",
+                    Some(json!({"content":String::from_utf8(std::fs::read(file)?)?})),
+                    None,
+                )?)?;
             }
             EvidenceCommand::Import {
                 repository,
@@ -510,24 +566,34 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
                 file,
             } => {
                 require_skill_confirmation(confirmed)?;
-                let engine = SkillEngine::open(repository, state)?;
-                print_json(&engine.import_evidence(EvidenceImport {
-                    skill_id: commonkit_contracts::StableId::parse(skill)?,
-                    source_kind: parse_evidence_source(&source_kind)?,
-                    consent: parse_evidence_consent(&consent)?,
-                    retention: commonkit_contracts::EvidenceRetention {
-                        delete_after_unix_ms,
-                    },
-                    created_at_unix_ms,
-                    bytes: std::fs::read(file)?,
-                })?)?;
+                let _ = (repository, state);
+                print_daemon(daemon_control(
+                    "POST",
+                    "/control/v1/skills/evidence/import",
+                    Some(json!({
+                        "confirmed": true, "confirmationId": nonce("skill-evidence"), "skillId": skill,
+                        "sourceKind": source_kind, "consent": consent,
+                        "retention": {"deleteAfterUnixMs": delete_after_unix_ms},
+                        "createdAtUnixMs": created_at_unix_ms,
+                        "content": String::from_utf8(std::fs::read(file)?)?,
+                    })),
+                    None,
+                )?)?;
             }
         },
         SkillsCommand::Opportunities {
             repository,
             state,
             minimum_evidence,
-        } => print_json(&SkillEngine::open(repository, state)?.opportunities(minimum_evidence)?)?,
+        } => {
+            let _ = (repository, state);
+            print_daemon(daemon_control(
+                "POST",
+                "/control/v1/skills/opportunities",
+                Some(json!({"minimumEvidence":minimum_evidence})),
+                None,
+            )?)?
+        }
         SkillsCommand::Optimize {
             repository,
             state,
@@ -545,20 +611,17 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
             let manifest: commonkit_contracts::SkillOptimizationManifest =
                 read_json_file(&manifest)?;
             let suite: commonkit_contracts::SkillEvaluationSuite = read_json_file(&suite)?;
-            let optimizer = SkillOptSleepOptimizer::new(SkillOptProviderConfig {
-                environment_root: environment,
-                provider_lock: manifest.provider.clone(),
-                backend: parse_backend(&backend)?,
-                model,
-                tasks_file: tasks,
-                harness_executable: harness,
-                harness_corpus: corpus,
-                environment: provider_environment(),
-                timeout_seconds: manifest.limits.timeout_seconds,
-            })?;
-            print_json(
-                &SkillEngine::open(repository, state)?.optimize(&manifest, &suite, &optimizer)?,
-            )?;
+            let _ = (repository, state);
+            print_daemon(daemon_control(
+                "POST",
+                "/control/v1/skills/optimize",
+                Some(json!({
+                    "confirmed": true, "confirmationId": nonce("skill-optimize"), "manifest": manifest,
+                    "suite": suite, "environment": environment, "tasks": tasks, "harness": harness,
+                    "corpus": corpus, "backend": backend, "model": model,
+                })),
+                None,
+            )?)?;
         }
         SkillsCommand::Promote {
             repository,
@@ -570,14 +633,15 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
             confirmed,
         } => {
             require_skill_confirmation(confirmed)?;
-            print_json(&SkillEngine::open(repository, state)?.plan_promotion(
-                &commonkit_contracts::StableId::parse(candidate)?,
-                Approval {
-                    approver: commonkit_contracts::StableId::parse(approver)?,
-                    approved_at_unix_ms: now_unix_ms()?,
-                    reason,
-                },
-                commonkit_contracts::GitRevision::parse(repository_revision)?,
+            let _ = (repository, state);
+            print_daemon(daemon_control(
+                "POST",
+                &format!("/control/v1/skills/candidates/{candidate}/promotion-plans"),
+                Some(json!({
+                    "confirmed": true, "confirmationId": nonce("skill-promote"), "repositoryRevision": repository_revision,
+                    "approval": {"approver": approver, "approvedAtUnixMs": now_unix_ms()?, "reason": reason}
+                })),
+                None,
             )?)?;
         }
         SkillsCommand::ApplyPromotion {
@@ -587,13 +651,15 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
             confirmed,
         } => {
             require_skill_confirmation(confirmed)?;
-            print_json(
-                &SkillEngine::open(repository, state)?.apply_promotion(&read_json_file::<
-                    PromotionPlan,
-                >(
-                    &plan
-                )?)?,
-            )?;
+            let _ = (repository, state);
+            print_daemon(daemon_control(
+                "POST",
+                "/control/v1/skills/promotions/apply",
+                Some(
+                    json!({"confirmed":true,"confirmationId":nonce("skill-apply"),"plan":read_json_file::<PromotionPlan>(&plan)?}),
+                ),
+                None,
+            )?)?;
         }
         SkillsCommand::Rollback {
             repository,
@@ -602,21 +668,27 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
             confirmed,
         } => {
             require_skill_confirmation(confirmed)?;
-            print_json(
-                &SkillEngine::open(repository, state)?.rollback_promotion(&read_json_file::<
-                    PromotionReceipt,
-                >(
-                    &receipt
-                )?)?,
-            )?;
+            let _ = (repository, state);
+            print_daemon(daemon_control(
+                "POST",
+                "/control/v1/skills/promotions/rollback",
+                Some(
+                    json!({"confirmed":true,"confirmationId":nonce("skill-rollback"),"receipt":read_json_file::<PromotionReceipt>(&receipt)?}),
+                ),
+                None,
+            )?)?;
         }
         SkillsCommand::Provider { command } => match command {
             ProviderCommand::Check {
                 environment,
                 lock_file,
-            } => print_json(&check_skillopt_provider(
-                &environment,
-                &read_json_file(&lock_file)?,
+            } => print_daemon(daemon_control(
+                "POST",
+                "/control/v1/skills/provider/check",
+                Some(
+                    json!({"environment":environment,"providerLock":read_json_file::<commonkit_contracts::ProviderLock>(&lock_file)?}),
+                ),
+                None,
             )?)?,
             ProviderCommand::Upgrade {
                 uv,
@@ -629,13 +701,16 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
                 confirmed,
             } => {
                 require_skill_confirmation(confirmed)?;
-                let manager =
-                    SkillOptProviderManager::open(uv, root)?.with_harness(harness, corpus)?;
-                let result = manager.execute_upgrade(
-                    &manager.plan_upgrade(read_json_file(&lock_file)?, fixtures)?,
+                let result = daemon_control(
+                    "POST",
+                    "/control/v1/skills/provider/upgrade",
+                    Some(
+                        json!({"confirmed":true,"confirmationId":nonce("skill-provider-upgrade"),"uv":uv,"root":root,"providerLock":read_json_file::<commonkit_contracts::ProviderLock>(&lock_file)?,"fixtures":fixtures,"harness":harness,"corpus":corpus}),
+                    ),
+                    None,
                 )?;
                 std::fs::write(report, serde_json::to_vec_pretty(&result)?)?;
-                print_json(&result)?;
+                print_daemon(result)?;
             }
             ProviderCommand::Activate {
                 uv,
@@ -647,23 +722,26 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
                 confirmed,
             } => {
                 require_skill_confirmation(confirmed)?;
-                let manager = SkillOptProviderManager::open(uv, root)?;
                 let report: ProviderUpgradeReport = read_json_file(&report)?;
-                manager.activate_upgrade(
-                    &report,
-                    UpgradeApproval {
-                        approver: commonkit_contracts::StableId::parse(approver)?,
-                        approved_at_unix_ms: now_unix_ms()?,
-                        reason,
-                    },
-                    active_lock,
-                )?;
-                print_json(&json!({"activated": true, "provider": report.provider_lock}))?;
+                print_daemon(daemon_control(
+                    "POST",
+                    "/control/v1/skills/provider/activate",
+                    Some(
+                        json!({"confirmed":true,"confirmationId":nonce("skill-provider-activate"),"uv":uv,"root":root,"report":report,"approver":approver,"approvedAtUnixMs":now_unix_ms()?,"reason":reason,"activeLock":active_lock}),
+                    ),
+                    None,
+                )?)?;
             }
         },
         SkillsCommand::Schedule { command } => match command {
             SkillScheduleCommand::Status { repository, state } => {
-                print_json(&SkillEngine::open(repository, state)?.schedule_status()?)?
+                let _ = (repository, state);
+                print_daemon(daemon_control(
+                    "GET",
+                    "/control/v1/skills/schedule",
+                    None,
+                    None,
+                )?)?
             }
             SkillScheduleCommand::Enable {
                 repository,
@@ -679,13 +757,14 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
                     "candidate_generation" => ScheduleKind::CandidateGeneration,
                     _ => return Err(format!("unsupported schedule kind: {kind}").into()),
                 };
-                print_json(&SkillEngine::open(repository, state)?.configure_schedule(
-                    SkillSchedule {
-                        kind,
-                        enabled: true,
-                        interval_seconds,
-                        maximum_cost_micros_per_period: maximum_cost_micros,
-                    },
+                let _ = (repository, state);
+                print_daemon(daemon_control(
+                    "POST",
+                    "/control/v1/skills/schedule",
+                    Some(
+                        json!({"confirmed":true,"confirmationId":nonce("skill-schedule"),"enabled":true,"kind":kind,"intervalSeconds":interval_seconds,"maximumCostMicrosPerPeriod":maximum_cost_micros}),
+                    ),
+                    None,
                 )?)?;
             }
             SkillScheduleCommand::Disable {
@@ -694,64 +773,23 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
                 confirmed,
             } => {
                 require_skill_confirmation(confirmed)?;
-                print_json(&SkillEngine::open(repository, state)?.disable_schedule()?)?;
+                let _ = (repository, state);
+                print_daemon(daemon_control(
+                    "POST",
+                    "/control/v1/skills/schedule",
+                    Some(
+                        json!({"confirmed":true,"confirmationId":nonce("skill-schedule"),"enabled":false,"kind":"discovery","intervalSeconds":1,"maximumCostMicrosPerPeriod":0}),
+                    ),
+                    None,
+                )?)?;
             }
         },
     }
     Ok(())
 }
 
-fn print_json(value: &impl serde::Serialize) -> Result<(), Box<dyn Error>> {
-    println!("{}", serde_json::to_string_pretty(value)?);
-    Ok(())
-}
-
 fn read_json_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, Box<dyn Error>> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
-}
-fn parse_backend(value: &str) -> Result<SkillOptBackend, Box<dyn Error>> {
-    Ok(match value {
-        "mock" => SkillOptBackend::Mock,
-        "claude" => SkillOptBackend::Claude,
-        "codex" => SkillOptBackend::Codex,
-        "handoff" => SkillOptBackend::Handoff,
-        "azure_openai" => SkillOptBackend::AzureOpenAi,
-        _ => return Err(format!("unsupported SkillOpt backend: {value}").into()),
-    })
-}
-fn parse_evidence_source(
-    value: &str,
-) -> Result<commonkit_contracts::EvidenceSourceKind, Box<dyn Error>> {
-    Ok(match value {
-        "manual_failure" => commonkit_contracts::EvidenceSourceKind::ManualFailure,
-        "claude_session" => commonkit_contracts::EvidenceSourceKind::ClaudeSession,
-        "codex_session" => commonkit_contracts::EvidenceSourceKind::CodexSession,
-        "evaluation_case" => commonkit_contracts::EvidenceSourceKind::EvaluationCase,
-        _ => return Err(format!("unsupported evidence source: {value}").into()),
-    })
-}
-fn parse_evidence_consent(
-    value: &str,
-) -> Result<commonkit_contracts::EvidenceConsent, Box<dyn Error>> {
-    Ok(match value {
-        "local_only" => commonkit_contracts::EvidenceConsent::LocalOnly,
-        "approved_for_provider" => commonkit_contracts::EvidenceConsent::ApprovedForProvider,
-        "approved_portable" => commonkit_contracts::EvidenceConsent::ApprovedPortable,
-        _ => return Err(format!("unsupported evidence consent: {value}").into()),
-    })
-}
-fn provider_environment() -> std::collections::BTreeMap<String, String> {
-    [
-        "ANTHROPIC_API_KEY",
-        "AZURE_OPENAI_API_KEY",
-        "AZURE_OPENAI_AUTH_MODE",
-        "AZURE_OPENAI_ENDPOINT",
-        "AZURE_OPENAI_API_VERSION",
-        "OPENAI_API_KEY",
-    ]
-    .into_iter()
-    .filter_map(|name| std::env::var(name).ok().map(|value| (name.into(), value)))
-    .collect()
 }
 fn now_unix_ms() -> Result<u64, Box<dyn Error>> {
     Ok(std::time::SystemTime::now()
