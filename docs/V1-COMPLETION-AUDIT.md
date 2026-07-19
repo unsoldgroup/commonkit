@@ -1,7 +1,7 @@
 # CommonKit v1 completion audit
 
 Audit date: 2026-07-19  
-Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `bf4046a`. “Met locally” means the committed Rust production path and its local contract suites pass on the audit host; it does not substitute for production signing/notarization, a published updater, or hosted multi-OS evidence. GitHub reported no workflow run for this exact commit at audit time.
+Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `314d748`. “Met locally” means the committed Rust production path and its local contract suites pass on the audit host; it does not substitute for production signing/notarization, a published updater, or hosted multi-OS evidence. GitHub reported no workflow run for this exact commit at audit time.
 
 ## Core eight-flow status
 
