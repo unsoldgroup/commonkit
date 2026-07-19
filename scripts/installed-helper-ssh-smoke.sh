@@ -9,9 +9,13 @@ test -x "$helper"
 
 port=40222
 user=commonkit_smoke
-home="$scratch/home"
-target="$scratch/target"
-state="$scratch/state"
+# GitHub's RUNNER_TEMP ancestors are intentionally not traversable by another
+# account. Keep keys and logs there, but place the simulated remote target under
+# a unique traverse-only root that the privilege-dropped sshd child can reach.
+runtime_root=$(mktemp -d /tmp/commonkit-ssh-smoke.XXXXXX)
+home="$runtime_root/home"
+target="$runtime_root/target"
+state="$runtime_root/state"
 key="$scratch/id_ed25519"
 mkdir -p "$home/.ssh" "$home/.config/commonkit" "$target" "$state" "$scratch/sshd"
 ssh-keygen -q -t ed25519 -N '' -f "$key"
@@ -34,6 +38,13 @@ unset password_hash
 sudo chage --expiredate -1 "$user"
 sudo awk -F: -v user="$user" '$1 == user && $2 ~ /^\$6\$/ && $8 == "" { found = 1 } END { exit !found }' /etc/shadow
 sudo chown -R "$user:$user" "$home" "$target" "$state"
+sudo chown root:root "$runtime_root"
+sudo chmod 0711 "$runtime_root"
+# These assertions reproduce the hosted failure before sshd obscures it as a
+# generic public-key rejection, and ensure no broader access is required.
+sudo -u "$user" test -r "$home/.ssh/authorized_keys"
+sudo -u "$user" test -x "$home/commonkit-target-helper"
+sudo -u "$user" test -w "$target" -a -w "$state"
 host_key="$scratch/sshd/host_key"
 ssh-keygen -q -t ed25519 -N '' -f "$host_key"
 cat > "$scratch/sshd/config" <<CFG
@@ -55,6 +66,10 @@ sshd_log="$scratch/sshd/sshd.log"
 cleanup() {
   if [[ -f "$scratch/sshd/pid" ]]; then sudo kill "$(cat "$scratch/sshd/pid")" 2>/dev/null || true; fi
   sudo userdel "$user" 2>/dev/null || true
+  case "$runtime_root" in
+    /tmp/commonkit-ssh-smoke.*) sudo rm -rf -- "$runtime_root" ;;
+    *) printf 'refusing to remove unexpected runtime root: %s\n' "$runtime_root" >&2 ;;
+  esac
 }
 trap cleanup EXIT
 sudo install -d -m 0755 /run/sshd
