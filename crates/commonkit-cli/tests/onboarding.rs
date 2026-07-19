@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use commonkit_cli::onboarding::{InitMode, InitRequest, ProcessRunner, initialize};
@@ -22,6 +23,12 @@ fn connect_uses_existing_gh_credentials_and_writes_first_run_state() {
     let temporary = tempfile::tempdir().unwrap();
     let bin = temporary.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(temporary.path().join("target")).unwrap();
+    std::fs::set_permissions(
+        temporary.path().join("target"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
     test_support::write_tool(
         &bin,
         "gh",
@@ -92,6 +99,14 @@ exit 92
         .plan(serde_json::json!({"confirmed":true,"confirmationId":"first-diff"}))
         .unwrap();
     assert_eq!(plan["operations"], serde_json::json!([]));
+    assert_eq!(
+        std::fs::metadata(temporary.path().join("target"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
 }
 
 #[test]

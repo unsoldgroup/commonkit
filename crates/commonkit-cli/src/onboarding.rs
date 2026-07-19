@@ -100,6 +100,7 @@ pub fn initialize(
     validate_absolute_destination(&request.target_root)?;
     validate_absolute_destination(&request.config_directory)?;
     validate_absolute_destination(&request.state_directory)?;
+    validate_distinct_roots(request)?;
     ensure_clone_destination(&request.kit_directory)?;
 
     runner.run(
@@ -315,13 +316,10 @@ fn write_runtime_state(
     revision: &str,
     target: &StableId,
 ) -> Result<PathBuf, OnboardingError> {
-    for directory in [
-        &request.config_directory,
-        &request.state_directory,
-        &request.target_root,
-    ] {
+    for directory in [&request.config_directory, &request.state_directory] {
         ensure_private_path(directory, PrivatePathKind::Directory)?;
     }
+    ensure_target_root(&request.target_root)?;
     let artifacts = request.state_directory.join("provider-artifacts");
     ensure_private_path(&artifacts, PrivatePathKind::Directory)?;
     ArtifactStore::open(&artifacts)?;
@@ -395,6 +393,37 @@ fn validate_git_revision(revision: &str) -> Result<(), OnboardingError> {
     }
 }
 
+fn validate_distinct_roots(request: &InitRequest) -> Result<(), OnboardingError> {
+    let roots = [
+        &request.kit_directory,
+        &request.config_directory,
+        &request.state_directory,
+        &request.target_root,
+    ];
+    for (index, left) in roots.iter().enumerate() {
+        for right in &roots[index + 1..] {
+            if left.starts_with(right) || right.starts_with(left) {
+                return Err(OnboardingError::OverlappingRoots);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ensure_target_root(path: &Path) -> Result<(), OnboardingError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(OnboardingError::UnsafePath(path.into()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn os_args<const N: usize>(values: [&str; N]) -> Vec<OsString> {
     values.into_iter().map(OsString::from).collect()
 }
@@ -407,6 +436,8 @@ pub enum OnboardingError {
     UnsafePath(PathBuf),
     #[error("clone destination must be absent or empty: {0}")]
     DestinationNotEmpty(PathBuf),
+    #[error("kit, configuration, state, and target roots must not overlap")]
+    OverlappingRoots,
     #[error("selected loadout does not exist as a regular layer file: {0}")]
     MissingLoadout(PathBuf),
     #[error("selected loadout ID does not match its layer document")]
