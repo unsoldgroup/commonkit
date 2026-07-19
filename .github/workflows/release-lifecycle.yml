@@ -20,10 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - uses: dtolnay/rust-toolchain@stable
       - name: Install Tauri test dependencies
         run: |
           sudo apt-get update
@@ -46,6 +46,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: sigstore/cosign-installer@v3
       - name: Download both published release generations
         shell: bash
@@ -168,6 +169,32 @@ jobs:
           test -n "$cli"
           chmod +x "$cli"
           "$cli" --version
+      - name: Exercise current signed standalone artifacts end to end
+        shell: bash
+        run: |
+          set -euo pipefail
+          installed="$RUNNER_TEMP/commonkit-published-bin"
+          mkdir -p "$installed"
+          case "${{ runner.os }}" in
+            macOS)
+              cp current/commonkit-macos-universal "$installed/commonkit"
+              cp current/commonkitd-macos-universal "$installed/commonkitd"
+              ;;
+            Linux)
+              cp current/commonkit-linux-x86_64 "$installed/commonkit"
+              cp current/commonkitd-linux-x86_64 "$installed/commonkitd"
+              ;;
+            Windows)
+              cp current/commonkit-windows-x86_64.exe "$installed/commonkit.exe"
+              cp current/commonkitd-windows-x86_64.exe "$installed/commonkitd.exe"
+              ;;
+          esac
+          cargo install --locked --path crates/commonkit-snapshots \
+            --bin commonkit-snapshot-recovery-fixture --root "$RUNNER_TEMP/commonkit-fixture-install"
+          cp "$RUNNER_TEMP/commonkit-fixture-install/bin/commonkit-snapshot-recovery-fixture"* "$installed/"
+          chmod +x "$installed"/*
+          chmod +x scripts/installed-lifecycle.sh
+          scripts/installed-lifecycle.sh "$RUNNER_TEMP/commonkit-published-lifecycle" "$installed"
       - name: Uninstall macOS and verify application removal
         if: runner.os == 'macOS'
         shell: bash

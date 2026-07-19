@@ -129,20 +129,33 @@ test("release lifecycle matrix exercises install update and uninstall", async ()
   assert.match(workflow, /hdiutil attach/);
   assert.match(workflow, /dpkg -i/);
   assert.match(workflow, /Start-Process.*\/S/);
+  assert.match(workflow, /commonkitd-macos-universal/);
+  assert.match(workflow, /commonkitd-linux-x86_64/);
+  assert.match(workflow, /commonkitd-windows-x86_64\.exe/);
+  assert.match(workflow, /installed-lifecycle\.sh/);
 });
 
 test("CI exercises an unsigned installed CLI and daemon lifecycle on every OS", async () => {
   const workflow = await read(".github/workflows/ci.yml");
+  const harness = await read("scripts/installed-lifecycle.sh");
 
   assert.match(workflow, /unsigned-installed-lifecycle/);
   assert.match(workflow, /cargo install --locked --path crates\/commonkit-cli/);
   assert.match(workflow, /cargo install --locked --path crates\/commonkit-service/);
   assert.match(workflow, /commonkitd/);
-  assert.match(workflow, /commonkit status/);
-  assert.match(workflow, /commonkit verify/);
-  assert.match(workflow, /commonkit-snapshots --test durable_restore/);
-  assert.match(workflow, /registry_startup_recovers_snapshot/);
-  assert.match(workflow, /local_executor/);
+  assert.match(workflow, /installed-lifecycle\.sh/);
+  assert.match(workflow, /commonkit-snapshot-recovery-fixture/);
+  assert.doesNotMatch(workflow, /commonkit-snapshots --test durable_restore/);
+  assert.match(harness, /"\$commonkit" init connect/);
+  assert.match(harness, /"\$commonkit" sync --confirmed/);
+  assert.match(harness, /"\$commonkit" apply/);
+  assert.match(harness, /"\$commonkit" verify/);
+  assert.match(harness, /"\$commonkit" snapshots create/);
+  assert.match(harness, /"\$commonkit" snapshots restore/);
+  assert.match(harness, /"\$recovery_fixture" interrupt/);
+  assert.match(harness, /"\$recovery_fixture" recover/);
+  assert.match(harness, /"\$commonkit" relay status/);
+  assert.match(harness, /ssh/);
   assert.match(workflow, /test:compatibility/);
 });
 

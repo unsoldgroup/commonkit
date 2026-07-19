@@ -91,34 +91,14 @@ jobs:
           install_root="$RUNNER_TEMP/commonkit-install"
           cargo install --locked --path crates/commonkit-cli --root "$install_root"
           cargo install --locked --path crates/commonkit-service --root "$install_root"
+          cargo install --locked --path crates/commonkit-snapshots --bin commonkit-snapshot-recovery-fixture --root "$install_root"
           echo "$install_root/bin" >> "$GITHUB_PATH"
-      - name: Execute installed CLI and daemon reconciliation surfaces
+      - name: Execute complete installed-artifact lifecycle
         shell: bash
         run: |
           set -euo pipefail
-          commonkit --version
-          commonkit status
-          commonkitd --help
-          commonkitd --port 0 --relay-port 0 > "$RUNNER_TEMP/commonkitd.log" 2>&1 &
-          daemon_pid=$!
-          trap 'kill "$daemon_pid" 2>/dev/null || true' EXIT
-          for attempt in $(seq 1 100); do
-            if commonkit relay status > "$RUNNER_TEMP/relay-status.json" 2>/dev/null; then break; fi
-            sleep 0.1
-          done
-          commonkit relay status
-          if commonkit verify; then
-            echo "clean daemon has a configured sync domain"
-          else
-            echo "clean daemon correctly reports that verification is not configured yet"
-          fi
-          cargo test --locked -p commonkit-service --test local_executor
-      - name: Execute installed-state snapshot restore and restart recovery
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test --locked -p commonkit-snapshots --test durable_restore
-          cargo test --locked -p commonkit-service --test production_domains registry_startup_recovers_snapshot_transactions_with_configured_service_lifecycle -- --exact
+          chmod +x scripts/installed-lifecycle.sh
+          scripts/installed-lifecycle.sh "$RUNNER_TEMP/commonkit-lifecycle" "$RUNNER_TEMP/commonkit-install/bin"
       - name: Execute legacy-to-Rust relay compatibility suite
         shell: bash
         env:

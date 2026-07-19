@@ -134,8 +134,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" release-artifacts/commonkit-macos-universal
-          codesign --verify --strict --verbose=2 release-artifacts/commonkit-macos-universal
+          for executable in release-artifacts/*-macos-universal; do
+            codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$executable"
+            codesign --verify --strict --verbose=2 "$executable"
+          done
       - name: Sign and verify standalone Windows CLI
         if: runner.os == 'Windows'
         shell: pwsh
@@ -150,10 +152,12 @@ jobs:
               Select-Object -First 1 -ExpandProperty FullName
           }
           if (-not $signtool) { throw 'signtool.exe was not found on the Windows release runner' }
-          & $signtool sign /sha1 $env:WINDOWS_CERTIFICATE_THUMBPRINT /fd SHA256 /tr $env:WINDOWS_TIMESTAMP_URL /td SHA256 release-artifacts/commonkit-windows-x86_64.exe
-          if ($LASTEXITCODE -ne 0) { throw 'signtool failed to sign standalone CommonKit CLI' }
-          & $signtool verify /pa /all /v release-artifacts/commonkit-windows-x86_64.exe
-          if ($LASTEXITCODE -ne 0) { throw 'signtool failed to verify standalone CommonKit CLI' }
+          Get-ChildItem release-artifacts/*-windows-x86_64.exe | ForEach-Object {
+            & $signtool sign /sha1 $env:WINDOWS_CERTIFICATE_THUMBPRINT /fd SHA256 /tr $env:WINDOWS_TIMESTAMP_URL /td SHA256 $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed to sign $($_.Name)" }
+            & $signtool verify /pa /all /v $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "signtool failed to verify $($_.Name)" }
+          }
       - name: Collect desktop and updater payloads
         shell: bash
         run: scripts/collect-release-assets.sh "${{ runner.os }}" release-artifacts

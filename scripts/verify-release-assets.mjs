@@ -14,12 +14,15 @@ for (const [label, predicate] of [
   ["macOS DMG", (name) => name.endsWith(".dmg")],
   ["macOS updater", (name) => name.endsWith(".app.tar.gz")],
   ["macOS CLI", (name) => name === "commonkit-macos-universal"],
+  ["macOS daemon", (name) => name === "commonkitd-macos-universal"],
   ["Linux AppImage", (name) => name.endsWith(".AppImage")],
   ["Linux Debian package", (name) => name.endsWith(".deb")],
   ["Linux CLI", (name) => name === "commonkit-linux-x86_64"],
+  ["Linux daemon", (name) => name === "commonkitd-linux-x86_64"],
   ["Windows NSIS installer", (name) => name.endsWith("-setup.exe")],
   ["Windows updater", (name) => name.endsWith(".nsis.zip")],
   ["Windows CLI", (name) => name === "commonkit-windows-x86_64.exe"],
+  ["Windows daemon", (name) => name === "commonkitd-windows-x86_64.exe"],
 ]) {
   if (!names.some(predicate)) throw new Error(`${label} release payload missing`);
 }
