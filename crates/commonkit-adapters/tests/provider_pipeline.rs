@@ -88,10 +88,27 @@ fn materializes_providers_into_digest_addressed_state_after_ownership_validation
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with(output.states[0].digest.as_str().trim_start_matches("sha256:"))
+            .starts_with(
+                output.states[0]
+                    .digest
+                    .as_str()
+                    .trim_start_matches("sha256:")
+            )
     );
     let persisted: commonkit_adapters::MaterializedState =
         serde_json::from_slice(&std::fs::read(&output.state_paths[0]).unwrap()).unwrap();
     persisted.verify().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let states = temporary.join("pipeline/states");
+        let redirected = temporary.join("redirected-states");
+        std::fs::remove_dir_all(&states).unwrap();
+        std::fs::create_dir(&redirected).unwrap();
+        symlink(&redirected, &states).unwrap();
+        let error = pipeline.materialize_all(&[&provider], &context).unwrap_err();
+        assert!(error.to_string().contains("non-symlink directory"));
+        assert_eq!(std::fs::read_dir(redirected).unwrap().count(), 0);
+    }
     std::fs::remove_dir_all(temporary).unwrap();
 }

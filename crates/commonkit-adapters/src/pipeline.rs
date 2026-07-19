@@ -42,8 +42,11 @@ impl ProviderPipeline {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ProviderPipelineError::UnsafeRoot);
         }
+        let root = root.canonicalize()?;
+        ensure_ordinary_directory(&root.join("workspaces"))?;
+        ensure_ordinary_directory(&root.join("states"))?;
         Ok(Self {
-            root: root.to_path_buf(),
+            root,
             artifacts,
             ownership_rules,
             protected_roots,
@@ -56,10 +59,12 @@ impl ProviderPipeline {
         context: &ProviderContext,
     ) -> Result<ProviderPipelineOutput, ProviderPipelineError> {
         let mut states = Vec::with_capacity(providers.len());
+        ensure_ordinary_directory(&self.root.join("workspaces"))?;
         for provider in providers {
-            if states.iter().any(|state: &MaterializedState| {
-                state.inputs.provider_id == *provider.id()
-            }) {
+            if states
+                .iter()
+                .any(|state: &MaterializedState| state.inputs.provider_id == *provider.id())
+            {
                 return Err(ProviderPipelineError::DuplicateProvider(
                     provider.id().to_string(),
                 ));
@@ -71,7 +76,9 @@ impl ProviderPipeline {
             let state = provider.materialize(context, &workspace, &self.artifacts)?;
             state.verify()?;
             if state.inputs != inspected {
-                return Err(ProviderPipelineError::InputsChanged(provider.id().to_string()));
+                return Err(ProviderPipelineError::InputsChanged(
+                    provider.id().to_string(),
+                ));
             }
             states.push(state);
         }
@@ -95,6 +102,7 @@ impl ProviderPipeline {
     }
 
     fn persist_state(&self, state: &MaterializedState) -> Result<PathBuf, ProviderPipelineError> {
+        ensure_ordinary_directory(&self.root.join("states"))?;
         let name = state.digest.as_str().trim_start_matches("sha256:");
         let path = self.root.join("states").join(format!("{name}.json"));
         let bytes = serde_json::to_vec(state)?;
@@ -112,6 +120,14 @@ impl ProviderPipeline {
         }
         Ok(path)
     }
+}
+
+fn ensure_ordinary_directory(path: &Path) -> Result<(), ProviderPipelineError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ProviderPipelineError::UnsafeRoot);
+    }
+    Ok(())
 }
 
 fn reset_private_workspace(path: &Path) -> Result<(), ProviderPipelineError> {
