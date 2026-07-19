@@ -423,7 +423,7 @@ fn observe_process_identity(
     #[cfg(target_os = "macos")]
     {
         use std::ffi::CStr;
-        use std::mem::{size_of, MaybeUninit};
+        use std::mem::{MaybeUninit, size_of};
         use std::os::unix::ffi::OsStrExt;
 
         let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
@@ -480,7 +480,9 @@ fn observe_process_identity(
             executable_path: PathBuf,
             creation_date: String,
         }
-        let script = format!("$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if ($null -eq $p) {{ exit 3 }}; $p | Select-Object ExecutablePath,CreationDate | ConvertTo-Json -Compress");
+        let script = format!(
+            "$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if ($null -eq $p) {{ exit 3 }}; $p | Select-Object ExecutablePath,CreationDate | ConvertTo-Json -Compress"
+        );
         let output = Command::new("powershell.exe")
             .args([
                 "-NoLogo",

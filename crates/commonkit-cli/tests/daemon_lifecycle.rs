@@ -48,15 +48,19 @@ fn windows_task_status_probe_is_numeric_and_does_not_parse_localized_output() {
     let probe = commonkit_cli::daemon_lifecycle::windows_task_status_probe();
 
     assert_eq!(probe.program, "powershell.exe");
-    assert!(probe
-        .arguments
-        .iter()
-        .any(|argument| argument.contains("[int]$task.State -eq 4")));
-    for localized_word in ["running", "en cours", "wird ausgeführt", "ejecutando"] {
-        assert!(!probe
+    assert!(
+        probe
             .arguments
             .iter()
-            .any(|argument| argument.to_ascii_lowercase().contains(localized_word)));
+            .any(|argument| argument.contains("[int]$task.State -eq 4"))
+    );
+    for localized_word in ["running", "en cours", "wird ausgeführt", "ejecutando"] {
+        assert!(
+            !probe
+                .arguments
+                .iter()
+                .any(|argument| argument.to_ascii_lowercase().contains(localized_word))
+        );
     }
 }
 
