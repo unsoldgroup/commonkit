@@ -216,7 +216,8 @@ jobs:
           $scratch = Join-Path $env:RUNNER_TEMP "commonkit-apm-preflight-scratch"
           $gitBin = (Get-Command git -CommandType Application -ErrorAction Stop).Source
           if (-not [System.IO.Path]::IsPathFullyQualified($gitBin)) { throw "Git executable path must be absolute" }
-          if ((Get-Item -LiteralPath $gitBin).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw "Git executable must not be a reparse point" }
+          $gitAttributes = (Get-Item -LiteralPath $gitBin).Attributes
+          if (($gitAttributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Git executable must not be a reparse point" }
           New-Item -ItemType Directory -Force -Path $stage, $scratch | Out-Null
           $psi = [System.Diagnostics.ProcessStartInfo]::new()
           $psi.FileName = $env:COMMONKIT_APM_025_BIN

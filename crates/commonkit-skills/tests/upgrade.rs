@@ -141,7 +141,6 @@ printf '{"schemaVersion":1,"suiteDigest":"%s","skillId":"%s","baselineDigest":"%
         assert!(matches!(error, SkillError::ProviderIsolationUnavailable));
         assert!(!root.join("active-provider.json").exists());
         fs::remove_dir_all(root).expect("cleanup");
-        return;
     }
     #[cfg(target_os = "macos")]
     let report = manager.execute_upgrade(&plan).expect("upgrade report");
