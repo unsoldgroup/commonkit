@@ -771,7 +771,7 @@ fn run_daemon_lifecycle(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
             "/control/v1/domains/reload",
             Some(json!({"confirmed": true})),
             None,
-        ));
+        )?);
     }
     let current = std::env::current_exe()?;
     let extension = if cfg!(windows) { ".exe" } else { "" };

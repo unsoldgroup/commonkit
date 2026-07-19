@@ -2393,6 +2393,24 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         let current_writer = portable_authority.record.current_writer.clone();
         let current_writer_digest = Self::observed_database_digest(database, &current_writer)?;
         let candidate_digest = Self::observed_database_digest(database, &target)?;
+        let promotion = PromotionPlan {
+            schema: "commonkit.promotion-plan.v1".into(),
+            run_id: request
+                .confirmation_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| format!("promote-{}-{target}", id)),
+            database: database_id(&id)?,
+            previous_writer: current_writer.clone(),
+            candidate_writer: target.clone(),
+            latest_snapshot_digest: latest.manifest.content_digest.clone(),
+            current_writer_digest,
+            candidate_digest,
+        };
+        let local_authority = AuthorityStore::open(self.root.join("authority"))
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        local_authority
+            .validate_promotion(&promotion)
+            .map_err(|_| DomainFailure::VerificationFailed)?;
         let updated_authority = portable_store
             .compare_and_swap_writer(
                 &database.id,
@@ -2401,21 +2419,8 @@ impl SnapshotDomain for ProductionSnapshotDomain {
                 &target,
             )
             .map_err(|_| DomainFailure::VerificationFailed)?;
-        let receipt = AuthorityStore::open(self.root.join("authority"))
-            .map_err(|_| DomainFailure::OperationFailed)?
-            .promote(PromotionPlan {
-                schema: "commonkit.promotion-plan.v1".into(),
-                run_id: request
-                    .confirmation_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| format!("promote-{}-{target}", id)),
-                database: database_id(&id)?,
-                previous_writer: current_writer,
-                candidate_writer: target.clone(),
-                latest_snapshot_digest: latest.manifest.content_digest.clone(),
-                current_writer_digest,
-                candidate_digest,
-            })
+        let receipt = local_authority
+            .promote(promotion)
             .map_err(|_| DomainFailure::VerificationFailed)?;
         Ok(serde_json::json!({
             "databaseId":id,

@@ -491,11 +491,9 @@ impl AuthorityStore {
         self.promote_with_failpoint(plan, PromotionFailpoint::None)
     }
 
-    pub fn promote_with_failpoint(
-        &self,
-        plan: PromotionPlan,
-        failpoint: PromotionFailpoint,
-    ) -> Result<PromotionReceipt, SnapshotError> {
+    /// Validates a promotion without writing plans, receipts, or authority. Callers coordinating
+    /// a portable compare-and-swap use this before publishing the portable writer transition.
+    pub fn validate_promotion(&self, plan: &PromotionPlan) -> Result<(), SnapshotError> {
         if plan.schema != "commonkit.promotion-plan.v1"
             || plan.run_id.is_empty()
             || plan.candidate_writer.is_empty()
@@ -514,6 +512,15 @@ impl AuthorityStore {
         {
             return Err(SnapshotError::TransactionIntegrity);
         }
+        Ok(())
+    }
+
+    pub fn promote_with_failpoint(
+        &self,
+        plan: PromotionPlan,
+        failpoint: PromotionFailpoint,
+    ) -> Result<PromotionReceipt, SnapshotError> {
+        self.validate_promotion(&plan)?;
         let run = self.root.join("promotions").join(&plan.run_id);
         std::fs::create_dir_all(&run).map_err(|_| SnapshotError::ObjectStoreFailed)?;
         let plan_digest = write_envelope(&run.join("plan.json"), &plan)?;
