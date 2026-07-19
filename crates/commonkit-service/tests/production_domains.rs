@@ -33,7 +33,14 @@ struct TreeEntry {
     kind: &'static str,
     bytes: Vec<u8>,
     mode: u32,
+    len: u64,
+    readonly: bool,
     modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    unix_identity: (u64, u64, u32, u32, u64, i64, i64, i64, i64),
+    #[cfg(unix)]
+    extended_attributes: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 fn filesystem_snapshot(root: &std::path::Path) -> Vec<TreeEntry> {
@@ -44,8 +51,8 @@ fn filesystem_snapshot(root: &std::path::Path) -> Vec<TreeEntry> {
             .collect::<Vec<_>>();
         children.sort();
         for child in children {
-            let metadata = std::fs::symlink_metadata(&child).unwrap();
-            let file_type = metadata.file_type();
+            let initial_metadata = std::fs::symlink_metadata(&child).unwrap();
+            let file_type = initial_metadata.file_type();
             let (kind, bytes) = if file_type.is_dir() {
                 ("directory", Vec::new())
             } else if file_type.is_symlink() {
@@ -60,6 +67,7 @@ fn filesystem_snapshot(root: &std::path::Path) -> Vec<TreeEntry> {
             } else {
                 ("file", std::fs::read(&child).unwrap())
             };
+            let metadata = std::fs::symlink_metadata(&child).unwrap();
             #[cfg(unix)]
             let mode = {
                 use std::os::unix::fs::PermissionsExt;
@@ -67,12 +75,34 @@ fn filesystem_snapshot(root: &std::path::Path) -> Vec<TreeEntry> {
             };
             #[cfg(not(unix))]
             let mode = u32::from(metadata.permissions().readonly());
+            #[cfg(unix)]
+            let unix_identity = {
+                use std::os::unix::fs::MetadataExt;
+                (
+                    metadata.dev(),
+                    metadata.ino(),
+                    metadata.uid(),
+                    metadata.gid(),
+                    metadata.nlink(),
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                )
+            };
             entries.push(TreeEntry {
                 path: child.strip_prefix(base).unwrap().to_owned(),
                 kind,
                 bytes,
                 mode,
+                len: metadata.len(),
+                readonly: metadata.permissions().readonly(),
                 modified: metadata.modified().ok(),
+                created: metadata.created().ok(),
+                #[cfg(unix)]
+                unix_identity,
+                #[cfg(unix)]
+                extended_attributes: read_xattrs(&child),
             });
             if file_type.is_dir() {
                 visit(base, &child, entries);
@@ -82,7 +112,116 @@ fn filesystem_snapshot(root: &std::path::Path) -> Vec<TreeEntry> {
 
     let mut entries = Vec::new();
     visit(root, root, &mut entries);
+    let metadata = std::fs::symlink_metadata(root).unwrap();
+    #[cfg(unix)]
+    let unix_identity = {
+        use std::os::unix::fs::MetadataExt;
+        (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.nlink(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime(),
+            metadata.ctime_nsec(),
+        )
+    };
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode()
+    };
+    #[cfg(not(unix))]
+    let mode = u32::from(metadata.permissions().readonly());
+    entries.push(TreeEntry {
+        path: std::path::PathBuf::from("."),
+        kind: "directory",
+        bytes: Vec::new(),
+        mode,
+        len: metadata.len(),
+        readonly: metadata.permissions().readonly(),
+        modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
+        #[cfg(unix)]
+        unix_identity,
+        #[cfg(unix)]
+        extended_attributes: read_xattrs(root),
+    });
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
     entries
+}
+
+#[cfg(unix)]
+fn read_xattrs(path: &std::path::Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return Vec::new();
+    };
+    #[cfg(target_os = "macos")]
+    unsafe fn list(path: *const libc::c_char, buffer: *mut libc::c_char, size: usize) -> isize {
+        unsafe { libc::listxattr(path, buffer, size, 0) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    unsafe fn list(path: *const libc::c_char, buffer: *mut libc::c_char, size: usize) -> isize {
+        unsafe { libc::listxattr(path, buffer, size) }
+    }
+    let size = unsafe { list(path.as_ptr(), std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    let mut names = vec![0_u8; size as usize];
+    if unsafe { list(path.as_ptr(), names.as_mut_ptr().cast(), names.len()) } < 0 {
+        return Vec::new();
+    }
+    let mut attributes = Vec::new();
+    for name in names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let Ok(name_c) = CString::new(name) else {
+            continue;
+        };
+        #[cfg(target_os = "macos")]
+        unsafe fn get(
+            path: *const libc::c_char,
+            name: *const libc::c_char,
+            buffer: *mut libc::c_void,
+            size: usize,
+        ) -> isize {
+            unsafe { libc::getxattr(path, name, buffer, size, 0, 0) }
+        }
+        #[cfg(not(target_os = "macos"))]
+        unsafe fn get(
+            path: *const libc::c_char,
+            name: *const libc::c_char,
+            buffer: *mut libc::c_void,
+            size: usize,
+        ) -> isize {
+            unsafe { libc::getxattr(path, name, buffer, size) }
+        }
+        let value_size = unsafe { get(path.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
+        if value_size < 0 {
+            continue;
+        }
+        let mut value = vec![0_u8; value_size as usize];
+        if unsafe {
+            get(
+                path.as_ptr(),
+                name_c.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        } == value_size
+        {
+            attributes.push((name.to_vec(), value));
+        }
+    }
+    attributes.sort();
+    attributes
 }
 
 #[cfg(unix)]
@@ -418,7 +557,7 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{PermissionsExt, symlink};
 
         let artifact_root = root.join("provider-artifacts");
         std::fs::set_permissions(&artifact_root, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -445,6 +584,37 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
             0o755
         );
         std::fs::set_permissions(&artifact_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let blob = std::fs::read_dir(&artifact_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "blob")
+            })
+            .unwrap();
+        let original_blob = blob.with_extension("original-blob");
+        let attacker_blob = root.join("attacker-controlled-blob");
+        std::fs::rename(&blob, &original_blob).unwrap();
+        std::fs::write(&attacker_blob, b"managed\n").unwrap();
+        symlink(&attacker_blob, &blob).unwrap();
+        let before_rejected_apply = filesystem_snapshot(root);
+        assert!(matches!(
+            control.apply(
+                &registered.id,
+                &StableId::parse("artifact-symlink-check").unwrap(),
+                "artifact-symlink-substitution",
+            ),
+            Err(ControlError::PlanAuthorityChanged)
+        ));
+        assert_eq!(
+            filesystem_snapshot(root),
+            before_rejected_apply,
+            "rejected apply must not mutate any root or entry metadata"
+        );
+        std::fs::remove_file(&blob).unwrap();
+        std::fs::rename(original_blob, blob).unwrap();
+        std::fs::remove_file(attacker_blob).unwrap();
     }
 
     let receipts = ReceiptStore::open(root.join("receipts")).unwrap();

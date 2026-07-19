@@ -125,3 +125,41 @@ fn artifact_load_rejects_a_symlink_substitution() {
     fs::remove_dir_all(root).expect("cleanup root");
     fs::remove_dir_all(outside).expect("cleanup outside");
 }
+
+#[cfg(unix)]
+#[test]
+fn an_opened_existing_store_remains_bound_to_the_original_directory() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = temporary_directory("artifact-root-race");
+    let moved = temporary_directory("artifact-root-original");
+    let substitute = temporary_directory("artifact-root-substitute");
+    let creating_store = ArtifactStore::open(&root).expect("create store");
+    let reference = creating_store
+        .put(b"original trusted bytes", ContentSensitivity::Portable)
+        .expect("put original");
+    drop(creating_store);
+
+    let store = ArtifactStore::open_existing(&root).expect("open existing capability");
+    fs::rename(&root, &moved).expect("move opened store");
+    fs::create_dir_all(&substitute).expect("substitute root");
+    fs::set_permissions(&substitute, fs::Permissions::from_mode(0o700))
+        .expect("private substitute");
+    let blob_name = format!(
+        "{}.blob",
+        reference.digest.as_str().trim_start_matches("sha256:")
+    );
+    fs::write(substitute.join(blob_name), b"substituted malicious bytes").expect("substitute blob");
+    symlink(&substitute, &root).expect("replace path with symlink");
+
+    assert_eq!(
+        store
+            .load(&reference)
+            .expect("load through retained handle"),
+        b"original trusted bytes"
+    );
+
+    fs::remove_file(root).expect("cleanup link");
+    fs::remove_dir_all(moved).expect("cleanup original");
+    fs::remove_dir_all(substitute).expect("cleanup substitute");
+}
