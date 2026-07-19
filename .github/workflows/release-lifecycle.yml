@@ -203,10 +203,20 @@ jobs:
           $env:COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION = $expected
           $process = Start-Process -FilePath $desktop -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Tauri updater failed: $($process.ExitCode)" }
+          if (-not (Test-Path $report)) { throw 'Windows updater did not publish its durable pre-exit marker' }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if (-not $result.updatedByTauri -or $result.previousVersion -ne $previous) { throw 'Tauri updater did not run from the previous signed release' }
-          $updated_hash = (Get-FileHash -Algorithm SHA256 $desktop).Hash
+          if (-not $result.updaterExitPrepared -or $result.previousVersion -ne $previous -or $result.expectedVersion -ne $expected) {
+            throw 'Windows updater did not reach the authenticated installer launch boundary from the expected release'
+          }
+          # Wait for the Windows updater to replace the installed executable after the old app exits.
+          $updated_hash = $previous_hash
+          foreach ($attempt in 1..600) {
+            try { $updated_hash = (Get-FileHash -Algorithm SHA256 $desktop -ErrorAction Stop).Hash } catch { $updated_hash = $previous_hash }
+            if ($updated_hash -ne $previous_hash) { break }
+            Start-Sleep -Milliseconds 100
+          }
           if ($updated_hash -eq $previous_hash) { throw 'Tauri updater left the installed desktop unchanged' }
+          if ((Get-AuthenticodeSignature $desktop).Status -ne 'Valid') { throw 'Updated desktop signature is not valid' }
       - name: Launch installed Windows desktop and verify its managed daemon
         if: runner.os == 'Windows'
         shell: pwsh

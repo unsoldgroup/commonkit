@@ -136,6 +136,8 @@ test("release lifecycle matrix exercises install update and uninstall", async ()
   assert.match(workflow, /COMMONKIT_DESKTOP_UPDATE_REPORT/);
   assert.match(workflow, /COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION/);
   assert.match(workflow, /updatedByTauri/);
+  assert.match(workflow, /updaterExitPrepared/);
+  assert.match(workflow, /Wait for the Windows updater to replace the installed executable/);
   assert.match(workflow, /desktopVersion/);
   assert.match(workflow, /desktopExecutable/);
   assert.match(workflow, /previous_hash/);

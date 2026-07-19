@@ -73,4 +73,9 @@ test("updater commands separate inspection from explicitly confirmed installatio
   assert.doesNotMatch(source, /check_for_update[\s\S]{0,500}download_and_install/);
   assert.doesNotMatch(source, /"installedVersion"\s*:\s*expected/);
   assert.match(source, /"desktopVersion"\s*:\s*env!\("CARGO_PKG_VERSION"\)/);
+  assert.match(source, /updater_builder\(\)/);
+  assert.match(source, /on_before_exit/);
+  assert.match(source, /"updaterExitPrepared"\s*:\s*true/);
+  assert.match(source, /cleanup_before_exit/);
+  assert.match(source, /expected\s*==\s*env!\("CARGO_PKG_VERSION"\)/);
 });

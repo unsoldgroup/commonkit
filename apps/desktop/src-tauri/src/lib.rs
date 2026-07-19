@@ -1092,6 +1092,16 @@ fn authorize_update_install(
     Ok(())
 }
 
+fn write_update_report(path: &Path, payload: &serde_json::Value) -> std::io::Result<()> {
+    let temporary = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(payload).unwrap_or_default();
+    let mut file = std::fs::File::create(&temporary)?;
+    use std::io::Write as _;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)
+}
+
 #[tauri::command]
 async fn install_update(
     app: tauri::AppHandle,
@@ -1116,9 +1126,28 @@ async fn install_update(
 
 async fn run_automated_update_lifecycle(app: tauri::AppHandle, report: PathBuf, expected: String) {
     let result = async {
-        let update = app
-            .updater()
-            .map_err(|error| error.to_string())?
+        #[cfg(target_os = "windows")]
+        let updater = {
+            let marker_app = app.clone();
+            let marker_report = report.clone();
+            let marker_expected = expected.clone();
+            app.updater_builder()
+                .on_before_exit(move || {
+                    let marker = serde_json::json!({
+                        "schemaVersion": 1,
+                        "previousVersion": env!("CARGO_PKG_VERSION"),
+                        "expectedVersion": marker_expected,
+                        "updaterExitPrepared": true,
+                    });
+                    let _ = write_update_report(&marker_report, &marker);
+                    marker_app.cleanup_before_exit();
+                })
+                .build()
+                .map_err(|error| error.to_string())?
+        };
+        #[cfg(not(target_os = "windows"))]
+        let updater = app.updater().map_err(|error| error.to_string())?;
+        let update = updater
             .check()
             .await
             .map_err(|error| error.to_string())?
@@ -1147,10 +1176,7 @@ async fn run_automated_update_lifecycle(app: tauri::AppHandle, report: PathBuf, 
             }),
         ),
     };
-    let _ = std::fs::write(
-        report,
-        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
-    );
+    let _ = write_update_report(&report, &payload);
     app.exit(exit_code);
 }
 
@@ -1349,11 +1375,18 @@ pub fn run() {
                 std::env::var_os("COMMONKIT_DESKTOP_UPDATE_REPORT"),
                 std::env::var("COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION"),
             ) {
-                tauri::async_runtime::spawn(run_automated_update_lifecycle(
-                    app_handle.clone(),
-                    report.into(),
-                    expected,
-                ));
+                if expected == env!("CARGO_PKG_VERSION") {
+                    // The Windows installer may automatically relaunch the replacement while
+                    // inheriting the old process environment. Leave the durable launch marker
+                    // untouched and exit so CI can start a clean, independent smoke process.
+                    app_handle.exit(0);
+                } else {
+                    tauri::async_runtime::spawn(run_automated_update_lifecycle(
+                        app_handle.clone(),
+                        report.into(),
+                        expected,
+                    ));
+                }
             }
             tauri::async_runtime::spawn(async move {
                 loop {
