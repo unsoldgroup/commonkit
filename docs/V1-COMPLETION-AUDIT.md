@@ -1,52 +1,71 @@
 # CommonKit v1 completion audit
 
-Audit basis: current `main` implementation and committed tests. Active, uncommitted SkillOpt CLI/MCP/service surface work is excluded. A component contract test is evidence for that component only; it is not evidence that the end-user flow is wired through every required interface or platform.
+Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `589c5e7`. Active, uncommitted SkillOpt work is excluded. Component tests establish their named contracts; they do not by themselves establish an installed, cross-platform product flow.
 
-## First six flows
+## Twelve-flow matrix
 
-| Flow | Status | Authoritative evidence | Release gap |
-| --- | --- | --- | --- |
-| 1. Initialize a target | Partial | `commonkit init` reports the intended private runtime roots; `commonkit-core/tests/target_inventory.rs` validates typed inventories; `commonkit-adapters/tests/git_sync.rs` validates constrained fetch/fast-forward behavior. | Initialization does not create the reported roots, authenticate with GitHub, select/create a kit repository, compose a loadout, register a target, or write production `headless.json`. No clean-machine onboarding test exists. |
-| 2. Preview drift | Partial | `commonkit-adapters/tests/provider_planning.rs` and `commonkit-service/tests/production_domains.rs` prove deterministic semantic plans bound to live observed state; stale preimages are rejected. | `commonkit diff` returns `plan_required`; the daemon `/compose` and `/explain` routes remain intentionally unavailable. There is no complete fetch → compose → explain → diff headless flow. |
-| 3. Apply safely | Core complete, flow partial | `commonkit-service/tests/control.rs`, `local_executor.rs`, and `production_domains.rs` cover authenticated confirmation, idempotency, durable plans, real adapters, and stale-target cancellation. | A production plan can be applied, but target initialization does not create the configuration needed to reach it, and desktop plan review/apply remains a placeholder. |
-| 4. Verify parity | Core complete, flow partial | `commonkit-adapters/tests/files.rs`, `filesystem_resources.rs`, provider tests, and `commonkit-service/tests/production_domains.rs` verify file/resource and provider integrity. | CLI verification reaches the daemon, but no cross-interface contract proves CLI, MCP, and desktop expose the same verification result; desktop verification is not wired. |
-| 5. Provision credential references independently | Partial | `commonkit-adapters/tests/credentials.rs` covers env/file/BWS and platform stores; `commonkit-service/tests/production_domains.rs` proves secret-free apply/verify destinations. | Production headless registry currently resolves env/file only. The CLI has no `credentials plan|apply|verify` command group, and the desktop credential view is a placeholder. |
-| 6. Recover or roll back | Core complete, flow partial | `commonkit-reconcile/tests/reconcile_engine.rs`, `durable_receipts.rs`, `commonkit-adapters/tests/files.rs`, and `commonkit-service/tests/production_domains.rs` cover reverse rollback, restart recovery, authenticated receipts, artifact tampering, and successful-run rollback. | Filesystem recovery is strong, but no release-matrix test exercises the full installed daemon/CLI rollback flow on macOS, Linux, and Windows. Snapshot restore keeps a previous file during the swap but does not yet expose a durable restore receipt/restart-recovery workflow. |
+| # | Flow | Status | Current evidence | Actual remaining gate |
+| --- | --- | --- | --- | --- |
+| 1 | Initialize a target | Partial | `commonkit init create|connect` now checks GitHub CLI authentication, creates or clones a repository, writes the required composition layers and target registration, creates private runtime roots, and writes production `headless.json`. `commonkit-cli/tests/onboarding.rs` covers both modes and production composition/plan loading. | Connected loadouts are represented by an empty native `MaterializedState`; initialization does not run the selected APM, chezmoi, or native provider pipeline. A clean machine therefore cannot yet reproduce a non-empty loadout end to end. Desktop onboarding is absent. |
+| 2 | Preview drift | Partial | Production compose/explain domains and durable plan retrieval are wired through daemon and CLI. Plans bind live observed state and reject stale preimages. | `sync` does not fetch Git or materialize providers. Production planning consumes materialized-state files prepared out of band, so fetch → compose → provider materialize → explain → diff is not one production flow. |
+| 3 | Apply safely | Partial | Content-bound plans, confirmation, idempotency, deterministic adapters, receipts, stale-target rejection, verification, and rollback are implemented and tested. Desktop can submit a reviewed plan ID. | The clean-machine/provider gap prevents a complete loadout-to-apply flow. Installed-app reconciliation is not exercised on the three-OS release matrix. |
+| 4 | Verify parity | Partial | Filesystem, provider, service, CLI, and MCP verification contracts exist. | Desktop has no verification command/view, no shared cross-interface result contract proves parity, and installed-platform parity has not run. |
+| 5 | Provision credential references | Partial | Credential readiness/apply/verify service routes and CLI commands exist. Env/file, BWS, macOS Keychain, Linux Secret Service, and Windows Credential Manager adapters have focused tests. | The production headless resolver wires env/file only; BWS and platform stores are not selectable there. Desktop is read-only for credential readiness. |
+| 6 | Recover or roll back | Partial | Reconciliation recovery is durable and plan-bound. Snapshot restore and writer promotion now have authenticated durable plans/receipts, encrypted preimages, fresh-process recovery, startup discovery, lifecycle stop/start coordination, tamper rejection, and SQLite integrity tests. | The CLI has no snapshot command group. Installed daemon/CLI recovery and snapshot restore have not run on macOS, Linux, and Windows release artifacts. |
+| 7 | Multiple targets and five-layer composition | Partial | Composition order, policy floor, provenance, target inventory, local execution, typed SSH transport, and controller-side portable-artifact staging are tested. Production composition is available through the daemon. | Production `headless.json` selects one local target. The SSH stager is not connected to a real provider → remote plan/apply flow, and no declared remote combination has completed the support matrix. |
+| 8 | Scheduled read-only drift checks | Partial | `commonkitd` now constructs and runs `DriftScheduler`; persistence, overlap suppression, read-only verification, and degraded-state reporting are tested. | The general CLI `schedule` command is status-only despite the scoped `enable|disable|status` surface. Desktop exposes schedule state but no mutation. Installed unattended execution is unproven. |
+| 9 | Optional MCP relay state | Partial | Rust relay configuration, runtime, lifecycle, transaction, provider convergence, HTTP upstream, service routes, stable endpoint, and legacy normalization/migration fixtures exist. | The required shared black-box suite has not run Node and Rust through tool discovery, calls, notifications, lifecycle, failure, and redaction equivalence. Desktop relay management is read-only; installed lifecycle remains a release gate. |
+| 10 | Coding-agent adapters | Partial | Pinned APM 0.25.0 and chezmoi 2.70.4 isolation contracts, native fallback, provider artifacts, ownership validation, transactional apply, and checksum-pinned CI gates exist. Portable provider artifacts can be staged over typed SSH. | Production onboarding/service does not invoke providers; it reads pre-materialized JSON. Windows chezmoi CI verifies the binary version but not the isolation fixture. Real remote provider staging/reconciliation is not exercised. |
+| 11 | Redacted diagnostics | Partial | Schema-bound redaction, service diagnostics, CLI export, and MCP export are tested. Desktop reads the diagnostics domain. | Desktop does not perform a diagnostic export, and no installed-platform malicious-input test proves the complete export path. |
+| 12 | OSS onboarding, schemas, threat model, CI, packaging, and releases | Partial | Schemas, threat model, support/migration/release docs, three-OS Rust/Node/Tauri CI, provider gates, release packaging, signatures, SBOM, updater fixtures, and an install/update/uninstall workflow exist. | `README.md` remains the legacy Node-era onboarding and contradicts current transactional recovery. Production signing/notarization identities and two published signed versions have not exercised the lifecycle workflow. That workflow checks installation, upgrade, CLI version, and uninstall, but not reconciliation or snapshots through each installed product. |
 
-## All twelve v1 flows
+No flow is fully met under the scope's product-level, cross-platform acceptance rule. Several underlying cores are complete; their remaining status is driven by missing production wiring or release evidence, not missing reconciliation primitives.
 
-| # | Flow | Audit status | Evidence and remaining gap |
-| --- | --- | --- | --- |
-| 1 | Initialize a target | Partial | See first-six matrix. GitHub authentication/repository provisioning remains an explicitly unresolved product decision in `CONTEXT.md`. |
-| 2 | Preview drift | Partial | Deterministic planning exists; user-facing diff and daemon composition are incomplete. |
-| 3 | Apply safely | Partial | Reconciliation core is production-capable; clean-machine and desktop wiring are incomplete. |
-| 4 | Verify parity | Partial | Adapter/service verification exists; interface and installed-platform parity is unproven. |
-| 5 | Provision credential references | Partial | Adapter/service paths exist; production external-manager wiring and CLI/desktop flows are incomplete. |
-| 6 | Recover or roll back | Partial | Durable filesystem recovery is demonstrated; installed-platform and snapshot recovery gates remain. |
-| 7 | Multiple targets and five-layer composition | Partial | `commonkit-config/tests/{layer_set,merge,provenance}.rs`, `commonkit-core/tests/{layer_contract,policy_floor,target_inventory}.rs`, and CLI compose/explain tests cover composition. Remote SSH boundaries have contract tests. No production registry discovers/composes layer files itself, remote staging remains deferred, and daemon compose/explain are unavailable. |
-| 8 | Scheduled read-only drift checks | Partial | `commonkit-service/tests/scheduler.rs` proves persistence, overlap suppression, and read-only checker behavior. The production daemon does not construct/run a `DriftScheduler`, so persisted schedules do not execute unattended checks. |
-| 9 | Optional MCP relay state | Substantially implemented | Relay runtime/config/lifecycle/provider-convergence/transaction tests and service relay routes cover the Rust data/control plane; legacy normalization parity is tested. Installed lifecycle and full dual-runtime black-box parity remain release gates. |
-| 10 | Coding-agent adapters | Substantially implemented | APM 0.25.0 contract/real-release tests, chezmoi 2.70.4 isolation tests, native fallback, provider ownership, and artifact tests exist. Remote provider staging and the full platform release matrix are not complete; SkillOpt is separately excluded from this audit. |
-| 11 | Redacted diagnostics | Implemented contract, partial release flow | Contract redaction and `commonkit-service/tests/diagnostics.rs` cover schema-bound secret-free exports; CLI and MCP expose diagnostics. Desktop export is not wired and installed-platform validation remains. |
-| 12 | OSS onboarding, schemas, threat model, CI | Partial | Schemas, `docs/THREAT-MODEL.md`, migration/release/support docs, three-OS CI, provider gates, and release workflows exist. README/desktop onboarding does not deliver the clean-machine product flow, production signing/notarization has not run, and lifecycle automation upgrades with installers rather than the in-app updater. |
+## Stale claims closed since the prior audit
 
-## Acceptance checklist audit
+- GitHub-backed create/connect onboarding, required layer creation, target registration, private roots, and `headless.json` generation now exist.
+- Daemon composition and explanation, durable CLI diff, credential CLI commands, and production scheduler execution are wired.
+- Snapshot restore and authoritative-writer promotion now support authenticated durable recovery across restart and lifecycle coordination.
+- Portable provider artifacts can be integrity-checked and staged through the typed SSH boundary.
+- Desktop management reads real plan, credential, snapshot, relay, schedule, and diagnostic domain state, and plan apply is daemon-authorized.
+- Three-OS CI, signed release assembly, updater consent fixtures, and a published-release lifecycle workflow exist.
+
+## Acceptance checklist
 
 | Criterion | Result |
 | --- | --- |
-| All 12 flow contract suites | Not met; no single suite covers the twelve end-user flows, and several are only component-level. |
-| macOS/Linux/Windows installation, reconciliation, snapshot, uninstall | Not met; workflows exist, but production signed two-version execution is not recorded and snapshot/reconciliation are not exercised through installed applications on all three OSes. |
-| Declared remote target combinations | Not met; typed SSH command/filesystem tests exist, while remote provider staging is explicitly deferred. |
-| Organization policy weakening rejected with provenance | Met at core/config contract level (`policy_floor`, merge/provenance tests). |
-| Deterministic, redacted, input/observed-bound plans | Met for provider/filesystem and relay plans; live observed-state production coverage exists. |
-| Idempotent apply and failure recovery | Met for the reconciliation core and local filesystem adapter. |
-| No secret/live SQLite in Git or diagnostics | Secret/redaction/path contracts exist; no end-to-end malicious-repository release gate proves the complete claim. |
-| Snapshot restore integrity and rollback safety | Partial; encryption/integrity and atomic previous-file restoration exist, but durable restore receipts/restart recovery and service lifecycle coordination are missing. |
-| Rust relay black-box parity/migration | Partial; configuration normalization and migration fixtures exist, not the full behavior matrix named by the scope. |
-| Desktop/headless same domain state | Not met; desktop status is limited and management panels are placeholders. |
-| Signed installers and updates verified | Not met in production; automation and local signature fixtures exist without production identities/notarization evidence. |
-| Threat model, schemas, onboarding, support, migration docs | Partial; documents exist, but onboarding is descriptive rather than a working clean-machine flow. |
+| All 12 flow contract suites | Not met: component suites exist, but no twelve-flow product suite covers provider materialization, all interfaces, and installed platforms. |
+| macOS/Linux/Windows installation, reconciliation, snapshot, update, uninstall | Not met: automation covers install/update/version/uninstall only; production signed runs and installed reconciliation/snapshot coverage are absent. |
+| Declared remote target combinations | Not met: typed SSH staging passes; production provider/reconciliation integration and remote support-matrix runs are absent. |
+| Organization policy weakening rejected with provenance | Met at composition/core contract level. |
+| Deterministic, redacted, input/observed-bound plans | Met for the implemented local provider/filesystem and relay planning paths. |
+| Idempotent apply and failure recovery | Met for reconciliation and local filesystem operations; installed-platform evidence remains part of the release gate. |
+| No secret or live SQLite in Git/diagnostics | Partial: focused scanners, redaction, and snapshot separation pass; a complete malicious-repository installed-flow gate is absent. |
+| Snapshot restore integrity and rollback safety | Met at core/service contract level, including restart recovery and tamper rejection; installed-platform proof remains. |
+| Rust relay black-box parity/migration | Not met: migration/configuration parity exists, not the required dual-runtime behavior suite. |
+| Desktop/headless same domain state | Not met: desktop reads most domain state and applies plans, but verification, onboarding, and management mutations are missing. |
+| Signed installers and updates verified | Not met in production: fail-closed automation and local updater fixtures exist without production identities, notarization, or a published two-version run. |
+| Threat model, schemas, onboarding, support, migration docs | Partial: required reference documents exist; public onboarding remains stale. |
 
-## Release conclusion
+## Remaining implementation versus external release gates
 
-Do not mark CommonKit v1 complete or release-ready. The reconciliation/provider/relay foundations are credible and well tested, but the product-level initialization, scheduled execution, complete headless surface, desktop management, snapshot recovery lifecycle, remote staging, and production release evidence are still open gates.
+Implementation work:
+
+1. Connect Git fetch and pinned provider materialization to onboarding/service planning, then use the same pipeline for local and SSH targets.
+2. Add production multi-target selection and exercise remote provider staging through semantic CommonKit plans and adapters.
+3. Complete the scoped CLI surface for snapshots and drift-schedule enable/disable.
+4. Wire BWS and platform credential resolvers into the production credential domain.
+5. Complete desktop onboarding, verification, credential/snapshot/relay/schedule mutations, and diagnostics export.
+6. Run one shared Node/Rust relay black-box contract suite across the full required behavior matrix.
+7. Replace the legacy README with the Rust v1 installation and clean-machine workflow.
+8. Extend installed-release tests to reconcile, verify, snapshot, restore, and recover—not only install and report a version.
+
+External release evidence:
+
+1. Supply production macOS signing/notarization and Windows signing identities.
+2. Publish two signed versions and pass the lifecycle workflow on macOS, Linux, and Windows.
+3. Record the declared remote-target support-matrix runs.
+
+## Conclusion
+
+Do not mark CommonKit v1 complete or release-ready. The differentiated reconciliation, policy, provider isolation, relay, snapshot, and service foundations are credible. Completion is now concentrated in provider-to-production wiring, full operator surfaces, cross-runtime relay parity, current onboarding documentation, and executable release evidence.
