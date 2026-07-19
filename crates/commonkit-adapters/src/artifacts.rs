@@ -31,12 +31,13 @@ pub struct ArtifactStore {
 impl ArtifactStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ArtifactError> {
         fs::create_dir_all(root.as_ref())?;
-        set_private_directory(root.as_ref())?;
-        let root = root.as_ref().canonicalize()?;
-        if !root.is_dir() {
+        let directory =
+            open_directory_handle(root.as_ref()).map_err(|_| ArtifactError::InvalidRoot)?;
+        let metadata = directory.dir_metadata()?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ArtifactError::InvalidRoot);
         }
-        let directory = Dir::open_ambient_dir(&root, cap_std::ambient_authority())?;
+        set_private_directory(&directory)?;
         Ok(Self { directory })
     }
 
@@ -171,14 +172,17 @@ fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, ArtifactError> {
 }
 
 #[cfg(unix)]
-fn set_private_directory(path: &Path) -> Result<(), std::io::Error> {
+fn set_private_directory(directory: &Dir) -> Result<(), std::io::Error> {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    directory
+        .try_clone()?
+        .into_std_file()
+        .set_permissions(fs::Permissions::from_mode(0o700))
 }
 
 #[cfg(not(unix))]
-fn set_private_directory(_path: &Path) -> Result<(), std::io::Error> {
+fn set_private_directory(_directory: &Dir) -> Result<(), std::io::Error> {
     Ok(())
 }
 

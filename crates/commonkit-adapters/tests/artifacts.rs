@@ -98,6 +98,32 @@ fn opening_an_existing_store_rejects_unsafe_metadata_without_repairing_it() {
 
 #[cfg(unix)]
 #[test]
+fn creating_a_store_rejects_a_symlink_root_instead_of_reopening_its_target() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let outside = temporary_directory("artifact-create-outside");
+    let link = temporary_directory("artifact-create-link");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::set_permissions(&outside, fs::Permissions::from_mode(0o700)).expect("private outside");
+    symlink(&outside, &link).expect("substitute root");
+
+    assert!(matches!(
+        ArtifactStore::open(&link),
+        Err(ArtifactError::InvalidRoot)
+    ));
+    assert!(
+        fs::symlink_metadata(&link)
+            .expect("link remains")
+            .file_type()
+            .is_symlink()
+    );
+
+    fs::remove_file(link).expect("cleanup link");
+    fs::remove_dir_all(outside).expect("cleanup outside");
+}
+
+#[cfg(unix)]
+#[test]
 fn artifact_load_rejects_a_symlink_substitution() {
     use std::os::unix::fs::symlink;
 

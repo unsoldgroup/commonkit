@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_adapters::{
-    FileAdapter, FileMode, FilesystemIntent, NormalizedManagedPath, SafeSymlinkTarget,
+    ArtifactStore, ContentSensitivity, FileAdapter, FileMode, FilesystemIntent,
+    NormalizedManagedPath, SafeSymlinkTarget,
 };
 use commonkit_contracts::StableId;
 use commonkit_reconcile::Adapter;
@@ -21,6 +22,30 @@ fn temporary_directory(test: &str) -> PathBuf {
 
 fn id(value: &str) -> StableId {
     StableId::parse(value).expect("id")
+}
+
+fn file_operation(
+    adapter: &mut FileAdapter,
+    root: &std::path::Path,
+    path: &str,
+    bytes: &[u8],
+) -> commonkit_contracts::Operation {
+    let provider = ArtifactStore::open(root.join("provider-artifacts")).expect("provider store");
+    let content = provider
+        .put(bytes, ContentSensitivity::Portable)
+        .expect("provider content");
+    adapter
+        .register_materialized_resource(
+            id("managed-file"),
+            FilesystemIntent::File {
+                path: NormalizedManagedPath::parse(path).expect("path"),
+                content,
+                mode: Some(FileMode::parse(0o600).expect("mode")),
+                expected_before: None,
+            },
+            &provider,
+        )
+        .expect("file operation")
 }
 
 #[test]
@@ -106,4 +131,166 @@ fn applies_and_rolls_back_directory_symlink_and_removal_resources() {
     );
 
     fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn semantic_apply_rejects_an_ancestor_substitution_without_mutating_outside() {
+    let root = temporary_directory("semantic-apply-ancestor-substitution");
+    let target = root.join("target");
+    let state = root.join("state");
+    let outside = root.join("outside");
+    let displaced = root.join("displaced");
+    fs::create_dir_all(target.join("config")).expect("target ancestor");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("settings"), b"outside sentinel").expect("sentinel");
+
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = file_operation(&mut adapter, &root, "config/settings", b"managed");
+    adapter.prepare(&operation).expect("prepare");
+    fs::rename(target.join("config"), &displaced).expect("displace ancestor");
+    symlink(&outside, target.join("config")).expect("substitute ancestor");
+
+    let error = adapter
+        .apply(&operation)
+        .expect_err("substituted ancestor must fail closed");
+    assert!(matches!(
+        error.code.as_str(),
+        "unsafe_path" | "preimage_changed"
+    ));
+    assert_eq!(
+        fs::read(outside.join("settings")).expect("outside sentinel"),
+        b"outside sentinel"
+    );
+    assert!(!displaced.join("settings").exists());
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn semantic_apply_rejects_a_target_root_substitution_without_mutating_outside() {
+    let root = temporary_directory("semantic-apply-root-substitution");
+    let target = root.join("target");
+    let state = root.join("state");
+    let outside = root.join("outside");
+    let displaced = root.join("displaced-target");
+    fs::create_dir_all(&target).expect("target");
+    fs::create_dir_all(&outside).expect("outside");
+
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = file_operation(&mut adapter, &root, "settings", b"managed");
+    adapter.prepare(&operation).expect("prepare");
+    fs::rename(&target, &displaced).expect("displace target root");
+    symlink(&outside, &target).expect("substitute target root");
+
+    let error = adapter
+        .apply(&operation)
+        .expect_err("substituted root must fail closed");
+    assert!(matches!(
+        error.code.as_str(),
+        "unsafe_path" | "preimage_changed"
+    ));
+    assert!(!outside.join("settings").exists());
+    assert!(!displaced.join("settings").exists());
+
+    fs::remove_file(&target).expect("cleanup substitute");
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn semantic_apply_rejects_a_leaf_substitution_without_mutating_outside() {
+    let root = temporary_directory("semantic-apply-leaf-substitution");
+    let target = root.join("target");
+    let state = root.join("state");
+    let outside = root.join("outside");
+    fs::create_dir_all(&target).expect("target");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(target.join("settings"), b"original").expect("preimage");
+    fs::write(outside.join("sentinel"), b"outside sentinel").expect("sentinel");
+
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = file_operation(&mut adapter, &root, "settings", b"managed");
+    adapter.prepare(&operation).expect("prepare");
+    fs::remove_file(target.join("settings")).expect("remove leaf");
+    symlink(outside.join("sentinel"), target.join("settings")).expect("substitute leaf");
+
+    let error = adapter
+        .apply(&operation)
+        .expect_err("substituted leaf must fail closed");
+    assert!(matches!(
+        error.code.as_str(),
+        "unsafe_path" | "preimage_changed"
+    ));
+    assert_eq!(
+        fs::read(outside.join("sentinel")).expect("outside sentinel"),
+        b"outside sentinel"
+    );
+    assert!(
+        fs::symlink_metadata(target.join("settings"))
+            .expect("substituted leaf")
+            .file_type()
+            .is_symlink()
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn semantic_rollback_rejects_root_ancestor_and_leaf_substitution_without_outside_mutation() {
+    for substitution in ["root", "ancestor", "leaf"] {
+        let root = temporary_directory(&format!("semantic-rollback-{substitution}"));
+        let target = root.join("target");
+        let state = root.join("state");
+        let outside = root.join("outside");
+        let displaced = root.join("displaced");
+        fs::create_dir_all(target.join("config")).expect("target");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("settings"), b"outside sentinel").expect("sentinel");
+        let managed_path = if substitution == "root" {
+            "settings"
+        } else {
+            "config/settings"
+        };
+
+        let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+        let operation = file_operation(&mut adapter, &root, managed_path, b"managed");
+        adapter.prepare(&operation).expect("prepare");
+        adapter.apply(&operation).expect("apply");
+
+        match substitution {
+            "root" => {
+                fs::rename(&target, &displaced).expect("displace target");
+                symlink(&outside, &target).expect("substitute target");
+            }
+            "ancestor" => {
+                fs::rename(target.join("config"), &displaced).expect("displace ancestor");
+                symlink(&outside, target.join("config")).expect("substitute ancestor");
+            }
+            "leaf" => {
+                fs::remove_file(target.join("config/settings")).expect("remove leaf");
+                symlink(outside.join("settings"), target.join("config/settings"))
+                    .expect("substitute leaf");
+            }
+            _ => unreachable!(),
+        }
+
+        let error = adapter
+            .rollback(&operation)
+            .expect_err("substituted rollback path must fail closed");
+        assert!(matches!(
+            error.code.as_str(),
+            "unsafe_path" | "rollback_preimage_changed"
+        ));
+        assert_eq!(
+            fs::read(outside.join("settings")).expect("outside sentinel"),
+            b"outside sentinel"
+        );
+
+        if target
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            fs::remove_file(&target).expect("cleanup target link");
+        }
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }
