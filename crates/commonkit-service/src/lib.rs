@@ -196,12 +196,15 @@ pub enum SchedulerError {
     Json(#[from] serde_json::Error),
 }
 
+#[cfg(unix)]
 fn make_private_directory(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_private_directory(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 

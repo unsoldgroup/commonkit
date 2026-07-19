@@ -1697,13 +1697,16 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), DomainFailure> 
     sync_parent_directory(parent)
 }
 
+#[cfg(unix)]
 fn sync_parent_directory(parent: &Path) -> Result<(), DomainFailure> {
-    #[cfg(unix)]
-    {
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|_| DomainFailure::OperationFailed)?;
-    }
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> Result<(), DomainFailure> {
     Ok(())
 }
 

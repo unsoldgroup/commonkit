@@ -473,11 +473,14 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     result
 }
 
+#[cfg(unix)]
 fn make_private(path: &Path) -> Result<(), std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_private(_path: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }

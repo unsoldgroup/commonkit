@@ -91,17 +91,21 @@ impl EnvFileLoader {
             return Err(RelayStorageError::RootEscape);
         }
         #[cfg(windows)]
-        return Err(RelayStorageError::WindowsAclVerificationRequired);
-
-        #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            if fs::metadata(&path)?.permissions().mode() & 0o077 != 0 {
-                return Err(RelayStorageError::InsecureEnvPermissions);
-            }
+            Err(RelayStorageError::WindowsAclVerificationRequired)
         }
-        let content = fs::read_to_string(path)?;
-        Ok(parse_env_file(&content))
+        #[cfg(not(windows))]
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if fs::metadata(&path)?.permissions().mode() & 0o077 != 0 {
+                    return Err(RelayStorageError::InsecureEnvPermissions);
+                }
+            }
+            let content = fs::read_to_string(path)?;
+            Ok(parse_env_file(&content))
+        }
     }
 }
 
@@ -235,9 +239,14 @@ fn contained_path(root: &Path, requested: &Path) -> Result<PathBuf, RelayStorage
     Ok(path)
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), RelayStorageError> {
-    #[cfg(unix)]
     fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), RelayStorageError> {
     Ok(())
 }
 
