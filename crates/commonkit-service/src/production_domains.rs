@@ -2241,6 +2241,57 @@ impl ProductionSnapshotDomain {
         )
     }
 
+    fn read_authority_or_deferred(
+        &self,
+        database: &SnapshotDatabase,
+        cipher: &XChaCha20Cipher,
+    ) -> Result<Option<commonkit_snapshots::VersionedPortableAuthority>, DomainFailure> {
+        let authority_path = self
+            .portable_state
+            .join("authority")
+            .join(format!("{}.json", database.id));
+        if authority_path.exists() {
+            return self
+                .portable_authority(cipher)
+                .map_err(|_| DomainFailure::OperationFailed)?
+                .read(&database.id)
+                .map(Some)
+                .map_err(|_| DomainFailure::VerificationFailed);
+        }
+        if self
+            .portable_state
+            .join("authority-history")
+            .join(database.id.to_string())
+            .exists()
+        {
+            return Err(DomainFailure::VerificationFailed);
+        }
+        for entry in fs::read_dir(self.portable_state.join("snapshots"))
+            .map_err(|_| DomainFailure::OperationFailed)?
+        {
+            let path = entry.map_err(|_| DomainFailure::OperationFailed)?.path();
+            let bytes = fs::read(&path).map_err(|_| DomainFailure::OperationFailed)?;
+            let expected = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .ok_or(DomainFailure::VerificationFailed)?;
+            if path.extension().and_then(|value| value.to_str()) != Some("json")
+                || format!("{:x}", Sha256::digest(&bytes)) != expected
+            {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            let descriptor: PortableSnapshotDescriptor =
+                serde_json::from_slice(&bytes).map_err(|_| DomainFailure::VerificationFailed)?;
+            if descriptor.schema != "commonkit.portable-snapshot-descriptor.v1" {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            if descriptor.database_id == database.id {
+                return Err(DomainFailure::VerificationFailed);
+            }
+        }
+        Ok(None)
+    }
+
     fn initialize_authority(
         &self,
         database: &SnapshotDatabase,
@@ -2541,14 +2592,8 @@ impl ProductionSnapshotDomain {
             output.insert(stored.snapshot_id.clone(), stored);
         }
         let all_manifests = output.into_values().collect::<Vec<_>>();
-        let authority_store = self
-            .portable_authority(&cipher)
-            .map_err(|_| DomainFailure::VerificationFailed)?;
         let mut manifests = Vec::new();
         for database in self.databases.values() {
-            let authority = authority_store
-                .read(&database.id)
-                .map_err(|_| DomainFailure::VerificationFailed)?;
             let mut by_content = all_manifests
                 .iter()
                 .filter(|stored| stored.manifest.database == database.id)
@@ -2562,6 +2607,12 @@ impl ProductionSnapshotDomain {
             {
                 return Err(DomainFailure::VerificationFailed);
             }
+            let Some(authority) = self.read_authority_or_deferred(database, &cipher)? else {
+                if by_content.is_empty() {
+                    continue;
+                }
+                return Err(DomainFailure::VerificationFailed);
+            };
             let Some(mut cursor) = authority.record.accepted_head else {
                 // Unaccepted descriptors are interrupted/concurrent object-store or Git orphans,
                 // never history. They become visible only through an authority CAS.
@@ -2664,15 +2715,13 @@ impl ProductionSnapshotDomain {
     }
     fn writers(&self) -> Result<BTreeMap<String, String>, DomainFailure> {
         let cipher = self.cipher()?;
-        let store = self
-            .portable_authority(&cipher)
-            .map_err(|_| DomainFailure::OperationFailed)?;
         let mut writers = BTreeMap::new();
         for (id, database) in &self.databases {
-            let authority = store
-                .read(&database.id)
-                .map_err(|_| DomainFailure::VerificationFailed)?;
-            writers.insert(id.clone(), authority.record.current_writer);
+            let writer = self
+                .read_authority_or_deferred(database, &cipher)?
+                .map(|authority| authority.record.current_writer)
+                .unwrap_or_else(|| database.target_id.clone());
+            writers.insert(id.clone(), writer);
         }
         Ok(writers)
     }
@@ -2913,23 +2962,31 @@ impl SnapshotDomain for ProductionSnapshotDomain {
     fn list(&self) -> Result<Value, DomainFailure> {
         let writers = self.writers()?;
         let cipher = self.cipher()?;
-        let authority_store = self
-            .portable_authority(&cipher)
-            .map_err(|_| DomainFailure::OperationFailed)?;
         let authority_revisions = self
             .databases
             .iter()
             .map(|(id, database)| {
-                let authority = authority_store
-                    .read(&database.id)
-                    .map_err(|_| DomainFailure::VerificationFailed)?;
+                let authority = self.read_authority_or_deferred(database, &cipher)?;
                 Ok((
                     id.clone(),
-                    serde_json::json!({
-                        "revision":authority.revision,
-                        "generation":authority.record.generation,
-                        "acceptedHead":authority.record.accepted_head
-                    }),
+                    authority.map_or_else(
+                        || {
+                            serde_json::json!({
+                                "revision": null,
+                                "generation": 0,
+                                "acceptedHead": null,
+                                "pendingInitialization": true
+                            })
+                        },
+                        |authority| {
+                            serde_json::json!({
+                                "revision":authority.revision,
+                                "generation":authority.record.generation,
+                                "acceptedHead":authority.record.accepted_head,
+                                "pendingInitialization": false
+                            })
+                        },
+                    ),
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, DomainFailure>>()?;

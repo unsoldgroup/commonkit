@@ -179,6 +179,14 @@ config.snapshots = {
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 JS
 "$commonkit" daemon reload-domains --confirmed >/dev/null
+"$commonkit" snapshots list | node -e '
+let body="";
+process.stdin.on("data", chunk => body += chunk);
+process.stdin.on("end", () => {
+  const state=JSON.parse(body);
+  if (state.snapshots.length !== 0 || state.writers["context-mode"] !== "local" ||
+      state.authority["context-mode"].pendingInitialization !== true) process.exit(1);
+});'
 
 snapshot_json="$scratch/snapshot.json"
 "$commonkit" snapshots create context-mode --confirmed > "$snapshot_json"
