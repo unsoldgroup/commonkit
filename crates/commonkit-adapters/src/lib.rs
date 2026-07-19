@@ -8,6 +8,7 @@ mod files;
 mod git_sync;
 mod native;
 mod planning;
+mod pipeline;
 mod provider;
 mod remote_helper;
 mod remote_provider;
@@ -35,6 +36,7 @@ pub use git_sync::{
 };
 pub use native::NativeProvider;
 pub use planning::{ProviderPlanError, ProviderPlanRequest, build_provider_plan};
+pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutput};
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,
     ProviderContext, ProviderContractError, ProviderFailure, ProviderInputs, ProviderWorkspace,
