@@ -134,6 +134,12 @@ pub fn initialize(
         "gh",
         &os_args(["auth", "status", "--hostname", "github.com"]),
     )?;
+
+    let provider = if request.mode == InitMode::Create {
+        import_create_provider_inputs(request)?
+    } else {
+        request.provider.clone()
+    };
     if request.mode == InitMode::Create {
         runner.run(
             "gh",
@@ -201,7 +207,7 @@ pub fn initialize(
         .to_owned();
     validate_git_revision(&revision)?;
     let (headless_config, first_plan_id) =
-        write_runtime_state(request, &layer_paths, &revision, &target)?;
+        write_runtime_state(request, &provider, &layer_paths, &revision, &target)?;
     Ok(InitResult {
         status: "initialized",
         repository: request.repository.clone(),
@@ -344,14 +350,16 @@ fn git_commit_created_kit(
         OsString::from("-C"),
         request.kit_directory.as_os_str().to_owned(),
     ];
+    let mut add = vec![
+        OsString::from("add"),
+        OsString::from("layers"),
+        OsString::from("targets"),
+    ];
+    if request.kit_directory.join("providers").is_dir() {
+        add.push(OsString::from("providers"));
+    }
     for arguments in [
-        vec![
-            OsString::from("add"),
-            OsString::from("layers/public-base.json"),
-            OsString::from("layers/organization-policy.json"),
-            OsString::from(format!("layers/{}.json", request.loadout)),
-            OsString::from(format!("targets/{}.json", request.target)),
-        ],
+        add,
         vec![
             OsString::from("commit"),
             OsString::from("-m"),
@@ -372,6 +380,7 @@ fn git_commit_created_kit(
 
 fn write_runtime_state(
     request: &InitRequest,
+    selected_provider: &ProviderSelection,
     layer_paths: &[PathBuf],
     revision: &str,
     target: &StableId,
@@ -452,7 +461,7 @@ fn write_runtime_state(
         Box<dyn DesiredStateProvider>,
         serde_json::Value,
         &str,
-    ) = match &request.provider {
+    ) = match selected_provider {
         ProviderSelection::Native => (
             Box::new(native),
             json!({"provider":"native", "version": env!("CARGO_PKG_VERSION"), "files": native_file_configs(layer_paths)?}),
@@ -614,6 +623,148 @@ fn write_runtime_state(
     let path = request.config_directory.join("headless.json");
     write_private_json(&path, &config)?;
     Ok((path, first_plan.id))
+}
+
+fn import_create_provider_inputs(
+    request: &InitRequest,
+) -> Result<ProviderSelection, OnboardingError> {
+    match &request.provider {
+        ProviderSelection::Native => Ok(ProviderSelection::Native),
+        ProviderSelection::Apm {
+            executable,
+            manifest,
+            lockfile,
+            policy,
+        } => {
+            for path in [manifest, lockfile, policy] {
+                if !path.is_absolute() {
+                    return Err(OnboardingError::CreateImportMustBeAbsolute(path.clone()));
+                }
+            }
+            let parent = manifest
+                .parent()
+                .ok_or_else(|| OnboardingError::UnsafePath(manifest.clone()))?;
+            if lockfile.parent() != Some(parent) || policy.parent() != Some(parent) {
+                return Err(OnboardingError::ApmInputsMustShareDirectory);
+            }
+            let destination = request.kit_directory.join("providers/apm");
+            copy_safe_tree(parent, &destination)?;
+            Ok(ProviderSelection::Apm {
+                executable: executable.clone(),
+                manifest: PathBuf::from("providers/apm").join(
+                    manifest
+                        .file_name()
+                        .ok_or_else(|| OnboardingError::UnsafePath(manifest.clone()))?,
+                ),
+                lockfile: PathBuf::from("providers/apm").join(
+                    lockfile
+                        .file_name()
+                        .ok_or_else(|| OnboardingError::UnsafePath(lockfile.clone()))?,
+                ),
+                policy: PathBuf::from("providers/apm").join(
+                    policy
+                        .file_name()
+                        .ok_or_else(|| OnboardingError::UnsafePath(policy.clone()))?,
+                ),
+            })
+        }
+        ProviderSelection::Chezmoi {
+            executable,
+            source,
+            config,
+        } => {
+            if !source.is_absolute() || !config.is_absolute() {
+                return Err(OnboardingError::CreateImportMustBeAbsolute(
+                    if !source.is_absolute() {
+                        source.clone()
+                    } else {
+                        config.clone()
+                    },
+                ));
+            }
+            let destination = request.kit_directory.join("providers/chezmoi/source");
+            copy_safe_tree(source, &destination)?;
+            let config_bytes = read_safe_import_file(config)?;
+            let config_destination = request.kit_directory.join("providers/chezmoi/chezmoi.toml");
+            fs::create_dir_all(config_destination.parent().unwrap())?;
+            fs::write(&config_destination, &config_bytes)?;
+            if fs::read(&config_destination)? != config_bytes {
+                return Err(OnboardingError::ImportDigestMismatch);
+            }
+            Ok(ProviderSelection::Chezmoi {
+                executable: executable.clone(),
+                source: "providers/chezmoi/source".into(),
+                config: "providers/chezmoi/chezmoi.toml".into(),
+            })
+        }
+    }
+}
+
+fn copy_safe_tree(source: &Path, destination: &Path) -> Result<(), OnboardingError> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|_| OnboardingError::MissingProviderInput(source.into()))?;
+    if !source.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(OnboardingError::UnsafePath(source.into()));
+    }
+    fs::create_dir_all(destination)?;
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let input = entry.path();
+        let output = destination.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&input)?;
+        if metadata.file_type().is_symlink() {
+            return Err(OnboardingError::UnsafeImportObject(input));
+        }
+        if metadata.is_dir() {
+            copy_safe_tree(&input, &output)?;
+        } else if metadata.is_file() {
+            let bytes = read_safe_import_file(&input)?;
+            fs::write(&output, &bytes)?;
+            if fs::read(&output)? != bytes {
+                return Err(OnboardingError::ImportDigestMismatch);
+            }
+        } else {
+            return Err(OnboardingError::UnsafeImportObject(input));
+        }
+    }
+    Ok(())
+}
+
+fn read_safe_import_file(path: &Path) -> Result<Vec<u8>, OnboardingError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|_| OnboardingError::MissingProviderInput(path.into()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(OnboardingError::UnsafeImportObject(path.into()));
+    }
+    let bytes = fs::read(path)?;
+    if bytes.is_empty() {
+        return Err(OnboardingError::EmptyProviderInput(path.into()));
+    }
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        for line in text.lines() {
+            let lower = line.trim().to_ascii_lowercase();
+            if [
+                "token:",
+                "password:",
+                "api_key:",
+                "apikey:",
+                "client_secret:",
+            ]
+            .iter()
+            .any(|key| lower.starts_with(key))
+            {
+                let value = line
+                    .split_once(':')
+                    .map(|(_, value)| value.trim())
+                    .unwrap_or("");
+                if !value.is_empty() && !value.starts_with("${") && !value.contains("://") {
+                    return Err(OnboardingError::SecretLikeImport(path.into()));
+                }
+            }
+        }
+    }
+    Ok(bytes)
 }
 
 fn native_file_configs(layer_paths: &[PathBuf]) -> Result<Vec<serde_json::Value>, OnboardingError> {
@@ -795,6 +946,18 @@ pub enum OnboardingError {
         "connecting a target requires explicit --publish-registration consent before CommonKit commits and pushes the portable registration"
     )]
     RegistrationConsentRequired,
+    #[error("provider inputs for init create must be absolute import paths: {0}")]
+    CreateImportMustBeAbsolute(PathBuf),
+    #[error(
+        "APM manifest, lockfile, and policy imports must share one directory so manifest-relative sources remain valid"
+    )]
+    ApmInputsMustShareDirectory,
+    #[error("provider import contains a symlink or unsupported filesystem object: {0}")]
+    UnsafeImportObject(PathBuf),
+    #[error("provider import contains secret-like plaintext: {0}")]
+    SecretLikeImport(PathBuf),
+    #[error("provider import changed while it was copied; retry from a stable source")]
+    ImportDigestMismatch,
     #[error("required tool {tool} is unavailable: {detail}")]
     ToolUnavailable { tool: String, detail: String },
     #[error(

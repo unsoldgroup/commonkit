@@ -209,6 +209,98 @@ fn create_provisions_a_private_repository_and_pushes_only_portable_files() {
 }
 
 #[test]
+fn create_imports_apm_inputs_and_materializes_the_first_plan() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let inputs = temporary.path().join("apm-inputs");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&inputs).unwrap();
+    std::fs::write(inputs.join("apm.yml"), "name: kit\n").unwrap();
+    std::fs::write(inputs.join("apm.lock.yaml"), "lockfileVersion: 1\n").unwrap();
+    std::fs::write(inputs.join("apm-policy.yml"), "allowedSources: []\n").unwrap();
+    test_support::write_logging_tools(&bin, &temporary.path().join("commands"));
+    test_support::write_tool(
+        &bin,
+        "apm",
+        r#"
+if [ "$1" = "--version" ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0\n'; exit 0; fi
+if [ "$1" = install ]; then exit 0; fi
+if [ "$1" = compile ]; then mkdir -p .claude; printf 'context\n' > .claude/CLAUDE.md; exit 0; fi
+if [ "$1" = audit ]; then printf '{}\n'; exit 0; fi
+exit 93
+"#,
+    );
+    let mut request = request(temporary.path(), InitMode::Create, "owner/apm-kit");
+    request.provider = ProviderSelection::Apm {
+        executable: bin.join("apm"),
+        manifest: inputs.join("apm.yml"),
+        lockfile: inputs.join("apm.lock.yaml"),
+        policy: inputs.join("apm-policy.yml"),
+    };
+    let result = initialize(&request, &ProcessRunner::new(&bin)).unwrap();
+    assert!(result.kit_directory.join("providers/apm/apm.yml").is_file());
+    let plan = commonkit_reconcile::PlanStore::open(temporary.path().join("state/plans"))
+        .unwrap()
+        .load(&result.first_plan_id)
+        .unwrap();
+    assert_eq!(plan.operations.len(), 1);
+}
+
+#[test]
+fn create_imports_chezmoi_source_and_rejects_symlinks() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let source = temporary.path().join("chez-source");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("dot_editor"), "managed\n").unwrap();
+    let config = temporary.path().join("chezmoi.toml");
+    std::fs::write(&config, "[data]\n").unwrap();
+    test_support::write_logging_tools(&bin, &temporary.path().join("commands"));
+    test_support::write_tool(
+        &bin,
+        "chezmoi",
+        r#"
+if [ "$1" = "--version" ]; then printf 'chezmoi version v2.70.4\n'; exit 0; fi
+dest=''; src=''; prev=''; for arg in "$@"; do [ "$prev" = --destination ] && dest="$arg"; [ "$prev" = --source ] && src="$arg"; prev="$arg"; done
+mkdir -p "$dest"; cp -R "$src"/. "$dest"/; [ -f "$dest/dot_editor" ] && mv "$dest/dot_editor" "$dest/.editor"; exit 0
+"#,
+    );
+    let mut chez_request = request(temporary.path(), InitMode::Create, "owner/chez-kit");
+    chez_request.provider = ProviderSelection::Chezmoi {
+        executable: bin.join("chezmoi"),
+        source: source.clone(),
+        config: config.clone(),
+    };
+    let result = initialize(&chez_request, &ProcessRunner::new(&bin)).unwrap();
+    assert!(
+        result
+            .kit_directory
+            .join("providers/chezmoi/source/dot_editor")
+            .is_file()
+    );
+    assert!(
+        commonkit_reconcile::PlanStore::open(temporary.path().join("state/plans"))
+            .unwrap()
+            .load(&result.first_plan_id)
+            .is_ok()
+    );
+
+    let unsafe_root = tempfile::tempdir().unwrap();
+    let unsafe_source = unsafe_root.path().join("source");
+    std::fs::create_dir_all(&unsafe_source).unwrap();
+    std::os::unix::fs::symlink(&config, unsafe_source.join("dot_escape")).unwrap();
+    let mut unsafe_request = request(unsafe_root.path(), InitMode::Create, "owner/unsafe-kit");
+    unsafe_request.provider = ProviderSelection::Chezmoi {
+        executable: bin.join("chezmoi"),
+        source: unsafe_source,
+        config,
+    };
+    let error = initialize(&unsafe_request, &ProcessRunner::new(&bin)).unwrap_err();
+    assert!(error.to_string().contains("symlink"));
+}
+
+#[test]
 fn connect_rejects_native_sources_that_escape_the_git_checkout() {
     let temporary = tempfile::tempdir().unwrap();
     let bin = temporary.path().join("bin");

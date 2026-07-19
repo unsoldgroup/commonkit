@@ -6,6 +6,7 @@ import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } fro
 import { updatePanel, type UpdateUiState } from "./updater-view.ts";
 import { managementPanel } from "./management-view.ts";
 import { onboardingPanel, type OnboardingProvider } from "./onboarding-view.ts";
+import { open } from "@tauri-apps/plugin-dialog";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
@@ -59,6 +60,17 @@ function bindTargetActions(): void {
 }
 
 function bindOnboardingActions(): void {
+  for (const button of document.querySelectorAll<HTMLButtonElement>("[data-pick], [data-pick-directory]")) {
+    button.addEventListener("click", async () => {
+      const name = button.dataset.pick ?? button.dataset.pickDirectory;
+      if (!name) return;
+      const selected = await open({ directory: Boolean(button.dataset.pickDirectory), multiple: false });
+      if (typeof selected === "string") {
+        const input = document.querySelector<HTMLInputElement>(`[name="${name}"]`);
+        if (input) input.value = selected;
+      }
+    });
+  }
   document.querySelector<HTMLSelectElement>("#onboarding-provider")?.addEventListener("change", (event) => {
     onboardingProvider = (event.currentTarget as HTMLSelectElement).value as OnboardingProvider;
     onboardingMessage = "";
@@ -66,7 +78,7 @@ function bindOnboardingActions(): void {
   });
   document.querySelector<HTMLFormElement>("#onboarding-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const values = Object.fromEntries(new FormData(event.currentTarget as HTMLFormElement).entries());
+    const values: Record<string, unknown> = Object.fromEntries(new FormData(event.currentTarget as HTMLFormElement).entries());
     values.publishRegistration = values.publishRegistration === "true";
     onboardingMessage = "Validating pinned provider and materializing…";
     render();

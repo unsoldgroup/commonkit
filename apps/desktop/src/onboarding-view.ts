@@ -2,15 +2,15 @@ export type OnboardingProvider = "native" | "apm" | "chezmoi";
 
 export function onboardingPanel(provider: OnboardingProvider = "native", message = ""): string {
   const apm = provider === "apm" ? `
-    <label>APM executable<input name="providerExecutable" required></label>
-    <label>Manifest path in kit<input name="apmManifest" value="apm.yml" required></label>
-    <label>Lockfile path in kit<input name="apmLockfile" value="apm.lock.yaml" required></label>
-    <label>Package policy path in kit<input name="apmPolicy" value="apm-policy.yml" required></label>
+    <label>APM executable<input name="providerExecutable" required><button type="button" data-pick="providerExecutable">Choose file</button></label>
+    <label>Manifest path<input name="apmManifest" value="apm.yml" required><button type="button" data-pick="apmManifest">Choose file</button></label>
+    <label>Lockfile path<input name="apmLockfile" value="apm.lock.yaml" required><button type="button" data-pick="apmLockfile">Choose file</button></label>
+    <label>Package policy path<input name="apmPolicy" value="apm-policy.yml" required><button type="button" data-pick="apmPolicy">Choose file</button></label>
     <input name="providerVersion" type="hidden" value="0.25.0">` : "";
   const chezmoi = provider === "chezmoi" ? `
-    <label>chezmoi executable<input name="providerExecutable" required></label>
-    <label>Source directory in kit<input name="chezmoiSource" value="home" required></label>
-    <label>Config path in kit<input name="chezmoiConfig" value="chezmoi.toml" required></label>
+    <label>chezmoi executable<input name="providerExecutable" required><button type="button" data-pick="providerExecutable">Choose file</button></label>
+    <label>Source directory<input name="chezmoiSource" value="home" required><button type="button" data-pick-directory="chezmoiSource">Choose directory</button></label>
+    <label>Config path<input name="chezmoiConfig" value="chezmoi.toml" required><button type="button" data-pick="chezmoiConfig">Choose file</button></label>
     <input name="providerVersion" type="hidden" value="2.70.4">` : "";
   return `<section class="panel onboarding-panel"><p class="eyebrow">Get started</p><h1>Create or connect your kit</h1>
     <p>Provider output is staged and shown as a CommonKit plan before this machine changes.</p>

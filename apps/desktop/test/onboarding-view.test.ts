@@ -8,8 +8,10 @@ test("guided onboarding exposes only pinned provider-specific inputs", () => {
   assert.doesNotMatch(onboardingPanel("native"), /providerVersion/);
   assert.match(onboardingPanel("apm"), /value="0.25.0"/);
   assert.match(onboardingPanel("apm"), /apmLockfile/);
+  assert.match(onboardingPanel("apm"), /data-pick="apmManifest"/);
   assert.match(onboardingPanel("chezmoi"), /value="2.70.4"/);
   assert.match(onboardingPanel("chezmoi"), /chezmoiSource/);
+  assert.match(onboardingPanel("chezmoi"), /data-pick-directory="chezmoiSource"/);
   assert.doesNotMatch(onboardingPanel("apm"), /type="password"/);
 });
 
