@@ -165,6 +165,7 @@ impl FileAdapter {
         &self,
         intents: impl IntoIterator<Item = &'a FilesystemIntent>,
     ) -> Result<Sha256Digest, FileAdapterError> {
+        self.validate_target_binding()?;
         let mut observed = Vec::new();
         for intent in intents {
             validate_semantic_intent(intent)?;
@@ -311,6 +312,7 @@ impl FileAdapter {
         intent: FilesystemIntent,
     ) -> Result<Operation, FileAdapterError> {
         validate_semantic_intent(&intent)?;
+        self.validate_target_binding()?;
         let observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())?;
         let before_digest = semantic_digest(&observed)?;
         let expected = match &intent {
@@ -443,8 +445,10 @@ impl FileAdapter {
 impl FileAdapter {
     fn prepare_semantic(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
         let intent = self.semantic(operation)?;
+        self.validate_target_binding()
+            .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
         let observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
-            .map_err(|_| failure("inspect_failed", "could not inspect managed resource"))?;
+            .map_err(|_| failure("unsafe_path", "managed resource path is unsafe"))?;
         let digest = semantic_digest(&observed)
             .map_err(|_| failure("digest_failed", "could not digest managed resource"))?;
         if digest != operation.before_digest {
@@ -502,8 +506,10 @@ impl FileAdapter {
 
     fn verify_semantic(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
         let intent = self.semantic(operation)?;
+        self.validate_target_binding()
+            .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
         let mut actual = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
-            .map_err(|_| failure("verify_failed", "could not inspect managed resource"))?;
+            .map_err(|_| failure("unsafe_path", "managed resource path is unsafe"))?;
         if matches!(
             &intent,
             FilesystemIntent::File { mode: None, .. }
@@ -844,8 +850,14 @@ fn inspect_resource(
     artifacts: &ArtifactStore,
     path: &str,
 ) -> Result<ResourcePreimage, FileAdapterError> {
-    let path = Path::new(path);
-    let metadata = match directory.symlink_metadata(path) {
+    let (parent, leaf) = match open_parent_nofollow(directory, path, false) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ResourcePreimage::Absent);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = match parent.symlink_metadata(&leaf) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(ResourcePreimage::Absent);
@@ -853,7 +865,7 @@ fn inspect_resource(
         Err(error) => return Err(error.into()),
     };
     if metadata.file_type().is_symlink() {
-        let target = directory.read_link(path)?;
+        let target = parent.read_link(&leaf)?;
         return Ok(ResourcePreimage::Symlink {
             target: target.to_string_lossy().into_owned(),
         });
@@ -863,7 +875,7 @@ fn inspect_resource(
         return Ok(ResourcePreimage::Directory { mode });
     }
     if metadata.is_file() {
-        let bytes = read_optional(directory, path)?.ok_or(FileAdapterError::MissingStateEntry)?;
+        let bytes = read_optional_in(&parent, &leaf)?.ok_or(FileAdapterError::MissingStateEntry)?;
         let content = artifacts.put(&bytes, ContentSensitivity::LocalSensitive)?;
         return Ok(ResourcePreimage::File { content, mode });
     }

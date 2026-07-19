@@ -210,3 +210,130 @@ fn an_opened_existing_store_remains_bound_to_the_original_directory() {
     fs::remove_dir_all(moved).expect("cleanup original");
     fs::remove_dir_all(substitute).expect("cleanup substitute");
 }
+
+#[cfg(unix)]
+#[test]
+fn creating_stores_during_ancestor_substitution_never_creates_outside() {
+    use std::os::unix::fs::symlink;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let base = temporary_directory("artifact-concurrent-create-base");
+    let ancestor = base.join("ancestor");
+    let parked = base.join("parked");
+    let outside = temporary_directory("artifact-concurrent-create-outside");
+    fs::create_dir_all(&ancestor).expect("ancestor");
+    fs::create_dir_all(&outside).expect("outside");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let attacker_stop = Arc::clone(&stop);
+    let attacker_ancestor = ancestor.clone();
+    let attacker_parked = parked.clone();
+    let attacker_outside = outside.clone();
+    let attacker = std::thread::spawn(move || {
+        while !attacker_stop.load(Ordering::Acquire) {
+            if fs::rename(&attacker_ancestor, &attacker_parked).is_ok() {
+                if symlink(&attacker_outside, &attacker_ancestor).is_ok() {
+                    std::thread::yield_now();
+                    let _ = fs::remove_file(&attacker_ancestor);
+                }
+                let _ = fs::rename(&attacker_parked, &attacker_ancestor);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        if attacker_ancestor
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            let _ = fs::remove_file(&attacker_ancestor);
+        }
+        if attacker_parked.exists() {
+            let _ = fs::rename(&attacker_parked, &attacker_ancestor);
+        }
+    });
+
+    for index in 0..2_000 {
+        let _ = ArtifactStore::open(ancestor.join(format!("store-{index}")));
+    }
+    stop.store(true, Ordering::Release);
+    attacker.join().expect("attacker");
+
+    assert_eq!(
+        fs::read_dir(&outside).expect("outside").count(),
+        0,
+        "artifact bootstrap escaped through a concurrently substituted ancestor"
+    );
+    fs::remove_dir_all(base).expect("cleanup base");
+    fs::remove_dir_all(outside).expect("cleanup outside");
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_existing_stores_during_ancestor_substitution_never_opens_outside() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let base = temporary_directory("artifact-concurrent-open-base");
+    let ancestor = base.join("ancestor");
+    let parked = base.join("parked");
+    let outside = temporary_directory("artifact-concurrent-open-outside");
+    let trusted_store = ancestor.join("store");
+    let outside_store = outside.join("store");
+    let trusted = ArtifactStore::open(&trusted_store).expect("trusted store");
+    let reference = trusted
+        .put(b"trusted bytes", ContentSensitivity::Portable)
+        .expect("trusted artifact");
+    drop(trusted);
+    fs::create_dir_all(&outside_store).expect("outside store");
+    fs::set_permissions(&outside_store, fs::Permissions::from_mode(0o700))
+        .expect("outside store mode");
+    let blob = format!(
+        "{}.blob",
+        reference.digest.as_str().trim_start_matches("sha256:")
+    );
+    fs::write(outside_store.join(blob), b"outside bytes").expect("outside artifact");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let attacker_stop = Arc::clone(&stop);
+    let attacker_ancestor = ancestor.clone();
+    let attacker_parked = parked.clone();
+    let attacker_outside = outside.clone();
+    let attacker = std::thread::spawn(move || {
+        while !attacker_stop.load(Ordering::Acquire) {
+            if fs::rename(&attacker_ancestor, &attacker_parked).is_ok() {
+                if symlink(&attacker_outside, &attacker_ancestor).is_ok() {
+                    std::thread::yield_now();
+                    let _ = fs::remove_file(&attacker_ancestor);
+                }
+                let _ = fs::rename(&attacker_parked, &attacker_ancestor);
+            } else {
+                std::thread::yield_now();
+            }
+        }
+        if attacker_ancestor
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            let _ = fs::remove_file(&attacker_ancestor);
+        }
+        if attacker_parked.exists() {
+            let _ = fs::rename(&attacker_parked, &attacker_ancestor);
+        }
+    });
+
+    for _ in 0..2_000 {
+        if let Ok(store) = ArtifactStore::open_existing(&trusted_store) {
+            assert_eq!(
+                store.load(&reference).expect("retained trusted store"),
+                b"trusted bytes"
+            );
+        }
+    }
+    stop.store(true, Ordering::Release);
+    attacker.join().expect("attacker");
+
+    fs::remove_dir_all(base).expect("cleanup base");
+    fs::remove_dir_all(outside).expect("cleanup outside");
+}

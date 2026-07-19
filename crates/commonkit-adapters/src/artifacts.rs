@@ -1,4 +1,4 @@
-use std::fs::{self, OpenOptions as StdOpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -45,8 +45,7 @@ impl ArtifactStore {
     /// permissions. Execution-time authority checks use this path so rejecting
     /// a stale or malformed plan is a strictly read-only operation.
     pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, ArtifactError> {
-        let root = root.as_ref();
-        let directory = open_directory_handle(root).map_err(|_| ArtifactError::InvalidRoot)?;
+        let directory = open_existing_directory_handle(root.as_ref())?;
         let metadata = directory.dir_metadata()?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ArtifactError::InvalidRoot);
@@ -141,33 +140,13 @@ impl ArtifactStore {
 }
 
 fn open_or_create_directory_handle(path: &Path) -> Result<Dir, ArtifactError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    let mut ancestor = absolute.as_path();
-    let existing = loop {
-        match fs::symlink_metadata(ancestor) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-                return Err(ArtifactError::InvalidRoot);
-            }
-            Ok(_) => break ancestor,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                ancestor = ancestor.parent().ok_or(ArtifactError::InvalidRoot)?;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    };
-    let mut current = open_directory_handle(existing).map_err(|_| ArtifactError::InvalidRoot)?;
-    let suffix = absolute
-        .strip_prefix(existing)
-        .map_err(|_| ArtifactError::InvalidRoot)?;
-    for component in suffix.components() {
-        let std::path::Component::Normal(name) = component else {
-            return Err(ArtifactError::InvalidRoot);
-        };
-        let name = Path::new(name);
+    let absolute = absolute_path(path)?;
+    let (mut current, components) = trusted_root_and_components(&absolute)?;
+    if components.is_empty() {
+        return Err(ArtifactError::InvalidRoot);
+    }
+    for name in components {
+        let name = Path::new(&name);
         match open_directory_component(&current, name) {
             Ok(next) => current = next,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -185,6 +164,122 @@ fn open_or_create_directory_handle(path: &Path) -> Result<Dir, ArtifactError> {
         }
     }
     Ok(current)
+}
+
+fn open_existing_directory_handle(path: &Path) -> Result<Dir, ArtifactError> {
+    let absolute = absolute_path(path)?;
+    let (mut current, components) = trusted_root_and_components(&absolute)?;
+    if components.is_empty() {
+        return Err(ArtifactError::InvalidRoot);
+    }
+    for name in components {
+        current = open_directory_component(&current, Path::new(&name))
+            .map_err(|_| ArtifactError::InvalidRoot)?;
+    }
+    Ok(current)
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, ArtifactError> {
+    Ok(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    })
+}
+
+#[cfg(unix)]
+fn trusted_root_and_components(
+    absolute: &Path,
+) -> Result<(Dir, Vec<std::ffi::OsString>), ArtifactError> {
+    use std::path::Component;
+
+    let mut components = absolute.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(ArtifactError::InvalidRoot);
+    }
+    let mut names = components
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_os_string()),
+            _ => Err(ArtifactError::InvalidRoot),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let root = Dir::open_ambient_dir(Path::new("/"), cap_std::ambient_authority())
+        .map_err(|_| ArtifactError::InvalidRoot)?;
+    // macOS exposes trusted root aliases such as `/var -> private/var` and
+    // `/tmp -> private/tmp`. Resolve only this root-owned first component by
+    // reading it through the retained `/` capability. Every resulting and
+    // subsequent component is still opened individually with no-follow.
+    if let Some(first) = names.first()
+        && root
+            .symlink_metadata(first)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        let target = root
+            .read_link(first)
+            .map_err(|_| ArtifactError::InvalidRoot)?;
+        let mut target_names = Vec::new();
+        for component in target.components() {
+            match component {
+                Component::RootDir => target_names.clear(),
+                Component::Normal(name) => target_names.push(name.to_os_string()),
+                _ => return Err(ArtifactError::InvalidRoot),
+            }
+        }
+        if target_names.is_empty() {
+            return Err(ArtifactError::InvalidRoot);
+        }
+        target_names.extend(names.into_iter().skip(1));
+        names = target_names;
+    }
+    Ok((root, names))
+}
+
+#[cfg(windows)]
+fn trusted_root_and_components(
+    absolute: &Path,
+) -> Result<(Dir, Vec<std::ffi::OsString>), ArtifactError> {
+    use std::path::Component;
+
+    let mut components = absolute.components();
+    let prefix = match components.next() {
+        Some(Component::Prefix(prefix)) => prefix.as_os_str().to_os_string(),
+        _ => return Err(ArtifactError::InvalidRoot),
+    };
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(ArtifactError::InvalidRoot);
+    }
+    let mut volume_root = PathBuf::from(prefix);
+    volume_root.push(std::path::MAIN_SEPARATOR.to_string());
+    let names = components
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_os_string()),
+            _ => Err(ArtifactError::InvalidRoot),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let root = Dir::open_ambient_dir(&volume_root, cap_std::ambient_authority())
+        .map_err(|_| ArtifactError::InvalidRoot)?;
+    Ok((root, names))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn trusted_root_and_components(
+    absolute: &Path,
+) -> Result<(Dir, Vec<std::ffi::OsString>), ArtifactError> {
+    use std::path::Component;
+
+    let mut components = absolute.components();
+    if !matches!(components.next(), Some(Component::RootDir)) {
+        return Err(ArtifactError::InvalidRoot);
+    }
+    let names = components
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_os_string()),
+            _ => Err(ArtifactError::InvalidRoot),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let root = Dir::open_ambient_dir(Path::new("/"), cap_std::ambient_authority())
+        .map_err(|_| ArtifactError::InvalidRoot)?;
+    Ok((root, names))
 }
 
 fn open_directory_component(parent: &Dir, name: &Path) -> Result<Dir, std::io::Error> {
@@ -278,35 +373,6 @@ fn sync_directory(directory: &Dir) -> Result<(), std::io::Error> {
 #[cfg(not(unix))]
 fn sync_directory(_directory: &Dir) -> Result<(), std::io::Error> {
     Ok(())
-}
-
-#[cfg(unix)]
-fn open_directory_handle(path: &Path) -> Result<Dir, std::io::Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let file = StdOpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(path)?;
-    Ok(Dir::from_std_file(file))
-}
-
-#[cfg(windows)]
-fn open_directory_handle(path: &Path) -> Result<Dir, std::io::Error> {
-    use std::os::windows::fs::OpenOptionsExt;
-
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    let file = StdOpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    Ok(Dir::from_std_file(file))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_directory_handle(path: &Path) -> Result<Dir, std::io::Error> {
-    Dir::open_ambient_dir(path, cap_std::ambient_authority())
 }
 
 #[cfg(windows)]
