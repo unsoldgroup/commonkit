@@ -21,7 +21,7 @@ use commonkit_relay::{
 };
 use commonkit_service::{
     ApplyStatus, ControlPlane, ControlToken, DomainFailure, EventHub, ExecutionResult,
-    PlanExecutor, RelayProviderAuthority, ServiceStatus, SyncDomain,
+    PlanExecutionAuthority, PlanExecutor, RelayProviderAuthority, ServiceStatus, SyncDomain,
     resolved_mcp_from_materialized, router_with_control,
 };
 use tokio::sync::RwLock;
@@ -111,6 +111,105 @@ impl SyncDomain for MutableRelayDomain {
     fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
         Ok(self.0.lock().unwrap().clone())
     }
+    fn plan_execution_authority(
+        &self,
+        _: &commonkit_contracts::Plan,
+    ) -> Result<PlanExecutionAuthority, DomainFailure> {
+        let authority = self.0.lock().unwrap();
+        Ok(PlanExecutionAuthority {
+            policy_digest: authority.policy_digest.clone(),
+            bindings: PlanBindings {
+                target_identity_digest: authority.target_identity_digest.clone(),
+                composed_loadout_digest: authority.composed_loadout_digest.clone(),
+                provider_inputs_digest: authority.provider_inputs_digest.clone(),
+                ownership_map_digest: authority.ownership_map_digest.clone(),
+                artifact_set_digest: authority.artifact_set_digest.clone(),
+            },
+        })
+    }
+}
+
+struct MutablePlanDomain(Mutex<PlanExecutionAuthority>);
+
+impl SyncDomain for MutablePlanDomain {
+    fn plan(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    fn verify(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    fn rollback(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    fn plan_execution_authority(
+        &self,
+        _: &commonkit_contracts::Plan,
+    ) -> Result<PlanExecutionAuthority, DomainFailure> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
+#[tokio::test]
+async fn filesystem_apply_recomputes_provider_authority_and_rejects_stale_plan_before_mutation() {
+    let root = temporary_directory("filesystem-stale-plan");
+    fs::create_dir_all(&root).unwrap();
+    let managed = root.join("config.json");
+    fs::write(&managed, b"reviewed-bytes").unwrap();
+    let executor = Arc::new(SuccessfulExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let control = ControlPlane::new(executor.clone());
+    let reviewed = plan();
+    let domain = Arc::new(MutablePlanDomain(Mutex::new(PlanExecutionAuthority {
+        policy_digest: reviewed.policy_digest.clone(),
+        bindings: reviewed.bindings.clone(),
+    })));
+    control
+        .set_target_sync_domains(BTreeMap::from([(
+            reviewed.target_id.clone(),
+            domain.clone() as Arc<dyn SyncDomain>,
+        )]))
+        .unwrap();
+    let reviewed = control.register_plan(reviewed).unwrap();
+
+    domain.0.lock().unwrap().bindings.provider_inputs_digest = digest('9');
+    let token = ControlToken::generate();
+    let application = router_with_control(
+        token.clone(),
+        Arc::new(RwLock::new(ServiceStatus::default())),
+        "127.0.0.1:3764",
+        EventHub::new(8),
+        control,
+    );
+    let response = application
+        .oneshot(
+            Request::post(format!("/control/v1/plans/{}/apply", reviewed.id))
+                .header(header::HOST, "127.0.0.1:3764")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose_for_client()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "filesystem-apply")
+                .body(Body::from(
+                    r#"{"confirmed":true,"confirmationId":"filesystem-review"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"],
+        "stale_plan"
+    );
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(fs::read(&managed).unwrap(), b"reviewed-bytes");
+    fs::remove_dir_all(root).unwrap();
 }
 
 fn relay_authority() -> RelayProviderAuthority {

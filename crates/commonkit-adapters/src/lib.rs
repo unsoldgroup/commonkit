@@ -41,6 +41,7 @@ pub use native::NativeProvider;
 pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutput};
 pub use planning::{
     ProviderPlanError, ProviderPlanRequest, ProviderResourcePlanner, build_provider_plan,
+    provider_plan_bindings,
 };
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,

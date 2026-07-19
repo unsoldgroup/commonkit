@@ -15,7 +15,7 @@ use commonkit_adapters::{
     ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
     ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
-    materialize_mcp_client_state, validate_ownership,
+    materialize_mcp_client_state, provider_plan_bindings, validate_ownership,
 };
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{
@@ -968,7 +968,105 @@ struct ProductionSyncDomain {
     receipt_root: PathBuf,
     ssh_factory: Arc<dyn ProductionSshTransportFactory>,
 }
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderAuthorityRecord {
+    states: Vec<MaterializedState>,
+    relay_endpoint: Option<String>,
+    executable_digests: BTreeMap<PathBuf, Sha256Digest>,
+    external_state_digests: BTreeMap<PathBuf, Sha256Digest>,
+    source_revision: Option<String>,
+}
+
 impl ProductionSyncDomain {
+    fn authority_path(&self, plan: &Plan) -> PathBuf {
+        self.config
+            .adapter_state
+            .join("provider-authority")
+            .join(format!(
+                "{}.json",
+                plan.id.as_str().trim_start_matches("sha256:")
+            ))
+    }
+
+    fn executable_digests(&self) -> Result<BTreeMap<PathBuf, Sha256Digest>, DomainFailure> {
+        let mut digests = BTreeMap::new();
+        if let Some(pipeline) = &self.config.provider_pipeline {
+            for provider in &pipeline.providers {
+                let executable = match provider {
+                    ConfiguredProvider::Apm { executable, .. }
+                    | ConfiguredProvider::Chezmoi { executable, .. } => Some(executable),
+                    ConfiguredProvider::Native { .. } => None,
+                };
+                if let Some(path) = executable {
+                    let bytes = fs::read(path).map_err(|_| DomainFailure::OperationFailed)?;
+                    digests.insert(path.clone(), digest_bytes(&bytes)?);
+                }
+            }
+        }
+        Ok(digests)
+    }
+
+    fn external_state_digests(&self) -> Result<BTreeMap<PathBuf, Sha256Digest>, DomainFailure> {
+        self.config
+            .materialized_states
+            .iter()
+            .map(|path| {
+                let bytes = fs::read(path).map_err(|_| DomainFailure::OperationFailed)?;
+                Ok((path.clone(), digest_bytes(&bytes)?))
+            })
+            .collect()
+    }
+
+    fn persist_execution_authority(
+        &self,
+        plan: &Plan,
+        states: &[MaterializedState],
+    ) -> Result<(), DomainFailure> {
+        let record = ProviderAuthorityRecord {
+            states: states.to_vec(),
+            relay_endpoint: self.config.relay_endpoint.clone(),
+            executable_digests: self.executable_digests()?,
+            external_state_digests: self.external_state_digests()?,
+            source_revision: self
+                .config
+                .provider_pipeline
+                .as_ref()
+                .map(|pipeline| pipeline.source.revision.clone()),
+        };
+        let bytes = serde_json::to_vec(&record).map_err(|_| DomainFailure::OperationFailed)?;
+        let path = self.authority_path(plan);
+        let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
+        fs::create_dir_all(parent).map_err(|_| DomainFailure::OperationFailed)?;
+        if path.exists() {
+            return if fs::read(path).map_err(|_| DomainFailure::OperationFailed)? == bytes {
+                Ok(())
+            } else {
+                Err(DomainFailure::OperationFailed)
+            };
+        }
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        file.write_all(&bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        fs::rename(&temporary, &path).map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn load_execution_authority(
+        &self,
+        plan: &Plan,
+    ) -> Result<ProviderAuthorityRecord, DomainFailure> {
+        let bytes =
+            fs::read(self.authority_path(plan)).map_err(|_| DomainFailure::OperationFailed)?;
+        serde_json::from_slice(&bytes).map_err(|_| DomainFailure::OperationFailed)
+    }
+
     fn states(&self) -> Result<Vec<MaterializedState>, DomainFailure> {
         if let Some(config) = &self.config.provider_pipeline {
             return self.materialize_configured(config);
@@ -1158,17 +1256,10 @@ impl ProductionSyncDomain {
             }
         }
     }
-    fn build(&self) -> Result<Plan, DomainFailure> {
-        fs::create_dir_all(&self.config.adapter_state)
-            .map_err(|_| DomainFailure::OperationFailed)?;
-        let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
-            .map_err(|_| DomainFailure::OperationFailed)?;
-        let rules = OwnershipRules::new(
-            self.config.case_sensitive,
-            self.config.declared_roots.clone(),
-            self.config.protected_roots.clone(),
-        )
-        .map_err(|_| DomainFailure::OperationFailed)?;
+    fn states_for_plan(
+        &self,
+        artifacts: &ArtifactStore,
+    ) -> Result<Vec<MaterializedState>, DomainFailure> {
         let mut states = self.states()?;
         let has_mcp = states.iter().any(|state| !state.capabilities.is_empty());
         if has_mcp {
@@ -1200,6 +1291,21 @@ impl ProductionSyncDomain {
                 states.push(client_state);
             }
         }
+        Ok(states)
+    }
+
+    fn build(&self) -> Result<Plan, DomainFailure> {
+        fs::create_dir_all(&self.config.adapter_state)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let rules = OwnershipRules::new(
+            self.config.case_sensitive,
+            self.config.declared_roots.clone(),
+            self.config.protected_roots.clone(),
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        let states = self.states_for_plan(&artifacts)?;
         let resources = states
             .iter()
             .flat_map(|state| state.resources.iter().cloned())
@@ -1249,6 +1355,7 @@ impl ProductionSyncDomain {
                 self.finish_plan(&states, &artifacts, &rules, observed, &mut files)?
             }
         };
+        self.persist_execution_authority(&plan, &states)?;
         self.plan_store
             .persist(&plan)
             .map_err(|_| DomainFailure::OperationFailed)?;
@@ -1366,6 +1473,105 @@ struct RollbackRequest {
     idempotency_key: Option<String>,
 }
 impl SyncDomain for ProductionSyncDomain {
+    fn plan_execution_authority(
+        &self,
+        approved: &Plan,
+    ) -> Result<crate::PlanExecutionAuthority, DomainFailure> {
+        let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let rules = OwnershipRules::new(
+            self.config.case_sensitive,
+            self.config.declared_roots.clone(),
+            self.config.protected_roots.clone(),
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        let record = self.load_execution_authority(approved)?;
+        if record.relay_endpoint != self.config.relay_endpoint
+            || record.executable_digests != self.executable_digests()?
+            || record.external_state_digests != self.external_state_digests()?
+        {
+            return Err(DomainFailure::OperationFailed);
+        }
+        if let Some(pipeline) = &self.config.provider_pipeline {
+            if record.source_revision.as_deref() != Some(pipeline.source.revision.as_str()) {
+                return Err(DomainFailure::OperationFailed);
+            }
+            let mut repository = GitRepository::new(
+                ProcessGitRunner::new(&pipeline.source.repository),
+                pipeline.source.trusted_remote_url.clone(),
+                "origin",
+            );
+            let status = repository
+                .inspect(true)
+                .map_err(|_| DomainFailure::OperationFailed)?;
+            if status.revision.as_str() != pipeline.source.revision
+                || !matches!(
+                    status.disposition,
+                    GitSyncDisposition::Clean | GitSyncDisposition::Ahead
+                )
+            {
+                return Err(DomainFailure::OperationFailed);
+            }
+            for configured in &pipeline.providers {
+                let expected = match configured {
+                    ConfiguredProvider::Native { version, .. } => Some(("native", version)),
+                    ConfiguredProvider::Apm { version, .. } => Some(("apm", version)),
+                    ConfiguredProvider::Chezmoi { .. } => None,
+                };
+                if let Some((id, version)) = expected {
+                    if !record.states.iter().any(|state| {
+                        state.inputs.provider_id.as_str() == id
+                            && &state.inputs.provider_version == version
+                    }) {
+                        return Err(DomainFailure::OperationFailed);
+                    }
+                }
+            }
+        }
+        let mut states = record.states;
+        states.retain(|state| state.inputs.provider_id.as_str() != "commonkit-relay-client");
+        if states.iter().any(|state| !state.capabilities.is_empty()) {
+            let managed_root = self
+                .config
+                .relay_client_root
+                .as_ref()
+                .ok_or(DomainFailure::OperationFailed)?;
+            if let Some(client_state) = materialize_mcp_client_state(
+                &states,
+                &artifacts,
+                managed_root,
+                self.config
+                    .relay_endpoint
+                    .as_deref()
+                    .unwrap_or("http://127.0.0.1:3764/mcp"),
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?
+            {
+                states.push(client_state);
+            }
+        }
+        let bindings = provider_plan_bindings(
+            ProviderPlanRequest {
+                target_id: self.config.target_id.clone(),
+                target_identity_digest: self.config.target_identity_digest.clone(),
+                composed_loadout_digest: self.config.composed_loadout_digest.clone(),
+                // Observed state is deliberately excluded from provider
+                // authority; adapters revalidate each operation preimage.
+                observed_digest: self.config.target_identity_digest.clone(),
+                policy_digest: self.config.policy_digest.clone(),
+                ownership_rules: &rules,
+                mapped_side_effects: BTreeSet::new(),
+            },
+            &states,
+            &artifacts,
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(crate::PlanExecutionAuthority {
+            policy_digest: self.config.policy_digest.clone(),
+            bindings,
+        })
+    }
+
     fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
         let states = self.states()?;
         let artifact_store = ArtifactStore::open(&self.config.provider_artifacts)
@@ -2409,7 +2615,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         let local_authority = AuthorityStore::open(self.root.join("authority"))
             .map_err(|_| DomainFailure::OperationFailed)?;
         local_authority
-            .validate_promotion(&promotion)
+            .prepare_promotion(promotion.clone())
             .map_err(|_| DomainFailure::VerificationFailed)?;
         let updated_authority = portable_store
             .compare_and_swap_writer(
@@ -2419,8 +2625,11 @@ impl SnapshotDomain for ProductionSnapshotDomain {
                 &target,
             )
             .map_err(|_| DomainFailure::VerificationFailed)?;
+        local_authority
+            .synchronize_from_portable(&database.id, &updated_authority.record.current_writer)
+            .map_err(|_| DomainFailure::VerificationFailed)?;
         let receipt = local_authority
-            .promote(promotion)
+            .commit_prepared_promotion(&promotion.run_id)
             .map_err(|_| DomainFailure::VerificationFailed)?;
         Ok(serde_json::json!({
             "databaseId":id,

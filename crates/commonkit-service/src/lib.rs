@@ -1397,9 +1397,24 @@ pub trait SyncDomain: Send + Sync + 'static {
     fn plan(&self, request: Value) -> Result<Value, DomainFailure>;
     fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
     fn rollback(&self, request: Value) -> Result<Value, DomainFailure>;
+    /// Recomputes the provider-backed authority bound into an approved plan.
+    /// Implementations must validate provider artifacts and policy inputs and
+    /// must not mutate the managed target.
+    fn plan_execution_authority(
+        &self,
+        _approved: &Plan,
+    ) -> Result<PlanExecutionAuthority, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
     fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
         Err(DomainFailure::OperationFailed)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanExecutionAuthority {
+    pub policy_digest: Sha256Digest,
+    pub bindings: commonkit_contracts::PlanBindings,
 }
 
 #[derive(Debug, Clone)]
@@ -1861,6 +1876,7 @@ impl ControlPlane {
             return Err(ControlError::InvalidIdempotencyKey);
         }
         let plan = self.plan(plan_id).ok_or(ControlError::PlanNotFound)?;
+        self.validate_plan_execution_authority(&plan)?;
         self.validate_relay_execution_authority(&plan, confirmation_id, idempotency_key)?;
         let operation_id = digest_domain_json(
             "commonkit.control-operation.v1",
@@ -1913,6 +1929,31 @@ impl ControlPlane {
                 idempotency_key: idempotency_key.to_owned(),
             }),
         ))
+    }
+
+    fn validate_plan_execution_authority(&self, plan: &Plan) -> Result<(), ControlError> {
+        let domain = {
+            self.inner
+                .runtime
+                .read()
+                .expect("control runtime lock")
+                .target_sync
+                .get(&plan.target_id)
+                .cloned()
+        };
+        // Plans registered directly by API clients are retained for backward
+        // compatibility. A target domain marks a plan as provider-backed and
+        // therefore requires fail-closed execution-time authority validation.
+        let Some(domain) = domain else {
+            return Ok(());
+        };
+        let authority = domain
+            .plan_execution_authority(plan)
+            .map_err(|_| ControlError::PlanAuthorityChanged)?;
+        if plan.policy_digest != authority.policy_digest || plan.bindings != authority.bindings {
+            return Err(ControlError::PlanAuthorityChanged);
+        }
+        Ok(())
     }
 
     fn validate_relay_execution_authority(
@@ -2040,6 +2081,8 @@ pub enum ControlError {
     IdempotencyConflict,
     #[error("relay authority changed after plan review")]
     RelayAuthorityChanged,
+    #[error("provider plan authority changed after plan review")]
+    PlanAuthorityChanged,
     #[error("target inventory is unavailable")]
     TargetsUnavailable,
     #[error(transparent)]
@@ -2293,6 +2336,7 @@ impl From<ControlError> for ApiError {
                 Self::conflict("conflict")
             }
             ControlError::RelayAuthorityChanged => Self::conflict("relay_authority_changed"),
+            ControlError::PlanAuthorityChanged => Self::conflict("stale_plan"),
             ControlError::InvalidIdempotencyKey => Self::bad_request("invalid_idempotency_key"),
             ControlError::InvalidPlan | ControlError::Contract(_) => {
                 Self::bad_request("invalid_plan")

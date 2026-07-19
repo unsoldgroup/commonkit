@@ -59,6 +59,29 @@ pub struct ProviderPlanRequest<'a> {
     pub mapped_side_effects: BTreeSet<DeclaredSideEffect>,
 }
 
+/// Computes and validates the durable provider bindings without registering
+/// operations or touching a managed target. This is used immediately before
+/// apply to reject approvals whose provider authority has gone stale.
+pub fn provider_plan_bindings(
+    request: ProviderPlanRequest<'_>,
+    states: &[MaterializedState],
+    provider_artifacts: &ArtifactStore,
+) -> Result<PlanBindings, ProviderPlanError> {
+    struct AuthorityOnlyPlanner;
+    impl ProviderResourcePlanner for AuthorityOnlyPlanner {
+        fn register_provider_resource(
+            &mut self,
+            _id: StableId,
+            _resource: &NormalizedResource,
+            _provider_artifacts: &ArtifactStore,
+        ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
+            Ok(None)
+        }
+    }
+    let mut planner = AuthorityOnlyPlanner;
+    Ok(build_provider_plan(request, states, provider_artifacts, &mut planner)?.bindings)
+}
+
 pub fn build_provider_plan<P: ProviderResourcePlanner + ?Sized>(
     request: ProviderPlanRequest<'_>,
     states: &[MaterializedState],
