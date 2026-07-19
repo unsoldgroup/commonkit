@@ -56,4 +56,4 @@ External or hosted evidence still required:
 
 ## Conclusion
 
-Do not mark CommonKit v1 fully release-ready yet. Eight of the twelve flows are implemented and pass local production-path contracts; four remain partial because of first-run provider selection, multi-target product wiring, or external signed/platform evidence. The remaining work is no longer a reconciliation-core rewrite.
+Do not mark CommonKit v1 fully release-ready yet. Nine of the twelve flows are implemented and pass local production-path contracts; three remain partial because of first-run provider selection, multi-target product wiring, or external signed/platform evidence. The remaining work is no longer a reconciliation-core rewrite.
