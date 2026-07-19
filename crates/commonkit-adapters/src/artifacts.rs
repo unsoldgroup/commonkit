@@ -30,9 +30,7 @@ pub struct ArtifactStore {
 
 impl ArtifactStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ArtifactError> {
-        fs::create_dir_all(root.as_ref())?;
-        let directory =
-            open_directory_handle(root.as_ref()).map_err(|_| ArtifactError::InvalidRoot)?;
+        let directory = open_or_create_directory_handle(root.as_ref())?;
         let metadata = directory.dir_metadata()?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(ArtifactError::InvalidRoot);
@@ -140,6 +138,92 @@ impl ArtifactStore {
         }
         Ok(file)
     }
+}
+
+fn open_or_create_directory_handle(path: &Path) -> Result<Dir, ArtifactError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut ancestor = absolute.as_path();
+    let existing = loop {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(ArtifactError::InvalidRoot);
+            }
+            Ok(_) => break ancestor,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                ancestor = ancestor.parent().ok_or(ArtifactError::InvalidRoot)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let mut current = open_directory_handle(existing).map_err(|_| ArtifactError::InvalidRoot)?;
+    let suffix = absolute
+        .strip_prefix(existing)
+        .map_err(|_| ArtifactError::InvalidRoot)?;
+    for component in suffix.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(ArtifactError::InvalidRoot);
+        };
+        let name = Path::new(name);
+        match open_directory_component(&current, name) {
+            Ok(next) => current = next,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match current.create_dir(name) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                let next = open_directory_component(&current, name)
+                    .map_err(|_| ArtifactError::InvalidRoot)?;
+                set_private_directory(&next)?;
+                current = next;
+            }
+            Err(_) => return Err(ArtifactError::InvalidRoot),
+        }
+    }
+    Ok(current)
+}
+
+fn open_directory_component(parent: &Dir, name: &Path) -> Result<Dir, std::io::Error> {
+    let mut options = nofollow_options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = parent.open_with(name, &options)?;
+    let metadata = file.metadata()?;
+    if metadata_is_reparse_or_symlink(&metadata) || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "artifact path component is not an ordinary directory",
+        ));
+    }
+    Ok(Dir::from_std_file(file.into_std()))
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_or_symlink(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_or_symlink(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn nofollow_options() -> OpenOptions {

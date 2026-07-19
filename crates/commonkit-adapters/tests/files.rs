@@ -40,6 +40,81 @@ fn intent(path: &str, content: &[u8], expected_before: Option<Sha256Digest>) -> 
     }
 }
 
+#[cfg(unix)]
+fn assert_legacy_substitution_fails_closed(phase: &str, substitution: &str) {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary_directory(&format!("legacy-{phase}-{substitution}-substitution"));
+    let target = root.join("target");
+    let state = root.join("state");
+    let outside = root.join("outside");
+    let displaced = root.join("displaced");
+    fs::create_dir_all(target.join("config")).expect("target");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("settings"), b"outside sentinel").expect("outside sentinel");
+    let managed_path = if substitution == "root" {
+        "settings"
+    } else {
+        "config/settings"
+    };
+
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register(intent(managed_path, b"managed", None))
+        .expect("operation");
+    adapter.prepare(&operation).expect("prepare");
+    if phase == "rollback" {
+        adapter
+            .apply(&operation)
+            .expect("apply before rollback race");
+    }
+
+    match substitution {
+        "root" => {
+            fs::rename(&target, &displaced).expect("displace root");
+            symlink(&outside, &target).expect("substitute root");
+        }
+        "ancestor" => {
+            fs::rename(target.join("config"), &displaced).expect("displace ancestor");
+            symlink(&outside, target.join("config")).expect("substitute ancestor");
+        }
+        "leaf" => {
+            if phase == "rollback" {
+                fs::remove_file(target.join(managed_path)).expect("remove applied leaf");
+            }
+            symlink(outside.join("settings"), target.join(managed_path)).expect("substitute leaf");
+        }
+        _ => unreachable!(),
+    }
+
+    let error = if phase == "apply" {
+        adapter.apply(&operation)
+    } else {
+        adapter.rollback(&operation)
+    }
+    .expect_err("substitution must fail closed");
+    assert!(
+        matches!(
+            error.code.as_str(),
+            "unsafe_path" | "preimage_changed" | "rollback_preimage_changed"
+        ),
+        "unexpected error code: {}",
+        error.code
+    );
+    assert_eq!(
+        fs::read(outside.join("settings")).expect("outside sentinel"),
+        b"outside sentinel"
+    );
+
+    if target
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        fs::remove_file(&target).expect("remove substituted root");
+    }
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
 #[test]
 fn rejects_absolute_traversal_windows_and_git_paths() {
     for path in [
@@ -76,6 +151,90 @@ fn creates_verifies_and_removes_a_managed_file_on_rollback() {
     assert!(!target.join("nested/config.json").exists());
 
     fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_replaces_an_existing_file_atomically_and_restores_it() {
+    let root = temporary_directory("windows-atomic-replacement");
+    let target = root.join("target");
+    let state = root.join("state");
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("settings"), b"before").expect("preimage");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register(intent("settings", b"after", Some(digest(b"before"))))
+        .expect("operation");
+
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("atomic replace");
+    assert_eq!(
+        fs::read(target.join("settings")).expect("applied"),
+        b"after"
+    );
+    adapter
+        .rollback(&operation)
+        .expect("atomic rollback replace");
+    assert_eq!(
+        fs::read(target.join("settings")).expect("restored"),
+        b"before"
+    );
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_rejects_a_reparse_ancestor_without_outside_mutation() {
+    use std::os::windows::fs::symlink_dir;
+
+    let root = temporary_directory("windows-reparse-ancestor");
+    let target = root.join("target");
+    let state = root.join("state");
+    let outside = root.join("outside");
+    let displaced = root.join("displaced");
+    fs::create_dir_all(target.join("config")).expect("target");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("settings"), b"outside sentinel").expect("sentinel");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register(intent("config/settings", b"managed", None))
+        .expect("operation");
+    adapter.prepare(&operation).expect("prepare");
+    fs::rename(target.join("config"), &displaced).expect("displace ancestor");
+    if let Err(error) = symlink_dir(&outside, target.join("config")) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            fs::remove_dir_all(root).expect("cleanup unsupported symlink environment");
+            return;
+        }
+        panic!("create reparse ancestor: {error}");
+    }
+
+    let error = adapter.apply(&operation).expect_err("must fail closed");
+    assert!(matches!(
+        error.code.as_str(),
+        "unsafe_path" | "preimage_changed"
+    ));
+    assert_eq!(
+        fs::read(outside.join("settings")).expect("outside sentinel"),
+        b"outside sentinel"
+    );
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_apply_rejects_root_ancestor_and_leaf_substitution() {
+    for substitution in ["root", "ancestor", "leaf"] {
+        assert_legacy_substitution_fails_closed("apply", substitution);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_rollback_rejects_root_ancestor_and_leaf_substitution() {
+    for substitution in ["root", "ancestor", "leaf"] {
+        assert_legacy_substitution_fails_closed("rollback", substitution);
+    }
 }
 
 #[test]

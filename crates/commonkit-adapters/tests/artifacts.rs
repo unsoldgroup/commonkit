@@ -124,6 +124,27 @@ fn creating_a_store_rejects_a_symlink_root_instead_of_reopening_its_target() {
 
 #[cfg(unix)]
 #[test]
+fn creating_a_nested_store_rejects_a_substituted_missing_component() {
+    use std::os::unix::fs::symlink;
+
+    let parent = temporary_directory("artifact-create-retained-parent");
+    let outside = temporary_directory("artifact-create-retained-outside");
+    fs::create_dir_all(&parent).expect("retained parent");
+    fs::create_dir_all(&outside).expect("outside");
+    symlink(&outside, parent.join("substituted")).expect("substituted component");
+
+    assert!(matches!(
+        ArtifactStore::open(parent.join("substituted/store")),
+        Err(ArtifactError::InvalidRoot)
+    ));
+    assert!(!outside.join("store").exists());
+
+    fs::remove_dir_all(parent).expect("cleanup parent");
+    fs::remove_dir_all(outside).expect("cleanup outside");
+}
+
+#[cfg(unix)]
+#[test]
 fn artifact_load_rejects_a_symlink_substitution() {
     use std::os::unix::fs::symlink;
 

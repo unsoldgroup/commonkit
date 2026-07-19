@@ -674,7 +674,24 @@ impl Adapter for FileAdapter {
                 "operation content artifact is missing or invalid",
             )
         })?;
-        replace_file(&self.target, managed.path.as_path(), &content)
+        self.validate_target_binding()
+            .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
+        let (parent, leaf) = open_parent_nofollow(&self.target, &managed.path.portable(), true)
+            .map_err(|_| failure("unsafe_path", "managed file has an unsafe ancestor"))?;
+        let observed = read_optional_in(&parent, &leaf)
+            .map_err(|_| failure("unsafe_path", "managed file path is unsafe"))?;
+        let observed_digest = observed
+            .as_deref()
+            .map(digest_bytes)
+            .transpose()
+            .map_err(|_| failure("preimage_changed", "managed file cannot be digested"))?;
+        if observed_digest != operation.before_digest {
+            return Err(failure(
+                "preimage_changed",
+                "managed file changed after prepare",
+            ));
+        }
+        replace_file_in(&parent, &leaf, &content, None)
             .map_err(|_| failure("apply_failed", "could not replace managed file"))
     }
 
@@ -683,7 +700,11 @@ impl Adapter for FileAdapter {
             return self.verify_semantic(operation);
         }
         let managed = self.managed(operation)?;
-        let actual = read_optional(&self.target, managed.path.as_path())
+        self.validate_target_binding()
+            .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
+        let (parent, leaf) = open_parent_nofollow(&self.target, &managed.path.portable(), false)
+            .map_err(|_| failure("unsafe_path", "managed file has an unsafe ancestor"))?;
+        let actual = read_optional_in(&parent, &leaf)
             .map_err(|_| failure("verify_failed", "could not read managed file"))?
             .ok_or_else(|| failure("verify_failed", "managed file is missing"))?;
         let digest = digest_bytes(&actual)
@@ -713,6 +734,32 @@ impl Adapter for FileAdapter {
                 "preimage backup record does not match the operation",
             ));
         }
+        self.validate_target_binding()
+            .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
+        let (parent, leaf) = open_parent_nofollow(
+            &self.target,
+            &managed.path.portable(),
+            backup.content.is_some(),
+        )
+        .map_err(|_| failure("unsafe_path", "managed file has an unsafe ancestor"))?;
+        let current = read_optional_in(&parent, &leaf)
+            .map_err(|_| failure("unsafe_path", "managed rollback path is unsafe"))?;
+        let current_digest = current
+            .as_deref()
+            .map(digest_bytes)
+            .transpose()
+            .map_err(|_| {
+                failure(
+                    "rollback_preimage_changed",
+                    "managed rollback state cannot be digested",
+                )
+            })?;
+        if current_digest != operation.after_digest && current.is_some() {
+            return Err(failure(
+                "rollback_preimage_changed",
+                "managed file changed after apply",
+            ));
+        }
         match backup.content {
             Some(reference) => {
                 let bytes = self.artifacts.load(&reference).map_err(|_| {
@@ -727,16 +774,12 @@ impl Adapter for FileAdapter {
                         "preimage backup digest does not match the operation",
                     ));
                 }
-                replace_file(&self.target, managed.path.as_path(), &bytes)
+                replace_file_in(&parent, &leaf, &bytes, None)
             }
             None if operation.kind == OperationKind::Create
                 && operation.before_digest.is_none() =>
             {
-                match self.target.remove_file(managed.path.as_path()) {
-                    Ok(()) => Ok(()),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(error) => Err(error),
-                }
+                remove_entry_in(&parent, &leaf)
             }
             None => {
                 return Err(failure(
@@ -946,7 +989,7 @@ fn open_dir_component_nofollow(parent: &Dir, name: &Path) -> Result<Dir, std::io
     }
     let file = parent.open_with(name, &options)?;
     let metadata = file.metadata()?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if metadata_is_reparse_or_symlink(&metadata) || !metadata.is_dir() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "managed path component is not a directory",
@@ -979,7 +1022,12 @@ fn open_directory_handle(path: &Path) -> Result<Dir, std::io::Error> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)?;
     let metadata = file.metadata()?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    if metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || !metadata.is_dir()
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "managed root is not an ordinary directory",
@@ -1037,7 +1085,13 @@ fn replace_file_in(
     #[cfg(windows)]
     {
         use cap_std::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_WRITE;
+        use windows_sys::Win32::Storage::FileSystem::{
+            DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.access_mode(GENERIC_WRITE | DELETE);
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let mut file = parent.open_with(&temporary, &options)?;
@@ -1045,12 +1099,85 @@ fn replace_file_in(
         file.write_all(bytes)?;
         set_file_mode(&file, mode)?;
         file.sync_all()?;
-        parent.rename(&temporary, parent, leaf)
+        atomic_replace_in(parent, &temporary, leaf, &file)
     })();
     if result.is_err() {
         let _ = parent.remove_file(&temporary);
     }
     result
+}
+
+#[cfg(not(windows))]
+fn atomic_replace_in(
+    parent: &Dir,
+    temporary: &Path,
+    leaf: &Path,
+    _temporary_file: &cap_std::fs::File,
+) -> Result<(), std::io::Error> {
+    parent.rename(temporary, parent, leaf)
+}
+
+#[cfg(windows)]
+fn atomic_replace_in(
+    parent: &Dir,
+    _temporary: &Path,
+    leaf: &Path,
+    temporary_file: &cap_std::fs::File,
+) -> Result<(), std::io::Error> {
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
+    };
+
+    let name = leaf.as_os_str().encode_wide().collect::<Vec<_>>();
+    let name_bytes = name
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| std::io::Error::other("replacement filename is too long"))?;
+    let total_bytes = offset_of!(FILE_RENAME_INFO, FileName)
+        .checked_add(name_bytes)
+        .ok_or_else(|| std::io::Error::other("replacement filename is too long"))?;
+    let words = total_bytes.div_ceil(size_of::<usize>());
+    let mut storage = vec![0usize; words];
+    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+    let parent_file = parent.try_clone()?.into_std_file();
+    unsafe {
+        (*info).Anonymous.ReplaceIfExists = 1;
+        (*info).RootDirectory = parent_file.as_raw_handle() as _;
+        (*info).FileNameLength = u32::try_from(name_bytes)
+            .map_err(|_| std::io::Error::other("replacement filename is too long"))?;
+        std::ptr::copy_nonoverlapping(
+            name.as_ptr(),
+            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
+            name.len(),
+        );
+        let result = SetFileInformationByHandle(
+            temporary_file.as_raw_handle() as _,
+            FileRenameInfo,
+            info.cast(),
+            u32::try_from(total_bytes)
+                .map_err(|_| std::io::Error::other("replacement metadata is too large"))?,
+        );
+        if result == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_or_symlink(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_or_symlink(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn apply_intent_in(
@@ -1150,7 +1277,7 @@ fn create_symlink_in(parent: &Dir, target: &str, leaf: &Path) -> Result<(), std:
 
 fn read_optional(directory: &Dir, path: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
     match directory.symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+        Ok(metadata) if metadata_is_reparse_or_symlink(&metadata) || !metadata.is_file() => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "managed file path is not an ordinary file",
@@ -1169,6 +1296,50 @@ fn read_optional(directory: &Dir, path: &Path) -> Result<Option<Vec<u8>>, std::i
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn read_optional_in(parent: &Dir, leaf: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
+    let metadata = match parent.symlink_metadata(leaf) {
+        Ok(metadata) if metadata_is_reparse_or_symlink(&metadata) || !metadata.is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "managed file leaf is not an ordinary file",
+            ));
+        }
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed file leaf is not an ordinary file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = parent.open_with(leaf, &options)?;
+    let metadata = file.metadata()?;
+    if metadata_is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "managed file leaf is not an ordinary file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 fn write_new(directory: &Dir, path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -1225,29 +1396,6 @@ fn backup_record_path(operation_id: &Sha256Digest) -> PathBuf {
         "{}.json",
         operation_id.as_str().trim_start_matches("sha256:")
     ))
-}
-
-fn replace_file(directory: &Dir, path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
-    let file_name = path
-        .file_name()
-        .ok_or_else(|| std::io::Error::other("missing filename"))?;
-    let nonce = REPLACEMENT_NONCE.fetch_add(1, Ordering::Relaxed);
-    let temporary = path.with_file_name(format!(
-        ".{}.commonkit-tmp-{}-{nonce}",
-        file_name.to_string_lossy(),
-        std::process::id()
-    ));
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        directory.create_dir_all(parent)?;
-    }
-    write_new(directory, &temporary, bytes)?;
-    let result = directory.rename(&temporary, directory, path);
-    if result.is_err() {
-        let _ = directory.remove_file(&temporary);
-    }
-    result
 }
 
 fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, commonkit_contracts::ContractError> {
