@@ -2,11 +2,14 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const LABEL: &str = "com.unsoldgroup.commonkitd";
+const PROCESS_EXEC_TIMEOUT: Duration = Duration::from_secs(2);
+const PROCESS_EXEC_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -282,16 +285,21 @@ impl DaemonService {
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
             .spawn()?;
-        let identity = match observe_process_identity(child.id(), &self.root)? {
-            Some(identity) => identity,
-            None => {
+        let expected_executable = canonical_path(&self.executable)?;
+        let identity = match wait_for_started_identity(
+            child.id(),
+            &self.root,
+            &expected_executable,
+            &mut child,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(DaemonLifecycleError::ProcessIdentityUnavailable);
+                return Err(error);
             }
         };
-        let expected_executable = canonical_path(&self.executable)?;
-        if identity.executable != expected_executable {
+        if !same_executable(&identity.executable, &expected_executable)? {
             let _ = child.kill();
             let _ = child.wait();
             return Err(DaemonLifecycleError::ProcessIdentityMismatch);
@@ -332,7 +340,7 @@ impl DaemonService {
         &self,
         expected: &ProcessIdentity,
     ) -> Result<bool, DaemonLifecycleError> {
-        if expected.executable != canonical_path(&self.executable)?
+        if !same_executable(&expected.executable, &self.executable)?
             || expected.service_root != canonical_path(&self.root)?
         {
             return Ok(false);
@@ -342,6 +350,57 @@ impl DaemonService {
     fn pid_path(&self) -> PathBuf {
         self.root.join("commonkitd.pid")
     }
+}
+
+fn wait_for_started_identity(
+    pid: u32,
+    service_root: &Path,
+    expected_executable: &Path,
+    child: &mut std::process::Child,
+) -> Result<ProcessIdentity, DaemonLifecycleError> {
+    let deadline = Instant::now() + PROCESS_EXEC_TIMEOUT;
+    let mut birth_token = None;
+    loop {
+        if let Some(identity) = observe_process_identity(pid, service_root)? {
+            if started_identity_matches(&identity, expected_executable, &mut birth_token)? {
+                return Ok(identity);
+            }
+        }
+        if child.try_wait()?.is_some() {
+            return Err(DaemonLifecycleError::ProcessIdentityUnavailable);
+        }
+        if Instant::now() >= deadline {
+            return Err(DaemonLifecycleError::ProcessExecTimeout);
+        }
+        std::thread::sleep(PROCESS_EXEC_POLL_INTERVAL);
+    }
+}
+
+fn started_identity_matches(
+    identity: &ProcessIdentity,
+    expected_executable: &Path,
+    birth_token: &mut Option<String>,
+) -> Result<bool, DaemonLifecycleError> {
+    match birth_token.as_ref() {
+        Some(token) if token != &identity.start_token => {
+            return Err(DaemonLifecycleError::ProcessIdentityMismatch);
+        }
+        None => *birth_token = Some(identity.start_token.clone()),
+        _ => {}
+    }
+    Ok(same_executable(&identity.executable, expected_executable)?)
+}
+
+fn same_executable(left: &Path, right: &Path) -> Result<bool, io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let left = fs::metadata(left)?;
+        let right = fs::metadata(right)?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+    #[cfg(not(unix))]
+    Ok(canonical_path(left)? == canonical_path(right)?)
 }
 
 fn home() -> Result<PathBuf, DaemonLifecycleError> {
@@ -593,6 +652,10 @@ pub enum DaemonLifecycleError {
     ProcessIdentityUnavailable,
     #[error("the started daemon executable does not match the configured executable")]
     ProcessIdentityMismatch,
+    #[error(
+        "the daemon did not transition to the configured executable before the safety timeout; verify commonkitd is a directly executable binary, not a script or wrapper"
+    )]
+    ProcessExecTimeout,
     #[error("stored daemon process identity is invalid: {0}")]
     InvalidProcessIdentity(String),
     #[error("system clock is before the Unix epoch")]
@@ -609,4 +672,41 @@ pub enum DaemonLifecycleError {
     CommandFailed(String),
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hosted_spawn_transition_waits_for_exec_while_binding_the_pid_birth_token() {
+        let expected = if Path::new("/usr/bin/yes").is_file() {
+            PathBuf::from("/usr/bin/yes")
+        } else {
+            PathBuf::from("/bin/yes")
+        };
+        let pre_exec = ProcessIdentity {
+            pid: 42,
+            executable: std::env::current_exe().unwrap(),
+            start_token: "same-linux-proc-start-time".into(),
+            service_root: PathBuf::from("/tmp/commonkit-service"),
+        };
+        let post_exec = ProcessIdentity {
+            executable: expected.clone(),
+            ..pre_exec.clone()
+        };
+        let mut birth_token = None;
+
+        assert!(!started_identity_matches(&pre_exec, &expected, &mut birth_token).unwrap());
+        assert!(started_identity_matches(&post_exec, &expected, &mut birth_token).unwrap());
+
+        let replacement = ProcessIdentity {
+            start_token: "reused-pid-start-time".into(),
+            ..post_exec
+        };
+        assert!(matches!(
+            started_identity_matches(&replacement, &expected, &mut birth_token),
+            Err(DaemonLifecycleError::ProcessIdentityMismatch)
+        ));
+    }
 }
