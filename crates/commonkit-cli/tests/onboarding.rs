@@ -4,8 +4,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use commonkit_cli::onboarding::{
-    InitMode, InitRequest, ProcessRunner, ProviderSelection, initialize,
+    CommandRunner, InitMode, InitRequest, OnboardingError, ProcessRunner, ProviderSelection,
+    initialize,
 };
+use std::ffi::OsString;
+use std::process::Command;
 
 fn request(root: &Path, mode: InitMode, repository: &str) -> InitRequest {
     InitRequest {
@@ -247,6 +250,83 @@ exit 93
 }
 
 #[test]
+fn create_clones_an_empty_repository_before_importing_provider_files() {
+    struct RealCloneRunner {
+        remote: std::path::PathBuf,
+    }
+
+    impl CommandRunner for RealCloneRunner {
+        fn run(&self, program: &str, arguments: &[OsString]) -> Result<String, OnboardingError> {
+            let args = arguments
+                .iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            if program == "gh" && args.starts_with(&["auth".into(), "status".into()]) {
+                return Ok(String::new());
+            }
+            if program == "gh" && args.starts_with(&["repo".into(), "create".into()]) {
+                return Ok(String::new());
+            }
+            if program == "gh" && args.starts_with(&["repo".into(), "clone".into()]) {
+                let output = Command::new("git")
+                    .arg("clone")
+                    .arg(&self.remote)
+                    .arg(&args[3])
+                    .output()
+                    .unwrap();
+                if !output.status.success() {
+                    return Err(OnboardingError::ToolFailed {
+                        tool: "gh".into(),
+                        status: output.status.code(),
+                    });
+                }
+                return Ok(String::new());
+            }
+            let output = Command::new(program).args(arguments).output().unwrap();
+            if !output.status.success() {
+                return Err(OnboardingError::ToolFailed {
+                    tool: program.into(),
+                    status: output.status.code(),
+                });
+            }
+            Ok(String::from_utf8(output.stdout).unwrap())
+        }
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let remote = temporary.path().join("remote.git");
+    assert!(
+        Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let inputs = temporary.path().join("apm-inputs");
+    std::fs::create_dir_all(&inputs).unwrap();
+    std::fs::write(inputs.join("apm.yml"), "name: kit\n").unwrap();
+    std::fs::write(inputs.join("apm.lock.yaml"), "lockfileVersion: 1\n").unwrap();
+    std::fs::write(inputs.join("apm-policy.yml"), "allowedSources: []\n").unwrap();
+    let executable = temporary.path().join("apm");
+    test_support::write_tool(
+        temporary.path(),
+        "apm",
+        "[ \"$1\" = --version ] && printf 'Agent Package Manager (APM) CLI version 0.25.0\\n' && exit 0\n[ \"$1\" = install ] && exit 0\n[ \"$1\" = compile ] && mkdir -p .claude && printf context > .claude/CLAUDE.md && exit 0\n[ \"$1\" = audit ] && printf '{}\\n' && exit 0\nexit 93",
+    );
+    let mut init = request(temporary.path(), InitMode::Create, "owner/real-clone");
+    init.provider = ProviderSelection::Apm {
+        executable,
+        manifest: inputs.join("apm.yml"),
+        lockfile: inputs.join("apm.lock.yaml"),
+        policy: inputs.join("apm-policy.yml"),
+    };
+    let result = initialize(&init, &RealCloneRunner { remote }).unwrap();
+    assert!(result.kit_directory.join(".git").is_dir());
+    assert!(result.kit_directory.join("providers/apm/apm.yml").is_file());
+}
+
+#[test]
 fn create_imports_chezmoi_source_and_rejects_symlinks() {
     let temporary = tempfile::tempdir().unwrap();
     let bin = temporary.path().join("bin");
@@ -320,6 +400,75 @@ fn create_rejects_secret_plaintext_in_provider_imports() {
     };
     let error = initialize(&request, &ProcessRunner::new(&bin)).unwrap_err();
     assert!(error.to_string().contains("secret-like"));
+}
+
+#[test]
+fn create_rejects_non_utf8_provider_inputs_before_clone_or_copy() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let source = temporary.path().join("source");
+    let log = temporary.path().join("commands");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(
+        source.join("dot_credentials"),
+        b"api_key=ghp_binary_payload\xff\xfe",
+    )
+    .unwrap();
+    let config = temporary.path().join("chezmoi.toml");
+    std::fs::write(&config, "[data]\n").unwrap();
+    test_support::write_logging_tools(&bin, &log);
+    test_support::write_tool(&bin, "chezmoi", "exit 0");
+    let mut init = request(
+        temporary.path(),
+        InitMode::Create,
+        "owner/binary-secret-kit",
+    );
+    init.provider = ProviderSelection::Chezmoi {
+        executable: bin.join("chezmoi"),
+        source,
+        config,
+    };
+
+    let error = initialize(&init, &ProcessRunner::new(&bin)).unwrap_err();
+    assert!(error.to_string().contains("UTF-8 text"), "{error}");
+    assert!(!init.kit_directory.exists());
+    assert!(
+        !log.exists()
+            || !std::fs::read_to_string(log)
+                .unwrap()
+                .contains("repo create")
+    );
+}
+
+#[test]
+fn create_removes_the_local_checkout_when_provider_validation_fails() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let inputs = temporary.path().join("apm-inputs");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&inputs).unwrap();
+    std::fs::write(inputs.join("apm.yml"), "name: kit\n").unwrap();
+    std::fs::write(inputs.join("apm.lock.yaml"), "lockfileVersion: 1\n").unwrap();
+    std::fs::write(inputs.join("apm-policy.yml"), "allowedSources: []\n").unwrap();
+    let log = temporary.path().join("commands");
+    test_support::write_logging_tools(&bin, &log);
+    test_support::write_tool(
+        &bin,
+        "apm",
+        "[ \"$1\" = --version ] && printf 'Agent Package Manager (APM) CLI version 9.9.9\\n' && exit 0\nexit 93",
+    );
+    let mut init = request(temporary.path(), InitMode::Create, "owner/failed-kit");
+    init.provider = ProviderSelection::Apm {
+        executable: bin.join("apm"),
+        manifest: inputs.join("apm.yml"),
+        lockfile: inputs.join("apm.lock.yaml"),
+        policy: inputs.join("apm-policy.yml"),
+    };
+
+    assert!(initialize(&init, &ProcessRunner::new(&bin)).is_err());
+    assert!(!init.kit_directory.exists());
+    assert!(!std::fs::read_to_string(log).unwrap().contains("push"));
 }
 
 #[test]

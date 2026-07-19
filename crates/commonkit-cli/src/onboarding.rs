@@ -129,17 +129,15 @@ pub fn initialize(
     validate_absolute_destination(&request.state_directory)?;
     validate_distinct_roots(request)?;
     ensure_clone_destination(&request.kit_directory)?;
+    if request.mode == InitMode::Create {
+        validate_create_provider_inputs(&request.provider)?;
+    }
 
     runner.run(
         "gh",
         &os_args(["auth", "status", "--hostname", "github.com"]),
     )?;
 
-    let provider = if request.mode == InitMode::Create {
-        import_create_provider_inputs(request)?
-    } else {
-        request.provider.clone()
-    };
     if request.mode == InitMode::Create {
         runner.run(
             "gh",
@@ -160,6 +158,13 @@ pub fn initialize(
             request.kit_directory.as_os_str().to_owned(),
         ],
     )?;
+    let mut checkout_cleanup = (request.mode == InitMode::Create)
+        .then(|| CreatedCheckoutCleanup::new(request.kit_directory.clone()));
+    let provider = if request.mode == InitMode::Create {
+        import_create_provider_inputs(request)?
+    } else {
+        request.provider.clone()
+    };
 
     let layer_paths = [
         request.kit_directory.join("layers/public-base.json"),
@@ -208,7 +213,10 @@ pub fn initialize(
     validate_git_revision(&revision)?;
     let (headless_config, first_plan_id) =
         write_runtime_state(request, &provider, &layer_paths, &revision, &target)?;
-    Ok(InitResult {
+    if request.mode == InitMode::Create {
+        git_push_created_kit(request, runner)?;
+    }
+    let result = InitResult {
         status: "initialized",
         repository: request.repository.clone(),
         repository_revision: revision,
@@ -217,7 +225,34 @@ pub fn initialize(
         target: target.to_string(),
         headless_config,
         first_plan_id,
-    })
+    };
+    if let Some(cleanup) = checkout_cleanup.as_mut() {
+        cleanup.disarm();
+    }
+    Ok(result)
+}
+
+struct CreatedCheckoutCleanup {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl CreatedCheckoutCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CreatedCheckoutCleanup {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 fn git_publish_registration(
@@ -365,16 +400,28 @@ fn git_commit_created_kit(
             OsString::from("-m"),
             OsString::from("Initialize CommonKit"),
         ],
-        vec![
+    ] {
+        let combined = prefix.iter().cloned().chain(arguments).collect::<Vec<_>>();
+        runner.run("git", &combined)?;
+    }
+    Ok(())
+}
+
+fn git_push_created_kit(
+    request: &InitRequest,
+    runner: &dyn CommandRunner,
+) -> Result<(), OnboardingError> {
+    runner.run(
+        "git",
+        &[
+            OsString::from("-C"),
+            request.kit_directory.as_os_str().to_owned(),
             OsString::from("push"),
             OsString::from("--set-upstream"),
             OsString::from("origin"),
             OsString::from("HEAD"),
         ],
-    ] {
-        let combined = prefix.iter().cloned().chain(arguments).collect::<Vec<_>>();
-        runner.run("git", &combined)?;
-    }
+    )?;
     Ok(())
 }
 
@@ -700,6 +747,69 @@ fn import_create_provider_inputs(
     }
 }
 
+fn validate_create_provider_inputs(provider: &ProviderSelection) -> Result<(), OnboardingError> {
+    match provider {
+        ProviderSelection::Native => Ok(()),
+        ProviderSelection::Apm {
+            manifest,
+            lockfile,
+            policy,
+            ..
+        } => {
+            for path in [manifest, lockfile, policy] {
+                if !path.is_absolute() {
+                    return Err(OnboardingError::CreateImportMustBeAbsolute(path.clone()));
+                }
+            }
+            let parent = manifest
+                .parent()
+                .ok_or_else(|| OnboardingError::UnsafePath(manifest.clone()))?;
+            if lockfile.parent() != Some(parent) || policy.parent() != Some(parent) {
+                return Err(OnboardingError::ApmInputsMustShareDirectory);
+            }
+            inspect_safe_tree(parent)
+        }
+        ProviderSelection::Chezmoi { source, config, .. } => {
+            if !source.is_absolute() || !config.is_absolute() {
+                return Err(OnboardingError::CreateImportMustBeAbsolute(
+                    if !source.is_absolute() {
+                        source.clone()
+                    } else {
+                        config.clone()
+                    },
+                ));
+            }
+            inspect_safe_tree(source)?;
+            read_safe_import_file(config).map(|_| ())
+        }
+    }
+}
+
+fn inspect_safe_tree(source: &Path) -> Result<(), OnboardingError> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|_| OnboardingError::MissingProviderInput(source.into()))?;
+    if !source.is_absolute() || !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(OnboardingError::UnsafePath(source.into()));
+    }
+    let mut entries = fs::read_dir(source)?.collect::<Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(OnboardingError::UnsafeImportObject(path));
+        }
+        if metadata.is_dir() {
+            inspect_safe_tree(&path)?;
+        } else if metadata.is_file() {
+            read_safe_import_file(&path)?;
+        } else {
+            return Err(OnboardingError::UnsafeImportObject(path));
+        }
+    }
+    Ok(())
+}
+
 fn copy_safe_tree(source: &Path, destination: &Path) -> Result<(), OnboardingError> {
     let metadata = fs::symlink_metadata(source)
         .map_err(|_| OnboardingError::MissingProviderInput(source.into()))?;
@@ -741,7 +851,9 @@ fn read_safe_import_file(path: &Path) -> Result<Vec<u8>, OnboardingError> {
     if bytes.is_empty() {
         return Err(OnboardingError::EmptyProviderInput(path.into()));
     }
-    if let Ok(text) = std::str::from_utf8(&bytes) {
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| OnboardingError::NonUtf8ProviderInput(path.into()))?;
+    {
         commonkit_contracts::assert_no_embedded_secrets(&serde_json::Value::String(
             text.to_owned(),
         ))
@@ -968,6 +1080,8 @@ pub enum OnboardingError {
     UnsafeImportObject(PathBuf),
     #[error("provider import contains secret-like plaintext: {0}")]
     SecretLikeImport(PathBuf),
+    #[error("provider inputs must be ordinary UTF-8 text in v1: {0}")]
+    NonUtf8ProviderInput(PathBuf),
     #[error("provider import changed while it was copied; retry from a stable source")]
     ImportDigestMismatch,
     #[error("required tool {tool} is unavailable: {detail}")]
