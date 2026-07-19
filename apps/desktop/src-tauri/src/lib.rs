@@ -488,9 +488,6 @@ fn onboarding_initialize(
     serde_json::to_value(result).map_err(Into::into)
 }
 
-impl ServiceClient {
-    fn discover() -> Result<Self, DesktopError> {
-        let paths = AppPaths::discover().map_err(|_| DesktopError::ServiceUnavailable)?;
 fn restore_headless_config(path: &Path, previous: Option<&[u8]>) -> Result<(), DesktopError> {
     match previous {
         Some(bytes) => {
@@ -520,6 +517,9 @@ fn restore_headless_config(path: &Path, previous: Option<&[u8]>) -> Result<(), D
     Ok(())
 }
 
+impl ServiceClient {
+    fn discover() -> Result<Self, DesktopError> {
+        let paths = AppPaths::discover().map_err(|_| DesktopError::ServiceUnavailable)?;
         Ok(Self {
             discovery: paths.state.join("daemon.json"),
             token: paths.config.join("control.token"),
@@ -1107,6 +1107,41 @@ async fn install_update(
         .map_err(|error| error.to_string())
 }
 
+async fn run_automated_update_lifecycle(app: tauri::AppHandle, report: PathBuf, expected: String) {
+    let result = async {
+        let update = app
+            .updater()
+            .map_err(|error| error.to_string())?
+            .check()
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "the expected published update is unavailable".to_owned())?;
+        authorize_update_install(true, &expected, &update.version)?;
+        update
+            .download_and_install(|_, _| {}, || {})
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>(serde_json::json!({
+            "schemaVersion": 1,
+            "previousVersion": env!("CARGO_PKG_VERSION"),
+            "installedVersion": expected,
+            "updatedByTauri": true,
+        }))
+    }
+    .await;
+    let (exit_code, payload) = match result {
+        Ok(payload) => (0, payload),
+        Err(error) => (70, serde_json::json!({
+            "schemaVersion": 1,
+            "previousVersion": env!("CARGO_PKG_VERSION"),
+            "updatedByTauri": false,
+            "error": error,
+        })),
+    };
+    let _ = std::fs::write(report, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+    app.exit(exit_code);
+}
+
 #[tauri::command]
 fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     let window = app
@@ -1258,6 +1293,16 @@ pub fn run() {
                 })
                 .build(app)?;
             let app_handle = app.handle().clone();
+            if let (Some(report), Ok(expected)) = (
+                std::env::var_os("COMMONKIT_DESKTOP_UPDATE_REPORT"),
+                std::env::var("COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION"),
+            ) {
+                tauri::async_runtime::spawn(run_automated_update_lifecycle(
+                    app_handle.clone(),
+                    report.into(),
+                    expected,
+                ));
+            }
             tauri::async_runtime::spawn(async move {
                 loop {
                     refresh_tray(app_handle.clone()).await;
