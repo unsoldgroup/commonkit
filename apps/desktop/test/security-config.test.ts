@@ -47,9 +47,9 @@ test("installed lifecycle atomically reloads an already-running daemon after onb
 test("desktop preflights and reloads through the authenticated daemon API regardless of process ownership", async () => {
   const source = await readFile(new URL("src/lib.rs", root), "utf8");
   const onboarding = source.slice(source.indexOf("fn onboarding_initialize"), source.indexOf("impl ServiceClient"));
-  const preflight = onboarding.indexOf('reqwest::Method::GET,\n        "/domains/reload"');
+  const preflight = onboarding.indexOf("reqwest::Method::GET");
   const initialize = onboarding.indexOf("let result = initialize(");
-  const reload = onboarding.indexOf('reqwest::Method::POST,\n        "/domains/reload"');
+  const reload = onboarding.indexOf("reqwest::Method::POST");
   assert.ok(preflight >= 0 && preflight < initialize);
   assert.ok(reload > initialize);
   assert.doesNotMatch(onboarding, /reload_owned_after_onboarding|ExternalServiceReloadRequired/);

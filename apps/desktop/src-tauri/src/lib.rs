@@ -442,15 +442,15 @@ fn onboarding_initialize(
         },
         _ => return Err(DesktopError::InvalidInput),
     };
-    let result = initialize(
-        &InitRequest {
-            mode: if request.mode == "create" {
     let headless_config = paths.config.join("headless.json");
     let previous_config = match std::fs::read(&headless_config) {
         Ok(bytes) => Some(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
+    let result = initialize(
+        &InitRequest {
+            mode: if request.mode == "create" {
                 InitMode::Create
             } else {
                 InitMode::Connect
