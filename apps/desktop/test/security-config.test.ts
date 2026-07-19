@@ -14,10 +14,16 @@ test("desktop capabilities expose no shell, process, filesystem, or arbitrary HT
 
 test("desktop is single-window, CSP-bound, and emits updater artifacts", async () => {
   const config = JSON.parse(await readFile(new URL("tauri.conf.json", root), "utf8"));
+  const source = await readFile(new URL("src/lib.rs", root), "utf8");
   assert.equal(config.app.windows.length, 1);
   assert.match(config.app.security.csp, /default-src 'self'/);
   assert.equal(config.bundle.createUpdaterArtifacts, true);
   assert.equal(config.app.withGlobalTauri, false);
+  assert.deepEqual(config.plugins?.updater, {
+    pubkey: "",
+    endpoints: [],
+  });
+  assert.match(source, /set_activation_policy\(tauri::ActivationPolicy::Accessory\)/);
   assert.deepEqual(config.bundle.externalBin, [
     "binaries/commonkit",
     "binaries/commonkitd",

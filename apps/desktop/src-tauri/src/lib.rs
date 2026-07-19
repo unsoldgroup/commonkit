@@ -1323,6 +1323,8 @@ pub fn run() {
             show_main_window
         ])
         .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
             let supervisor = ServiceSupervisor::ensure_started(&client)?;
             app.manage(supervisor);
             let health = MenuItem::with_id(app, "health", "Health: starting", false, None::<&str>)?;
