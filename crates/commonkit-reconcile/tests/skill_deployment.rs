@@ -51,7 +51,11 @@ struct Compiler {
 }
 
 impl ApmCompiler for Compiler {
-    fn compile(&mut self, _package: &StableId) -> Result<ApmCompilation, AdapterFailure> {
+    fn compile(
+        &mut self,
+        _package: &StableId,
+        _policy_digest: &Sha256Digest,
+    ) -> Result<ApmCompilation, AdapterFailure> {
         Ok(ApmCompilation {
             source_digest: self.source_digest.clone(),
             provider_inputs_digest: digest('4'),
@@ -60,6 +64,7 @@ impl ApmCompiler for Compiler {
             ownership_map_digest: digest('6'),
             artifact_set_digest: digest('7'),
             desired_digest: digest('8'),
+            observed_digest: digest('c'),
             operations: vec![operation()],
         })
     }
@@ -97,6 +102,26 @@ impl Adapter for RecordingAdapter {
     }
 }
 
+struct FailingRollbackAdapter;
+impl Adapter for FailingRollbackAdapter {
+    fn id(&self) -> &StableId {
+        static ID: std::sync::OnceLock<StableId> = std::sync::OnceLock::new();
+        ID.get_or_init(|| id("files"))
+    }
+    fn prepare(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    fn apply(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    fn verify(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    fn rollback(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
+        Err(AdapterFailure::new("rollback_failed", "fixture"))
+    }
+}
+
 fn request() -> SkillDeploymentRequest {
     SkillDeploymentRequest {
         candidate_id: id("candidate-1"),
@@ -104,7 +129,6 @@ fn request() -> SkillDeploymentRequest {
         apm_package: id("review-skill"),
         canary_loadout: id("codex-canary"),
         observed_digest: digest('c'),
-        policy_digest: digest('d'),
     }
 }
 
@@ -141,6 +165,8 @@ impl SkillPromotionAuthority for Authority {
                 value["promotedSourceDigest"].as_str().unwrap_or_default(),
             )
             .map_err(|_| SkillDeploymentError::PromotionAuthorityMismatch)?,
+            policy_digest: Sha256Digest::parse(value["policyDigest"].as_str().unwrap_or_default())
+                .map_err(|_| SkillDeploymentError::PromotionAuthorityMismatch)?,
         })
     }
 }
@@ -154,6 +180,7 @@ fn authority(root: &std::path::Path) -> Authority {
             "candidateId": "candidate-1",
             "candidateDigest": digest('9'),
             "promotedSourceDigest": digest('b'),
+            "policyDigest": digest('d'),
             "candidateState": "promoted"
         }))
         .expect("authority json"),
@@ -207,7 +234,7 @@ fn compiles_apm_applies_named_canary_and_links_receipts() {
     let restarted_store = ReceiptStore::open(&temporary).expect("restart store");
     let restarted_trust = DeploymentTrustStore::open(&anchors, [7; 32]).expect("restart trust");
     let restarted_workflow = SkillDeploymentWorkflow::new(&restarted_store, &restarted_trust);
-    let anchor_path = anchors.join("canary-run-1.anchor");
+    let anchor_path = anchors.join("canary-run-1.receipt.anchor");
     let authentic_anchor = std::fs::read(&anchor_path).expect("anchor");
     std::fs::write(&anchor_path, b"caller-forged-anchor").expect("tamper anchor");
     let error = restarted_workflow
@@ -215,6 +242,14 @@ fn compiles_apm_applies_named_canary_and_links_receipts() {
         .expect_err("independent anchor must authenticate the receipt");
     assert_eq!(error.code(), "skill_deployment_anchor_mismatch");
     std::fs::write(&anchor_path, authentic_anchor).expect("restore test anchor");
+    let intent_anchor = anchors.join("canary-run-1.intent.anchor");
+    let authentic_intent_anchor = std::fs::read(&intent_anchor).expect("intent anchor");
+    std::fs::write(&intent_anchor, b"forged-intent-anchor").expect("tamper intent");
+    let error = restarted_workflow
+        .load(&id("canary-run-1"), &deployment_id)
+        .expect_err("pre-mutation lineage must remain authenticated");
+    assert_eq!(error.code(), "skill_deployment_anchor_mismatch");
+    std::fs::write(&intent_anchor, authentic_intent_anchor).expect("restore intent anchor");
     let wrong_id = digest('f');
     let error = restarted_workflow
         .rollback(
@@ -238,6 +273,23 @@ fn compiles_apm_applies_named_canary_and_links_receipts() {
     assert_eq!(rollback.restored_digest, digest('c'));
     std::fs::remove_dir_all(temporary).expect("cleanup");
     std::fs::remove_dir_all(anchors).expect("cleanup anchors");
+}
+
+#[cfg(unix)]
+#[test]
+fn trust_store_rejects_group_readable_existing_keys() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = temporary_directory("skill-deployment-key");
+    let key = temporary.join("trust.key");
+    std::fs::write(&key, [7_u8; 32]).expect("key");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).expect("mode");
+    let error = match DeploymentTrustStore::open_or_create(temporary.join("anchors"), &key) {
+        Ok(_) => panic!("readable key must fail closed"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), "skill_deployment_trust_key_invalid");
+    std::fs::remove_dir_all(temporary).expect("cleanup");
 }
 
 #[test]
@@ -290,6 +342,47 @@ fn rollback_fails_closed_when_fresh_target_observation_is_not_exact() {
     assert_eq!(
         error.code(),
         "skill_deployment_rollback_verification_failed"
+    );
+    std::fs::remove_dir_all(temporary).expect("cleanup");
+    std::fs::remove_dir_all(anchors).expect("cleanup anchors");
+}
+
+#[test]
+fn rollback_failure_never_persists_a_restored_deployment_receipt() {
+    let temporary = temporary_directory("skill-deployment-rollback-failure");
+    let anchors = temporary_directory("skill-deployment-rollback-failure-anchors");
+    let store = ReceiptStore::open(&temporary).expect("store");
+    let trust = DeploymentTrustStore::open(&anchors, [4; 32]).expect("trust");
+    let workflow = SkillDeploymentWorkflow::new(&store, &trust);
+    let authority = authority(&temporary);
+    let mut compiler = Compiler {
+        source_digest: digest('b'),
+    };
+    let prepared = workflow
+        .prepare(request(), &mut compiler, &authority)
+        .expect("prepare");
+    let mut apply_adapters: Vec<Box<dyn Adapter>> = vec![Box::new(RecordingAdapter::default())];
+    let receipt = workflow
+        .apply(
+            prepared,
+            id("canary-run-rollback-failure"),
+            &mut apply_adapters,
+        )
+        .expect("apply");
+    let mut rollback_adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FailingRollbackAdapter)];
+    let error = workflow
+        .rollback(
+            &id("canary-run-rollback-failure"),
+            &receipt.id,
+            &mut rollback_adapters,
+            &mut Observer(digest('c')),
+        )
+        .expect_err("rollback failure");
+    assert_eq!(error.code(), "skill_deployment_rollback_failed");
+    assert!(
+        !temporary
+            .join("canary-run-rollback-failure/skill-deployment-rollback.receipt")
+            .exists()
     );
     std::fs::remove_dir_all(temporary).expect("cleanup");
     std::fs::remove_dir_all(anchors).expect("cleanup anchors");

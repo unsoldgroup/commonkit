@@ -7,6 +7,7 @@ use commonkit_contracts::{
     digest_domain_json,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -24,7 +25,6 @@ pub struct SkillDeploymentRequest {
     pub apm_package: StableId,
     pub canary_loadout: StableId,
     pub observed_digest: Sha256Digest,
-    pub policy_digest: Sha256Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +33,7 @@ pub struct AuthenticatedSkillPromotion {
     pub candidate_digest: Sha256Digest,
     pub promotion_receipt_id: Sha256Digest,
     pub promoted_source_digest: Sha256Digest,
+    pub policy_digest: Sha256Digest,
 }
 
 pub trait SkillPromotionAuthority {
@@ -56,18 +57,78 @@ pub struct DeploymentTrustStore {
 }
 
 impl DeploymentTrustStore {
+    pub fn open_or_create(
+        root: impl AsRef<Path>,
+        key_path: impl AsRef<Path>,
+    ) -> Result<Self, SkillDeploymentError> {
+        let key_path = key_path.as_ref();
+        if let Some(parent) = key_path.parent() {
+            fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            fs::set_permissions(parent, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        }
+        let key = match fs::symlink_metadata(key_path) {
+            Ok(metadata) => {
+                if !metadata.is_file() || metadata.file_type().is_symlink() {
+                    return Err(SkillDeploymentError::UnsafeTrustKey);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o077 != 0 {
+                        return Err(SkillDeploymentError::UnsafeTrustKey);
+                    }
+                }
+                let bytes = fs::read(key_path)?;
+                bytes
+                    .try_into()
+                    .map_err(|_| SkillDeploymentError::UnsafeTrustKey)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut key = [0_u8; 32];
+                rand::rng().fill_bytes(&mut key);
+                let mut options = OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let mut file = options.open(key_path)?;
+                file.write_all(&key)?;
+                file.sync_all()?;
+                key
+            }
+            Err(error) => return Err(error.into()),
+        };
+        Self::open(root, key)
+    }
+
     pub fn open(root: impl AsRef<Path>, key: [u8; 32]) -> Result<Self, SkillDeploymentError> {
         fs::create_dir_all(root.as_ref())?;
         let root = root.as_ref().canonicalize()?;
         Ok(Self { root, key })
     }
 
-    fn anchor(&self, run_id: &StableId, bytes: &[u8]) -> Result<(), SkillDeploymentError> {
-        persist_receipt(&self.path(run_id), hmac_sha256(&self.key, bytes).as_bytes())
+    fn anchor(
+        &self,
+        run_id: &StableId,
+        label: &str,
+        bytes: &[u8],
+    ) -> Result<(), SkillDeploymentError> {
+        persist_receipt(
+            &self.path(run_id, label),
+            hmac_sha256(&self.key, bytes).as_bytes(),
+        )
     }
 
-    fn verify(&self, run_id: &StableId, bytes: &[u8]) -> Result<(), SkillDeploymentError> {
-        let anchored = fs::read(self.path(run_id))?;
+    fn verify(
+        &self,
+        run_id: &StableId,
+        label: &str,
+        bytes: &[u8],
+    ) -> Result<(), SkillDeploymentError> {
+        let anchored = fs::read(self.path(run_id, label))?;
         let expected = hmac_sha256(&self.key, bytes);
         if anchored.as_slice() != expected.as_bytes() {
             return Err(SkillDeploymentError::DeploymentAnchorMismatch);
@@ -75,8 +136,9 @@ impl DeploymentTrustStore {
         Ok(())
     }
 
-    fn path(&self, run_id: &StableId) -> PathBuf {
-        self.root.join(format!("{}.anchor", run_id.as_str()))
+    fn path(&self, run_id: &StableId, label: &str) -> PathBuf {
+        self.root
+            .join(format!("{}.{}.anchor", run_id.as_str(), label))
     }
 }
 
@@ -89,11 +151,16 @@ pub struct ApmCompilation {
     pub ownership_map_digest: Sha256Digest,
     pub artifact_set_digest: Sha256Digest,
     pub desired_digest: Sha256Digest,
+    pub observed_digest: Sha256Digest,
     pub operations: Vec<Operation>,
 }
 
 pub trait ApmCompiler {
-    fn compile(&mut self, package: &StableId) -> Result<ApmCompilation, AdapterFailure>;
+    fn compile(
+        &mut self,
+        package: &StableId,
+        policy_digest: &Sha256Digest,
+    ) -> Result<ApmCompilation, AdapterFailure>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,10 +241,13 @@ impl<'a> SkillDeploymentWorkflow<'a> {
             return Err(SkillDeploymentError::PromotionAuthorityMismatch);
         }
         let compilation = compiler
-            .compile(&request.apm_package)
+            .compile(&request.apm_package, &authenticated.policy_digest)
             .map_err(SkillDeploymentError::ApmCompile)?;
         if compilation.source_digest != authenticated.promoted_source_digest {
             return Err(SkillDeploymentError::ApmSourceDigestMismatch);
+        }
+        if compilation.observed_digest != request.observed_digest {
+            return Err(SkillDeploymentError::ObservedStateMismatch);
         }
         if compilation.operations.is_empty() {
             return Err(SkillDeploymentError::EmptyCompilation);
@@ -192,8 +262,8 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         let plan = build_plan(PlanDraft {
             target_id: request.canary_loadout.clone(),
             desired_digest: compilation.desired_digest,
-            observed_digest: request.observed_digest,
-            policy_digest: request.policy_digest,
+            observed_digest: compilation.observed_digest,
+            policy_digest: authenticated.policy_digest,
             bindings,
             operations: compilation.operations,
         })?;
@@ -217,6 +287,18 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         run_id: StableId,
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<SkillDeploymentReceipt, SkillDeploymentError> {
+        let intent = canonical_json(&serde_json::json!({
+            "runId": &run_id,
+            "plan": &prepared.plan,
+            "lineage": &prepared.lineage,
+        }))?;
+        let run_directory = self.store.root().join(run_id.as_str());
+        fs::create_dir_all(&run_directory)?;
+        persist_receipt(
+            &run_directory.join("skill-deployment-intent.receipt"),
+            &intent,
+        )?;
+        self.trust.anchor(&run_id, "intent", &intent)?;
         let outcome =
             Reconciler::with_store(self.store).execute(&prepared.plan, run_id.clone(), adapters)?;
         if outcome != ReconcileOutcome::Succeeded {
@@ -238,7 +320,7 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         let receipt = draft.into_receipt()?;
         let bytes = canonical_json(&receipt)?;
         persist_receipt(&deployment_path(self.store, &receipt.run_id), &bytes)?;
-        self.trust.anchor(&receipt.run_id, &bytes)?;
+        self.trust.anchor(&receipt.run_id, "receipt", &bytes)?;
         Ok(receipt)
     }
 
@@ -247,9 +329,16 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         run_id: &StableId,
         expected_id: &Sha256Digest,
     ) -> Result<SkillDeploymentReceipt, SkillDeploymentError> {
+        let intent_path = self
+            .store
+            .root()
+            .join(run_id.as_str())
+            .join("skill-deployment-intent.receipt");
+        let intent = read_receipt_bytes(&intent_path)?;
+        self.trust.verify(run_id, "intent", &intent)?;
         let path = deployment_path(self.store, run_id);
         let bytes = read_receipt_bytes(&path)?;
-        self.trust.verify(run_id, &bytes)?;
+        self.trust.verify(run_id, "receipt", &bytes)?;
         let receipt: SkillDeploymentReceipt = serde_json::from_slice(&bytes)?;
         validate_receipt(&receipt, expected_id)?;
         let reconcile = self.store.load(run_id.clone())?;
@@ -281,7 +370,9 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         )?;
         let state = match outcome {
             ReconcileOutcome::RolledBack => SkillDeploymentState::RolledBack,
-            ReconcileOutcome::RollbackFailed => SkillDeploymentState::RollbackFailed,
+            ReconcileOutcome::RollbackFailed => {
+                return Err(SkillDeploymentError::CanaryRollbackFailed);
+            }
             _ => return Err(SkillDeploymentError::UnexpectedRollbackOutcome(outcome)),
         };
         let observed = observer
@@ -471,6 +562,8 @@ pub enum SkillDeploymentError {
     ApmCompile(AdapterFailure),
     #[error("APM output was not compiled from the promoted source digest")]
     ApmSourceDigestMismatch,
+    #[error("canary target changed after the requested observation")]
+    ObservedStateMismatch,
     #[error("APM compilation produced no target operations")]
     EmptyCompilation,
     #[error("canary reconciliation did not verify: {0:?}")]
@@ -481,12 +574,16 @@ pub enum SkillDeploymentError {
     DeploymentReceiptMismatch,
     #[error("durable canary deployment anchor does not authenticate its receipt")]
     DeploymentAnchorMismatch,
+    #[error("deployment trust key is not a protected ordinary 32-byte file")]
+    UnsafeTrustKey,
     #[error("durable promotion receipt or candidate state did not authenticate")]
     PromotionAuthorityMismatch,
     #[error("canary restored-state observation failed: {0:?}")]
     Observe(AdapterFailure),
     #[error("canary rollback did not restore the exact observed target state")]
     RollbackVerificationFailed,
+    #[error("canary reconciliation rollback failed; restored state was not certified")]
+    CanaryRollbackFailed,
     #[error("canary rollback produced an unexpected outcome: {0:?}")]
     UnexpectedRollbackOutcome(ReconcileOutcome),
     #[error(transparent)]
@@ -508,14 +605,17 @@ impl SkillDeploymentError {
         match self {
             Self::ApmCompile(_) => "apm_compile_failed",
             Self::ApmSourceDigestMismatch => "apm_source_digest_mismatch",
+            Self::ObservedStateMismatch => "skill_deployment_observed_state_mismatch",
             Self::EmptyCompilation => "apm_empty_compilation",
             Self::CanaryNotVerified(_) => "skill_canary_not_verified",
             Self::DeploymentNotVerified => "skill_deployment_not_verified",
             Self::DeploymentReceiptMismatch => "skill_deployment_receipt_mismatch",
             Self::DeploymentAnchorMismatch => "skill_deployment_anchor_mismatch",
+            Self::UnsafeTrustKey => "skill_deployment_trust_key_invalid",
             Self::PromotionAuthorityMismatch => "skill_promotion_authority_mismatch",
             Self::Observe(_) => "skill_deployment_observation_failed",
             Self::RollbackVerificationFailed => "skill_deployment_rollback_verification_failed",
+            Self::CanaryRollbackFailed => "skill_deployment_rollback_failed",
             Self::UnexpectedRollbackOutcome(_) => "skill_deployment_rollback_invalid",
             Self::Plan(_) => "skill_deployment_plan_invalid",
             Self::Reconcile(_) => "skill_deployment_reconcile_failed",

@@ -466,6 +466,7 @@ version = "0.1.0"
 dependencies = [
  "commonkit-contracts",
  "commonkit-core",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "sha2",
@@ -523,6 +524,7 @@ version = "0.1.0"
 dependencies = [
  "commonkit-adapters",
  "commonkit-contracts",
+ "commonkit-reconcile",
  "regex",
  "serde",
  "serde_json",

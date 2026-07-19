@@ -78,25 +78,47 @@ fi
     };
     let corpus = root.join("held-out");
     fs::create_dir(&corpus).expect("corpus");
+    fs::write(corpus.join("scorer"), b"scorer").expect("scorer");
     let harness = root.join("harness");
-    let baseline =
-        commonkit_skills::digest_bytes(b"# Contract fixture\n\nAnswer accurately.\n").unwrap();
-    let candidate = commonkit_skills::digest_bytes(b"# Contract fixture\n\nAnswer accurately. Always wrap the final answer in <answer>...</answer> tags.\n").unwrap();
-    let harness_report = serde_json::json!({
-        "schemaVersion":1,"suiteDigest":"sha256:441b280fee317839802de9768353550be4f655bdb0529cc99b279f8a67cd6d2e",
-        "skillId":"contract-fixture","baselineDigest":baseline,"candidateDigest":candidate,
-        "policyDigest": commonkit_skills::digest_bytes(b"provider-contract-policy").unwrap(), "policyPassed":true,
-        "evaluation":{"schemaVersion":1,"baselineBasisPoints":0,"candidateBasisPoints":10000,
-        "heldOutBaselineBasisPoints":10000,"heldOutCandidateBasisPoints":10000,"requiredCases":{"wrap-held-out":"passed"},
-        "costMicros":1,"harness":{"kind":"skillopt-sleep","version":"0.2.0","environmentDigest":commonkit_skills::digest_bytes(b"skillopt-sleep-v1-mock").unwrap()},
-        "scorerDigest":commonkit_skills::digest_bytes(b"scorer").unwrap()}
-    });
     fs::write(
         &harness,
-        format!("#!/bin/sh\nprintf '%s' '{}'\n", harness_report),
+        r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --suite-digest) suite="$2"; shift 2;;
+    --skill-id) skill="$2"; shift 2;;
+    --baseline-digest) baseline="$2"; shift 2;;
+    --candidate-digest) candidate="$2"; shift 2;;
+    --policy-digest) policy="$2"; shift 2;;
+    --harness-environment-digest) environment="$2"; shift 2;;
+    --scorer-digest) scorer="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+printf '{"schemaVersion":1,"suiteDigest":"%s","skillId":"%s","baselineDigest":"%s","candidateDigest":"%s","policyDigest":"%s","policyPassed":true,"evaluation":{"schemaVersion":1,"baselineBasisPoints":0,"candidateBasisPoints":10000,"heldOutBaselineBasisPoints":10000,"heldOutCandidateBasisPoints":10000,"requiredCases":{"wrap-held-out":"passed"},"costMicros":1,"harness":{"kind":"skillopt-sleep","version":"0.2.0","environmentDigest":"%s"},"scorerDigest":"%s"}}' "$suite" "$skill" "$baseline" "$candidate" "$policy" "$environment" "$scorer"
+"#,
     )
     .unwrap();
     fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).unwrap();
+    let suite = commonkit_skills::measured_provider_fixture_suite(&harness, &corpus)
+        .expect("measured fixture suite");
+    fs::write(
+        fixtures.join("reviewed-tasks.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "format":"skillopt_sleep.tasks.v1",
+            "reviewed":true,
+            "commonkit":{
+                "skillId":"contract-fixture",
+                "campaignId":"provider-contract",
+                "suiteDigest":suite.digest().expect("suite digest"),
+                "trainDigest":suite.train.content_digest,
+                "validationDigest":suite.validation.content_digest
+            },
+            "tasks":[{"id":"wrap-train"},{"id":"wrap-validation"}]
+        }))
+        .expect("tasks"),
+    )
+    .expect("tasks");
     let manager = SkillOptProviderManager::open(&uv, root.join("providers"))
         .expect("manager")
         .with_harness(&harness, &corpus)

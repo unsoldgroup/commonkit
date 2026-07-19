@@ -12,6 +12,7 @@ use commonkit_contracts::{
 };
 use commonkit_skills::{
     ProviderCheck, SkillOptBackend, SkillOptProviderConfig, SkillOptSleepOptimizer, SkillOptimizer,
+    measure_harness_lock, measure_provider_installation,
 };
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
@@ -45,6 +46,7 @@ while [ "$#" -gt 0 ]; do
 done
 if grep -R 'held' "$project/input" >/dev/null 2>&1; then exit 71; fi
 if [ -e "$project/harness-suite-manifest.json" ]; then exit 72; fi
+( sleep 1; grep -R 'held' "$(dirname "$project")"/commonkit-skill-harness-* >/dev/null 2>&1 && touch "$project/held-out-leaked" ) &
 mkdir -p "$project/.skillopt-sleep/staging/run-1"
 printf '# Review\n\nImproved safely.\n' > "$project/.skillopt-sleep/staging/run-1/proposed_SKILL.md"
 printf '{"live_skill_path":"%s","live_memory_path":"","has_skill":true,"has_memory":false,"accepted":true}' "$skill" > "$project/.skillopt-sleep/staging/run-1/manifest.json"
@@ -68,6 +70,8 @@ printf '{"night":1,"accepted":true,"gate_action":"accept","no_edits_reason":"","
             adapter_contract: provider_lock.adapter_contract.clone(),
             source: provider_lock.source,
             package_digest: provider_lock.package_digest.clone(),
+            installed_content_digest: measure_provider_installation(&root.join("tool"))
+                .expect("installation digest"),
             capabilities: provider_lock.capabilities.clone(),
             compatible: true,
         })
@@ -77,8 +81,30 @@ printf '{"night":1,"accepted":true,"gate_action":"accept","no_edits_reason":"","
     let tasks = root.join("tasks.json");
     let corpus = root.join("corpus");
     fs::create_dir_all(&corpus).expect("corpus");
+    fs::write(corpus.join("scorer"), "deterministic-scorer-v1").expect("scorer");
     let harness = root.join("harness");
-    let suite = SkillEvaluationSuite {
+    fs::write(
+        &harness,
+        r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --suite-digest) suite="$2"; shift 2;;
+    --skill-id) skill="$2"; shift 2;;
+    --baseline-digest) baseline="$2"; shift 2;;
+    --candidate-digest) candidate="$2"; shift 2;;
+    --policy-digest) policy="$2"; shift 2;;
+    --harness-environment-digest) environment="$2"; shift 2;;
+    --scorer-digest) scorer="$2"; shift 2;;
+    *) shift;;
+  esac
+done
+sleep 2
+printf '{"schemaVersion":1,"suiteDigest":"%s","skillId":"%s","baselineDigest":"%s","candidateDigest":"%s","policyDigest":"%s","policyPassed":true,"evaluation":{"schemaVersion":1,"baselineBasisPoints":5000,"candidateBasisPoints":7000,"heldOutBaselineBasisPoints":5000,"heldOutCandidateBasisPoints":7000,"requiredCases":{"held":"passed"},"costMicros":1,"harness":{"kind":"skillopt-sleep","version":"0.2.0","environmentDigest":"%s"},"scorerDigest":"%s"}}' "$suite" "$skill" "$baseline" "$candidate" "$policy" "$environment" "$scorer"
+"#,
+    )
+    .expect("harness");
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).expect("harness mode");
+    let mut suite = SkillEvaluationSuite {
         schema_version: SchemaVersion(1),
         id: id("suite"),
         skill_id: id("review"),
@@ -107,6 +133,8 @@ printf '{"night":1,"accepted":true,"gate_action":"accept","no_edits_reason":"","
             required_case_ids: BTreeSet::from([id("held")]),
         },
     };
+    suite.harness = measure_harness_lock(id("skillopt-sleep"), "0.2.0".into(), &harness, &corpus)
+        .expect("measured harness");
     let manifest = SkillOptimizationManifest {
         schema_version: SchemaVersion(1),
         id: id("run"),
@@ -141,7 +169,6 @@ printf '{"night":1,"accepted":true,"gate_action":"accept","no_edits_reason":"","
     };
 
     let original = b"# Review\n\nOriginal.\n";
-    let candidate = b"# Review\n\nImproved safely.\n";
     let suite_digest = suite.digest().expect("suite digest");
     fs::write(
         &tasks,
@@ -163,39 +190,13 @@ printf '{"night":1,"accepted":true,"gate_action":"accept","no_edits_reason":"","
         .expect("tasks json"),
     )
     .expect("tasks");
-    let harness_report = serde_json::json!({
-        "schemaVersion": 1,
-        "suiteDigest": suite_digest,
-        "skillId": "review",
-        "baselineDigest": commonkit_skills::digest_bytes(original).expect("baseline digest"),
-        "candidateDigest": commonkit_skills::digest_bytes(candidate).expect("candidate digest"),
-        "policyDigest": manifest.policy_digest.clone(),
-        "policyPassed": true,
-        "evaluation": {
-            "schemaVersion": 1,
-            "baselineBasisPoints": 5000,
-            "candidateBasisPoints": 7000,
-            "heldOutBaselineBasisPoints": 5000,
-            "heldOutCandidateBasisPoints": 7000,
-            "requiredCases": {"held":"passed"},
-            "costMicros": 1,
-            "harness": suite.harness.clone(),
-            "scorerDigest": digest('9')
-        }
-    });
-    fs::write(
-        &harness,
-        format!("#!/bin/sh\nprintf '%s' '{}'\n", harness_report.to_string()),
-    )
-    .expect("harness");
-    fs::set_permissions(&harness, fs::Permissions::from_mode(0o755)).expect("harness mode");
     let config = SkillOptProviderConfig {
         environment_root: root.join("tool"),
         provider_lock: provider_lock.clone(),
         backend: SkillOptBackend::Mock,
         model: None,
         tasks_file: tasks,
-        harness_executable: harness,
+        harness_executable: harness.clone(),
         harness_corpus: corpus,
         environment: BTreeMap::new(),
         timeout_seconds: 5,
@@ -208,6 +209,18 @@ printf '{"night":1,"accepted":true,"gate_action":"accept","no_edits_reason":"","
     assert_eq!(output.evaluation.baseline_basis_points, 5_000);
     assert_eq!(output.evaluation.candidate_basis_points, 7_000);
     assert_eq!(original, b"# Review\n\nOriginal.\n");
+
+    fs::write(&harness, "#!/bin/sh\nexit 0\n").expect("tamper harness");
+    assert!(matches!(
+        optimizer.optimize(&manifest, &suite, original),
+        Err(commonkit_skills::SkillError::HarnessIntegrityMismatch)
+    ));
+
+    fs::write(&executable, "#!/bin/sh\nexit 0\n").expect("tamper provider");
+    assert!(matches!(
+        optimizer.check(),
+        Err(commonkit_skills::SkillError::UnsupportedSkillOptProvider)
+    ));
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -242,6 +255,8 @@ fn provider_rejects_reviewed_task_files_without_tasks() {
             adapter_contract: lock.adapter_contract.clone(),
             source: lock.source,
             package_digest: lock.package_digest.clone(),
+            installed_content_digest: measure_provider_installation(&root.join("tool"))
+                .expect("installation digest"),
             capabilities: lock.capabilities.clone(),
             compatible: true,
         })

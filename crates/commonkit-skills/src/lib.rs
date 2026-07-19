@@ -163,6 +163,8 @@ pub struct ProviderCheck {
     pub adapter_contract: StableId,
     pub source: ProviderSource,
     pub package_digest: Sha256Digest,
+    /// Digest of the installed provider tree, excluding this check file.
+    pub installed_content_digest: Sha256Digest,
     pub capabilities: BTreeSet<StableId>,
     pub compatible: bool,
 }
@@ -248,7 +250,15 @@ impl SkillOptProviderManager {
         let temporary = create_private_staging()?;
         let tasks_path = temporary.join("tasks.json");
         fs::write(&tasks_path, &reviewed_tasks)?;
-        let suite = provider_fixture_suite()?;
+        let mut suite = provider_fixture_suite()?;
+        let (harness_executable, harness_corpus) =
+            self.harness.as_ref().ok_or(SkillError::InvalidHarness)?;
+        suite.harness = measure_harness_lock(
+            suite.harness.kind.clone(),
+            suite.harness.version.clone(),
+            harness_executable,
+            harness_corpus,
+        )?;
         let manifest = provider_fixture_manifest(
             provider_lock.clone(),
             digest_bytes(&fixture_skill)?,
@@ -351,7 +361,10 @@ impl SkillOptProviderManager {
                 "--require-hashes".into(),
             ],
         )?;
-        let marker = provider_check_from_lock(&plan.provider_lock);
+        let marker = provider_check_from_lock(
+            &plan.provider_lock,
+            measure_provider_installation(&environment)?,
+        );
         fs::write(
             environment.join("commonkit-provider-lock.json"),
             canonical_json(&marker)?,
@@ -364,7 +377,15 @@ impl SkillOptProviderManager {
         let tasks_path = fixtures.join("reviewed-tasks.json");
         fs::write(&skill_path, &plan.fixture_skill)?;
         fs::write(&tasks_path, &plan.reviewed_tasks)?;
-        let suite = provider_fixture_suite()?;
+        let mut suite = provider_fixture_suite()?;
+        let (harness_executable, harness_corpus) =
+            self.harness.as_ref().ok_or(SkillError::InvalidHarness)?;
+        suite.harness = measure_harness_lock(
+            suite.harness.kind.clone(),
+            suite.harness.version.clone(),
+            harness_executable,
+            harness_corpus,
+        )?;
         let source_digest = digest_bytes(&plan.fixture_skill)?;
         let manifest =
             provider_fixture_manifest(plan.provider_lock.clone(), source_digest, &suite)?;
@@ -376,18 +397,8 @@ impl SkillOptProviderManager {
             tasks_file: tasks_path,
             environment: BTreeMap::new(),
             timeout_seconds: 60,
-            harness_executable: self
-                .harness
-                .as_ref()
-                .ok_or(SkillError::InvalidHarness)?
-                .0
-                .clone(),
-            harness_corpus: self
-                .harness
-                .as_ref()
-                .ok_or(SkillError::InvalidHarness)?
-                .1
-                .clone(),
+            harness_executable: harness_executable.clone(),
+            harness_corpus: harness_corpus.clone(),
         })?;
         let output = optimizer.optimize(&manifest, &suite, &plan.fixture_skill)?;
         let source_unchanged = fs::read(&skill_path)? == plan.fixture_skill;
@@ -519,6 +530,15 @@ impl SkillOptSleepOptimizer {
         }
         validate_reviewed_tasks(&self.config.tasks_file, manifest, suite)?;
         self.check()?;
+        let measured_harness = measure_harness_lock(
+            suite.harness.kind.clone(),
+            suite.harness.version.clone(),
+            &self.config.harness_executable,
+            &self.config.harness_corpus,
+        )?;
+        if measured_harness != suite.harness {
+            return Err(SkillError::HarnessIntegrityMismatch);
+        }
         let staging = create_private_staging()?;
         let result = self.run_in_staging(&staging, manifest, suite, current_skill);
         let _ = fs::remove_dir_all(&staging);
@@ -665,17 +685,17 @@ impl SkillOptSleepOptimizer {
         }
         let candidate = read_bounded(&staging_dir.join("proposed_SKILL.md"), 256 * 1024)?;
         validate_candidate_content(&candidate)?;
-        // Held-out identities are materialized only after the provider exits.
-        // The independent harness receives the complete suite and corpus; the
-        // provider never receives either.
-        let harness_suite_path = staging.join("harness-suite-manifest.json");
+        // Provider descendants inherit the provider sandbox. Keep held-out
+        // identities in a separate root that was never provider-readable.
+        let harness_private = PrivateStaging::new("commonkit-skill-harness")?;
+        let harness_suite_path = harness_private.path().join("suite-manifest.json");
         fs::write(&harness_suite_path, canonical_json(suite)?)?;
         let harness_stdout = staging.join("harness-evaluation.json");
         let harness_stderr = staging.join("harness-stderr.log");
         let mut harness = isolated_command(
             &self.config.harness_executable,
             staging,
-            &[&self.config.harness_corpus],
+            &[&self.config.harness_corpus, harness_private.path()],
         )?;
         harness
             .env_clear()
@@ -689,6 +709,25 @@ impl SkillOptSleepOptimizer {
             .arg(&harness_suite_path)
             .arg("--corpus")
             .arg(&self.config.harness_corpus)
+            .arg("--suite-digest")
+            .arg(suite.digest()?.as_str())
+            .arg("--skill-id")
+            .arg(manifest.skill.id.as_str())
+            .arg("--baseline-digest")
+            .arg(digest_bytes(current_skill)?.as_str())
+            .arg("--candidate-digest")
+            .arg(digest_bytes(&candidate)?.as_str())
+            .arg("--policy-digest")
+            .arg(manifest.policy_digest.as_str())
+            .arg("--harness-environment-digest")
+            .arg(suite.harness.environment_digest.as_str())
+            .arg("--scorer-digest")
+            .arg(
+                digest_bytes(&read_ordinary_file(
+                    &self.config.harness_corpus.join("scorer"),
+                )?)?
+                .as_str(),
+            )
             .arg("--json")
             .stdin(Stdio::null())
             .stdout(Stdio::from(private_output_file(&harness_stdout)?))
@@ -699,6 +738,9 @@ impl SkillOptSleepOptimizer {
             &harness_stderr,
             self.config.timeout_seconds,
         )?;
+        if staging.join("held-out-leaked").exists() {
+            return Err(SkillError::ProviderIsolationBreached);
+        }
         let evaluation_bytes = read_bounded(&harness_stdout, 2 * 1024 * 1024)?;
         let harness_report: HarnessEvaluationReport = serde_json::from_slice(&evaluation_bytes)
             .map_err(|_| SkillError::HarnessOutputIncompatible)?;
@@ -709,6 +751,10 @@ impl SkillOptSleepOptimizer {
             || harness_report.candidate_digest != digest_bytes(&candidate)?
             || harness_report.policy_digest != manifest.policy_digest
             || harness_report.evaluation.harness != suite.harness
+            || harness_report.evaluation.scorer_digest
+                != digest_bytes(&read_ordinary_file(
+                    &self.config.harness_corpus.join("scorer"),
+                )?)?
         {
             return Err(SkillError::HarnessOutputIncompatible);
         }
@@ -737,6 +783,7 @@ pub fn check_skillopt_provider(
     }
     let marker_path = environment_root.join("commonkit-provider-lock.json");
     let marker: ProviderCheck = read_json(&marker_path)?;
+    let installed_content_digest = measure_provider_installation(&environment_root)?;
     let version = Command::new(&python)
         .env_clear()
         .arg("-c")
@@ -755,6 +802,7 @@ pub fn check_skillopt_provider(
         adapter_contract: lock.adapter_contract.clone(),
         source: lock.source,
         package_digest: lock.package_digest.clone(),
+        installed_content_digest,
         capabilities: lock.capabilities.clone(),
         compatible: true,
     };
@@ -772,6 +820,63 @@ impl SkillOptimizer for SkillOptSleepOptimizer {
         current_skill: &[u8],
     ) -> Result<OptimizerOutput, SkillError> {
         self.run_external(manifest, suite, current_skill)
+    }
+}
+
+impl commonkit_reconcile::SkillPromotionAuthority for SkillEngine {
+    fn authenticate(
+        &self,
+        promotion_receipt_id: &Sha256Digest,
+    ) -> Result<
+        commonkit_reconcile::AuthenticatedSkillPromotion,
+        commonkit_reconcile::SkillDeploymentError,
+    > {
+        let authenticate =
+            || -> Result<commonkit_reconcile::AuthenticatedSkillPromotion, SkillError> {
+                let receipt: PromotionReceipt =
+                    read_json(&self.receipt_path(promotion_receipt_id))?;
+                let receipt_draft = PromotionReceiptDraft {
+                    schema_version: receipt.schema_version,
+                    plan_id: receipt.plan_id.clone(),
+                    candidate_id: receipt.candidate_id.clone(),
+                    source_path: receipt.source_path.clone(),
+                    before: receipt.before.clone(),
+                    after: receipt.after.clone(),
+                    state: receipt.state,
+                };
+                if receipt.id != *promotion_receipt_id
+                    || receipt.state != PromotionState::Promoted
+                    || digest_domain_json("commonkit.skill-promotion-receipt.v1", &receipt_draft)?
+                        != receipt.id
+                {
+                    return Err(SkillError::PromotionReceiptMismatch);
+                }
+                let candidate = self.load_candidate(&receipt.candidate_id)?;
+                let plan: PromotionPlan = read_json(&self.plan_path(&receipt.plan_id))?;
+                validate_promotion_plan(&plan)?;
+                if plan.id != receipt.plan_id
+                    || plan.candidate_id != candidate.candidate.id
+                    || plan.candidate_digest != candidate.candidate.candidate_digest
+                    || receipt.after.digest != candidate.candidate.candidate_digest
+                    || receipt.source_path != candidate.source_path
+                    || candidate.candidate.state != CandidateState::Approvable
+                    || self.current_policy_digest()? != candidate.policy_digest
+                    || digest_bytes(&read_ordinary_file(
+                        &self.resolve_source(receipt.source_path.as_str())?,
+                    )?)? != receipt.after.digest
+                {
+                    return Err(SkillError::PromotionReceiptMismatch);
+                }
+                Ok(commonkit_reconcile::AuthenticatedSkillPromotion {
+                    candidate_id: candidate.candidate.id,
+                    candidate_digest: candidate.candidate.candidate_digest,
+                    promotion_receipt_id: receipt.id,
+                    promoted_source_digest: receipt.after.digest,
+                    policy_digest: candidate.policy_digest,
+                })
+            };
+        authenticate()
+            .map_err(|_| commonkit_reconcile::SkillDeploymentError::PromotionAuthorityMismatch)
     }
 }
 
@@ -1653,6 +1758,87 @@ pub fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, SkillError> {
     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(bytes))).map_err(Into::into)
 }
 
+/// Measures the complete installed provider environment. The self-describing
+/// check file is excluded so it cannot authenticate itself.
+pub fn measure_provider_installation(root: &Path) -> Result<Sha256Digest, SkillError> {
+    digest_directory(
+        root,
+        Some("commonkit-provider-lock.json"),
+        "commonkit.skillopt-installation.v1",
+    )
+}
+
+/// Binds the executable, held-out corpus, and scorer implementation to the
+/// suite's harness environment lock.
+pub fn measure_harness_lock(
+    kind: StableId,
+    version: String,
+    executable: &Path,
+    corpus: &Path,
+) -> Result<commonkit_contracts::HarnessLock, SkillError> {
+    let executable_digest = digest_bytes(&read_ordinary_file(executable)?)?;
+    let corpus_digest = digest_directory(corpus, None, "commonkit.skill-harness-corpus.v1")?;
+    let scorer_digest = digest_bytes(&read_ordinary_file(&corpus.join("scorer"))?)?;
+    let environment_digest = digest_domain_json(
+        "commonkit.skill-harness-environment.v1",
+        &(
+            &kind,
+            &version,
+            executable_digest,
+            corpus_digest,
+            scorer_digest,
+        ),
+    )?;
+    Ok(commonkit_contracts::HarnessLock {
+        kind,
+        version,
+        environment_digest,
+    })
+}
+
+fn digest_directory(
+    root: &Path,
+    excluded_root_file: Option<&str>,
+    domain: &str,
+) -> Result<Sha256Digest, SkillError> {
+    let root = root.canonicalize()?;
+    let mut pending = vec![root.clone()];
+    let mut entries = Vec::new();
+    while let Some(directory) = pending.pop() {
+        let mut children = fs::read_dir(&directory)?.collect::<Result<Vec<_>, _>>()?;
+        children.sort_by_key(|entry| entry.file_name());
+        for child in children {
+            let path = child.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                return Err(SkillError::IntegrityMeasurementFailed);
+            }
+            let relative = path
+                .strip_prefix(&root)
+                .map_err(|_| SkillError::IntegrityMeasurementFailed)?;
+            if relative.components().count() == 1
+                && excluded_root_file.is_some_and(|name| relative == Path::new(name))
+            {
+                continue;
+            }
+            let portable = relative
+                .to_str()
+                .ok_or(SkillError::IntegrityMeasurementFailed)?
+                .replace(std::path::MAIN_SEPARATOR, "/");
+            if metadata.is_dir() {
+                entries.push((portable, "directory", None));
+                pending.push(path);
+            } else if metadata.is_file() {
+                entries.push((portable, "file", Some(digest_bytes(&fs::read(path)?)?)));
+            } else {
+                return Err(SkillError::IntegrityMeasurementFailed);
+            }
+        }
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(digest_domain_json(domain, &entries)?)
+}
+
 fn validate_candidate_content(bytes: &[u8]) -> Result<(), SkillError> {
     if bytes.is_empty() || bytes.len() > 256 * 1024 {
         return Err(SkillError::InvalidCandidateContent);
@@ -1712,13 +1898,17 @@ fn validate_provider_lock(lock: &ProviderLock) -> Result<(), SkillError> {
     Ok(())
 }
 
-fn provider_check_from_lock(lock: &ProviderLock) -> ProviderCheck {
+fn provider_check_from_lock(
+    lock: &ProviderLock,
+    installed_content_digest: Sha256Digest,
+) -> ProviderCheck {
     ProviderCheck {
         provider: lock.id.clone(),
         version: lock.version.clone(),
         adapter_contract: lock.adapter_contract.clone(),
         source: lock.source,
         package_digest: lock.package_digest.clone(),
+        installed_content_digest,
         capabilities: lock.capabilities.clone(),
         compatible: true,
     }
@@ -1837,6 +2027,20 @@ fn provider_fixture_suite() -> Result<SkillEvaluationSuite, SkillError> {
             required_case_ids: BTreeSet::from([id("wrap-held-out")?]),
         },
     })
+}
+
+pub fn measured_provider_fixture_suite(
+    harness_executable: &Path,
+    harness_corpus: &Path,
+) -> Result<SkillEvaluationSuite, SkillError> {
+    let mut suite = provider_fixture_suite()?;
+    suite.harness = measure_harness_lock(
+        suite.harness.kind.clone(),
+        suite.harness.version.clone(),
+        harness_executable,
+        harness_corpus,
+    )?;
+    Ok(suite)
 }
 
 fn provider_fixture_manifest(
@@ -2036,14 +2240,36 @@ fn validate_reviewed_tasks(
 }
 
 fn create_private_staging() -> Result<PathBuf, SkillError> {
+    create_private_staging_named("commonkit-skillopt")
+}
+
+fn create_private_staging_named(prefix: &str) -> Result<PathBuf, SkillError> {
     let path = std::env::temp_dir().join(format!(
-        "commonkit-skillopt-{}-{}",
+        "{prefix}-{}-{}",
         std::process::id(),
         TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
     ));
     fs::create_dir(&path)?;
     set_private_directory(&path)?;
     Ok(path.canonicalize()?)
+}
+
+struct PrivateStaging(PathBuf);
+
+impl PrivateStaging {
+    fn new(prefix: &str) -> Result<Self, SkillError> {
+        Ok(Self(create_private_staging_named(prefix)?))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for PrivateStaging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 fn private_output_file(path: &Path) -> Result<fs::File, SkillError> {
@@ -2403,6 +2629,8 @@ pub enum SkillError {
     InvalidProviderEnvironmentVariable,
     #[error("SkillOpt provider OS isolation is unavailable")]
     ProviderIsolationUnavailable,
+    #[error("SkillOpt provider descendant accessed held-out harness state")]
+    ProviderIsolationBreached,
     #[error("SkillOpt provider version probe failed")]
     ProviderVersionProbeFailed,
     #[error("optimization manifest does not match the configured provider lock")]
@@ -2427,6 +2655,10 @@ pub enum SkillError {
     HarnessExecutionFailed,
     #[error("skill evaluation harness output is incompatible")]
     HarnessOutputIncompatible,
+    #[error("skill evaluation harness, corpus, or scorer does not match its lock")]
+    HarnessIntegrityMismatch,
+    #[error("provider or harness content could not be measured safely")]
+    IntegrityMeasurementFailed,
     #[error("SkillOpt provider output escaped its staging directory")]
     ProviderOutputEscapedStaging,
     #[error("SkillOpt provider manager is invalid")]

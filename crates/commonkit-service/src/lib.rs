@@ -30,6 +30,7 @@ use commonkit_contracts::{
 use commonkit_core::{PlanDraft, build_plan};
 use commonkit_reconcile::{
     Adapter, PlanStore, PlanStoreError, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
+    SkillDeploymentRequest,
 };
 use commonkit_relay::{
     DownstreamRequest, HttpUpstreamManager, PeerAddress, RelayAdapter, RelayLifecycleControl,
@@ -52,6 +53,7 @@ use tokio::sync::RwLock;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
 mod production_domains;
+mod skill_canary;
 pub use production_domains::{ProductionDomainError, ProductionDomainRegistry};
 
 pub const API_VERSION: &str = "v1";
@@ -400,6 +402,7 @@ struct ApiState {
     control: ControlPlane,
     relay_runtime: Arc<ManagedRelayRuntime>,
     skills: Option<Arc<SkillEngine>>,
+    skill_canary: Option<Arc<skill_canary::SkillCanaryRuntime>>,
 }
 
 struct ManagedRelayRuntime {
@@ -577,6 +580,7 @@ pub fn router_with_control(
         control,
         relay_runtime,
         None,
+        None,
     )
 }
 
@@ -596,6 +600,7 @@ pub fn router_with_skills(
         ControlPlane::new(Arc::new(UnavailableExecutor)),
         relay_runtime,
         Some(skills),
+        None,
     )
 }
 
@@ -607,6 +612,7 @@ fn router_with_control_and_relay(
     control: ControlPlane,
     relay_runtime: Arc<ManagedRelayRuntime>,
     skills: Option<Arc<SkillEngine>>,
+    skill_canary: Option<Arc<skill_canary::SkillCanaryRuntime>>,
 ) -> Router {
     let state = ApiState {
         token,
@@ -616,6 +622,7 @@ fn router_with_control_and_relay(
         control,
         relay_runtime,
         skills,
+        skill_canary,
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
@@ -689,6 +696,11 @@ fn router_with_control_and_relay(
         .route(
             "/control/v1/skills/promotions/rollback",
             post(skill_promotion_rollback),
+        )
+        .route("/control/v1/skills/canary/apply", post(skill_canary_apply))
+        .route(
+            "/control/v1/skills/canary/rollback",
+            post(skill_canary_rollback),
         )
         .route(
             "/control/v1/skills/schedule",
@@ -1990,6 +2002,54 @@ async fn skill_promotion_rollback(
     })?))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillCanaryApplyRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    run_id: StableId,
+    deployment: SkillDeploymentRequest,
+}
+
+async fn skill_canary_apply(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillCanaryApplyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let receipt = state
+        .skill_canary
+        .ok_or_else(|| ApiError::unavailable_code("skill_canary_unavailable"))?
+        .apply(request.deployment, request.run_id)
+        .map_err(|error| ApiError::conflict(error.code()))?;
+    Ok(Json(serde_json::to_value(receipt).map_err(|_| {
+        ApiError::internal("skill_canary_apply_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillCanaryRollbackRequest {
+    confirmed: bool,
+    confirmation_id: StableId,
+    run_id: StableId,
+    deployment_receipt_id: Sha256Digest,
+}
+
+async fn skill_canary_rollback(
+    State(state): State<ApiState>,
+    Json(request): Json<SkillCanaryRollbackRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
+    let receipt = state
+        .skill_canary
+        .ok_or_else(|| ApiError::unavailable_code("skill_canary_unavailable"))?
+        .rollback(&request.run_id, &request.deployment_receipt_id)
+        .map_err(|error| ApiError::conflict(error.code()))?;
+    Ok(Json(serde_json::to_value(receipt).map_err(|_| {
+        ApiError::internal("skill_canary_rollback_failed")
+    })?))
+}
+
 async fn skill_schedule_status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     let status = state
         .skills
@@ -2614,6 +2674,8 @@ impl BoundServer {
             paths.receipts.clone(),
         )?;
         let drift_checker = Arc::new(SyncDomainDriftChecker::new(production_domains.sync.clone()));
+        let skill_canary = production_domains.skill_canary.clone();
+        let skills = skill_canary.as_ref().map(|runtime| runtime.engine());
         control.set_headless_domains(production_domains.into_headless());
         let scheduler_store = SchedulerStore::open(
             discovery_path
@@ -2640,7 +2702,8 @@ impl BoundServer {
             events,
             control,
             relay_runtime.clone(),
-            None,
+            skills,
+            skill_canary,
         );
         let relay = match relay_address {
             Some(address) => Some((

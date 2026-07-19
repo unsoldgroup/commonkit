@@ -10,6 +10,7 @@ use commonkit_contracts::{
     ProviderSource, SchemaVersion, Sha256Digest, SkillDescriptor, SkillEvaluationSuite,
     SkillLifecycle, SkillOptimizationManifest, StableId,
 };
+use commonkit_reconcile::SkillPromotionAuthority;
 use commonkit_skills::{Approval, FakeOptimizer, SkillEngine};
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
@@ -235,6 +236,11 @@ fn candidate_survives_restart_and_promotes_only_with_fresh_approval() {
             .expect("promoted skill"),
         "# Review\n\nFind correctness, security, and reliability bugs.\n"
     );
+    let authenticated = engine
+        .authenticate(&receipt.id)
+        .expect("durable promotion authority");
+    assert_eq!(authenticated.candidate_id, candidate.id);
+    assert_eq!(authenticated.candidate_digest, candidate.candidate_digest);
 
     engine.rollback_promotion(&receipt).expect("rollback");
     assert_eq!(

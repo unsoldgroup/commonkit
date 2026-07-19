@@ -175,6 +175,24 @@ impl FileAdapter {
             .map_err(FileAdapterError::Contract)
     }
 
+    /// Reconstructs the normalized intents referenced by durable operations and
+    /// observes their live state without relying on process-local registration.
+    pub fn observed_operations_digest(
+        &self,
+        operations: &[Operation],
+    ) -> Result<Sha256Digest, FileAdapterError> {
+        let mut intents = Vec::with_capacity(operations.len());
+        for operation in operations {
+            let record: SemanticRecord =
+                read_record(&self.state, &operation_record_path(&operation.id))?;
+            if record.operation_id != operation.id {
+                return Err(FileAdapterError::MissingStateEntry);
+            }
+            intents.push(record.intent);
+        }
+        self.observed_state_digest(intents.iter())
+    }
+
     pub fn register(&mut self, intent: FileIntent) -> Result<Operation, FileAdapterError> {
         if let Ok(text) = std::str::from_utf8(&intent.content) {
             assert_no_embedded_secrets(&Value::String(text.into()))?;
