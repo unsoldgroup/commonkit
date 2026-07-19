@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Output;
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -78,7 +78,7 @@ impl<'a> ProviderSandbox<'a> {
         platform_output(self)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", windows)))]
     fn test_limits(&mut self, runtime: Duration, output_bytes: usize) -> &mut Self {
         self.limits = ProviderLimits {
             runtime,
@@ -97,80 +97,20 @@ fn unavailable(platform: &str, remediation: &str) -> ProviderFailure {
 
 #[cfg(target_os = "macos")]
 fn platform_output(spec: &ProviderSandbox<'_>) -> Result<Output, ProviderFailure> {
-    let launcher = Path::new("/usr/bin/sandbox-exec");
-    if !launcher.is_file() {
-        return Err(unavailable(
-            "macOS",
-            "install a CommonKit build with the required Seatbelt launcher",
-        ));
-    }
-    let mut profile = String::from(
-        "(version 1)\n(allow default)\n(deny network*)\n(deny mach-lookup)\n(deny signal)\n(deny ipc-posix*)\n(deny file-write*)\n(deny process-exec)\n",
+    let _ = (
+        spec.executable,
+        &spec.args,
+        &spec.environment,
+        spec.current_dir,
+        &spec.writable_roots,
+        &spec.readable_paths,
+        spec.limits.runtime,
+        spec.limits.output_bytes,
     );
-    // Keep system runtime reads, but remove ambient authority over user data,
-    // temporary peers, mounted volumes, and conventional secret locations.
-    // The exact declared provider paths are granted back below.
-    for sensitive in [
-        "/Users",
-        "/private/var/folders",
-        "/tmp",
-        "/var/tmp",
-        "/Volumes",
-        "/root",
-        "/run/secrets",
-    ] {
-        profile.push_str(&format!(
-            "(deny file-read* (subpath {}))\n",
-            scheme(sensitive)
-        ));
-    }
-    for runtime in ["/bin", "/usr/bin"] {
-        profile.push_str(&format!(
-            "(allow process-exec (subpath {}))\n",
-            scheme(runtime)
-        ));
-    }
-    let provider_executable = canonical_existing(spec.executable)?;
-    let current_dir = canonical_existing(spec.current_dir)?;
-    for executable in [provider_executable.as_path(), Path::new("/bin/sh")] {
-        profile.push_str(&format!(
-            "(allow process-exec (literal {}))\n(allow file-read* (literal {}))\n",
-            scheme_path(executable),
-            scheme_path(executable)
-        ));
-    }
-    for path in &spec.readable_paths {
-        let path = canonical_existing(path)?;
-        let selector = if path.is_dir() { "subpath" } else { "literal" };
-        profile.push_str(&format!(
-            "(allow file-read* ({selector} {}))\n",
-            scheme_path(&path)
-        ));
-        if path.is_file() {
-            profile.push_str(&format!(
-                "(allow process-exec (literal {}))\n",
-                scheme_path(&path)
-            ));
-        }
-    }
-    for path in &spec.writable_roots {
-        let path = canonical_existing(path)?;
-        profile.push_str(&format!(
-            "(allow file-read* file-write* (subpath {}))\n",
-            scheme_path(&path)
-        ));
-    }
-
-    let mut command = Command::new(launcher);
-    command
-        .arg("-p")
-        .arg(profile)
-        .arg(&provider_executable)
-        .args(&spec.args)
-        .current_dir(current_dir)
-        .env_clear()
-        .envs(&spec.environment);
-    bounded_unix_output(command, spec.limits, "macOS")
+    Err(unavailable(
+        "macOS",
+        "external providers require a privileged disposable-user helper or VM/container boundary that can terminate detached descendants; configure a native provider fallback until that isolation helper is installed",
+    ))
 }
 
 #[cfg(target_os = "linux")]
@@ -221,7 +161,7 @@ fn platform_output(spec: &ProviderSandbox<'_>) -> Result<Output, ProviderFailure
     bounded_unix_output(command, spec.limits, "Linux")
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn bounded_unix_output(
     mut command: Command,
     limits: ProviderLimits,
@@ -310,7 +250,7 @@ fn bounded_unix_output(
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn bounded_reader<R: std::io::Read + Send + 'static>(
     mut reader: R,
     limit: usize,
@@ -339,13 +279,13 @@ fn bounded_reader<R: std::io::Read + Send + 'static>(
     })
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn terminate_unix_group(process_group: i32, child: &mut std::process::Child) {
     terminate_unix_process_group(process_group);
     let _ = child.kill();
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn terminate_unix_process_group(process_group: i32) {
     unsafe {
         libc::kill(-process_group, libc::SIGKILL);
@@ -371,7 +311,7 @@ fn ensure_sandbox_parents(command: &mut Command, paths: &[PathBuf]) {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, target_os = "linux"))]
 mod unix_limit_tests {
     use super::ProviderSandbox;
     use std::os::unix::fs::PermissionsExt;
@@ -437,6 +377,45 @@ mod unix_limit_tests {
         assert!(
             !workspace.join("descendant-marker").exists(),
             "provider descendant survived sandbox completion"
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_fail_closed_tests {
+    use super::ProviderSandbox;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn detached_descendant_risk_fails_closed_before_provider_launch() {
+        let root = tempfile::tempdir().expect("root");
+        let executable = root.path().join("provider");
+        let workspace = root.path().join("workspace");
+        let marker = root.path().join("executed");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf executed > '{}'\n", marker.display()),
+        )
+        .expect("provider");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("permissions");
+        let mut command = ProviderSandbox::new(&executable, &workspace);
+        command.writable_root(&workspace);
+
+        let error = command
+            .output()
+            .expect_err("macOS provider must fail closed")
+            .to_string();
+
+        assert!(
+            error.contains("privileged disposable-user helper"),
+            "{error}"
+        );
+        assert!(error.contains("VM/container boundary"), "{error}");
+        assert!(
+            !marker.exists(),
+            "provider launched before isolation failed"
         );
     }
 }
@@ -1400,24 +1379,4 @@ fn platform_output(_spec: &ProviderSandbox<'_>) -> Result<Output, ProviderFailur
         std::env::consts::OS,
         "this platform has no supported provider process sandbox",
     ))
-}
-
-#[cfg(target_os = "macos")]
-fn canonical_existing(path: &Path) -> Result<PathBuf, ProviderFailure> {
-    path.canonicalize().map_err(|error| {
-        ProviderFailure::Materialize(format!(
-            "provider sandbox could not canonicalize {}: {error}",
-            path.display()
-        ))
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn scheme_path(path: &Path) -> String {
-    scheme(&path.to_string_lossy())
-}
-
-#[cfg(target_os = "macos")]
-fn scheme(value: &str) -> String {
-    serde_json::to_string(value).expect("JSON string escaping is valid Scheme string escaping")
 }
