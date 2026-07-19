@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1376,7 +1378,7 @@ impl SkillEngine {
             .replace_all(source, |captures: &regex::Captures<'_>| {
                 findings.push(format!(
                     "secret_assignment:{}",
-                    &captures["key"].to_ascii_lowercase()
+                    captures["key"].to_ascii_lowercase()
                 ));
                 "[REDACTED_SECRET_ASSIGNMENT]".to_string()
             })

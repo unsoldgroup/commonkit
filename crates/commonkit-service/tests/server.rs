@@ -1,23 +1,21 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_service::{BoundServer, ControlToken, EventHub, ServiceStatus};
 use std::io::{Read, Write};
 use tokio::sync::{RwLock, oneshot};
 
-fn temporary_directory() -> std::path::PathBuf {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    std::env::temp_dir().join(format!("commonkit-server-{}-{nonce}", std::process::id()))
+fn temporary_directory() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("commonkit-server-")
+        .tempdir()
+        .expect("unique server test directory")
 }
 
 #[tokio::test]
 async fn publishes_discovery_only_after_binding_and_removes_it_on_shutdown() {
     let directory = temporary_directory();
-    let discovery_path = directory.join("daemon.json");
+    let discovery_path = directory.path().join("daemon.json");
     let server = BoundServer::bind(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         ControlToken::generate(),
@@ -37,7 +35,6 @@ async fn publishes_discovery_only_after_binding_and_removes_it_on_shutdown() {
     shutdown.send(()).expect("shutdown");
     task.await.expect("task").expect("server");
     assert!(!discovery_path.exists());
-    std::fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[tokio::test]
@@ -48,7 +45,7 @@ async fn rejects_non_loopback_binding() {
         ControlToken::generate(),
         Arc::new(RwLock::new(ServiceStatus::default())),
         EventHub::new(8),
-        directory.join("daemon.json"),
+        directory.path().join("daemon.json"),
     )
     .await;
     assert!(result.is_err());
@@ -65,7 +62,7 @@ async fn hosts_a_separate_authenticated_loopback_mcp_listener() {
         token,
         Arc::new(RwLock::new(ServiceStatus::default())),
         EventHub::new(8),
-        directory.join("daemon.json"),
+        directory.path().join("daemon.json"),
     )
     .await
     .expect("bind");
@@ -97,5 +94,4 @@ async fn hosts_a_separate_authenticated_loopback_mcp_listener() {
     assert!(initialized.contains("commonkit-relay"));
     shutdown.send(()).expect("shutdown");
     task.await.expect("task").expect("server");
-    std::fs::remove_dir_all(directory).expect("cleanup");
 }
