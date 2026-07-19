@@ -67,6 +67,7 @@ function bindOnboardingActions(): void {
   document.querySelector<HTMLFormElement>("#onboarding-form")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const values = Object.fromEntries(new FormData(event.currentTarget as HTMLFormElement).entries());
+    values.publishRegistration = values.publishRegistration === "true";
     onboardingMessage = "Validating pinned provider and materializing…";
     render();
     try {

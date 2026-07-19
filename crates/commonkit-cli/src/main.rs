@@ -190,6 +190,9 @@ struct InitArgs {
     chezmoi_source: Option<PathBuf>,
     #[arg(long)]
     chezmoi_config: Option<PathBuf>,
+    /// Commit and push the portable target registration (required for connect).
+    #[arg(long)]
+    publish_registration: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -541,6 +544,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     config_directory: paths.config,
                     state_directory: paths.state,
                     provider,
+                    publish_registration: args.publish_registration,
                 },
                 &ProcessRunner::from_path(),
             )?;

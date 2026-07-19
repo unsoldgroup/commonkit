@@ -106,6 +106,7 @@ struct OnboardingRequest {
     apm_policy: Option<PathBuf>,
     chezmoi_source: Option<PathBuf>,
     chezmoi_config: Option<PathBuf>,
+    publish_registration: bool,
 }
 
 fn onboarding_arguments(request: &OnboardingRequest) -> Result<Vec<String>, DesktopError> {
@@ -268,6 +269,7 @@ fn onboarding_initialize(request: OnboardingRequest) -> Result<serde_json::Value
             config_directory: paths.config,
             state_directory: paths.state,
             provider,
+            publish_registration: request.publish_registration,
         },
         &ProcessRunner::from_path(),
     )
@@ -966,6 +968,7 @@ mod tests {
             apm_policy: Some("apm-policy.yml".into()),
             chezmoi_source: None,
             chezmoi_config: None,
+            publish_registration: true,
         };
         let arguments = onboarding_arguments(&request).unwrap();
         assert!(
@@ -997,6 +1000,7 @@ mod tests {
             apm_policy: None,
             chezmoi_source: Some("../home".into()),
             chezmoi_config: Some("chezmoi.toml".into()),
+            publish_registration: true,
         };
         assert!(onboarding_arguments(&request).is_err());
     }

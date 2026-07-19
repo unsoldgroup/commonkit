@@ -49,6 +49,7 @@ pub struct InitRequest {
     pub config_directory: PathBuf,
     pub state_directory: PathBuf,
     pub provider: ProviderSelection,
+    pub publish_registration: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -114,6 +115,9 @@ pub fn initialize(
     runner: &dyn CommandRunner,
 ) -> Result<InitResult, OnboardingError> {
     validate_repository(&request.repository)?;
+    if request.mode == InitMode::Connect && !request.publish_registration {
+        return Err(OnboardingError::RegistrationConsentRequired);
+    }
     let loadout = StableId::parse(&request.loadout)?;
     let target = StableId::parse(&request.target)?;
     if loadout.as_str() == "public-base" || loadout.as_str() == "organization-policy" {
@@ -180,6 +184,7 @@ pub fn initialize(
         validate_selected_layer(&layer_paths[1], &StableId::parse("organization-policy")?)?;
         validate_selected_layer(&layer_paths[2], &loadout)?;
         write_target_registration(request, &target)?;
+        git_publish_registration(request, runner)?;
     }
 
     let revision = runner
@@ -207,6 +212,36 @@ pub fn initialize(
         headless_config,
         first_plan_id,
     })
+}
+
+fn git_publish_registration(
+    request: &InitRequest,
+    runner: &dyn CommandRunner,
+) -> Result<(), OnboardingError> {
+    let target = format!("targets/{}.json", request.target);
+    for arguments in [
+        vec![OsString::from("add"), OsString::from(&target)],
+        vec![
+            OsString::from("commit"),
+            OsString::from("-m"),
+            OsString::from(format!("Register CommonKit target {}", request.target)),
+        ],
+        vec![
+            OsString::from("push"),
+            OsString::from("origin"),
+            OsString::from("HEAD"),
+        ],
+    ] {
+        let combined = [
+            OsString::from("-C"),
+            request.kit_directory.as_os_str().to_owned(),
+        ]
+        .into_iter()
+        .chain(arguments)
+        .collect::<Vec<_>>();
+        runner.run("git", &combined)?;
+    }
+    Ok(())
 }
 
 fn validate_repository(repository: &str) -> Result<(), OnboardingError> {
@@ -756,6 +791,10 @@ pub enum OnboardingError {
     MissingProviderInput(PathBuf),
     #[error("provider input must not be empty: {0}")]
     EmptyProviderInput(PathBuf),
+    #[error(
+        "connecting a target requires explicit --publish-registration consent before CommonKit commits and pushes the portable registration"
+    )]
+    RegistrationConsentRequired,
     #[error("required tool {tool} is unavailable: {detail}")]
     ToolUnavailable { tool: String, detail: String },
     #[error(

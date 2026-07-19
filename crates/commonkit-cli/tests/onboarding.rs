@@ -18,6 +18,7 @@ fn request(root: &Path, mode: InitMode, repository: &str) -> InitRequest {
         config_directory: root.join("config"),
         state_directory: root.join("state"),
         provider: ProviderSelection::Native,
+        publish_registration: true,
     }
 }
 
@@ -61,7 +62,7 @@ exit 91
     test_support::write_tool(
         &bin,
         "git",
-        "[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' && exit 0\nexit 92",
+        "[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\nexit 0",
     );
     let mut request = request(temporary.path(), InitMode::Connect, "owner/kit");
     request.provider = ProviderSelection::Apm {
@@ -122,7 +123,7 @@ exit 91
 case "$3" in
   rev-parse) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'; exit 0 ;;
 esac
-exit 92
+exit 0
 "#,
     );
     let result = initialize(
@@ -234,7 +235,7 @@ exit 91
     test_support::write_tool(
         &bin,
         "git",
-        "[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' && exit 0\nexit 92",
+        "[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\nexit 0",
     );
     let error = initialize(
         &request(temporary.path(), InitMode::Connect, "owner/kit"),
@@ -273,6 +274,16 @@ fn permits_platform_state_directory_nested_under_private_config_root() {
     request.state_directory = request.config_directory.join("state");
     let error = initialize(&request, &ProcessRunner::new(temporary.path())).unwrap_err();
     assert!(!error.to_string().contains("must not overlap"));
+}
+
+#[test]
+fn connect_requires_publish_consent_before_clone_or_registration_writes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut request = request(temporary.path(), InitMode::Connect, "owner/kit");
+    request.publish_registration = false;
+    let error = initialize(&request, &ProcessRunner::new(temporary.path())).unwrap_err();
+    assert!(error.to_string().contains("--publish-registration"));
+    assert!(!request.kit_directory.exists());
 }
 
 mod test_support {

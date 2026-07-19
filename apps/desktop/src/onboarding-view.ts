@@ -22,6 +22,7 @@ export function onboardingPanel(provider: OnboardingProvider = "native", message
       <label>Target<input name="target" value="workstation" required></label>
       <label>Managed target root<input name="targetRoot" required></label>
       <label>Provider<select id="onboarding-provider" name="provider"><option value="native"${provider === "native" ? " selected" : ""}>Native</option><option value="apm"${provider === "apm" ? " selected" : ""}>APM 0.25.0</option><option value="chezmoi"${provider === "chezmoi" ? " selected" : ""}>chezmoi 2.70.4</option></select></label>
+      <label><input name="publishRegistration" type="checkbox" value="true" required> Commit and push this target registration</label>
       ${apm}${chezmoi}<button class="primary" type="submit">Materialize first plan</button>
     </form>${message ? `<p class="onboarding-result">${escapeHtml(message)}</p>` : ""}</section>`;
 }
@@ -29,4 +30,3 @@ export function onboardingPanel(provider: OnboardingProvider = "native", message
 function escapeHtml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
-
