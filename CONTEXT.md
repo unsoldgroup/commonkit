@@ -93,10 +93,10 @@ _Avoid_: File copy, deployment
 - "Toolbox" was the initial metaphor; resolved: the product and domain object are **CommonKit**.
 - "Profile" described a selected subset; resolved: use **Loadout** unless later user research favors a more conventional term.
 - "Agent package manager" overlapped with CommonKit's initial adapter scope; resolved: package management belongs to the selected **Agent-context provider**, with APM preferred, while CommonKit orchestrates the complete developer environment.
+- APM MCP translation was initially open; resolved: CommonKit reads only APM's documented `dependencies.mcp` manifest shape and isolated staged `.mcp.json`, requires the two representations to agree, normalizes declarations with manifest/lock provenance, rejects ambiguous ownership or unsupported transports, and sends the resulting relay desired state and stable loopback client configuration through CommonKit's confirmation-bound plan. It does not import APM internals or invoke provider-native live apply.
 
 ## Open — not yet resolved
 
-- How the APM adapter translates MCP declarations into `mcp-local-relay` upstream desired state and generated client configuration.
 - Which GitHub authentication and repository-provisioning flow CommonKit supports in version 1.
 - Which S3-compatible object-store provider is the default for encrypted snapshots.
 

@@ -20,7 +20,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use commonkit_adapters::{
     CredentialReadinessInspector, CredentialReference, FileAdapter,
-    LocalCredentialReadinessInspector,
+    LocalCredentialReadinessInspector, MaterializedState, ProviderCapability,
 };
 use commonkit_contracts::{
     CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan, PlanBindings,
@@ -33,7 +33,8 @@ use commonkit_reconcile::{
     SkillDeploymentRequest,
 };
 use commonkit_relay::{
-    DownstreamRequest, HttpUpstreamManager, PeerAddress, RelayAdapter, RelayLifecycleControl,
+    DownstreamRequest, HttpUpstreamManager, McpDeclarationProvenance, PeerAddress,
+    PortableMcpDeclaration, PortableMcpResolution, RelayAdapter, RelayLifecycleControl,
     RelayMutationInputs, RelayPlanRequest, RelayRuntime, ResolvedMcpDeclarations,
     converge_provider_mcp, plan_relay_operation,
 };
@@ -2735,13 +2736,65 @@ struct RelayReconcileRequest {
     confirmed: bool,
     confirmation_id: StableId,
     idempotency_key: String,
-    resolved: ResolvedMcpDeclarations,
+    resolved: Option<ResolvedMcpDeclarations>,
+    #[serde(default)]
+    materialized_states: Vec<MaterializedState>,
     target_identity_digest: Sha256Digest,
     composed_loadout_digest: Sha256Digest,
     provider_inputs_digest: Sha256Digest,
     policy_digest: Sha256Digest,
     ownership_map_digest: Sha256Digest,
     artifact_set_digest: Sha256Digest,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ProviderMcpError {
+    #[error("provider materialization failed integrity verification")]
+    InvalidMaterialization,
+    #[error("multiple providers claim the same MCP server")]
+    OwnershipCollision,
+}
+
+/// Converts durable, integrity-checked provider output into the relay's narrow
+/// convergence DTO. It never re-runs APM or reads provider internals.
+pub fn resolved_mcp_from_materialized(
+    states: &[MaterializedState],
+) -> Result<ResolvedMcpDeclarations, ProviderMcpError> {
+    let mut declarations = BTreeMap::new();
+    for state in states {
+        state
+            .verify()
+            .map_err(|_| ProviderMcpError::InvalidMaterialization)?;
+        for resource in &state.capabilities {
+            let ProviderCapability::McpStreamableHttp {
+                id,
+                name,
+                enabled,
+                url,
+                headers,
+            } = &resource.capability;
+            let declaration = PortableMcpDeclaration {
+                id: id.clone(),
+                name: name.clone(),
+                enabled: *enabled,
+                resolution: PortableMcpResolution::StreamableHttp {
+                    url: url.clone(),
+                    headers: headers.clone(),
+                },
+                provenance: McpDeclarationProvenance {
+                    provider_id: resource.provenance.provider_id.to_string(),
+                    source: resource.provenance.source.clone(),
+                },
+            };
+            if declarations.insert(id.clone(), declaration).is_some() {
+                return Err(ProviderMcpError::OwnershipCollision);
+            }
+        }
+    }
+    Ok(ResolvedMcpDeclarations {
+        contract_version: "commonkit.resolved-mcp.v1".into(),
+        declarations: declarations.into_values().collect(),
+    })
 }
 
 async fn plan_relay_reconcile(
@@ -2755,7 +2808,13 @@ async fn plan_relay_reconcile(
         return Err(ApiError::bad_request("invalid_idempotency_key"));
     }
     let _confirmation_id = request.confirmation_id;
-    let converged = converge_provider_mcp(request.resolved)
+    let resolved = match (request.resolved, request.materialized_states.is_empty()) {
+        (Some(resolved), true) => resolved,
+        (None, false) => resolved_mcp_from_materialized(&request.materialized_states)
+            .map_err(|_| ApiError::bad_request("relay_provider_output_invalid"))?,
+        _ => return Err(ApiError::bad_request("relay_provider_source_ambiguous")),
+    };
+    let converged = converge_provider_mcp(resolved)
         .map_err(|_| ApiError::bad_request("relay_declarations_invalid"))?;
     let paths = commonkit_platform::AppPaths::discover()
         .map_err(|_| ApiError::internal("relay_paths_unavailable"))?;

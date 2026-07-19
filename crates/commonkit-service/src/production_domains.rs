@@ -107,7 +107,11 @@ impl SyncConfig {
             }
             return Ok(platform.clone());
         }
-        match self.target_transport.as_ref().unwrap_or(&SyncTargetTransport::Local) {
+        match self
+            .target_transport
+            .as_ref()
+            .unwrap_or(&SyncTargetTransport::Local)
+        {
             SyncTargetTransport::Local => Ok(SyncTargetPlatform {
                 operating_system: std::env::consts::OS.to_owned(),
                 architecture: std::env::consts::ARCH.to_owned(),

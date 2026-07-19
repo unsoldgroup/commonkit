@@ -7,12 +7,106 @@ use std::path::{Path, PathBuf};
 
 use commonkit_adapters::{
     ApmProvider, ApmProviderConfig, ArtifactStore, DesiredStateProvider, ExactProviderVersion,
-    FilesystemIntent, NormalizedManagedPath, ProviderContext, ProviderWorkspace,
+    FilesystemIntent, NormalizedManagedPath, ProviderCapability, ProviderContext,
+    ProviderWorkspace,
 };
 use commonkit_contracts::{Sha256Digest, StableId};
 
 fn digest(seed: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", seed.to_string().repeat(64))).unwrap()
+}
+
+#[test]
+fn documented_apm_mcp_output_becomes_provenance_bound_provider_capability() {
+    let root = fixture("mcp-capability");
+    let executable = root.join("apm");
+    write_executable(
+        &executable,
+        r##"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\n'; exit 0; fi
+if [ "$1" = "compile" ]; then
+  mkdir -p .claude .codex
+  printf 'context\n' > .claude/CLAUDE.md
+  printf '{"mcpServers":{"docs":{"type":"streamable-http","url":"https://docs.example/mcp","headers":{"Authorization":"${env:DOCS_TOKEN}"}}}}' > .mcp.json
+fi
+if [ "$1" = "audit" ]; then printf '{"ok":true}\n'; fi
+"##,
+    );
+    let provider = configured(&root, executable);
+    fs::write(
+        root.join("apm.yml"),
+        r#"name: test
+version: 1.0.0
+dependencies:
+  mcp:
+    - name: docs
+      registry: false
+      transport: streamable-http
+      url: https://docs.example/mcp
+      headers:
+        Authorization: ${env:DOCS_TOKEN}
+"#,
+    )
+    .unwrap();
+    let stage = root.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, &[]).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+
+    let state = provider
+        .materialize(&context(), &workspace, &artifacts)
+        .unwrap();
+    assert_eq!(state.capabilities.len(), 1);
+    assert!(matches!(&state.capabilities[0].capability,
+        ProviderCapability::McpStreamableHttp { id, url, .. }
+        if id == "docs" && url == "https://docs.example/mcp"));
+    assert_eq!(
+        state.capabilities[0].provenance.source,
+        "apm.yml:dependencies.mcp[docs] -> .mcp.json:mcpServers.docs"
+    );
+    state.verify().unwrap();
+}
+
+#[test]
+fn ambiguous_or_conflicting_apm_mcp_output_fails_closed() {
+    let root = fixture("mcp-conflict");
+    let executable = root.join("apm");
+    write_executable(
+        &executable,
+        r##"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\n'; exit 0; fi
+if [ "$1" = "compile" ]; then
+  mkdir -p .claude .codex
+  printf 'context\n' > .claude/CLAUDE.md
+  printf '{"mcpServers":{"docs":{"type":"streamable-http","url":"https://other.example/mcp"}}}' > .mcp.json
+fi
+if [ "$1" = "audit" ]; then printf '{"ok":true}\n'; fi
+"##,
+    );
+    let provider = configured(&root, executable);
+    fs::write(
+        root.join("apm.yml"),
+        r#"name: test
+version: 1.0.0
+dependencies:
+  mcp:
+    - name: docs
+      registry: false
+      transport: streamable-http
+      url: https://docs.example/mcp
+"#,
+    )
+    .unwrap();
+    let stage = root.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, &[]).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+
+    let error = provider
+        .materialize(&context(), &workspace, &artifacts)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("MCP") && error.contains("docs"), "{error}");
 }
 
 fn fixture(label: &str) -> PathBuf {

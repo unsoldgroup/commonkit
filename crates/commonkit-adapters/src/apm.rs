@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use commonkit_contracts::{Sha256Digest, StableId};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::artifacts::{ArtifactStore, ContentSensitivity};
 use super::provider::{
-    DesiredStateProvider, ExactProviderVersion, MaterializedState, ProviderContext,
-    ProviderFailure, ProviderInputs, ProviderWorkspace,
+    DesiredStateProvider, ExactProviderVersion, MaterializedState, ProviderCapability,
+    ProviderCapabilityResource, ProviderContext, ProviderFailure, ProviderInputs,
+    ProviderWorkspace,
 };
 use super::resources::{
     FilesystemIntent, NormalizedManagedPath, NormalizedResource, ResourceProvenance,
@@ -228,15 +230,230 @@ impl DesiredStateProvider for ApmProvider {
             ))
         })?;
 
+        let capabilities = scan_mcp_outputs(staging, &inputs)?;
         let resources = scan_outputs(staging, &self.config.managed_root, &inputs, artifacts)?;
         if resources.is_empty() {
             return Err(ProviderFailure::Materialize(
                 "APM produced no Claude or Codex files in isolated staging".into(),
             ));
         }
-        MaterializedState::finalize(inputs, resources, Vec::new(), Vec::new())
-            .map_err(ProviderFailure::Contract)
+        MaterializedState::finalize_with_capabilities(
+            inputs,
+            resources,
+            Vec::new(),
+            Vec::new(),
+            capabilities,
+        )
+        .map_err(ProviderFailure::Contract)
     }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct ApmManifest {
+    #[serde(default)]
+    dependencies: ApmDependencies,
+    #[serde(default)]
+    dev_dependencies: ApmDependencies,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ApmDependencies {
+    #[serde(default)]
+    mcp: Vec<ApmMcpEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ApmMcpEntry {
+    Registry(String),
+    Object(ApmMcpObject),
+}
+
+#[derive(Debug, Deserialize)]
+struct ApmMcpObject {
+    name: String,
+    #[serde(default)]
+    registry: Option<serde_yaml::Value>,
+    transport: Option<String>,
+    url: Option<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, serde_yaml::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StagedMcpConfig {
+    mcp_servers: BTreeMap<String, StagedMcpServer>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StagedMcpServer {
+    #[serde(rename = "type")]
+    transport: String,
+    url: String,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+}
+
+fn scan_mcp_outputs(
+    staging: &Path,
+    inputs: &ProviderInputs,
+) -> Result<Vec<ProviderCapabilityResource>, ProviderFailure> {
+    let manifest: ApmManifest =
+        serde_yaml::from_slice(&fs::read(staging.join("apm.yml")).map_err(materialize_io)?)
+            .map_err(|error| {
+                ProviderFailure::Materialize(format!(
+                    "invalid documented APM MCP manifest shape: {error}"
+                ))
+            })?;
+    let mut declared = BTreeMap::new();
+    for entry in manifest
+        .dependencies
+        .mcp
+        .into_iter()
+        .chain(manifest.dev_dependencies.mcp)
+    {
+        let (name, direct) = match entry {
+            ApmMcpEntry::Registry(name) => (name, None),
+            ApmMcpEntry::Object(object) => {
+                if !object.extra.is_empty() {
+                    return Err(ProviderFailure::Materialize(format!(
+                        "APM MCP declaration {} contains passthrough fields that CommonKit cannot safely translate",
+                        object.name
+                    )));
+                }
+                let is_self_defined =
+                    matches!(object.registry, Some(serde_yaml::Value::Bool(false)));
+                let direct = if is_self_defined {
+                    let transport = object.transport.as_deref().ok_or_else(|| {
+                        ProviderFailure::Materialize(format!(
+                            "APM MCP declaration {} has ambiguous transport",
+                            object.name
+                        ))
+                    })?;
+                    if !matches!(transport, "http" | "streamable-http") {
+                        return Err(ProviderFailure::Materialize(format!(
+                            "APM MCP declaration {} uses unsupported relay transport {transport}",
+                            object.name
+                        )));
+                    }
+                    Some((
+                        object.url.ok_or_else(|| {
+                            ProviderFailure::Materialize(format!(
+                                "APM MCP declaration {} has no resolved URL",
+                                object.name
+                            ))
+                        })?,
+                        object.headers,
+                    ))
+                } else {
+                    None
+                };
+                (object.name, direct)
+            }
+        };
+        if name.trim().is_empty() || declared.insert(name.clone(), direct).is_some() {
+            return Err(ProviderFailure::Materialize(format!(
+                "ambiguous duplicate APM MCP declaration {name}"
+            )));
+        }
+    }
+    let staged_path = staging.join(".mcp.json");
+    if declared.is_empty() {
+        if staged_path.exists() {
+            return Err(ProviderFailure::Materialize(
+                "APM staged MCP output without a manifest declaration".into(),
+            ));
+        }
+        return Ok(Vec::new());
+    }
+    let staged: StagedMcpConfig =
+        serde_json::from_slice(&fs::read(&staged_path).map_err(|_| {
+            ProviderFailure::Materialize(
+                "APM declared MCP servers but did not stage documented .mcp.json output".into(),
+            )
+        })?)
+        .map_err(|error| {
+            ProviderFailure::Materialize(format!("invalid staged APM MCP output: {error}"))
+        })?;
+    if declared.len() != staged.mcp_servers.len() {
+        return Err(ProviderFailure::Materialize(
+            "APM MCP manifest and staged output are ambiguous".into(),
+        ));
+    }
+    let mut capabilities = Vec::new();
+    for (name, direct) in declared {
+        let resolved = staged.mcp_servers.get(&name).ok_or_else(|| {
+            ProviderFailure::Materialize(format!(
+                "APM MCP declaration {name} was not present in staged output"
+            ))
+        })?;
+        if !matches!(resolved.transport.as_str(), "http" | "streamable-http") {
+            return Err(ProviderFailure::Materialize(format!(
+                "APM MCP declaration {name} resolved to unsupported relay transport {}",
+                resolved.transport
+            )));
+        }
+        if let Some((url, headers)) = direct {
+            if url != resolved.url || headers != resolved.headers {
+                return Err(ProviderFailure::Materialize(format!(
+                    "APM MCP declaration {name} conflicts with staged output"
+                )));
+            }
+        }
+        let headers = resolved
+            .headers
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), normalize_apm_secret_reference(value)?)))
+            .collect::<Result<BTreeMap<_, _>, ProviderFailure>>()?;
+        capabilities.push(ProviderCapabilityResource {
+            capability: ProviderCapability::McpStreamableHttp {
+                id: name.clone(),
+                name: name.clone(),
+                enabled: true,
+                url: resolved.url.clone(),
+                headers,
+            },
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id.clone(),
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest.clone(),
+                source: format!("apm.yml:dependencies.mcp[{name}] -> .mcp.json:mcpServers.{name}"),
+            },
+        });
+    }
+    Ok(capabilities)
+}
+
+fn normalize_apm_secret_reference(value: &str) -> Result<String, ProviderFailure> {
+    let variable = value
+        .strip_prefix("${env:")
+        .and_then(|value| value.strip_suffix('}'))
+        .or_else(|| {
+            value
+                .strip_prefix("${")
+                .and_then(|value| value.strip_suffix('}'))
+        });
+    let Some(variable) = variable else {
+        return Err(ProviderFailure::Materialize(
+            "APM MCP headers must use a portable environment reference; literal values and input prompts are unsupported".into(),
+        ));
+    };
+    if variable.is_empty()
+        || variable.starts_with("input:")
+        || !variable
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err(ProviderFailure::Materialize(
+            "APM MCP header contains an unsupported credential reference".into(),
+        ));
+    }
+    Ok(format!("env:{variable}"))
 }
 
 fn scan_outputs(

@@ -149,7 +149,28 @@ pub struct MaterializedState {
     pub resources: Vec<NormalizedResource>,
     pub declared_side_effects: Vec<DeclaredSideEffect>,
     pub unsupported: Vec<UnsupportedCapability>,
+    #[serde(default)]
+    pub capabilities: Vec<ProviderCapabilityResource>,
     pub digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderCapability {
+    McpStreamableHttp {
+        id: String,
+        name: String,
+        enabled: bool,
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderCapabilityResource {
+    pub capability: ProviderCapability,
+    pub provenance: super::resources::ResourceProvenance,
 }
 
 #[derive(Serialize)]
@@ -159,14 +180,36 @@ struct MaterializedSemantic<'a> {
     resources: &'a [NormalizedResource],
     declared_side_effects: &'a [DeclaredSideEffect],
     unsupported: &'a [UnsupportedCapability],
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    capabilities: &'a [ProviderCapabilityResource],
+}
+
+fn slice_is_empty<T>(values: &[T]) -> bool {
+    values.is_empty()
 }
 
 impl MaterializedState {
     pub fn finalize(
         inputs: ProviderInputs,
+        resources: Vec<NormalizedResource>,
+        declared_side_effects: Vec<DeclaredSideEffect>,
+        unsupported: Vec<UnsupportedCapability>,
+    ) -> Result<Self, ProviderContractError> {
+        Self::finalize_with_capabilities(
+            inputs,
+            resources,
+            declared_side_effects,
+            unsupported,
+            Vec::new(),
+        )
+    }
+
+    pub fn finalize_with_capabilities(
+        inputs: ProviderInputs,
         mut resources: Vec<NormalizedResource>,
         mut declared_side_effects: Vec<DeclaredSideEffect>,
         mut unsupported: Vec<UnsupportedCapability>,
+        mut capabilities: Vec<ProviderCapabilityResource>,
     ) -> Result<Self, ProviderContractError> {
         inputs.verify()?;
         for resource in &resources {
@@ -186,6 +229,21 @@ impl MaterializedState {
         declared_side_effects.dedup();
         unsupported.sort();
         unsupported.dedup();
+        for capability in &capabilities {
+            let provenance = &capability.provenance;
+            if provenance.provider_id != inputs.provider_id
+                || provenance.provider_version != inputs.provider_version.as_str()
+                || provenance.input_digest != inputs.input_set_digest
+            {
+                return Err(ProviderContractError::InvalidResourceProvenance);
+            }
+        }
+        capabilities.sort_by(|left, right| {
+            let ProviderCapability::McpStreamableHttp { id: left_id, .. } = &left.capability;
+            let ProviderCapability::McpStreamableHttp { id: right_id, .. } = &right.capability;
+            (&left.provenance.source, left_id).cmp(&(&right.provenance.source, right_id))
+        });
+        capabilities.dedup();
         let digest = digest_domain_json(
             "commonkit.materialized-state.v1",
             &MaterializedSemantic {
@@ -193,6 +251,7 @@ impl MaterializedState {
                 resources: &resources,
                 declared_side_effects: &declared_side_effects,
                 unsupported: &unsupported,
+                capabilities: &capabilities,
             },
         )?;
         Ok(Self {
@@ -200,16 +259,18 @@ impl MaterializedState {
             resources,
             declared_side_effects,
             unsupported,
+            capabilities,
             digest,
         })
     }
 
     pub fn verify(&self) -> Result<(), ProviderContractError> {
-        let rebuilt = Self::finalize(
+        let rebuilt = Self::finalize_with_capabilities(
             self.inputs.clone(),
             self.resources.clone(),
             self.declared_side_effects.clone(),
             self.unsupported.clone(),
+            self.capabilities.clone(),
         )?;
         if &rebuilt == self {
             Ok(())
@@ -245,7 +306,10 @@ impl ProviderContext {
         }
         digest_domain_json(
             "commonkit.provider-target-platform.v1",
-            &Facts { platform: &self.platform, architecture: &self.architecture },
+            &Facts {
+                platform: &self.platform,
+                architecture: &self.architecture,
+            },
         )
         .map_err(Into::into)
     }

@@ -180,10 +180,7 @@ impl DesiredStateProvider for ChezmoiProvider {
         &self.id
     }
 
-    fn inspect_inputs(
-        &self,
-        context: &ProviderContext,
-    ) -> Result<ProviderInputs, ProviderFailure> {
+    fn inspect_inputs(&self, context: &ProviderContext) -> Result<ProviderInputs, ProviderFailure> {
         self.preflight()?;
         self.validate_version()?;
         self.inputs(context)

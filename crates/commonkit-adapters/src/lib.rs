@@ -42,8 +42,8 @@ pub use planning::{
 };
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,
-    ProviderContext, ProviderContractError, ProviderFailure, ProviderInputs, ProviderWorkspace,
-    UnsupportedCapability,
+    ProviderCapability, ProviderCapabilityResource, ProviderContext, ProviderContractError,
+    ProviderFailure, ProviderInputs, ProviderWorkspace, UnsupportedCapability,
 };
 pub use remote_helper::TargetHelper;
 pub use remote_provider::{
