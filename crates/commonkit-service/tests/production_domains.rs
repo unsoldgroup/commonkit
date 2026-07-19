@@ -92,9 +92,10 @@ fn registry_startup_recovers_snapshot_transactions_with_configured_service_lifec
             "credentials": null,
             "snapshots": {
                 "root": root.join("snapshots"),
+                "portableState": root.join("kit"),
                 "keyReference": format!("file://{}", key_path.display()),
                 "objectStore": {"type":"local"},
-                "databases": [{"id":"context-mode", "path":database, "targetId":"local", "format":"file", "lifecycle":lifecycle}]
+                "databases": [{"id":"context-mode", "path":database, "targetId":"local", "observedPaths":{"workstation-b":root.join("context-candidate.db")}, "format":"file", "lifecycle":lifecycle}]
             }
         }),
     );
@@ -191,9 +192,9 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
       "credentials": { "root": root.join("credentials"), "destinations": [{
         "id": "api-token", "reference": format!("file://{}", source_secret.display()), "path": "tokens/api"
       }]},
-      "snapshots": { "root": root.join("snapshots"), "keyReference": format!("file://{}", source_secret.display()),
+      "snapshots": { "root": root.join("snapshots"), "portableState": root.join("kit"), "keyReference": format!("file://{}", source_secret.display()),
         "objectStore": {"type":"local"},
-        "databases": [{"id":"context-mode", "path": database, "targetId":"local", "format":"file", "lifecycle": lifecycle_config()}] }
+        "databases": [{"id":"context-mode", "path": database, "targetId":"local", "observedPaths":{"workstation-b":root.join("context-candidate.db")}, "format":"file", "lifecycle": lifecycle_config()}] }
     });
     let config_path = root.join("headless.json");
     write_json(&config_path, &config);
@@ -344,28 +345,199 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
     );
     let snapshot_listing = snapshots.list().unwrap().to_string();
     assert!(!snapshot_listing.contains("never serialize me"));
-    let encrypted_manifest = std::fs::read(
-        std::fs::read_dir(root.join("snapshots/manifests"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path(),
-    )
-    .unwrap();
-    assert!(
-        !encrypted_manifest
+    let encrypted_objects = std::fs::read_dir(root.join("snapshots/objects"))
+        .unwrap()
+        .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(encrypted_objects.len(), 2);
+    assert!(encrypted_objects.iter().all(|object| {
+        !object
             .windows(b"context-mode".len())
             .any(|window| window == b"context-mode")
-    );
+            && !object
+                .windows(b"never serialize me".len())
+                .any(|window| window == b"never serialize me")
+    }));
     std::fs::write(&database, b"database-v2").unwrap();
     snapshots.restore(serde_json::json!({"confirmed":true,"confirmationId":"test","snapshotId":created["snapshotId"]})).unwrap();
     assert_eq!(std::fs::read(database).unwrap(), b"database-v1");
+    std::fs::write(root.join("context-candidate.db"), b"database-v1").unwrap();
     snapshots.promote(serde_json::json!({"confirmed":true,"confirmationId":"test","databaseId":"context-mode","targetId":"workstation-b"})).unwrap();
     assert_eq!(
         snapshots.list().unwrap()["writers"]["context-mode"],
         "workstation-b"
     );
+}
+
+#[test]
+fn snapshot_promotion_rejects_unsnapshotted_authoritative_changes_and_missing_observations() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let database = root.join("writer.db");
+    let candidate = root.join("candidate.db");
+    std::fs::write(&database, b"snapshot-state").unwrap();
+    std::fs::write(&candidate, b"snapshot-state").unwrap();
+    let key_path = root.join("snapshot-key");
+    std::fs::write(&key_path, b"snapshot-test-key").unwrap();
+    let config = root.join("headless.json");
+    write_json(
+        &config,
+        &serde_json::json!({
+            "sync": null,
+            "credentials": null,
+            "snapshots": {
+                "root": root.join("snapshots"),
+                "portableState": root.join("kit"),
+                "keyReference": format!("file://{}", key_path.display()),
+                "objectStore": {"type":"local"},
+                "databases": [{
+                    "id":"context-mode",
+                    "path": database,
+                    "targetId":"writer",
+                    "observedPaths":{"candidate":candidate},
+                    "format":"file",
+                    "lifecycle":lifecycle_config()
+                }]
+            }
+        }),
+    );
+    let registry = ProductionDomainRegistry::load(
+        &config,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap();
+    let snapshots = registry.snapshots.unwrap();
+    assert_eq!(
+        snapshots.list().unwrap()["promotionEvidence"]["context-mode"]["observableTargets"],
+        serde_json::json!(["candidate", "writer"])
+    );
+    snapshots
+        .create(serde_json::json!({"databaseId":"context-mode"}))
+        .unwrap();
+    std::fs::write(&database, b"newer-authoritative-state").unwrap();
+
+    assert_eq!(
+        snapshots.promote(serde_json::json!({"databaseId":"context-mode","targetId":"candidate"})),
+        Err(commonkit_service::DomainFailure::VerificationFailed)
+    );
+    assert_eq!(
+        snapshots.list().unwrap()["writers"]["context-mode"],
+        "writer"
+    );
+    assert_eq!(
+        snapshots.promote(serde_json::json!({
+            "databaseId":"context-mode",
+            "targetId":"unconfigured",
+            "currentWriterDigest":"sha256:caller-assertion",
+            "candidateDigest":"sha256:caller-assertion"
+        })),
+        Err(commonkit_service::DomainFailure::InvalidRequest)
+    );
+}
+
+#[test]
+fn portable_descriptor_discovers_and_restores_snapshot_on_another_machine() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let portable_state = root.join("kit");
+    let key = root.join("provisioned-snapshot-key");
+    std::fs::write(&key, b"same-key-provisioned-outside-git").unwrap();
+    let source_database = root.join("machine-a.db");
+    std::fs::write(&source_database, b"portable database plaintext").unwrap();
+
+    let config_a = root.join("machine-a.json");
+    write_json(
+        &config_a,
+        &serde_json::json!({
+            "sync": null,
+            "credentials": null,
+            "snapshots": {
+                "root": root.join("machine-a-state"),
+                "portableState": portable_state,
+                "keyReference": format!("file://{}", key.display()),
+                "objectStore": {"type":"local"},
+                "databases": [{"id":"context-mode", "path":source_database, "targetId":"machine-a", "format":"file", "lifecycle":lifecycle_config()}]
+            }
+        }),
+    );
+    let snapshots_a = ProductionDomainRegistry::load(
+        &config_a,
+        std::sync::Arc::new(PlanStore::open(root.join("plans-a")).unwrap()),
+        root.join("receipts-a"),
+    )
+    .unwrap()
+    .snapshots
+    .unwrap();
+    let created = snapshots_a
+        .create(serde_json::json!({"databaseId":"context-mode"}))
+        .unwrap();
+    drop(snapshots_a);
+
+    // A shared S3 backend supplies these immutable ciphertext objects in production. Copying the
+    // local test backend models the same object availability without putting database bytes in Git.
+    let machine_b_state = root.join("machine-b-state");
+    std::fs::create_dir_all(machine_b_state.join("objects")).unwrap();
+    for entry in std::fs::read_dir(root.join("machine-a-state/objects")).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(
+            entry.path(),
+            machine_b_state.join("objects").join(entry.file_name()),
+        )
+        .unwrap();
+    }
+    let candidate_database = root.join("machine-b.db");
+    std::fs::write(&candidate_database, b"stale local database").unwrap();
+    let config_b = root.join("machine-b.json");
+    write_json(
+        &config_b,
+        &serde_json::json!({
+            "sync": null,
+            "credentials": null,
+            "snapshots": {
+                "root": machine_b_state,
+                "portableState": portable_state,
+                "keyReference": format!("file://{}", key.display()),
+                "objectStore": {"type":"local"},
+                "databases": [{"id":"context-mode", "path":candidate_database, "targetId":"machine-b", "format":"file", "lifecycle":lifecycle_config()}]
+            }
+        }),
+    );
+    let snapshots_b = ProductionDomainRegistry::load(
+        &config_b,
+        std::sync::Arc::new(PlanStore::open(root.join("plans-b")).unwrap()),
+        root.join("receipts-b"),
+    )
+    .unwrap()
+    .snapshots
+    .unwrap();
+    assert_eq!(
+        snapshots_b.list().unwrap()["snapshots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    snapshots_b
+        .restore(serde_json::json!({"snapshotId":created["snapshotId"]}))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(candidate_database).unwrap(),
+        b"portable database plaintext"
+    );
+    for entry in std::fs::read_dir(root.join("kit/snapshots")).unwrap() {
+        let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+        assert!(
+            !bytes
+                .windows(b"portable database plaintext".len())
+                .any(|window| { window == b"portable database plaintext" })
+        );
+        assert!(
+            !bytes
+                .windows(b"same-key-provisioned-outside-git".len())
+                .any(|window| { window == b"same-key-provisioned-outside-git" })
+        );
+    }
 }
 
 #[test]
@@ -527,6 +699,7 @@ fn invalid_s3_snapshot_backend_fails_at_registry_load() {
             "credentials": null,
             "snapshots": {
                 "root": root.join("snapshots"),
+                "portableState": root.join("kit"),
                 "keyReference": format!("file://{}", key.display()),
                 "objectStore": {"type":"s3", "executable":"relative/aws", "endpoint":"http://insecure", "bucket":"bad", "prefix":"."},
                 "databases": [{"id":"context-mode", "path":root.join("context.sqlite"), "targetId":"local", "format":"sqlite", "lifecycle": lifecycle_config()}]

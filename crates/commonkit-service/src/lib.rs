@@ -818,6 +818,15 @@ pub struct ExecutionResult {
 
 pub trait PlanExecutor: Send + Sync + 'static {
     fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult;
+
+    fn execute_bound(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        _idempotency_key: &str,
+    ) -> ExecutionResult {
+        self.execute(plan, confirmation_id)
+    }
 }
 
 pub struct TargetDispatchPlanExecutor {
@@ -870,6 +879,29 @@ impl PlanExecutor for TargetIdentityPlanExecutor {
         }
         self.fallback.execute(plan, confirmation_id)
     }
+
+    fn execute_bound(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        idempotency_key: &str,
+    ) -> ExecutionResult {
+        let filesystem = plan
+            .operations
+            .iter()
+            .all(|operation| matches!(operation.adapter_id.as_str(), "files" | "ssh-files"));
+        if filesystem && !plan.operations.is_empty() {
+            return self.targets.get(&plan.target_id).map_or(
+                ExecutionResult {
+                    status: ApplyStatus::Failed,
+                    failure_code: Some(stable_code("target_executor_unavailable")),
+                },
+                |executor| executor.execute_bound(plan, confirmation_id, idempotency_key),
+            );
+        }
+        self.fallback
+            .execute_bound(plan, confirmation_id, idempotency_key)
+    }
 }
 
 impl TargetDispatchPlanExecutor {
@@ -904,6 +936,29 @@ impl PlanExecutor for TargetDispatchPlanExecutor {
             );
         }
         self.local.execute(plan, confirmation_id)
+    }
+
+    fn execute_bound(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        idempotency_key: &str,
+    ) -> ExecutionResult {
+        let has_ssh = plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() == "ssh-files");
+        if has_ssh {
+            return self.ssh.as_ref().map_or(
+                ExecutionResult {
+                    status: ApplyStatus::Failed,
+                    failure_code: Some(stable_code("ssh_executor_unavailable")),
+                },
+                |executor| executor.execute_bound(plan, confirmation_id, idempotency_key),
+            );
+        }
+        self.local
+            .execute_bound(plan, confirmation_id, idempotency_key)
     }
 }
 
@@ -1011,6 +1066,7 @@ impl LocalPlanExecutor {
         &self,
         plan: &Plan,
         confirmation_id: &StableId,
+        idempotency_key: Option<&str>,
     ) -> Result<ReconcileOutcome, LocalExecutionError> {
         let durable = self.plan_store.load(&plan.id)?;
         if durable != *plan {
@@ -1023,9 +1079,11 @@ impl LocalPlanExecutor {
                 .iter()
                 .filter(|operation| operation.adapter_id.as_str() == "relay")
             {
-                adapter
-                    .validate_confirmation(operation, confirmation_id)
-                    .map_err(|_| LocalExecutionError::PlanMismatch)?;
+                match idempotency_key {
+                    Some(key) => adapter.validate_approval(operation, confirmation_id, key),
+                    None => adapter.validate_confirmation(operation, confirmation_id),
+                }
+                .map_err(|_| LocalExecutionError::PlanMismatch)?;
             }
         }
         let run_id = durable_run_id(&plan.id, confirmation_id)?;
@@ -1052,25 +1110,48 @@ impl PlanExecutor for LocalPlanExecutor {
             .execution_lock
             .lock()
             .map_err(|_| LocalExecutionError::Lock)
-            .and_then(|_guard| self.execute_durable(plan, confirmation_id));
-        match result {
-            Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
-                status: ApplyStatus::Succeeded,
-                failure_code: None,
-            },
-            Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
-                status: ApplyStatus::RolledBack,
-                failure_code: None,
-            },
-            Ok(ReconcileOutcome::RollbackFailed) => ExecutionResult {
-                status: ApplyStatus::Failed,
-                failure_code: Some(stable_code("rollback_failed")),
-            },
-            Err(error) => ExecutionResult {
-                status: ApplyStatus::Failed,
-                failure_code: Some(error.code()),
-            },
-        }
+            .and_then(|_guard| self.execute_durable(plan, confirmation_id, None));
+        execution_result(result)
+    }
+
+
+    fn execute_bound(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        idempotency_key: &str,
+    ) -> ExecutionResult {
+        let result = self
+            .execution_lock
+            .lock()
+            .map_err(|_| LocalExecutionError::Lock)
+            .and_then(|_guard| {
+                self.execute_durable(plan, confirmation_id, Some(idempotency_key))
+            });
+        execution_result(result)
+    }
+}
+
+fn execution_result(
+    result: Result<ReconcileOutcome, LocalExecutionError>,
+) -> ExecutionResult {
+    match result {
+        Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
+            status: ApplyStatus::Succeeded,
+            failure_code: None,
+        },
+        Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
+            status: ApplyStatus::RolledBack,
+            failure_code: None,
+        },
+        Ok(ReconcileOutcome::RollbackFailed) => ExecutionResult {
+            status: ApplyStatus::Failed,
+            failure_code: Some(stable_code("rollback_failed")),
+        },
+        Err(error) => ExecutionResult {
+            status: ApplyStatus::Failed,
+            failure_code: Some(error.code()),
+        },
     }
 }
 
@@ -1263,6 +1344,9 @@ pub trait SyncDomain: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct RelayProviderAuthority {
     pub materialized_states: Vec<MaterializedState>,
+    /// True only when the relay process and consuming clients execute on the
+    /// same target. Loopback client URLs are forbidden otherwise.
+    pub relay_is_target_local: bool,
     pub target_identity_digest: Sha256Digest,
     pub composed_loadout_digest: Sha256Digest,
     pub provider_inputs_digest: Sha256Digest,
@@ -1402,6 +1486,7 @@ pub enum DomainFailure {
     InvalidRequest,
     StalePlan,
     VerificationFailed,
+    RelayRequiresTargetResidentDaemon,
     OperationFailed,
 }
 
@@ -1428,6 +1513,7 @@ struct ControlPlaneInner {
     domains: std::sync::RwLock<HeadlessDomainRegistry>,
     targets: std::sync::RwLock<Option<Arc<TargetInventory>>>,
     target_sync: std::sync::RwLock<BTreeMap<StableId, Arc<dyn SyncDomain>>>,
+    relay_execution_paths: std::sync::RwLock<Option<(PathBuf, PathBuf)>>,
 }
 
 impl ControlPlane {
@@ -1443,6 +1529,7 @@ impl ControlPlane {
                 domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
                 targets: std::sync::RwLock::new(None),
                 target_sync: std::sync::RwLock::new(BTreeMap::new()),
+                relay_execution_paths: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -1459,6 +1546,7 @@ impl ControlPlane {
                 domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
                 targets: std::sync::RwLock::new(None),
                 target_sync: std::sync::RwLock::new(BTreeMap::new()),
+                relay_execution_paths: std::sync::RwLock::new(None),
             }),
         }
     }
@@ -1501,6 +1589,14 @@ impl ControlPlane {
         }
         *self.inner.target_sync.write().expect("target domain lock") = domains;
         Ok(())
+    }
+
+    pub fn set_relay_execution_paths(&self, live: PathBuf, state: PathBuf) {
+        *self
+            .inner
+            .relay_execution_paths
+            .write()
+            .expect("relay execution path lock") = Some((live, state));
     }
 
     fn target_sync_domain(&self, target: &StableId) -> Result<Arc<dyn SyncDomain>, ControlError> {
@@ -1618,6 +1714,7 @@ impl ControlPlane {
             return Err(ControlError::InvalidIdempotencyKey);
         }
         let plan = self.plan(plan_id).ok_or(ControlError::PlanNotFound)?;
+        self.validate_relay_execution_authority(&plan, confirmation_id, idempotency_key)?;
         let operation_id = digest_domain_json(
             "commonkit.control-operation.v1",
             &serde_json::json!({
@@ -1666,12 +1763,84 @@ impl ControlPlane {
                 operation_id,
                 plan,
                 confirmation_id: confirmation_id.clone(),
+                idempotency_key: idempotency_key.to_owned(),
             }),
         ))
     }
 
+    fn validate_relay_execution_authority(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        idempotency_key: &str,
+    ) -> Result<(), ControlError> {
+        let relay_operations = plan
+            .operations
+            .iter()
+            .filter(|operation| operation.adapter_id.as_str() == "relay")
+            .collect::<Vec<_>>();
+        if relay_operations.is_empty() {
+            return Ok(());
+        }
+        let domain = self.target_sync_domain(&plan.target_id)?;
+        let authority = domain
+            .relay_provider_authority()
+            .map_err(|_| ControlError::RelayAuthorityChanged)?;
+        if !authority.relay_is_target_local {
+            return Err(ControlError::RelayAuthorityChanged);
+        }
+        let resolved = resolved_mcp_from_materialized(&authority.materialized_states)
+            .map_err(|_| ControlError::RelayAuthorityChanged)?;
+        let declaration_digest = digest_domain_json(
+            "commonkit.resolved-mcp-declarations.v1",
+            &resolved,
+        )?;
+        if plan.policy_digest != authority.policy_digest
+            || plan.bindings.target_identity_digest != authority.target_identity_digest
+            || plan.bindings.composed_loadout_digest != authority.composed_loadout_digest
+            || plan.bindings.provider_inputs_digest != authority.provider_inputs_digest
+            || plan.bindings.ownership_map_digest != authority.ownership_map_digest
+            || plan.bindings.artifact_set_digest != authority.artifact_set_digest
+        {
+            return Err(ControlError::RelayAuthorityChanged);
+        }
+        let expected = RelayMutationInputs {
+            provider_inputs_digest: authority.provider_inputs_digest,
+            policy_digest: authority.policy_digest,
+            target_digest: authority.target_identity_digest,
+            declaration_digest,
+            ownership_map_digest: authority.ownership_map_digest,
+            artifact_set_digest: authority.artifact_set_digest,
+            approved_confirmation_id: confirmation_id.clone(),
+            approval_idempotency_key: idempotency_key.to_owned(),
+        };
+        let (live, state) = self
+            .inner
+            .relay_execution_paths
+            .read()
+            .expect("relay execution path lock")
+            .clone()
+            .ok_or(ControlError::RelayAuthorityChanged)?;
+        let adapter = RelayAdapter::open(
+            stable_code("relay"),
+            live,
+            state,
+        )
+        .map_err(|_| ControlError::RelayAuthorityChanged)?;
+        for operation in relay_operations {
+            adapter
+                .validate_mutation_inputs(operation, &expected)
+                .map_err(|_| ControlError::RelayAuthorityChanged)?;
+        }
+        Ok(())
+    }
+
     fn execute_job(&self, job: ExecutionJob) -> ApplyOperation {
-        let execution = self.inner.executor.execute(&job.plan, &job.confirmation_id);
+        let execution = self.inner.executor.execute_bound(
+            &job.plan,
+            &job.confirmation_id,
+            &job.idempotency_key,
+        );
         let completed = ApplyOperation {
             id: job.operation_id.clone(),
             plan_id: job.plan.id,
@@ -1691,6 +1860,7 @@ struct ExecutionJob {
     operation_id: Sha256Digest,
     plan: Plan,
     confirmation_id: StableId,
+    idempotency_key: String,
 }
 
 fn validate_control_plan(plan: &Plan) -> Result<(), ControlError> {
@@ -1723,6 +1893,8 @@ pub enum ControlError {
     InvalidIdempotencyKey,
     #[error("idempotency key is already bound to another plan")]
     IdempotencyConflict,
+    #[error("relay authority changed after plan review")]
+    RelayAuthorityChanged,
     #[error("target inventory is unavailable")]
     TargetsUnavailable,
     #[error(transparent)]
@@ -1974,6 +2146,9 @@ impl From<ControlError> for ApiError {
             ControlError::OperationNotFound => Self::not_found("operation_not_found"),
             ControlError::IdempotencyConflict | ControlError::PlanConflict => {
                 Self::conflict("conflict")
+            }
+            ControlError::RelayAuthorityChanged => {
+                Self::conflict("relay_authority_changed")
             }
             ControlError::InvalidIdempotencyKey => Self::bad_request("invalid_idempotency_key"),
             ControlError::InvalidPlan | ControlError::Contract(_) => {
@@ -2507,6 +2682,9 @@ fn domain_error(error: DomainFailure) -> ApiError {
         DomainFailure::InvalidRequest => ApiError::bad_request("invalid_domain_request"),
         DomainFailure::StalePlan => ApiError::conflict("stale_plan"),
         DomainFailure::VerificationFailed => ApiError::conflict("verification_failed"),
+        DomainFailure::RelayRequiresTargetResidentDaemon => {
+            ApiError::conflict("relay_requires_target_resident_daemon")
+        }
         DomainFailure::OperationFailed => ApiError::internal("domain_operation_failed"),
     }
 }
@@ -2850,6 +3028,11 @@ async fn plan_relay_reconcile(
     let authority = domain
         .relay_provider_authority()
         .map_err(|_| ApiError::conflict("relay_provider_authority_invalid"))?;
+    if !authority.relay_is_target_local {
+        return Err(ApiError::conflict(
+            "relay_requires_target_resident_daemon",
+        ));
+    }
     let resolved = resolved_mcp_from_materialized(&authority.materialized_states)
         .map_err(|_| ApiError::conflict("relay_provider_output_invalid"))?;
     let declaration_digest =
@@ -3148,6 +3331,10 @@ impl BoundServer {
         let fallback = Arc::new(TargetDispatchPlanExecutor::new(local_executor, None));
         let executor = Arc::new(TargetIdentityPlanExecutor::new(fallback, target_executors));
         let control = ControlPlane::with_plan_store(executor, plan_store);
+        control.set_relay_execution_paths(
+            paths.config.join("relay.json"),
+            paths.state.join("relay"),
+        );
         let drift_checker = Arc::new(match production_domains.targets.clone() {
             Some(targets) if !production_domains.target_sync_domains.is_empty() => {
                 ProductionDriftChecker::Selected(SelectedTargetsDriftChecker::new(

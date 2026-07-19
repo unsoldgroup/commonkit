@@ -63,6 +63,24 @@ fn relay_operation_is_content_addressed_bound_and_requires_confirmation() {
             .validate_confirmation(&first, &StableId::parse("relay-review-replayed").unwrap())
             .is_err()
     );
+    assert!(
+        adapter
+            .validate_approval(
+                &first,
+                &StableId::parse("relay-review-one").unwrap(),
+                "relay-request-one"
+            )
+            .is_ok()
+    );
+    assert!(
+        adapter
+            .validate_approval(
+                &first,
+                &StableId::parse("relay-review-one").unwrap(),
+                "relay-request-replayed"
+            )
+            .is_err()
+    );
 
     let mut changed = request;
     changed.inputs.policy_digest = digest("d");

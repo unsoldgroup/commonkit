@@ -187,7 +187,22 @@ fn one_durable_run_dispatches_filesystem_and_relay_operations() {
     .with_relay(&relay_live, &relay_state, Arc::new(NoopRelayLifecycle));
     assert_eq!(
         executor
-            .execute(&mixed, &StableId::parse("mixed-confirmation").unwrap())
+            .execute_bound(
+                &mixed,
+                &StableId::parse("mixed-confirmation").unwrap(),
+                "replayed-idempotency"
+            )
+            .status,
+        ApplyStatus::Failed
+    );
+    assert!(!relay_live.exists());
+    assert_eq!(
+        executor
+            .execute_bound(
+                &mixed,
+                &StableId::parse("mixed-confirmation").unwrap(),
+                "mixed-idempotency"
+            )
             .status,
         ApplyStatus::Succeeded
     );

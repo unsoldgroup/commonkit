@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -14,7 +15,7 @@ use commonkit_adapters::{
     ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
     ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
-    validate_ownership,
+    materialize_mcp_client_state, validate_ownership,
 };
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{
@@ -25,10 +26,10 @@ use commonkit_reconcile::{
     Adapter, PlanStore, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
 };
 use commonkit_snapshots::{
-    AuthenticatedCipher, Authority, AuthorityStore, DatabaseId, DatabaseLifecycle, DurableRestore,
-    ObjectStore, ProcessObjectCommandRunner, PromotionPlan, RestoreFailpoint, RestorePlan,
-    S3CompatibleObjectStore, SnapshotError, SnapshotManifest, SnapshotService, SqliteBackup,
-    StaticBackup, XChaCha20Cipher, manifest_digest,
+    AuthenticatedCipher, Authority, AuthorityStore, ConsistentBackup, DatabaseId,
+    DatabaseLifecycle, DurableRestore, ObjectStore, ProcessObjectCommandRunner, PromotionPlan,
+    RestoreFailpoint, RestorePlan, S3CompatibleObjectStore, SnapshotError, SnapshotManifest,
+    SnapshotService, SqliteBackup, StaticBackup, XChaCha20Cipher, manifest_digest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -84,6 +85,9 @@ struct SyncConfig {
     /// omit this and inherit the controller facts; SSH targets may not.
     target_platform: Option<SyncTargetPlatform>,
     declared_roots: Vec<NormalizedManagedPath>,
+    /// Target-relative home/project root where Claude and Codex consume their
+    /// relay client configuration. Required when providers declare MCP.
+    relay_client_root: Option<NormalizedManagedPath>,
     protected_roots: Vec<NormalizedManagedPath>,
     case_sensitive: bool,
     target_identity_digest: Sha256Digest,
@@ -203,6 +207,9 @@ struct CredentialDestination {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SnapshotConfig {
     root: PathBuf,
+    /// A directory inside the portable Git kit. It contains only content-addressed descriptors;
+    /// encrypted database and manifest objects remain in the configured object store.
+    portable_state: PathBuf,
     key_reference: CredentialReference,
     object_store: SnapshotObjectStoreConfig,
     databases: Vec<SnapshotDatabase>,
@@ -224,6 +231,11 @@ struct SnapshotDatabase {
     id: DatabaseId,
     path: PathBuf,
     target_id: String,
+    /// Explicit local observations of this database on other configured targets. Promotion is
+    /// unavailable when either side cannot be inspected; request-provided digests are never an
+    /// authority substitute.
+    #[serde(default)]
+    observed_paths: BTreeMap<String, PathBuf>,
     format: SnapshotSourceFormat,
     lifecycle: DatabaseLifecycleConfig,
 }
@@ -685,14 +697,28 @@ impl ProductionDomainRegistry {
             .snapshots
             .map(
                 |config| -> Result<Arc<dyn SnapshotDomain>, ProductionDomainError> {
-                    if config.databases.is_empty() || !config.root.is_absolute() {
+                    if config.databases.is_empty()
+                        || !config.root.is_absolute()
+                        || !config.portable_state.is_absolute()
+                    {
                         return Err(ProductionDomainError::EmptyCapability);
                     }
                     validate_object_store(&config.object_store)?;
                     fs::create_dir_all(config.root.join("objects"))?;
                     fs::create_dir_all(config.root.join("manifests"))?;
+                    fs::create_dir_all(config.portable_state.join("snapshots"))?;
                     let databases = unique_databases(config.databases)?;
                     for database in databases.values() {
+                        if !database.path.is_absolute()
+                            || database.target_id.is_empty()
+                            || database.observed_paths.iter().any(|(target, path)| {
+                                target.is_empty()
+                                    || target == &database.target_id
+                                    || !path.is_absolute()
+                            })
+                        {
+                            return Err(ProductionDomainError::UnsafeConfig);
+                        }
                         validate_lifecycle(&database.lifecycle)?;
                     }
                     let authorities = AuthorityStore::open(config.root.join("authority"))
@@ -704,6 +730,7 @@ impl ProductionDomainRegistry {
                     }
                     let domain = ProductionSnapshotDomain {
                         root: config.root,
+                        portable_state: config.portable_state,
                         key_reference: config.key_reference,
                         object_store: config.object_store,
                         databases,
@@ -1083,7 +1110,34 @@ impl ProductionSyncDomain {
             self.config.protected_roots.clone(),
         )
         .map_err(|_| DomainFailure::OperationFailed)?;
-        let states = self.states()?;
+        let mut states = self.states()?;
+        let has_mcp = states.iter().any(|state| !state.capabilities.is_empty());
+        if has_mcp {
+            if matches!(
+                self.config.target_transport,
+                Some(SyncTargetTransport::Ssh { .. })
+            ) {
+                // A loopback URL is target-local. An SSH controller cannot claim
+                // it operates a relay on the remote host; run commonkitd on the
+                // target until a transactional remote service adapter exists.
+                return Err(DomainFailure::RelayRequiresTargetResidentDaemon);
+            }
+            let managed_root = self
+                .config
+                .relay_client_root
+                .as_ref()
+                .ok_or(DomainFailure::OperationFailed)?;
+            if let Some(client_state) = materialize_mcp_client_state(
+                &states,
+                &artifacts,
+                managed_root,
+                "http://127.0.0.1:3764/mcp",
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?
+            {
+                states.push(client_state);
+            }
+        }
         let resources = states
             .iter()
             .flat_map(|state| state.resources.iter().cloned())
@@ -1292,6 +1346,13 @@ impl SyncDomain for ProductionSyncDomain {
         }
         Ok(RelayProviderAuthority {
             materialized_states: states,
+            relay_is_target_local: matches!(
+                self.config
+                    .target_transport
+                    .as_ref()
+                    .unwrap_or(&SyncTargetTransport::Local),
+                SyncTargetTransport::Local
+            ),
             target_identity_digest: self.config.target_identity_digest.clone(),
             composed_loadout_digest: self.config.composed_loadout_digest.clone(),
             provider_inputs_digest: digest_domain_json(
@@ -1517,6 +1578,7 @@ impl CredentialDomain for ProductionCredentialDomain {
 
 struct ProductionSnapshotDomain {
     root: PathBuf,
+    portable_state: PathBuf,
     key_reference: CredentialReference,
     object_store: SnapshotObjectStoreConfig,
     databases: BTreeMap<String, SnapshotDatabase>,
@@ -1557,6 +1619,14 @@ struct StoredSnapshot {
     snapshot_id: StableId,
     manifest: SnapshotManifest,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PortableSnapshotDescriptor {
+    schema: String,
+    snapshot_id: StableId,
+    database_id: DatabaseId,
+    encrypted_manifest_digest: Sha256Digest,
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
@@ -1567,8 +1637,6 @@ struct SnapshotRequest {
     confirmed: Option<bool>,
     confirmation_id: Option<StableId>,
     idempotency_key: Option<String>,
-    current_writer_digest: Option<String>,
-    candidate_digest: Option<String>,
 }
 impl SnapshotRequest {
     fn acknowledge_metadata(&self) {
@@ -1576,6 +1644,29 @@ impl SnapshotRequest {
     }
 }
 impl ProductionSnapshotDomain {
+    fn observed_database_digest(
+        database: &SnapshotDatabase,
+        target: &str,
+    ) -> Result<String, DomainFailure> {
+        let path = if target == database.target_id {
+            &database.path
+        } else {
+            database
+                .observed_paths
+                .get(target)
+                .ok_or(DomainFailure::InvalidRequest)?
+        };
+        let bytes = match database.format {
+            SnapshotSourceFormat::Sqlite => SqliteBackup::new(path)
+                .export()
+                .map_err(|_| DomainFailure::VerificationFailed)?,
+            SnapshotSourceFormat::File => {
+                fs::read(path).map_err(|_| DomainFailure::VerificationFailed)?
+            }
+        };
+        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+
     fn recover_unfinished(&self) -> Result<(), ProductionDomainError> {
         let cipher = self
             .cipher()
@@ -1641,32 +1732,119 @@ impl ProductionSnapshotDomain {
         Ok(XChaCha20Cipher::new(key))
     }
     fn manifests(&self) -> Result<Vec<StoredSnapshot>, DomainFailure> {
-        let mut output: Vec<StoredSnapshot> = Vec::new();
+        let mut output = BTreeMap::<StableId, StoredSnapshot>::new();
         let cipher = self.cipher()?;
-        for entry in
-            fs::read_dir(self.root.join("manifests")).map_err(|_| DomainFailure::OperationFailed)?
+        // Portable descriptors are the sole discovery/commit point. A failed create may leave an
+        // immutable object-store orphan, but it can never expose an uncommitted local snapshot.
+        for entry in fs::read_dir(self.portable_state.join("snapshots"))
+            .map_err(|_| DomainFailure::OperationFailed)?
         {
             let path = entry.map_err(|_| DomainFailure::OperationFailed)?.path();
-            if path.extension().and_then(|v| v.to_str()) != Some("bin") {
-                return Err(DomainFailure::OperationFailed);
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                return Err(DomainFailure::VerificationFailed);
             }
-            let encrypted = fs::read(&path).map_err(|_| DomainFailure::OperationFailed)?;
+            let descriptor_bytes = fs::read(&path).map_err(|_| DomainFailure::OperationFailed)?;
             let expected = path
                 .file_stem()
                 .and_then(|value| value.to_str())
-                .ok_or(DomainFailure::OperationFailed)?;
-            if format!("{:x}", Sha256::digest(&encrypted)) != expected {
+                .ok_or(DomainFailure::VerificationFailed)?;
+            if format!("{:x}", Sha256::digest(&descriptor_bytes)) != expected {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            let descriptor: PortableSnapshotDescriptor = serde_json::from_slice(&descriptor_bytes)
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+            if descriptor.schema != "commonkit.portable-snapshot-descriptor.v1" {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            let encrypted = self
+                .objects()?
+                .get(descriptor.encrypted_manifest_digest.as_str())
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+            if format!("sha256:{:x}", Sha256::digest(&encrypted))
+                != descriptor.encrypted_manifest_digest.as_str()
+            {
                 return Err(DomainFailure::VerificationFailed);
             }
             let plaintext = cipher
                 .open(&encrypted, b"commonkit.snapshot-manifest.v1")
                 .map_err(|_| DomainFailure::VerificationFailed)?;
-            output.push(
-                serde_json::from_slice(&plaintext).map_err(|_| DomainFailure::OperationFailed)?,
-            );
+            let stored: StoredSnapshot = serde_json::from_slice(&plaintext)
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+            if stored.snapshot_id != descriptor.snapshot_id
+                || stored.manifest.database != descriptor.database_id
+            {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            output.insert(stored.snapshot_id.clone(), stored);
         }
-        output.sort_by(|a, b| a.snapshot_id.cmp(&b.snapshot_id));
-        Ok(output)
+        Ok(output.into_values().collect())
+    }
+
+    fn write_portable_descriptor(
+        &self,
+        stored: &StoredSnapshot,
+        encrypted_manifest: &[u8],
+    ) -> Result<(), DomainFailure> {
+        let encrypted_manifest_digest =
+            Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(encrypted_manifest)))
+                .map_err(|_| DomainFailure::OperationFailed)?;
+        let descriptor = PortableSnapshotDescriptor {
+            schema: "commonkit.portable-snapshot-descriptor.v1".into(),
+            snapshot_id: stored.snapshot_id.clone(),
+            database_id: stored.manifest.database.clone(),
+            encrypted_manifest_digest: encrypted_manifest_digest.clone(),
+        };
+        let bytes = serde_json::to_vec(&descriptor).map_err(|_| DomainFailure::OperationFailed)?;
+        let descriptor_digest = format!("{:x}", Sha256::digest(&bytes));
+        let directory = self.portable_state.join("snapshots");
+        let destination = directory.join(format!("{descriptor_digest}.json"));
+        // The manifest is ciphertext before it crosses the portable-state boundary. Uploading and
+        // verifying it first makes the descriptor rename the final discoverability commit point.
+        if self
+            .objects()?
+            .get(encrypted_manifest_digest.as_str())
+            .is_err()
+        {
+            return Err(DomainFailure::VerificationFailed);
+        }
+        if destination.exists() {
+            return (fs::read(destination).map_err(|_| DomainFailure::OperationFailed)? == bytes)
+                .then_some(())
+                .ok_or(DomainFailure::VerificationFailed);
+        }
+        let (mut temporary, temporary_path) = (0..16)
+            .find_map(|_| {
+                let path = directory.join(format!(".snapshot-{:032x}.tmp", rand::random::<u128>()));
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .ok()
+                    .map(|file| (file, path))
+            })
+            .ok_or(DomainFailure::OperationFailed)?;
+        if temporary
+            .write_all(&bytes)
+            .and_then(|_| temporary.sync_all())
+            .is_err()
+        {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(DomainFailure::OperationFailed);
+        }
+        drop(temporary);
+        match fs::rename(&temporary_path, &destination) {
+            Ok(()) => Ok(()),
+            Err(_) if destination.exists() => {
+                let _ = fs::remove_file(&temporary_path);
+                (fs::read(destination).map_err(|_| DomainFailure::OperationFailed)? == bytes)
+                    .then_some(())
+                    .ok_or(DomainFailure::VerificationFailed)
+            }
+            Err(_) => {
+                let _ = fs::remove_file(&temporary_path);
+                Err(DomainFailure::OperationFailed)
+            }
+        }
     }
     fn writers(&self) -> Result<BTreeMap<String, String>, DomainFailure> {
         let store = AuthorityStore::open(self.root.join("authority"))
@@ -1772,17 +1950,37 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .seal(&manifest_bytes, b"commonkit.snapshot-manifest.v1")
             .map_err(|_| DomainFailure::OperationFailed)?;
         let encrypted_digest = format!("{:x}", Sha256::digest(&encrypted_manifest));
-        fs::write(
-            self.root
-                .join("manifests")
-                .join(format!("{encrypted_digest}.bin")),
-            encrypted_manifest,
-        )
-        .map_err(|_| DomainFailure::OperationFailed)?;
+        let encrypted_object_digest = format!("sha256:{encrypted_digest}");
+        self.objects()?
+            .put(&encrypted_object_digest, &encrypted_manifest)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        self.write_portable_descriptor(&stored, &encrypted_manifest)?;
         Ok(serde_json::json!({"snapshotId":snapshot_id,"databaseId":id}))
     }
     fn list(&self) -> Result<Value, DomainFailure> {
-        Ok(serde_json::json!({"snapshots":self.manifests()?,"writers":self.writers()?}))
+        let writers = self.writers()?;
+        let promotion_evidence = self
+            .databases
+            .iter()
+            .map(|(id, database)| {
+                let mut observable_targets = vec![database.target_id.clone()];
+                observable_targets.extend(database.observed_paths.keys().cloned());
+                observable_targets.sort();
+                (
+                    id.clone(),
+                    serde_json::json!({
+                        "currentWriter": writers.get(id),
+                        "observableTargets": observable_targets,
+                        "requirement": "both current writer and candidate must be observable and match the latest snapshot"
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        Ok(serde_json::json!({
+            "snapshots":self.manifests()?,
+            "writers":writers,
+            "promotionEvidence":promotion_evidence
+        }))
     }
     fn restore(&self, request: Value) -> Result<Value, DomainFailure> {
         let _guard = self
@@ -1839,11 +2037,14 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
         request.acknowledge_metadata();
         let id = request.database_id.ok_or(DomainFailure::InvalidRequest)?;
-        if !self.databases.contains_key(&id)
-            || !self
-                .manifests()?
-                .iter()
-                .any(|item| item.manifest.database.to_string() == id)
+        let database = self
+            .databases
+            .get(&id)
+            .ok_or(DomainFailure::InvalidRequest)?;
+        if !self
+            .manifests()?
+            .iter()
+            .any(|item| item.manifest.database.to_string() == id)
         {
             return Err(DomainFailure::InvalidRequest);
         }
@@ -1858,6 +2059,8 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .writers()?
             .remove(&id)
             .ok_or(DomainFailure::VerificationFailed)?;
+        let current_writer_digest = Self::observed_database_digest(database, &current_writer)?;
+        let candidate_digest = Self::observed_database_digest(database, &target)?;
         let receipt = AuthorityStore::open(self.root.join("authority"))
             .map_err(|_| DomainFailure::OperationFailed)?
             .promote(PromotionPlan {
@@ -1870,12 +2073,8 @@ impl SnapshotDomain for ProductionSnapshotDomain {
                 previous_writer: current_writer,
                 candidate_writer: target.clone(),
                 latest_snapshot_digest: latest.manifest.content_digest.clone(),
-                current_writer_digest: request
-                    .current_writer_digest
-                    .unwrap_or_else(|| latest.manifest.content_digest.clone()),
-                candidate_digest: request
-                    .candidate_digest
-                    .unwrap_or_else(|| latest.manifest.content_digest.clone()),
+                current_writer_digest,
+                candidate_digest,
             })
             .map_err(|_| DomainFailure::VerificationFailed)?;
         Ok(serde_json::json!({"databaseId":id,"writer":target,"receipt":receipt}))

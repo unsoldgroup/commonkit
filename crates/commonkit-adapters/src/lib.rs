@@ -6,6 +6,7 @@ mod chezmoi;
 mod credentials;
 mod files;
 mod git_sync;
+mod mcp_clients;
 mod native;
 mod pipeline;
 mod planning;
@@ -35,6 +36,7 @@ pub use git_sync::{
     FastForwardPolicy, GitCommandError, GitCommandOutput, GitCommandRunner, GitRepository,
     GitRevision, GitSyncDisposition, GitSyncError, GitSyncStatus, ProcessGitRunner,
 };
+pub use mcp_clients::{McpClientMaterializationError, materialize_mcp_client_state};
 pub use native::NativeProvider;
 pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutput};
 pub use planning::{

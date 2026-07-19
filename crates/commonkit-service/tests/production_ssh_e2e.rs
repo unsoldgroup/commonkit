@@ -124,6 +124,18 @@ fn setup(
     Arc<PlanStore>,
     Arc<dyn PlanExecutor>,
 ) {
+    setup_with_capabilities(root, remote, false)
+}
+
+fn setup_with_capabilities(
+    root: &std::path::Path,
+    remote: Memory,
+    with_mcp: bool,
+) -> (
+    ProductionDomainRegistry,
+    Arc<PlanStore>,
+    Arc<dyn PlanExecutor>,
+) {
     let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
     let inputs = ProviderInputs::new(
         StableId::parse("native").unwrap(),
@@ -133,7 +145,22 @@ fn setup(
         vec!["files".into()],
     )
     .unwrap();
-    let state = MaterializedState::finalize(
+    let capabilities = with_mcp.then(|| ProviderCapabilityResource {
+        capability: ProviderCapability::McpStreamableHttp {
+            id: "docs".into(),
+            name: "Docs".into(),
+            enabled: true,
+            url: "https://docs.example/mcp".into(),
+            headers: BTreeMap::new(),
+        },
+        provenance: ResourceProvenance {
+            provider_id: inputs.provider_id.clone(),
+            provider_version: inputs.provider_version.to_string(),
+            input_digest: inputs.input_set_digest.clone(),
+            source: "native:mcp:docs".into(),
+        },
+    });
+    let state = MaterializedState::finalize_with_capabilities(
         inputs.clone(),
         vec![NormalizedResource {
             intent: FilesystemIntent::File {
@@ -153,6 +180,7 @@ fn setup(
         }],
         vec![],
         vec![],
+        capabilities.into_iter().collect(),
     )
     .unwrap();
     let state_path = root.join("state.json");
@@ -165,7 +193,7 @@ fn setup(
         "targetTransport":{"type":"ssh","rootId":"home-root","host":"fixture","user":"al","port":22,
             "knownHosts":root.join("known_hosts"),"fingerprint":"SHA256:fixturefixturefixture"},
         "targetPlatform":{"operatingSystem":"linux","architecture":"x86_64"},
-        "declaredRoots":["home"],"protectedRoots":[],"caseSensitive":true,
+        "declaredRoots":["home"],"relayClientRoot":"home","protectedRoots":[],"caseSensitive":true,
         "targetIdentityDigest":digest("target"),"composedLoadoutDigest":digest("loadout"),"policyDigest":digest("policy")
     }});
     let config_path = root.join("headless.json");
@@ -188,6 +216,24 @@ fn setup(
         Some(ssh),
     ));
     (registry, plans, dispatch)
+}
+
+#[test]
+fn ssh_target_with_provider_mcp_requires_a_target_resident_daemon() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote = Memory::default();
+    let (registry, _, _) = setup_with_capabilities(temporary.path(), remote, true);
+    assert_eq!(
+        registry
+            .sync
+            .as_ref()
+            .unwrap()
+            .plan(serde_json::json!({
+                "confirmed": true,
+                "confirmationId": "relay-plan"
+            })),
+        Err(DomainFailure::RelayRequiresTargetResidentDaemon)
+    );
 }
 
 async fn apply_and_wait(

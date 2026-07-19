@@ -159,6 +159,46 @@ impl RelayAdapter {
         }
         Ok(())
     }
+
+    /// Validates both pieces of user consent bound into the reviewed relay
+    /// operation. An idempotency key is authorization context here, not merely
+    /// a request de-duplication hint.
+    pub fn validate_approval(
+        &self,
+        operation: &Operation,
+        confirmation_id: &StableId,
+        idempotency_key: &str,
+    ) -> Result<(), AdapterFailure> {
+        let payload = self.payload(operation)?;
+        if &payload.inputs.approved_confirmation_id != confirmation_id {
+            return Err(failure(
+                "relay_confirmation_mismatch",
+                "confirmation does not authorize the reviewed relay operation",
+            ));
+        }
+        if payload.inputs.approval_idempotency_key != idempotency_key {
+            return Err(failure(
+                "relay_idempotency_mismatch",
+                "idempotency key does not authorize the reviewed relay operation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Compares execution-time authority with the immutable reviewed payload.
+    pub fn validate_mutation_inputs(
+        &self,
+        operation: &Operation,
+        expected: &RelayMutationInputs,
+    ) -> Result<(), AdapterFailure> {
+        if &self.payload(operation)?.inputs != expected {
+            return Err(failure(
+                "relay_authority_changed",
+                "relay authority changed after review",
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub fn plan_relay_operation(

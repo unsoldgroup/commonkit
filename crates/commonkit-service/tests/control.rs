@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     fs,
@@ -10,10 +11,18 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use commonkit_contracts::{OperationKind, PlanBindings, ResourceRef, Risk, Sha256Digest, StableId};
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
+use commonkit_adapters::{
+    ExactProviderVersion, MaterializedState, ProviderCapability, ProviderCapabilityResource,
+    ProviderInputs, ResourceProvenance,
+};
 use commonkit_reconcile::PlanStore;
+use commonkit_relay::{
+    RelayAdapter, RelayConfig, RelayMutationInputs, RelayPlanRequest, plan_relay_operation,
+};
 use commonkit_service::{
-    ApplyStatus, ControlPlane, ControlToken, EventHub, ExecutionResult, PlanExecutor,
-    ServiceStatus, router_with_control,
+    ApplyStatus, ControlPlane, ControlToken, DomainFailure, EventHub, ExecutionResult,
+    PlanExecutor, RelayProviderAuthority, ServiceStatus, SyncDomain, resolved_mcp_from_materialized,
+    router_with_control,
 };
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -85,6 +94,134 @@ impl PlanExecutor for SuccessfulExecutor {
             failure_code: None,
         }
     }
+}
+
+struct MutableRelayDomain(Mutex<RelayProviderAuthority>);
+
+impl SyncDomain for MutableRelayDomain {
+    fn plan(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    fn verify(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    fn rollback(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
+fn relay_authority() -> RelayProviderAuthority {
+    let inputs = ProviderInputs::new(
+        StableId::parse("apm").unwrap(),
+        ExactProviderVersion::parse("0.25.0").unwrap(),
+        "apm.v1".into(),
+        BTreeMap::from([("manifest".into(), digest('1'))]),
+        vec!["agent-context".into()],
+    )
+    .unwrap();
+    let state = MaterializedState::finalize_with_capabilities(
+        inputs.clone(),
+        vec![],
+        vec![],
+        vec![],
+        vec![ProviderCapabilityResource {
+            capability: ProviderCapability::McpStreamableHttp {
+                id: "docs".into(),
+                name: "Docs".into(),
+                enabled: true,
+                url: "https://docs.example/mcp".into(),
+                headers: BTreeMap::new(),
+            },
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id,
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest,
+                source: "apm:mcp:docs".into(),
+            },
+        }],
+    )
+    .unwrap();
+    RelayProviderAuthority {
+        materialized_states: vec![state],
+        relay_is_target_local: true,
+        target_identity_digest: digest('3'),
+        composed_loadout_digest: digest('4'),
+        provider_inputs_digest: digest('5'),
+        policy_digest: digest('c'),
+        ownership_map_digest: digest('6'),
+        artifact_set_digest: digest('7'),
+    }
+}
+
+#[test]
+fn relay_apply_recomputes_authority_and_rejects_change_after_review() {
+    let root = temporary_directory("relay-authority-change");
+    fs::create_dir_all(&root).unwrap();
+    let live = root.join("relay.json");
+    let state_root = root.join("relay-state");
+    let authority = relay_authority();
+    let declaration_digest = commonkit_contracts::digest_domain_json(
+        "commonkit.resolved-mcp-declarations.v1",
+        &resolved_mcp_from_materialized(&authority.materialized_states).unwrap(),
+    )
+    .unwrap();
+    let confirmation = StableId::parse("relay-review").unwrap();
+    let mut adapter =
+        RelayAdapter::open(StableId::parse("relay").unwrap(), &live, &state_root).unwrap();
+    let operation = plan_relay_operation(
+        &mut adapter,
+        RelayPlanRequest {
+            desired: RelayConfig::normalize(serde_json::json!({"servers":[]})).unwrap(),
+            inputs: RelayMutationInputs {
+                provider_inputs_digest: authority.provider_inputs_digest.clone(),
+                policy_digest: authority.policy_digest.clone(),
+                target_digest: authority.target_identity_digest.clone(),
+                declaration_digest,
+                ownership_map_digest: authority.ownership_map_digest.clone(),
+                artifact_set_digest: authority.artifact_set_digest.clone(),
+                approved_confirmation_id: confirmation.clone(),
+                approval_idempotency_key: "relay-apply".into(),
+            },
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let plan = build_plan(PlanDraft {
+        target_id: StableId::parse("local").unwrap(),
+        desired_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: authority.policy_digest.clone(),
+        bindings: PlanBindings {
+            target_identity_digest: authority.target_identity_digest.clone(),
+            composed_loadout_digest: authority.composed_loadout_digest.clone(),
+            provider_inputs_digest: authority.provider_inputs_digest.clone(),
+            ownership_map_digest: authority.ownership_map_digest.clone(),
+            artifact_set_digest: authority.artifact_set_digest.clone(),
+        },
+        operations: vec![operation],
+    })
+    .unwrap();
+    let domain = Arc::new(MutableRelayDomain(Mutex::new(authority)));
+    let executor = Arc::new(SuccessfulExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let control = ControlPlane::new(executor.clone());
+    control
+        .set_target_sync_domains(BTreeMap::from([(
+            StableId::parse("local").unwrap(),
+            domain.clone() as Arc<dyn SyncDomain>,
+        )]))
+        .unwrap();
+    control.set_relay_execution_paths(live, state_root);
+    let plan = control.register_plan(plan).unwrap();
+
+    domain.0.lock().unwrap().policy_digest = digest('9');
+    assert!(control.apply(&plan.id, &confirmation, "relay-apply").is_err());
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
