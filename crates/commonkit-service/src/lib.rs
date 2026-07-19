@@ -1480,16 +1480,32 @@ impl DriftChecker for SelectedTargetsDriftChecker {
     }
 }
 
-enum ProductionDriftChecker {
+enum ProductionDriftMode {
     Single(SyncDomainDriftChecker),
     Selected(SelectedTargetsDriftChecker),
 }
 
+struct ProductionDriftChecker {
+    mode: std::sync::RwLock<ProductionDriftMode>,
+}
+
+impl ProductionDriftChecker {
+    fn new(mode: ProductionDriftMode) -> Self {
+        Self {
+            mode: std::sync::RwLock::new(mode),
+        }
+    }
+
+    fn replace(&self, mode: ProductionDriftMode) {
+        *self.mode.write().expect("drift checker lock") = mode;
+    }
+}
+
 impl DriftChecker for ProductionDriftChecker {
     fn check(&self) -> DriftResult {
-        match self {
-            Self::Single(checker) => checker.check(),
-            Self::Selected(checker) => checker.check(),
+        match &*self.mode.read().expect("drift checker lock") {
+            ProductionDriftMode::Single(checker) => checker.check(),
+            ProductionDriftMode::Selected(checker) => checker.check(),
         }
     }
 }
@@ -3394,6 +3410,7 @@ struct ProductionRuntimeReloader {
     plan_store: Arc<PlanStore>,
     relay_address: SocketAddr,
     relay_runtime: Arc<ManagedRelayRuntime>,
+    drift_checker: Arc<ProductionDriftChecker>,
 }
 
 impl RuntimeReloader for ProductionRuntimeReloader {
@@ -3427,9 +3444,17 @@ impl RuntimeReloader for ProductionRuntimeReloader {
         let executor = Arc::new(TargetIdentityPlanExecutor::new(fallback, target_executors));
         let targets = registry.targets.clone();
         let target_sync = registry.target_sync_domains.clone();
+        let drift_mode = match targets.clone() {
+            Some(targets) if !target_sync.is_empty() => ProductionDriftMode::Selected(
+                SelectedTargetsDriftChecker::new(targets, target_sync.clone()),
+            ),
+            _ => ProductionDriftMode::Single(SyncDomainDriftChecker::new(registry.sync.clone())),
+        };
         control
             .replace_runtime(executor, registry.into_headless(), targets, target_sync)
-            .map_err(|_| ServiceError::ReloadFailed)
+            .map_err(|_| ServiceError::ReloadFailed)?;
+        self.drift_checker.replace(drift_mode);
+        Ok(())
     }
 }
 
@@ -3541,17 +3566,19 @@ impl BoundServer {
         let control = ControlPlane::with_plan_store(executor, plan_store.clone());
         control
             .set_relay_execution_paths(paths.config.join("relay.json"), paths.state.join("relay"));
-        let drift_checker = Arc::new(match production_domains.targets.clone() {
-            Some(targets) if !production_domains.target_sync_domains.is_empty() => {
-                ProductionDriftChecker::Selected(SelectedTargetsDriftChecker::new(
-                    targets,
-                    production_domains.target_sync_domains.clone(),
-                ))
-            }
-            _ => ProductionDriftChecker::Single(SyncDomainDriftChecker::new(
-                production_domains.sync.clone(),
-            )),
-        });
+        let drift_checker = Arc::new(ProductionDriftChecker::new(
+            match production_domains.targets.clone() {
+                Some(targets) if !production_domains.target_sync_domains.is_empty() => {
+                    ProductionDriftMode::Selected(SelectedTargetsDriftChecker::new(
+                        targets,
+                        production_domains.target_sync_domains.clone(),
+                    ))
+                }
+                _ => ProductionDriftMode::Single(SyncDomainDriftChecker::new(
+                    production_domains.sync.clone(),
+                )),
+            },
+        ));
         let skill_canary = production_domains.skill_canary.clone();
         let skills = skill_canary.as_ref().map(|runtime| runtime.engine());
         if let Some(targets) = production_domains.targets.clone() {
@@ -3577,6 +3604,7 @@ impl BoundServer {
                 plan_store: plan_store.clone(),
                 relay_address,
                 relay_runtime: relay_runtime.clone(),
+                drift_checker: drift_checker.clone(),
             }));
         }
         let scheduler = Arc::new(
