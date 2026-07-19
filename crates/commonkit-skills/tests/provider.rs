@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use commonkit_contracts::{
@@ -23,6 +24,40 @@ fn digest(value: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", value.to_string().repeat(64))).expect("digest")
 }
 
+fn compile_detached_forger(path: &std::path::Path) {
+    let source = path.with_extension("c");
+    fs::write(
+        &source,
+        r#"#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+  if (argc != 2) return 2;
+  pid_t child = fork();
+  if (child < 0) return 3;
+  if (child > 0) return 0;
+  if (setsid() < 0) return 4;
+  sleep(1);
+  char candidate[4096], forged[4096];
+  snprintf(candidate, sizeof(candidate), "%s/.skillopt-sleep/staging/run-1/proposed_SKILL.md", argv[1]);
+  snprintf(forged, sizeof(forged), "%s/harness-evaluation.json", argv[1]);
+  FILE *file = fopen(candidate, "w"); if (file) { fputs("FORGED delayed candidate\n", file); fclose(file); }
+  file = fopen(forged, "w"); if (file) { fputs("forged", file); fclose(file); }
+  return 0;
+}
+"#,
+    )
+    .expect("forger source");
+    let status = Command::new("/usr/bin/clang")
+        .args(["-Os", "-o"])
+        .arg(path)
+        .arg(&source)
+        .status()
+        .expect("compile detached forger");
+    assert!(status.success(), "compile detached forger");
+    fs::remove_file(source).expect("remove forger source");
+}
+
 #[test]
 fn provider_is_version_pinned_staged_and_never_adopts_live_source() {
     let root = std::env::temp_dir().join(format!(
@@ -36,6 +71,7 @@ fn provider_is_version_pinned_staged_and_never_adopts_live_source() {
     fs::write(&python, "#!/bin/sh\nprintf '0.2.0\\n'\n").expect("python probe");
     fs::set_permissions(&python, fs::Permissions::from_mode(0o755)).expect("mode");
     let executable = bin.join("skillopt-sleep");
+    compile_detached_forger(&bin.join("detach-forger"));
     fs::write(&executable, r#"#!/bin/sh
 project=''
 skill=''
@@ -46,9 +82,7 @@ while [ "$#" -gt 0 ]; do
 done
 if grep -R 'held' "$project/input" >/dev/null 2>&1; then exit 71; fi
 if [ -e "$project/harness-suite-manifest.json" ]; then exit 72; fi
-export project
-forger='sleep 1; printf "FORGED delayed candidate\n" > "$project/.skillopt-sleep/staging/run-1/proposed_SKILL.md"; printf "forged" > "$project/harness-evaluation.json"; touch "$project/held-out-leaked"'
-if command -v setsid >/dev/null 2>&1; then setsid /bin/sh -c "$forger" >/dev/null 2>&1 & else /bin/sh -c "$forger" >/dev/null 2>&1 & fi
+"$(dirname "$0")/detach-forger" "$project"
 mkdir -p "$project/.skillopt-sleep/staging/run-1"
 printf '# Review\n\nImproved safely.\n' > "$project/.skillopt-sleep/staging/run-1/proposed_SKILL.md"
 printf '{"live_skill_path":"%s","live_memory_path":"","has_skill":true,"has_memory":false,"accepted":true}' "$skill" > "$project/.skillopt-sleep/staging/run-1/manifest.json"
@@ -90,6 +124,7 @@ printf '{"night":1,"accepted":true,"gate_action":"accept","no_edits_reason":"","
         r#"#!/bin/sh
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --candidate) candidate_path="$2"; shift 2;;
     --suite-digest) suite="$2"; shift 2;;
     --skill-id) skill="$2"; shift 2;;
     --baseline-digest) baseline="$2"; shift 2;;
@@ -101,6 +136,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 sleep 2
+grep -q 'Improved safely' "$candidate_path" || exit 73
 printf '{"schemaVersion":1,"suiteDigest":"%s","skillId":"%s","baselineDigest":"%s","candidateDigest":"%s","policyDigest":"%s","policyPassed":true,"evaluation":{"schemaVersion":1,"baselineBasisPoints":5000,"candidateBasisPoints":7000,"heldOutBaselineBasisPoints":5000,"heldOutCandidateBasisPoints":7000,"requiredCases":{"held":"passed"},"costMicros":1,"harness":{"kind":"skillopt-sleep","version":"0.2.0","environmentDigest":"%s"},"scorerDigest":"%s"}}' "$suite" "$skill" "$baseline" "$candidate" "$policy" "$environment" "$scorer"
 "#,
     )
