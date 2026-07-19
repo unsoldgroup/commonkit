@@ -824,6 +824,53 @@ pub struct TargetDispatchPlanExecutor {
     ssh: Option<Arc<dyn PlanExecutor>>,
 }
 
+pub struct TargetIdentityPlanExecutor {
+    fallback: Arc<dyn PlanExecutor>,
+    targets: BTreeMap<StableId, Arc<dyn PlanExecutor>>,
+}
+
+impl TargetIdentityPlanExecutor {
+    pub fn new(
+        fallback: Arc<dyn PlanExecutor>,
+        targets: BTreeMap<StableId, Arc<dyn PlanExecutor>>,
+    ) -> Self {
+        Self { fallback, targets }
+    }
+}
+
+impl PlanExecutor for TargetIdentityPlanExecutor {
+    fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult {
+        let filesystem = plan
+            .operations
+            .iter()
+            .all(|operation| matches!(operation.adapter_id.as_str(), "files" | "ssh-files"));
+        let mixed_filesystem = plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() == "files")
+            && plan
+                .operations
+                .iter()
+                .any(|operation| operation.adapter_id.as_str() == "ssh-files");
+        if mixed_filesystem {
+            return ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("mixed_target_plan")),
+            };
+        }
+        if filesystem && !plan.operations.is_empty() {
+            return self.targets.get(&plan.target_id).map_or(
+                ExecutionResult {
+                    status: ApplyStatus::Failed,
+                    failure_code: Some(stable_code("target_executor_unavailable")),
+                },
+                |executor| executor.execute(plan, confirmation_id),
+            );
+        }
+        self.fallback.execute(plan, confirmation_id)
+    }
+}
+
 impl TargetDispatchPlanExecutor {
     pub fn new(local: Arc<dyn PlanExecutor>, ssh: Option<Arc<dyn PlanExecutor>>) -> Self {
         Self { local, ssh }
@@ -2967,11 +3014,10 @@ impl BoundServer {
             plan_store.clone(),
             paths.receipts.clone(),
         )?;
-        let ssh_executor = production_domains.ssh_executor(plan_store.clone(), &paths.receipts)?;
-        let executor = Arc::new(TargetDispatchPlanExecutor::new(
-            local_executor,
-            ssh_executor,
-        ));
+        let target_executors =
+            production_domains.target_executors(plan_store.clone(), &paths.receipts)?;
+        let fallback = Arc::new(TargetDispatchPlanExecutor::new(local_executor, None));
+        let executor = Arc::new(TargetIdentityPlanExecutor::new(fallback, target_executors));
         let control = ControlPlane::with_plan_store(executor, plan_store);
         let drift_checker = Arc::new(match production_domains.targets.clone() {
             Some(targets) if !production_domains.target_sync_domains.is_empty() => {

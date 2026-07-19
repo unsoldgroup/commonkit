@@ -46,6 +46,8 @@ struct ProductionConfig {
     targets: Option<TargetInventoryConfig>,
     composition: Option<CompositionConfig>,
     sync: Option<SyncConfig>,
+    #[serde(default)]
+    sync_targets: Vec<SyncConfig>,
     credentials: Option<CredentialConfig>,
     snapshots: Option<SnapshotConfig>,
     skill_canary: Option<SkillCanaryConfig>,
@@ -221,6 +223,7 @@ pub struct ProductionDomainRegistry {
     pub(crate) skill_canary: Option<Arc<SkillCanaryRuntime>>,
     pub targets: Option<Arc<crate::TargetInventory>>,
     pub target_sync_domains: BTreeMap<StableId, Arc<dyn SyncDomain>>,
+    sync_configs: BTreeMap<StableId, SyncConfig>,
     ssh_execution: Option<(PathBuf, ProductionSshTarget)>,
 }
 
@@ -370,6 +373,57 @@ impl PlanExecutor for ProductionSshPlanExecutor {
 }
 
 impl ProductionDomainRegistry {
+    pub fn target_executors(
+        &self,
+        plan_store: Arc<PlanStore>,
+        receipt_root: impl AsRef<Path>,
+    ) -> Result<BTreeMap<StableId, Arc<dyn PlanExecutor>>, ProductionDomainError> {
+        self.target_executors_with_factory(
+            plan_store,
+            receipt_root,
+            Arc::new(ProcessSshTransportFactory),
+        )
+    }
+
+    pub fn target_executors_with_factory(
+        &self,
+        plan_store: Arc<PlanStore>,
+        receipt_root: impl AsRef<Path>,
+        factory: Arc<dyn ProductionSshTransportFactory>,
+    ) -> Result<BTreeMap<StableId, Arc<dyn PlanExecutor>>, ProductionDomainError> {
+        let mut executors = BTreeMap::new();
+        for (id, config) in &self.sync_configs {
+            let executor: Arc<dyn PlanExecutor> = match config
+                .target_transport
+                .as_ref()
+                .unwrap_or(&SyncTargetTransport::Local)
+            {
+                SyncTargetTransport::Local => Arc::new(
+                    crate::LocalPlanExecutor::open(
+                        plan_store.clone(),
+                        receipt_root.as_ref(),
+                        &config.target_root,
+                        &config.adapter_state,
+                    )
+                    .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                ),
+                transport @ SyncTargetTransport::Ssh { .. } => Arc::new(
+                    ProductionSshPlanExecutor::with_factory(
+                        plan_store.clone(),
+                        receipt_root.as_ref(),
+                        config.adapter_state.clone(),
+                        production_ssh_target(transport)
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                        factory.clone(),
+                    )
+                    .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                ),
+            };
+            executors.insert(id.clone(), executor);
+        }
+        Ok(executors)
+    }
+
     pub fn ssh_executor(
         &self,
         plan_store: Arc<PlanStore>,
@@ -417,6 +471,7 @@ impl ProductionDomainRegistry {
                 skill_canary: None,
                 targets: None,
                 target_sync_domains: BTreeMap::new(),
+                sync_configs: BTreeMap::new(),
                 ssh_execution: None,
             });
         }
@@ -446,6 +501,18 @@ impl ProductionDomainRegistry {
             return Err(ProductionDomainError::UnsafeConfig);
         }
         let config: ProductionConfig = serde_json::from_slice(&fs::read(config_path)?)?;
+        let mut sync_configs = BTreeMap::new();
+        for sync in config
+            .sync
+            .iter()
+            .chain(config.sync_targets.iter())
+            .cloned()
+        {
+            let id = sync.target_id.clone();
+            if sync_configs.insert(id, sync).is_some() {
+                return Err(ProductionDomainError::UnsafeConfig);
+            }
+        }
         let targets = if let Some(targets) = config.targets.as_ref() {
             if !targets.state.is_absolute() {
                 return Err(ProductionDomainError::UnsafeConfig);
@@ -460,33 +527,39 @@ impl ProductionDomainRegistry {
                 .map_err(|_| ProductionDomainError::UnsafeConfig)?,
             )
         } else {
-            config
-                .sync
-                .as_ref()
-                .map(|sync| {
-                    let transport = match sync.target_transport.as_ref() {
-                        Some(SyncTargetTransport::Ssh {
-                            host, user, port, ..
-                        }) => crate::TargetTransport::Ssh {
-                            host: host.clone(),
-                            user: user.clone(),
-                            port: *port,
-                        },
-                        _ => crate::TargetTransport::Local,
-                    };
-                    crate::TargetInventory::open(
-                        config_path.with_extension("targets.json"),
-                        vec![crate::TargetRecord {
+            if sync_configs.is_empty() {
+                None
+            } else {
+                let entries = sync_configs
+                    .values()
+                    .map(|sync| {
+                        let transport = match sync.target_transport.as_ref() {
+                            Some(SyncTargetTransport::Ssh {
+                                host, user, port, ..
+                            }) => crate::TargetTransport::Ssh {
+                                host: host.clone(),
+                                user: user.clone(),
+                                port: *port,
+                            },
+                            _ => crate::TargetTransport::Local,
+                        };
+                        crate::TargetRecord {
                             id: sync.target_id.clone(),
                             transport,
                             identity_digest: sync.target_identity_digest.clone(),
-                        }],
+                        }
+                    })
+                    .collect();
+                Some(
+                    crate::TargetInventory::open(
+                        config_path.with_extension("targets.json"),
+                        entries,
                         None,
                     )
                     .map(Arc::new)
-                    .map_err(|_| ProductionDomainError::UnsafeConfig)
-                })
-                .transpose()?
+                    .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                )
+            }
         };
         let ssh_execution =
             config
@@ -530,38 +603,23 @@ impl ProductionDomainRegistry {
                 },
             )
             .transpose()?;
-        let legacy_sync_target_id = config.sync.as_ref().map(|sync| sync.target_id.clone());
+        let mut target_sync_domains = BTreeMap::new();
+        for (id, sync_config) in &sync_configs {
+            validate_sync_config(sync_config)?;
+            target_sync_domains.insert(
+                id.clone(),
+                Arc::new(ProductionSyncDomain {
+                    config: sync_config.clone(),
+                    plan_store: plan_store.clone(),
+                    receipt_root: receipt_root.clone(),
+                    ssh_factory: ssh_factory.clone(),
+                }) as Arc<dyn SyncDomain>,
+            );
+        }
         let sync = config
             .sync
-            .map(
-                |config| -> Result<Arc<dyn SyncDomain>, ProductionDomainError> {
-                    let configured_pipeline = config.provider_pipeline.as_ref().is_some_and(|p| {
-                        p.root.is_absolute()
-                            && p.source.repository.is_absolute()
-                            && !p.providers.is_empty()
-                    });
-                    if (config.materialized_states.is_empty() && !configured_pipeline)
-                        || (!config.materialized_states.is_empty() && configured_pipeline)
-                        || config.declared_roots.is_empty()
-                        || !config.target_root.is_absolute()
-                        || !config.adapter_state.is_absolute()
-                        || !config.provider_artifacts.is_absolute()
-                    {
-                        return Err(ProductionDomainError::EmptyCapability);
-                    }
-                    Ok(Arc::new(ProductionSyncDomain {
-                        config,
-                        plan_store: plan_store.clone(),
-                        receipt_root: receipt_root.clone(),
-                        ssh_factory: ssh_factory.clone(),
-                    }))
-                },
-            )
-            .transpose()?;
-        let target_sync_domains = legacy_sync_target_id
-            .zip(sync.clone())
-            .into_iter()
-            .collect();
+            .as_ref()
+            .and_then(|legacy| target_sync_domains.get(&legacy.target_id).cloned());
         let credentials = config
             .credentials
             .map(
@@ -637,6 +695,7 @@ impl ProductionDomainRegistry {
             skill_canary,
             targets,
             target_sync_domains,
+            sync_configs,
             ssh_execution,
         })
     }
@@ -648,6 +707,24 @@ impl ProductionDomainRegistry {
             snapshots: self.snapshots,
         }
     }
+}
+
+fn validate_sync_config(config: &SyncConfig) -> Result<(), ProductionDomainError> {
+    let configured_pipeline = config.provider_pipeline.as_ref().is_some_and(|pipeline| {
+        pipeline.root.is_absolute()
+            && pipeline.source.repository.is_absolute()
+            && !pipeline.providers.is_empty()
+    });
+    if (config.materialized_states.is_empty() && !configured_pipeline)
+        || (!config.materialized_states.is_empty() && configured_pipeline)
+        || config.declared_roots.is_empty()
+        || !config.target_root.is_absolute()
+        || !config.adapter_state.is_absolute()
+        || !config.provider_artifacts.is_absolute()
+    {
+        return Err(ProductionDomainError::EmptyCapability);
+    }
+    Ok(())
 }
 
 fn unique_destinations(

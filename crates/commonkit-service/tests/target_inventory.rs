@@ -1,6 +1,11 @@
 use std::fs;
 
-use commonkit_contracts::{Sha256Digest, StableId, digest_domain_json};
+use commonkit_adapters::{
+    ArtifactStore, ContentSensitivity, ExactProviderVersion, FilesystemIntent, MaterializedState,
+    NormalizedManagedPath, NormalizedResource, ProviderInputs, ResourceProvenance,
+};
+use commonkit_contracts::{PlanBindings, Sha256Digest, StableId, digest_domain_json};
+use commonkit_core::{PlanDraft, build_plan};
 use commonkit_reconcile::PlanStore;
 use commonkit_service::ProductionDomainRegistry;
 use commonkit_service::{TargetInventory, TargetRecord, TargetTransport};
@@ -170,6 +175,23 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
             ),
         ]))
         .unwrap();
+    let digest = |value: &str| digest_domain_json("test.target-plan", &value).unwrap();
+    let local_plan = build_plan(PlanDraft {
+        target_id: StableId::parse("local").unwrap(),
+        desired_digest: digest("desired"),
+        observed_digest: digest("observed"),
+        policy_digest: digest("policy"),
+        bindings: PlanBindings {
+            target_identity_digest: digest("identity"),
+            composed_loadout_digest: digest("loadout"),
+            provider_inputs_digest: digest("providers"),
+            ownership_map_digest: digest("ownership"),
+            artifact_set_digest: digest("artifacts"),
+        },
+        operations: vec![],
+    })
+    .unwrap();
+    control.register_plan(local_plan.clone()).unwrap();
     let token = ControlToken::generate();
     let app = router_with_control(
         token.clone(),
@@ -245,6 +267,7 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
     assert_eq!(body["selected"], serde_json::json!(["remote"]));
 
     let plan = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -266,6 +289,30 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(plan.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["targetId"], "remote");
+
+    let mismatch = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/control/v1/targets/remote/plans/{}/apply",
+                    local_plan.id
+                ))
+                .header(header::HOST, "127.0.0.1:3764")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose_for_client()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "mismatch-test")
+                .body(Body::from(
+                    r#"{"confirmed":true,"confirmationId":"target-mismatch"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mismatch.status(), StatusCode::CONFLICT);
 }
 
 #[test]
@@ -318,6 +365,152 @@ fn production_config_loads_local_and_multiple_ssh_targets_without_a_sync_domain(
             .collect::<Vec<_>>(),
         vec!["build", "staging"]
     );
+}
+
+#[test]
+fn production_config_builds_a_sync_domain_for_each_local_and_ssh_target() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let digest = |name: &str| digest_domain_json("test.multi-target", &name).unwrap();
+    let sync = |id: &str, transport: serde_json::Value| {
+        serde_json::json!({
+            "targetId": id,
+            "targetRoot": root.join(format!("target-{id}")),
+            "adapterState": root.join(format!("adapter-{id}")),
+            "providerArtifacts": root.join("artifacts"),
+            "materializedStates": [root.join(format!("{id}.state.json"))],
+            "targetTransport": transport,
+            "declaredRoots": ["home"],
+            "protectedRoots": [".commonkit"],
+            "caseSensitive": true,
+            "targetIdentityDigest": digest(&format!("identity-{id}")),
+            "composedLoadoutDigest": digest("loadout"),
+            "policyDigest": digest("policy")
+        })
+    };
+    let config = root.join("headless.json");
+    fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "syncTargets": [
+                sync("local", serde_json::json!({"type":"local"})),
+                sync("remote", serde_json::json!({
+                    "type":"ssh", "rootId":"home-root", "host":"remote.internal", "user":"al",
+                    "port":22, "knownHosts":root.join("known_hosts"), "fingerprint":"SHA256:test"
+                }))
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let registry = ProductionDomainRegistry::load(
+        &config,
+        Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap();
+    assert_eq!(registry.target_sync_domains.len(), 2);
+    assert_eq!(registry.targets.as_ref().unwrap().targets().len(), 2);
+}
+
+#[test]
+fn production_local_target_executor_applies_to_each_configured_root_and_survives_restart() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+    let state_path = |id: &str, content: &[u8]| {
+        let reference = artifacts
+            .put(content, ContentSensitivity::Portable)
+            .unwrap();
+        let inputs = ProviderInputs::new(
+            StableId::parse(format!("native-{id}")).unwrap(),
+            ExactProviderVersion::parse("1.0.0").unwrap(),
+            "1".into(),
+            BTreeMap::from([(
+                "input".into(),
+                digest_domain_json("test.input", &id).unwrap(),
+            )]),
+            vec!["files".into()],
+        )
+        .unwrap();
+        let materialized = MaterializedState::finalize(
+            inputs.clone(),
+            vec![NormalizedResource {
+                intent: FilesystemIntent::File {
+                    path: NormalizedManagedPath::parse("home/managed.txt").unwrap(),
+                    content: reference,
+                    mode: None,
+                    expected_before: None,
+                },
+                provenance: ResourceProvenance {
+                    provider_id: inputs.provider_id.clone(),
+                    provider_version: inputs.provider_version.to_string(),
+                    input_digest: inputs.input_set_digest,
+                    source: format!("fixture-{id}"),
+                },
+            }],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let path = root.join(format!("{id}.state.json"));
+        fs::write(&path, serde_json::to_vec(&materialized).unwrap()).unwrap();
+        path
+    };
+    let first_state = state_path("first", b"first\n");
+    let second_state = state_path("second", b"second\n");
+    let digest = |value: &str| digest_domain_json("test.multi-executor", &value).unwrap();
+    let sync = |id: &str, state: &std::path::Path| {
+        serde_json::json!({
+            "targetId":id, "targetRoot":root.join(format!("target-{id}")),
+            "adapterState":root.join(format!("adapter-{id}")), "providerArtifacts":root.join("artifacts"),
+            "materializedStates":[state], "targetTransport":{"type":"local"},
+            "declaredRoots":["home"], "protectedRoots":[], "caseSensitive":true,
+            "targetIdentityDigest":digest(&format!("identity-{id}")),
+            "composedLoadoutDigest":digest("loadout"), "policyDigest":digest("policy")
+        })
+    };
+    let config = root.join("headless.json");
+    fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "syncTargets":[sync("first", &first_state), sync("second", &second_state)]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let plans = Arc::new(PlanStore::open(root.join("plans")).unwrap());
+    let registry =
+        ProductionDomainRegistry::load(&config, plans.clone(), root.join("receipts")).unwrap();
+    let executors = registry
+        .target_executors(plans.clone(), root.join("receipts"))
+        .unwrap();
+    for id in ["first", "second"] {
+        let target = StableId::parse(id).unwrap();
+        let plan_value = registry.target_sync_domains[&target]
+            .plan(serde_json::json!({"confirmed":true,"confirmationId":"integration-plan"}))
+            .unwrap();
+        let plan: commonkit_contracts::Plan = serde_json::from_value(plan_value).unwrap();
+        assert_eq!(
+            executors[&target]
+                .execute(&plan, &StableId::parse("integration-apply").unwrap())
+                .status,
+            ApplyStatus::Succeeded
+        );
+        assert_eq!(
+            fs::read(root.join(format!("target-{id}/home/managed.txt"))).unwrap(),
+            format!("{id}\n").as_bytes()
+        );
+    }
+    drop(registry);
+    let reopened = ProductionDomainRegistry::load(&config, plans, root.join("receipts")).unwrap();
+    assert_eq!(reopened.target_sync_domains.len(), 2);
+    for id in ["first", "second"] {
+        let verified = reopened.target_sync_domains[&StableId::parse(id).unwrap()]
+            .verify(serde_json::json!({}))
+            .unwrap();
+        assert_eq!(verified["verified"], true);
+    }
 }
 
 #[test]
