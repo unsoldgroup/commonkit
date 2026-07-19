@@ -526,6 +526,119 @@ fn concrete_git_publisher_recovers_both_post_push_interruption_windows() {
 
 #[cfg(unix)]
 #[test]
+fn concrete_git_publisher_recovers_through_a_later_remote_fast_forward() {
+    let fixture = GitFixture::new();
+    let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    let mut publisher = fixture.publisher();
+    publisher.set_failpoint(PublisherFailpoint::AfterPushBeforeLocalRef);
+    assert_eq!(
+        PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+            .unwrap()
+            .compare_and_swap_writer_published(
+                &fixture.database,
+                &initial.revision,
+                "machine-a",
+                "machine-b",
+                &fixture.parent,
+                &mut publisher,
+            ),
+        Err(SnapshotError::Interrupted)
+    );
+
+    let later = fixture.root.path().join("later-clone");
+    assert!(
+        std::process::Command::new("/usr/bin/git")
+            .args([
+                "clone",
+                "--branch",
+                "main",
+                fixture.remote.to_str().unwrap(),
+                later.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    GitFixture::git(&later, &["config", "user.name", "Unrelated Writer"]);
+    GitFixture::git(
+        &later,
+        &["config", "user.email", "unrelated-writer@localhost"],
+    );
+    fs::write(later.join("unrelated.txt"), b"retain me").unwrap();
+    GitFixture::git(&later, &["add", "unrelated.txt"]);
+    GitFixture::git(&later, &["commit", "-m", "unrelated fast-forward"]);
+    GitFixture::git(&later, &["push", "origin", "main"]);
+    let remote_head = GitFixture::git(&later, &["rev-parse", "HEAD"]);
+
+    let recovered = fixture
+        .publisher()
+        .recover_pending_publication()
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.database, fixture.database);
+    assert_eq!(
+        GitFixture::git(&fixture.clone, &["rev-parse", "HEAD"]),
+        remote_head
+    );
+    assert_eq!(
+        fs::read(fixture.clone.join("unrelated.txt")).unwrap(),
+        b"retain me"
+    );
+    assert_eq!(
+        PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+            .unwrap()
+            .read(&fixture.database)
+            .unwrap()
+            .record
+            .current_writer,
+        "machine-b"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn concrete_git_publisher_recovery_rejects_a_non_descendant_remote_head() {
+    let fixture = GitFixture::new();
+    let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    let mut publisher = fixture.publisher();
+    publisher.set_failpoint(PublisherFailpoint::AfterPushBeforeLocalRef);
+    assert_eq!(
+        PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+            .unwrap()
+            .compare_and_swap_writer_published(
+                &fixture.database,
+                &initial.revision,
+                "machine-a",
+                "machine-b",
+                &fixture.parent,
+                &mut publisher,
+            ),
+        Err(SnapshotError::Interrupted)
+    );
+    GitFixture::git(
+        &fixture.clone,
+        &[
+            "push",
+            "--force",
+            "origin",
+            &format!("{}:main", fixture.parent),
+        ],
+    );
+
+    assert_eq!(
+        fixture.publisher().recover_pending_publication(),
+        Err(SnapshotError::PortableAuthorityRollback)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn fresh_clone_rejects_a_force_rolled_back_branch_using_remote_generation_anchor() {
     let fixture = GitFixture::new();
     let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)

@@ -525,9 +525,7 @@ impl ProcessGitAuthorityPublisher {
             pending.generation,
             &pending.authority_revision,
         )?;
-        if self.trusted_remote_revision()? != pending.repository_revision {
-            return Err(SnapshotError::PortableAuthorityRollback);
-        }
+        let remote_head = self.trusted_remote_revision()?;
         let remote_ref = format!("refs/heads/{}", self.branch);
         self.git_status(
             &pending.clone,
@@ -538,6 +536,42 @@ impl ProcessGitAuthorityPublisher {
                 &remote_ref,
             ],
         )?;
+        let publication_is_ancestor = Command::new(&self.executable)
+            .arg("-C")
+            .arg(&pending.clone)
+            .args([
+                "merge-base",
+                "--is-ancestor",
+                &pending.repository_revision,
+                &remote_head,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !publication_is_ancestor.success() {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        let portable = self
+            .portable_relative
+            .to_str()
+            .ok_or(SnapshotError::InvalidObjectStore)?;
+        let portable_unchanged = Command::new(&self.executable)
+            .arg("-C")
+            .arg(&pending.clone)
+            .args([
+                "diff",
+                "--quiet",
+                &pending.repository_revision,
+                &remote_head,
+                "--",
+                portable,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !portable_unchanged.success() {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
         self.git_status(
             &pending.clone,
             &[
@@ -557,20 +591,39 @@ impl ProcessGitAuthorityPublisher {
             ],
         )?;
         let local_ref = format!("refs/heads/{}", self.branch);
+        if self.git_output(&self.repository, &["symbolic-ref", "HEAD"])? != local_ref {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
         let current = self.git_output(&self.repository, &["rev-parse", &local_ref])?;
-        if current != pending.repository_revision {
-            self.git_status(
-                &self.repository,
-                &[
-                    "update-ref",
-                    &local_ref,
-                    &pending.repository_revision,
-                    &pending.expected_parent,
-                ],
-            )?;
+        if current != pending.expected_parent
+            && current != pending.repository_revision
+            && current != remote_head
+        {
+            return Err(SnapshotError::PortableAuthorityRollback);
         }
         let source = pending.clone.join(&self.portable_relative);
         let destination = self.repository.join(&self.portable_relative);
+        // Prior successful publications intentionally advance the branch ref before installing
+        // their managed subtree. Reconcile only that CommonKit-owned subtree to the validated
+        // local commit so an interrupted index cannot block the later fast-forward. Unrelated
+        // worktree edits remain untouched and make `merge --ff-only` fail safely on conflict.
+        self.git_status(&self.repository, &["checkout", &current, "--", portable])?;
+        if current != remote_head {
+            let local_can_fast_forward = Command::new(&self.executable)
+                .arg("-C")
+                .arg(&self.repository)
+                .args(["merge-base", "--is-ancestor", &current, &remote_head])
+                .stdin(Stdio::null())
+                .status()
+                .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+            if !local_can_fast_forward.success() {
+                return Err(SnapshotError::PortableAuthorityRollback);
+            }
+            self.git_status(
+                &self.repository,
+                &["merge", "--ff-only", "--no-edit", &remote_head],
+            )?;
+        }
         if destination.exists() {
             std::fs::remove_dir_all(&destination).map_err(|_| SnapshotError::ObjectStoreFailed)?;
         }

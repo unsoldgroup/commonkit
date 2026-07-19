@@ -1260,6 +1260,48 @@ fn production_startup_completes_promotion_after_each_post_push_interruption_wind
             Err(SnapshotError::Interrupted)
         );
 
+        let later_clone = root.join(format!("later-fast-forward-{index}"));
+        assert!(
+            std::process::Command::new(git_executable())
+                .args([
+                    "clone",
+                    "--branch",
+                    "main",
+                    remote.to_str().unwrap(),
+                    later_clone.to_str().unwrap(),
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        for args in [
+            ["config", "user.name", "Unrelated Writer"],
+            ["config", "user.email", "unrelated-writer@localhost"],
+        ] {
+            let status = std::process::Command::new(git_executable())
+                .arg("-C")
+                .arg(&later_clone)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let unrelated = format!("unrelated-after-interruption-{index}.txt");
+        std::fs::write(later_clone.join(&unrelated), b"retain me").unwrap();
+        for args in [
+            vec!["add", unrelated.as_str()],
+            vec!["commit", "-m", "unrelated fast-forward"],
+            vec!["push", "origin", "main"],
+        ] {
+            let status = std::process::Command::new(git_executable())
+                .arg("-C")
+                .arg(&later_clone)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+
         drop(registry);
         let restarted = ProductionDomainRegistry::load(
             &config,
@@ -1272,6 +1314,13 @@ fn production_startup_completes_promotion_after_each_post_push_interruption_wind
             "candidate"
         );
         assert!(local.unfinished_promotions().unwrap().is_empty());
+        assert_eq!(std::fs::read(root.join(unrelated)).unwrap(), b"retain me");
+        assert!(
+            root.join("snapshots/authority/promotions")
+                .join(run_id)
+                .join("receipt.json")
+                .is_file()
+        );
     }
 }
 
