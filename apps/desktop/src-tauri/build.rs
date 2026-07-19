@@ -6,7 +6,7 @@ fn main() {
         let extension = if target.contains("windows") { ".exe" } else { "" };
         let directory = std::path::Path::new("binaries");
         std::fs::create_dir_all(directory).expect("create debug sidecar directory");
-        for binary in ["commonkit", "commonkitd"] {
+        for binary in ["commonkit", "commonkitd", "commonkit-target-helper"] {
             let path = directory.join(format!("{binary}-{target}{extension}"));
             if !path.exists() {
                 std::fs::write(path, []).expect("create debug-only sidecar placeholder");

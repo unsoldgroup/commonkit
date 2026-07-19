@@ -41,6 +41,10 @@ commonkit --version
 commonkitd --port 0
 ```
 
+For unattended operation, run `commonkit daemon install` and `commonkit daemon start`; see
+[the service guide](docs/DAEMON-SERVICE.md). SSH targets use the separately packaged helper in
+[the target-helper guide](docs/TARGET-HELPER.md).
+
 The daemon creates private, platform-native config and state roots plus a
 0600/ACL-protected control token. In a second terminal, create or connect a kit:
 

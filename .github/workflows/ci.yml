@@ -91,6 +91,7 @@ jobs:
           install_root="$RUNNER_TEMP/commonkit-install"
           cargo install --locked --path crates/commonkit-cli --root "$install_root"
           cargo install --locked --path crates/commonkit-service --root "$install_root"
+          cargo install --locked --path crates/commonkit-adapters --bin commonkit-target-helper --root "$install_root"
           cargo install --locked --path crates/commonkit-snapshots --bin commonkit-snapshot-recovery-fixture --root "$install_root"
           echo "$install_root/bin" >> "$GITHUB_PATH"
       - name: Execute complete installed-artifact lifecycle
@@ -99,6 +100,15 @@ jobs:
           set -euo pipefail
           chmod +x scripts/installed-lifecycle.sh
           scripts/installed-lifecycle.sh "$RUNNER_TEMP/commonkit-lifecycle" "$RUNNER_TEMP/commonkit-install/bin"
+      - name: Exercise installed helper through isolated OpenSSH
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends openssh-server
+          chmod +x scripts/installed-helper-ssh-smoke.sh
+          scripts/installed-helper-ssh-smoke.sh "$RUNNER_TEMP/commonkit-ssh-smoke" "$RUNNER_TEMP/commonkit-install/bin"
       - name: Execute legacy-to-Rust relay compatibility suite
         shell: bash
         env:

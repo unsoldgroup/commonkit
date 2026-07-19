@@ -127,7 +127,7 @@ jobs:
           for _ in $(seq 1 200); do test -s "$report" && break; sleep 0.1; done
           test -s "$report"
           wait "$desktop_pid"
-          node -e 'const r=require(process.argv[1]);if(r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon)process.exit(1)' "$report"
+          node -e 'const r=require(process.argv[1]);if(r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon||!r.bundledTargetHelper)process.exit(1)' "$report"
       - name: Install previous signed Debian release
         if: runner.os == 'Linux'
         shell: bash
@@ -165,7 +165,7 @@ jobs:
           for _ in $(seq 1 200); do test -s "$report" && break; sleep 0.1; done
           test -s "$report"
           wait "$desktop_pid"
-          node -e 'const r=require(process.argv[1]);if(r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon)process.exit(1)' "$report"
+          node -e 'const r=require(process.argv[1]);if(r.serviceState!=="healthy"||!r.bundledCli||!r.bundledDaemon||!r.bundledTargetHelper)process.exit(1)' "$report"
       - name: Install previous signed NSIS release
         if: runner.os == 'Windows'
         shell: pwsh
@@ -204,7 +204,7 @@ jobs:
           $process.WaitForExit()
           if ($process.ExitCode -ne 0) { throw "Installed desktop smoke failed: $($process.ExitCode)" }
           $result = Get-Content $report -Raw | ConvertFrom-Json
-          if ($result.serviceState -ne 'healthy' -or -not $result.bundledCli -or -not $result.bundledDaemon) {
+          if ($result.serviceState -ne 'healthy' -or -not $result.bundledCli -or -not $result.bundledDaemon -or -not $result.bundledTargetHelper) {
             throw 'Installed desktop did not launch a healthy bundled runtime'
           }
       - name: Verify current standalone CLI
@@ -229,14 +229,17 @@ jobs:
             macOS)
               cp current/commonkit-macos-universal "$installed/commonkit"
               cp current/commonkitd-macos-universal "$installed/commonkitd"
+              cp current/commonkit-target-helper-macos-universal "$installed/commonkit-target-helper"
               ;;
             Linux)
               cp current/commonkit-linux-x86_64 "$installed/commonkit"
               cp current/commonkitd-linux-x86_64 "$installed/commonkitd"
+              cp current/commonkit-target-helper-linux-x86_64 "$installed/commonkit-target-helper"
               ;;
             Windows)
               cp current/commonkit-windows-x86_64.exe "$installed/commonkit.exe"
               cp current/commonkitd-windows-x86_64.exe "$installed/commonkitd.exe"
+              cp current/commonkit-target-helper-windows-x86_64.exe "$installed/commonkit-target-helper.exe"
               ;;
           esac
           cargo install --locked --path crates/commonkit-snapshots \

@@ -25,7 +25,7 @@ case "$target" in
     ;;
 esac
 
-for binary in commonkit commonkitd; do
+for binary in commonkit commonkitd commonkit-target-helper; do
   source_path="$artifacts/$binary-$suffix$extension"
   destination_path="$destination/$binary-$target$extension"
   test -f "$source_path"

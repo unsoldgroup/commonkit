@@ -28,6 +28,11 @@ enum Command {
     },
     /// Report local runtime paths and contract versions.
     Status,
+    /// Install and manage the unattended per-user CommonKit daemon.
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommand,
+    },
     /// List and select configured local and SSH targets.
     Targets {
         #[command(subcommand)]
@@ -92,6 +97,15 @@ enum Command {
         #[command(subcommand)]
         command: SkillsCommand,
     },
+}
+
+#[derive(Subcommand)]
+enum DaemonCommand {
+    Install,
+    Start,
+    Status,
+    Restart,
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -564,6 +578,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 }))?
             );
         }
+        Command::Daemon { command } => run_daemon_lifecycle(command)?,
         Command::Targets { command } => {
             match command {
                 TargetCommand::List => {
@@ -739,6 +754,28 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Snapshots { command } => run_snapshots(command)?,
         Command::Skills { command } => run_skills(command)?,
     }
+    Ok(())
+}
+
+fn run_daemon_lifecycle(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
+    let current = std::env::current_exe()?;
+    let extension = if cfg!(windows) { ".exe" } else { "" };
+    let daemon = current
+        .parent()
+        .ok_or("installed CLI has no parent directory")?
+        .join(format!("commonkitd{extension}"));
+    if !daemon.is_file() {
+        return Err(format!("installed daemon is missing: {}", daemon.display()).into());
+    }
+    let service = commonkit_cli::daemon_lifecycle::DaemonService::discover(daemon)?;
+    let status = match command {
+        DaemonCommand::Install => service.install()?,
+        DaemonCommand::Start => service.start()?,
+        DaemonCommand::Status => service.status()?,
+        DaemonCommand::Restart => service.restart()?,
+        DaemonCommand::Uninstall => service.uninstall()?,
+    };
+    println!("{}", serde_json::to_string_pretty(&status)?);
     Ok(())
 }
 

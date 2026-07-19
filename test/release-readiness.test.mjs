@@ -142,6 +142,7 @@ test("CI exercises an unsigned installed CLI and daemon lifecycle on every OS", 
   assert.match(workflow, /unsigned-installed-lifecycle/);
   assert.match(workflow, /cargo install --locked --path crates\/commonkit-cli/);
   assert.match(workflow, /cargo install --locked --path crates\/commonkit-service/);
+  assert.match(workflow, /commonkit-target-helper/);
   assert.match(workflow, /commonkitd/);
   assert.match(workflow, /installed-lifecycle\.sh/);
   assert.match(workflow, /commonkit-snapshot-recovery-fixture/);
@@ -156,7 +157,26 @@ test("CI exercises an unsigned installed CLI and daemon lifecycle on every OS", 
   assert.match(harness, /"\$recovery_fixture" recover/);
   assert.match(harness, /"\$commonkit" relay status/);
   assert.match(harness, /ssh/);
+  assert.match(harness, /"\$target_helper" --stdio-v1/);
+  assert.doesNotMatch(harness, /target-helper.*\.mjs/);
+  for (const command of ["install", "start", "status", "restart", "uninstall"]) {
+    assert.match(harness, new RegExp(`"\\$commonkit" daemon ${command}`));
+  }
   assert.match(workflow, /test:compatibility/);
+});
+
+test("release artifacts include and verify the target helper on every platform", async () => {
+  const [builder, verifier, desktop] = await Promise.all([
+    read("scripts/build-release-cli.sh"),
+    read("scripts/verify-release-assets.mjs"),
+    read("apps/desktop/src-tauri/tauri.conf.json"),
+  ]);
+  for (const source of [builder, verifier, desktop]) {
+    assert.match(source, /commonkit-target-helper/);
+  }
+  for (const suffix of ["macos-universal", "linux-x86_64", "windows-x86_64\\.exe"]) {
+    assert.match(verifier, new RegExp(`commonkit-target-helper-${suffix}`));
+  }
 });
 
 test("CI isolates the real APM integration behind a checksum-verified provider gate", async () => {

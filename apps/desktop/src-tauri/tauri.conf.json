@@ -30,7 +30,8 @@
     "targets": "all",
     "externalBin": [
       "binaries/commonkit",
-      "binaries/commonkitd"
+      "binaries/commonkitd",
+      "binaries/commonkit-target-helper"
     ],
     "icon": [
       "icons/32x32.png",

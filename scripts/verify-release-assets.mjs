@@ -15,14 +15,17 @@ for (const [label, predicate] of [
   ["macOS updater", (name) => name.endsWith(".app.tar.gz")],
   ["macOS CLI", (name) => name === "commonkit-macos-universal"],
   ["macOS daemon", (name) => name === "commonkitd-macos-universal"],
+  ["macOS target helper", (name) => name === "commonkit-target-helper-macos-universal"],
   ["Linux AppImage", (name) => name.endsWith(".AppImage")],
   ["Linux Debian package", (name) => name.endsWith(".deb")],
   ["Linux CLI", (name) => name === "commonkit-linux-x86_64"],
   ["Linux daemon", (name) => name === "commonkitd-linux-x86_64"],
+  ["Linux target helper", (name) => name === "commonkit-target-helper-linux-x86_64"],
   ["Windows NSIS installer", (name) => name.endsWith("-setup.exe")],
   ["Windows updater", (name) => name.endsWith(".nsis.zip")],
   ["Windows CLI", (name) => name === "commonkit-windows-x86_64.exe"],
   ["Windows daemon", (name) => name === "commonkitd-windows-x86_64.exe"],
+  ["Windows target helper", (name) => name === "commonkit-target-helper-windows-x86_64.exe"],
 ]) {
   if (!names.some(predicate)) throw new Error(`${label} release payload missing`);
 }
