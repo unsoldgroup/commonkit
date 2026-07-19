@@ -6,7 +6,8 @@ use std::{
 
 use commonkit_snapshots::{
     DatabaseId, DeterministicTestCipher, PortableAuthorityFailpoint, PortableAuthorityPublisher,
-    PortableAuthorityStore, ProcessGitAuthorityPublisher, PublisherFailpoint, SnapshotError,
+    PortableAuthorityStore, PortablePublication, ProcessGitAuthorityPublisher, PublisherFailpoint,
+    SnapshotError,
 };
 use sha2::{Digest, Sha256};
 
@@ -580,6 +581,99 @@ fn fresh_clone_rejects_a_force_rolled_back_branch_using_remote_generation_anchor
 }
 
 #[cfg(unix)]
+#[test]
+fn fresh_clone_accepts_authority_when_latest_anchor_precedes_unrelated_kit_commits() {
+    let fixture = GitFixture::new();
+    let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    let published = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .compare_and_swap_writer_published(
+            &fixture.database,
+            &initial.revision,
+            "machine-a",
+            "machine-b",
+            &fixture.parent,
+            &mut fixture.publisher(),
+        )
+        .unwrap();
+
+    fs::write(fixture.clone.join("README.md"), b"unrelated kit change\n").unwrap();
+    GitFixture::git(&fixture.clone, &["add", "README.md"]);
+    GitFixture::git(&fixture.clone, &["commit", "-m", "unrelated kit change"]);
+    GitFixture::git(&fixture.clone, &["push", "origin", "main"]);
+
+    let fresh = fixture.root.path().join("fresh-after-unrelated-change");
+    assert!(
+        std::process::Command::new("/usr/bin/git")
+            .args([
+                "clone",
+                "--branch",
+                "main",
+                fixture.remote.to_str().unwrap(),
+                fresh.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    ProcessGitAuthorityPublisher::new(
+        "/usr/bin/git",
+        &fresh,
+        fixture.remote.to_str().unwrap(),
+        "main",
+        "kit",
+        fixture.root.path().join("fresh-unrelated-staging"),
+    )
+    .unwrap()
+    .verify_remote_trust_anchor(
+        &fixture.database,
+        published.authority.record.generation,
+        &published.authority.revision,
+    )
+    .unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn missing_remote_anchor_namespace_fails_closed() {
+    let fixture = GitFixture::new();
+    let output = std::process::Command::new("/usr/bin/git")
+        .args([
+            "ls-remote",
+            fixture.remote.to_str().unwrap(),
+            &format!("refs/tags/commonkit-authority/{}/*", fixture.database),
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    for reference in String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| line.split_whitespace().nth(1).unwrap().to_owned())
+    {
+        GitFixture::git(
+            &fixture.clone,
+            &["push", "origin", &format!(":{reference}")],
+        );
+    }
+    let authority = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    assert_eq!(
+        fixture.publisher().verify_remote_trust_anchor(
+            &fixture.database,
+            authority.record.generation,
+            &authority.revision,
+        ),
+        Err(SnapshotError::PortableAuthorityRollback)
+    );
+}
+
+#[cfg(unix)]
 struct GitFixture {
     root: tempfile::TempDir,
     remote: std::path::PathBuf,
@@ -645,14 +739,30 @@ impl GitFixture {
                 .success()
         );
         let parent = Self::git(&clone, &["rev-parse", "HEAD"]);
-        Self {
+        let fixture = Self {
             root,
             remote,
             clone,
             parent,
             cipher,
             database,
-        }
+        };
+        let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+            .unwrap()
+            .read(&fixture.database)
+            .unwrap();
+        fixture
+            .publisher()
+            .bootstrap_remote_trust_anchor(
+                &fixture.clone.join("kit"),
+                &PortablePublication {
+                    database: fixture.database.clone(),
+                    generation: initial.record.generation,
+                    authority_revision: initial.revision,
+                },
+            )
+            .unwrap();
+        fixture
     }
 
     fn publisher(&self) -> ProcessGitAuthorityPublisher {

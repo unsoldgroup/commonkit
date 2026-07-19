@@ -408,10 +408,7 @@ impl ProcessGitAuthorityPublisher {
         let pattern = format!("refs/tags/commonkit-authority/{database}/*");
         let refs = self.remote_refs(&pattern)?;
         if refs.is_empty() {
-            // A kit that has never published through CommonKit has no remote anchor yet. The
-            // first atomic publication establishes it; after that, the tag is independently
-            // monotonic even if an administrator force-rolls the kit branch back.
-            return Ok(());
+            return Err(SnapshotError::PortableAuthorityRollback);
         }
         let mut parsed = refs
             .into_iter()
@@ -433,6 +430,7 @@ impl ProcessGitAuthorityPublisher {
         let latest = parsed
             .last()
             .ok_or(SnapshotError::PortableAuthorityRollback)?;
+        let remote_head = self.trusted_remote_revision()?;
         if parsed
             .iter()
             .rev()
@@ -441,11 +439,49 @@ impl ProcessGitAuthorityPublisher {
             != 1
             || latest.0 != generation
             || latest.1 != authority_revision
-            || latest.2 != self.trusted_remote_revision()?
         {
             return Err(SnapshotError::PortableAuthorityRollback);
         }
+        let remote_ref = format!("refs/heads/{}", self.branch);
+        self.git_status(
+            &self.repository,
+            &[
+                "fetch",
+                "--no-tags",
+                self.trusted_remote_url.as_str(),
+                &remote_ref,
+            ],
+        )?;
+        let ancestry = Command::new(&self.executable)
+            .arg("-C")
+            .arg(&self.repository)
+            .args(["merge-base", "--is-ancestor", &latest.2, &remote_head])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !ancestry.success() {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
         Ok(())
+    }
+
+    /// Establishes the first immutable authority anchor for a repository. This is deliberately
+    /// separate from verification: callers must opt into genesis once, while every normal open
+    /// fails closed when the anchor namespace is absent.
+    pub fn bootstrap_remote_trust_anchor(
+        &mut self,
+        staged_portable_root: &Path,
+        publication: &PortablePublication,
+    ) -> Result<String, SnapshotError> {
+        let pattern = format!("refs/tags/commonkit-authority/{}/*", publication.database);
+        if !self.remote_refs(&pattern)?.is_empty() {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
+        let expected_parent = self.trusted_remote_revision()?;
+        if self.checked_out_revision()? != expected_parent {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
+        self.publish(&expected_parent, staged_portable_root, publication)
     }
 
     pub fn recover_pending_publication(
@@ -666,20 +702,29 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
                 .to_str()
                 .ok_or(SnapshotError::InvalidObjectStore)?;
             self.git_status(&clone, &["add", "--", portable])?;
-            if let Err(error) = self.git_status(
-                &clone,
-                &[
-                    "-c",
-                    "user.name=CommonKit",
-                    "-c",
-                    "user.email=commonkit@localhost",
-                    "commit",
-                    "-m",
-                    "commonkit: publish portable authority",
-                ],
-            ) {
-                let _ = std::fs::remove_file(self.pending_path());
-                return Err(error);
+            let staged_changes = Command::new(&self.executable)
+                .arg("-C")
+                .arg(&clone)
+                .args(["diff", "--cached", "--quiet", "--exit-code"])
+                .stdin(Stdio::null())
+                .status()
+                .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+            if !staged_changes.success() {
+                if let Err(error) = self.git_status(
+                    &clone,
+                    &[
+                        "-c",
+                        "user.name=CommonKit",
+                        "-c",
+                        "user.email=commonkit@localhost",
+                        "commit",
+                        "-m",
+                        "commonkit: publish portable authority",
+                    ],
+                ) {
+                    let _ = std::fs::remove_file(self.pending_path());
+                    return Err(error);
+                }
             }
             let revision = self.git_output(&clone, &["rev-parse", "HEAD"])?;
             std::fs::create_dir_all(&self.staging_root)

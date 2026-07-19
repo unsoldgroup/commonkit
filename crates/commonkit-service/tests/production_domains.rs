@@ -372,7 +372,8 @@ fn snapshot_git_authority(repository: &std::path::Path) -> serde_json::Value {
         "repository": repository,
         "trustedRemoteUrl": remote,
         "branch": "main",
-        "stagingRoot": repository.join("snapshot-git-staging")
+        "stagingRoot": repository.join("snapshot-git-staging"),
+        "bootstrap": true
     })
 }
 
@@ -929,7 +930,7 @@ fn promoted_writer_is_the_only_source_allowed_to_advance_snapshot_history() {
 }
 
 #[test]
-fn fresh_clone_rejects_force_rolled_back_snapshot_authority_branch() {
+fn fresh_clone_rejects_deleted_anchors_and_force_rolled_back_snapshot_authority_branch() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
     let database = root.join("writer.db");
@@ -968,6 +969,38 @@ fn fresh_clone_rejects_force_rolled_back_snapshot_authority_branch() {
     snapshots
         .create(serde_json::json!({"databaseId":"context-mode"}))
         .unwrap();
+
+    let anchors = std::process::Command::new(git_executable())
+        .args([
+            "ls-remote",
+            remote.to_str().unwrap(),
+            "refs/tags/commonkit-authority/context-mode/*",
+        ])
+        .output()
+        .unwrap();
+    assert!(anchors.status.success());
+    for reference in String::from_utf8(anchors.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| line.split_whitespace().nth(1).unwrap().to_owned())
+    {
+        let status = std::process::Command::new(git_executable())
+            .arg("-C")
+            .arg(root)
+            .args(["push", remote.to_str().unwrap(), &format!(":{reference}")])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    assert!(
+        ProductionDomainRegistry::load(
+            &config,
+            std::sync::Arc::new(PlanStore::open(root.join("missing-anchor-plans")).unwrap()),
+            root.join("missing-anchor-receipts"),
+        )
+        .is_err(),
+        "bootstrap must not recreate deleted anchors for an existing authority record"
+    );
 
     let initial = {
         let output = std::process::Command::new(git_executable())
@@ -1036,6 +1069,95 @@ fn fresh_clone_rejects_force_rolled_back_snapshot_authority_branch() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn production_fresh_clone_accepts_later_unrelated_kit_commits_after_anchor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let database = root.join("writer.db");
+    std::fs::write(&database, b"state-v1").unwrap();
+    let key_path = root.join("snapshot-key");
+    std::fs::write(&key_path, b"snapshot-test-key").unwrap();
+    let git_authority = snapshot_git_authority(root);
+    let remote = root.join(".snapshot-authority-remote.git");
+    let config = root.join("headless.json");
+    write_json(
+        &config,
+        &serde_json::json!({
+            "sync": null, "credentials": null,
+            "snapshots": {
+                "root": root.join("snapshots"), "portableState": root.join("kit"),
+                "keyReference": format!("file://{}", key_path.display()),
+                "objectStore": {"type":"local"}, "gitAuthority":git_authority,
+                "databases":[{"id":"context-mode", "path":database, "targetId":"writer",
+                    "observedPaths":{}, "format":"file", "lifecycle":lifecycle_config()}]
+            }
+        }),
+    );
+    ProductionDomainRegistry::load(
+        &config,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap();
+
+    std::fs::write(root.join("README.md"), b"later unrelated kit commit\n").unwrap();
+    for args in [
+        vec!["add", "README.md"],
+        vec!["commit", "-m", "later unrelated kit commit"],
+        vec!["push", ".snapshot-authority-remote.git", "main"],
+    ] {
+        let output = std::process::Command::new(git_executable())
+            .arg("-C")
+            .arg(root)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let fresh = root.join("fresh-valid-clone");
+    assert!(
+        std::process::Command::new(git_executable())
+            .args([
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                fresh.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let fresh_config = root.join("fresh-valid-headless.json");
+    write_json(
+        &fresh_config,
+        &serde_json::json!({
+            "sync":null, "credentials":null,
+            "snapshots": {
+                "root":root.join("fresh-valid-state"), "portableState":fresh.join("kit"),
+                "keyReference":format!("file://{}", key_path.display()),
+                "objectStore":{"type":"local"},
+                "gitAuthority":{"executable":git_executable(), "repository":fresh,
+                    "trustedRemoteUrl":remote, "branch":"main",
+                    "stagingRoot":root.join("fresh-valid-staging")},
+                "databases":[{"id":"context-mode", "path":database, "targetId":"writer",
+                    "observedPaths":{}, "format":"file", "lifecycle":lifecycle_config()}]
+            }
+        }),
+    );
+    ProductionDomainRegistry::load(
+        &fresh_config,
+        std::sync::Arc::new(PlanStore::open(root.join("fresh-valid-plans")).unwrap()),
+        root.join("fresh-valid-receipts"),
+    )
+    .unwrap();
 }
 
 #[test]

@@ -231,6 +231,8 @@ struct SnapshotGitAuthorityConfig {
     trusted_remote_url: String,
     branch: String,
     staging_root: PathBuf,
+    #[serde(default)]
+    bootstrap: bool,
 }
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -824,13 +826,36 @@ impl ProductionDomainRegistry {
                     let local = AuthorityStore::open(domain.root.join("authority"))
                         .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     for database in domain.databases.values() {
+                        let authority_preexisted = domain
+                            .portable_state
+                            .join("authority")
+                            .join(format!("{}.json", database.id))
+                            .exists();
                         let authority = portable
                             .initialize(&database.id, &database.target_id)
                             .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                         if domain.git_authority.is_some() {
-                            domain
+                            let mut publisher = domain
                                 .git_authority_publisher()
-                                .map_err(|_| ProductionDomainError::UnsafeConfig)?
+                                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                            if !authority_preexisted
+                                && domain
+                                    .git_authority
+                                    .as_ref()
+                                    .is_some_and(|config| config.bootstrap)
+                            {
+                                publisher
+                                    .bootstrap_remote_trust_anchor(
+                                        &domain.portable_state,
+                                        &commonkit_snapshots::PortablePublication {
+                                            database: database.id.clone(),
+                                            generation: authority.record.generation,
+                                            authority_revision: authority.revision.clone(),
+                                        },
+                                    )
+                                    .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                            }
+                            publisher
                                 .verify_remote_trust_anchor(
                                     &database.id,
                                     authority.record.generation,
