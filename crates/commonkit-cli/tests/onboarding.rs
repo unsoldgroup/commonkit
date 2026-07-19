@@ -3,7 +3,9 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use commonkit_cli::onboarding::{InitMode, InitRequest, ProcessRunner, initialize};
+use commonkit_cli::onboarding::{
+    InitMode, InitRequest, ProcessRunner, ProviderSelection, initialize,
+};
 
 fn request(root: &Path, mode: InitMode, repository: &str) -> InitRequest {
     InitRequest {
@@ -15,7 +17,73 @@ fn request(root: &Path, mode: InitMode, repository: &str) -> InitRequest {
         target_root: root.join("target"),
         config_directory: root.join("config"),
         state_directory: root.join("state"),
+        provider: ProviderSelection::Native,
     }
+}
+
+#[test]
+fn connect_with_apm_validates_the_pin_and_writes_a_provider_pipeline() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(temporary.path().join("target")).unwrap();
+    test_support::write_tool(
+        &bin,
+        "apm",
+        r#"
+if [ "$1" = "--version" ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0\n'; exit 0; fi
+if [ "$1" = "install" ]; then exit 0; fi
+if [ "$1" = "compile" ]; then mkdir -p .claude .codex; printf 'claude\n' > .claude/CLAUDE.md; printf 'codex\n' > .codex/AGENTS.md; exit 0; fi
+if [ "$1" = "audit" ]; then printf '{}\n'; exit 0; fi
+exit 93
+"#,
+    );
+    test_support::write_tool(
+        &bin,
+        "gh",
+        r#"
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers" "$4/agent/.apm"
+    for id in public-base organization-policy personal; do
+      kind=personal_kit; [ "$id" = public-base ] && kind=public_base; [ "$id" = organization-policy ] && kind=organization_policy
+      printf '{"schemaVersion":1,"id":"%s","kind":"%s","source":{"path":"layers/%s.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' "$id" "$kind" "$id" > "$4/layers/$id.json"
+    done
+    printf 'name: kit\n' > "$4/agent/apm.yml"
+    printf 'lockfileVersion: 1\n' > "$4/agent/apm.lock.yaml"
+    printf 'allowedSources: []\n' > "$4/agent/apm-policy.yml"
+    exit 0 ;;
+esac
+exit 91
+"#,
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        "[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' && exit 0\nexit 92",
+    );
+    let mut request = request(temporary.path(), InitMode::Connect, "owner/kit");
+    request.provider = ProviderSelection::Apm {
+        executable: bin.join("apm"),
+        manifest: "agent/apm.yml".into(),
+        lockfile: "agent/apm.lock.yaml".into(),
+        policy: "agent/apm-policy.yml".into(),
+    };
+    let result = initialize(&request, &ProcessRunner::new(&bin)).unwrap();
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result.headless_config).unwrap()).unwrap();
+    let provider = &config["sync"]["providerPipeline"]["providers"][0];
+    assert_eq!(provider["provider"], "apm");
+    assert_eq!(provider["version"], "0.25.0");
+    assert_eq!(provider["manifest"], "agent/apm.yml");
+    assert_eq!(
+        config["sync"]["materializedStates"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -78,32 +146,28 @@ exit 92
             .as_array()
             .unwrap()
             .len(),
-        1
+        0
     );
     let serialized = serde_json::to_string(&config).unwrap();
     assert!(!serialized.to_ascii_lowercase().contains("token"));
     assert!(!serialized.contains("ghp_"));
 
     let plans = std::sync::Arc::new(
-        commonkit_reconcile::PlanStore::open(temporary.path().join("plans")).unwrap(),
+        commonkit_reconcile::PlanStore::open(temporary.path().join("state/plans")).unwrap(),
     );
     let registry = commonkit_service::ProductionDomainRegistry::load(
         &result.headless_config,
-        plans,
+        plans.clone(),
         temporary.path().join("receipts"),
     )
     .unwrap();
     let composition = registry.composition.unwrap().compose().unwrap();
     assert_eq!(composition["spec"]["files"].as_array().unwrap().len(), 1);
-    let plan = registry
-        .sync
-        .unwrap()
-        .plan(serde_json::json!({"confirmed":true,"confirmationId":"first-diff"}))
-        .unwrap();
-    assert_eq!(plan["operations"].as_array().unwrap().len(), 1);
+    let plan = plans.load(&result.first_plan_id).unwrap();
+    assert_eq!(plan.operations.len(), 1);
     assert_eq!(
-        plan["operations"][0]["resource"]["managedPath"],
-        "portable/editor.conf"
+        plan.operations[0].resource.managed_path.as_deref(),
+        Some("portable/editor.conf")
     );
     assert_eq!(
         std::fs::metadata(temporary.path().join("target"))

@@ -1,15 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use commonkit_adapters::{
-    ArtifactStore, ContentSensitivity, DesiredStateProvider, ExactProviderVersion,
-    FilesystemIntent, NativeProvider, NormalizedManagedPath, NormalizedResource, ProviderContext,
-    ProviderInputs, ProviderWorkspace, ResourceProvenance,
+    ApmProvider, ApmProviderConfig, ArtifactStore, ChezmoiProvider, ContentSensitivity,
+    DesiredStateProvider, ExactProviderVersion, FileAdapter, FilesystemIntent, NativeProvider,
+    NormalizedManagedPath, NormalizedResource, OwnershipRules, ProviderContext, ProviderInputs,
+    ProviderPlanRequest, ProviderWorkspace, ResourceProvenance, build_provider_plan,
 };
-use commonkit_contracts::{LayerDocument, StableId, digest_domain_json};
+use commonkit_contracts::{LayerDocument, Sha256Digest, StableId, digest_domain_json};
 use commonkit_platform::{PrivatePathKind, ensure_private_path};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -22,6 +23,22 @@ pub enum InitMode {
 }
 
 #[derive(Debug, Clone)]
+pub enum ProviderSelection {
+    Native,
+    Apm {
+        executable: PathBuf,
+        manifest: PathBuf,
+        lockfile: PathBuf,
+        policy: PathBuf,
+    },
+    Chezmoi {
+        executable: PathBuf,
+        source: PathBuf,
+        config: PathBuf,
+    },
+}
+
+#[derive(Debug, Clone)]
 pub struct InitRequest {
     pub mode: InitMode,
     pub repository: String,
@@ -31,6 +48,7 @@ pub struct InitRequest {
     pub target_root: PathBuf,
     pub config_directory: PathBuf,
     pub state_directory: PathBuf,
+    pub provider: ProviderSelection,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,6 +61,7 @@ pub struct InitResult {
     pub loadout: String,
     pub target: String,
     pub headless_config: PathBuf,
+    pub first_plan_id: Sha256Digest,
 }
 
 pub trait CommandRunner {
@@ -176,7 +195,8 @@ pub fn initialize(
         .trim()
         .to_owned();
     validate_git_revision(&revision)?;
-    let headless_config = write_runtime_state(request, &layer_paths, &revision, &target)?;
+    let (headless_config, first_plan_id) =
+        write_runtime_state(request, &layer_paths, &revision, &target)?;
     Ok(InitResult {
         status: "initialized",
         repository: request.repository.clone(),
@@ -185,6 +205,7 @@ pub fn initialize(
         loadout: loadout.to_string(),
         target: target.to_string(),
         headless_config,
+        first_plan_id,
     })
 }
 
@@ -319,7 +340,7 @@ fn write_runtime_state(
     layer_paths: &[PathBuf],
     revision: &str,
     target: &StableId,
-) -> Result<PathBuf, OnboardingError> {
+) -> Result<(PathBuf, Sha256Digest), OnboardingError> {
     for directory in [&request.config_directory, &request.state_directory] {
         ensure_private_path(directory, PrivatePathKind::Directory)?;
     }
@@ -369,10 +390,8 @@ fn write_runtime_state(
             if !canonical_source.starts_with(&canonical_kit) {
                 return Err(OnboardingError::UnsafeProviderSource(declaration.source));
             }
-            let content = artifact_store.put(
-                &fs::read(&canonical_source)?,
-                ContentSensitivity::Portable,
-            )?;
+            let content =
+                artifact_store.put(&fs::read(&canonical_source)?, ContentSensitivity::Portable)?;
             resources.push((managed_path, content, declaration.source));
         }
     }
@@ -393,8 +412,81 @@ fn write_runtime_state(
             },
         })
         .collect();
-    let provider = NativeProvider::new(inputs, resources)?;
-    let staging = request.state_directory.join("provider-workspaces/native");
+    let native = NativeProvider::new(inputs, resources)?;
+    let (provider, provider_config, provider_id): (
+        Box<dyn DesiredStateProvider>,
+        serde_json::Value,
+        &str,
+    ) = match &request.provider {
+        ProviderSelection::Native => (
+            Box::new(native),
+            json!({"provider":"native", "version": env!("CARGO_PKG_VERSION"), "files": native_file_configs(layer_paths)?}),
+            "native",
+        ),
+        ProviderSelection::Apm {
+            executable,
+            manifest,
+            lockfile,
+            policy,
+        } => {
+            validate_provider_executable(executable)?;
+            let manifest_path = checked_portable_input(&request.kit_directory, manifest)?;
+            let lockfile_path = checked_portable_input(&request.kit_directory, lockfile)?;
+            let policy_path = checked_portable_input(&request.kit_directory, policy)?;
+            let version = ExactProviderVersion::parse("0.25.0")?;
+            let provider = ApmProvider::new(ApmProviderConfig {
+                executable: executable.clone(),
+                version: version.clone(),
+                manifest: manifest_path,
+                lockfile: lockfile_path,
+                policy: policy_path,
+                targets: vec!["claude".into(), "codex".into()],
+                managed_root: NormalizedManagedPath::parse("agent-context")?,
+                bound_source: None,
+            })?;
+            (
+                Box::new(provider),
+                json!({
+                    "provider":"apm", "executable": executable, "version": version,
+                    "manifest": portable_text(manifest)?, "lockfile": portable_text(lockfile)?,
+                    "policy": portable_text(policy)?, "targets":["claude","codex"], "managedRoot":"agent-context"
+                }),
+                "apm",
+            )
+        }
+        ProviderSelection::Chezmoi {
+            executable,
+            source,
+            config,
+        } => {
+            validate_provider_executable(executable)?;
+            let source_path = checked_portable_directory(&request.kit_directory, source)?;
+            let config_path = checked_portable_input(&request.kit_directory, config)?;
+            let workspace_root = request
+                .state_directory
+                .join("provider-workspaces/chezmoi/staging");
+            let provider = ChezmoiProvider::new(
+                executable,
+                source_path,
+                config_path,
+                workspace_root.join("cache"),
+                workspace_root.join("state/chezmoi.db"),
+                workspace_root.join("working-tree"),
+            )?;
+            (
+                Box::new(provider),
+                json!({
+                    "provider":"chezmoi", "executable": executable,
+                    "source": portable_text(source)?, "config": portable_text(config)?
+                }),
+                "chezmoi",
+            )
+        }
+    };
+    let staging = request
+        .state_directory
+        .join("provider-workspaces")
+        .join(provider_id);
     ensure_private_path(&staging, PrivatePathKind::Directory)?;
     let workspace = ProviderWorkspace::open(
         &staging,
@@ -412,34 +504,147 @@ fn write_runtime_state(
         observed_fact_digests: BTreeMap::new(),
     };
     let materialized = provider.materialize(&context, &workspace, &artifact_store)?;
-    let provider_state = request.state_directory.join("providers/native.json");
+    let provider_state = request
+        .state_directory
+        .join("providers")
+        .join(format!("{provider_id}.json"));
     ensure_private_path(provider_state.parent().unwrap(), PrivatePathKind::Directory)?;
     write_private_json(&provider_state, &materialized)?;
+
+    let adapter_state = request.state_directory.join("filesystem");
+    let mut files = FileAdapter::open(&request.target_root, &adapter_state)?;
+    let observed = files.observed_state_digest(
+        materialized
+            .resources
+            .iter()
+            .map(|resource| &resource.intent),
+    )?;
+    let ownership = OwnershipRules::new(
+        !cfg!(windows),
+        vec![
+            NormalizedManagedPath::parse("portable")?,
+            NormalizedManagedPath::parse("agent-context")?,
+        ],
+        vec![],
+    )?;
+    let target_identity_digest = digest_domain_json(
+        "commonkit.onboarding.target.v1",
+        &json!({
+            "repository": request.repository, "revision": revision, "target": target, "root": request.target_root,
+        }),
+    )?;
+    let policy_digest = context.policy_digest.clone();
+    let first_plan = build_provider_plan(
+        ProviderPlanRequest {
+            target_id: target.clone(),
+            target_identity_digest: target_identity_digest.clone(),
+            composed_loadout_digest: layer_digest.clone(),
+            observed_digest: observed,
+            policy_digest: policy_digest.clone(),
+            ownership_rules: &ownership,
+            mapped_side_effects: BTreeSet::new(),
+        },
+        &[materialized],
+        &artifact_store,
+        &mut files,
+    )?;
+    commonkit_reconcile::PlanStore::open(request.state_directory.join("plans"))?
+        .persist(&first_plan)?;
 
     let config = json!({
         "composition": { "layers": layer_paths },
         "sync": {
             "targetId": target,
             "targetRoot": request.target_root,
-            "adapterState": request.state_directory.join("filesystem"),
+            "adapterState": adapter_state,
             "providerArtifacts": artifacts,
-            "materializedStates": [provider_state],
+            "materializedStates": [],
+            "providerPipeline": {
+                "root": request.state_directory.join("provider-pipeline"),
+                "source": {
+                    "repository": request.kit_directory,
+                    "trustedRemoteUrl": format!("https://github.com/{}.git", request.repository),
+                    "revision": revision
+                },
+                "providers": [provider_config]
+            },
             "declaredRoots": ["portable"],
             "protectedRoots": [],
             "caseSensitive": !cfg!(windows),
-            "targetIdentityDigest": digest_domain_json("commonkit.onboarding.target.v1", &json!({
-                "repository": request.repository, "revision": revision, "target": target,
-                "root": request.target_root,
-            }))?,
+            "targetIdentityDigest": target_identity_digest,
             "composedLoadoutDigest": layer_digest,
-            "policyDigest": digest_domain_json("commonkit.onboarding.policy.v1", &json!({
-                "organizationFloor": "required"
-            }))?,
+            "policyDigest": policy_digest,
         }
     });
     let path = request.config_directory.join("headless.json");
     write_private_json(&path, &config)?;
-    Ok(path)
+    Ok((path, first_plan.id))
+}
+
+fn native_file_configs(layer_paths: &[PathBuf]) -> Result<Vec<serde_json::Value>, OnboardingError> {
+    let mut files = Vec::new();
+    for path in layer_paths {
+        let document: LayerDocument = serde_json::from_slice(&fs::read(path)?)?;
+        for declaration in document
+            .spec
+            .get("files")
+            .cloned()
+            .map(serde_json::from_value::<Vec<NativeFileDeclaration>>)
+            .transpose()?
+            .unwrap_or_default()
+        {
+            files.push(json!({"path": declaration.path, "source": declaration.source}));
+        }
+    }
+    Ok(files)
+}
+
+fn portable_text(path: &Path) -> Result<String, OnboardingError> {
+    Ok(NormalizedManagedPath::parse(
+        path.to_str()
+            .ok_or_else(|| OnboardingError::UnsafePath(path.into()))?,
+    )?
+    .to_string())
+}
+
+fn checked_portable_input(root: &Path, relative: &Path) -> Result<PathBuf, OnboardingError> {
+    let relative = portable_text(relative)?;
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| OnboardingError::MissingProviderInput(path.clone()))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(OnboardingError::UnsafePath(path));
+    }
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(root.canonicalize()?) {
+        return Err(OnboardingError::UnsafePath(path));
+    }
+    if fs::read(&canonical)?.is_empty() {
+        return Err(OnboardingError::EmptyProviderInput(path));
+    }
+    Ok(canonical)
+}
+
+fn checked_portable_directory(root: &Path, relative: &Path) -> Result<PathBuf, OnboardingError> {
+    let relative = portable_text(relative)?;
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|_| OnboardingError::MissingProviderInput(path.clone()))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(OnboardingError::UnsafePath(path));
+    }
+    let canonical = path.canonicalize()?;
+    if !canonical.starts_with(root.canonicalize()?) {
+        return Err(OnboardingError::UnsafePath(path));
+    }
+    Ok(canonical)
+}
+
+fn validate_provider_executable(path: &Path) -> Result<(), OnboardingError> {
+    if !path.is_absolute() || !fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) {
+        return Err(OnboardingError::MissingProviderExecutable(path.into()));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -535,6 +740,12 @@ pub enum OnboardingError {
     MissingProviderSource(String),
     #[error("native provider source must be a regular non-symlink file: {0}")]
     UnsafeProviderSource(String),
+    #[error("provider executable is missing or is not an absolute regular file: {0}")]
+    MissingProviderExecutable(PathBuf),
+    #[error("provider input is missing: {0}")]
+    MissingProviderInput(PathBuf),
+    #[error("provider input must not be empty: {0}")]
+    EmptyProviderInput(PathBuf),
     #[error("required tool {tool} is unavailable: {detail}")]
     ToolUnavailable { tool: String, detail: String },
     #[error(
@@ -557,6 +768,14 @@ pub enum OnboardingError {
     Resource(#[from] commonkit_adapters::ResourceError),
     #[error(transparent)]
     Artifact(#[from] commonkit_adapters::ArtifactError),
+    #[error(transparent)]
+    FileAdapter(#[from] commonkit_adapters::FileAdapterError),
+    #[error(transparent)]
+    Ownership(#[from] commonkit_adapters::OwnershipError),
+    #[error(transparent)]
+    Plan(#[from] commonkit_adapters::ProviderPlanError),
+    #[error(transparent)]
+    PlanStore(#[from] commonkit_reconcile::PlanStoreError),
     #[error(transparent)]
     Platform(#[from] commonkit_platform::PlatformError),
 }
