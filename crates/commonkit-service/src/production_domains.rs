@@ -5,15 +5,18 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
-    ArtifactStore, BwsCredentialResolver, CredentialReference, CredentialResolver, FileAdapter,
-    LocalSensitiveFileStore, MaterializedState, NormalizedManagedPath, OwnershipRules,
-    PlatformKeychain, PlatformKeychainCredentialResolver, ProcessBwsRunner,
-    ProcessPlatformSecretCommandRunner, ProviderPlanRequest, SecretValue, build_provider_plan,
-    validate_ownership,
+    ApmProvider, ApmProviderConfig, ArtifactStore, BwsCredentialResolver, ChezmoiProvider,
+    ContentSensitivity, CredentialReference, CredentialResolver, DesiredStateProvider,
+    ExactProviderVersion, FileAdapter, FilesystemIntent, GitRepository, GitSyncDisposition,
+    LocalSensitiveFileStore, MaterializedState, NativeProvider, NormalizedManagedPath,
+    NormalizedResource, OwnershipRules, PlatformKeychain, PlatformKeychainCredentialResolver,
+    ProcessBwsRunner, ProcessGitRunner, ProcessPlatformSecretCommandRunner, ProviderContext,
+    ProviderInputs, ProviderPipeline, ProviderPlanRequest, ResourceProvenance, SecretValue,
+    build_provider_plan, validate_ownership,
 };
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{
-    LayerDocument, Plan, Sha256Digest, StableId, assert_no_embedded_secrets,
+    LayerDocument, Plan, Sha256Digest, StableId, assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_reconcile::{Adapter, PlanStore, ReceiptStore, Reconciler};
 use commonkit_snapshots::{
@@ -27,6 +30,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::skill_canary::{SkillCanaryConfig, SkillCanaryRuntime};
 use crate::{
     CompositionDomain, CredentialDomain, DomainFailure, HeadlessDomainRegistry, SnapshotDomain,
     SyncDomain,
@@ -39,6 +43,7 @@ struct ProductionConfig {
     sync: Option<SyncConfig>,
     credentials: Option<CredentialConfig>,
     snapshots: Option<SnapshotConfig>,
+    skill_canary: Option<SkillCanaryConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -54,13 +59,61 @@ struct SyncConfig {
     target_root: PathBuf,
     adapter_state: PathBuf,
     provider_artifacts: PathBuf,
+    #[serde(default)]
     materialized_states: Vec<PathBuf>,
+    provider_pipeline: Option<ProviderPipelineConfig>,
     declared_roots: Vec<NormalizedManagedPath>,
     protected_roots: Vec<NormalizedManagedPath>,
     case_sensitive: bool,
     target_identity_digest: Sha256Digest,
     composed_loadout_digest: Sha256Digest,
     policy_digest: Sha256Digest,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderPipelineConfig {
+    root: PathBuf,
+    source: GitProviderSource,
+    providers: Vec<ConfiguredProvider>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GitProviderSource {
+    repository: PathBuf,
+    trusted_remote_url: String,
+    revision: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
+enum ConfiguredProvider {
+    Native {
+        version: ExactProviderVersion,
+        files: Vec<NativeProviderFile>,
+    },
+    Apm {
+        executable: PathBuf,
+        version: ExactProviderVersion,
+        manifest: PathBuf,
+        lockfile: PathBuf,
+        policy: PathBuf,
+        targets: Vec<String>,
+        managed_root: NormalizedManagedPath,
+    },
+    Chezmoi {
+        executable: PathBuf,
+        source: PathBuf,
+        config: PathBuf,
+    },
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeProviderFile {
+    path: NormalizedManagedPath,
+    source: NormalizedManagedPath,
 }
 
 #[derive(Deserialize)]
@@ -134,6 +187,7 @@ pub struct ProductionDomainRegistry {
     pub sync: Option<Arc<dyn SyncDomain>>,
     pub credentials: Option<Arc<dyn CredentialDomain>>,
     pub snapshots: Option<Arc<dyn SnapshotDomain>>,
+    pub(crate) skill_canary: Option<Arc<SkillCanaryRuntime>>,
 }
 
 impl ProductionDomainRegistry {
@@ -148,6 +202,7 @@ impl ProductionDomainRegistry {
                 sync: None,
                 credentials: None,
                 snapshots: None,
+                skill_canary: None,
             });
         }
         Self::load(config_path, plan_store, receipt_root)
@@ -183,7 +238,13 @@ impl ProductionDomainRegistry {
             .sync
             .map(
                 |config| -> Result<Arc<dyn SyncDomain>, ProductionDomainError> {
-                    if config.materialized_states.is_empty()
+                    let configured_pipeline = config.provider_pipeline.as_ref().is_some_and(|p| {
+                        p.root.is_absolute()
+                            && p.source.repository.is_absolute()
+                            && !p.providers.is_empty()
+                    });
+                    if (config.materialized_states.is_empty() && !configured_pipeline)
+                        || (!config.materialized_states.is_empty() && configured_pipeline)
                         || config.declared_roots.is_empty()
                         || !config.target_root.is_absolute()
                         || !config.adapter_state.is_absolute()
@@ -258,11 +319,20 @@ impl ProductionDomainRegistry {
                 },
             )
             .transpose()?;
+        let skill_canary = config
+            .skill_canary
+            .map(|config| {
+                SkillCanaryRuntime::open(config, &receipt_root.join("skill-canary"))
+                    .map(Arc::new)
+                    .map_err(|_| ProductionDomainError::UnsafeConfig)
+            })
+            .transpose()?;
         Ok(Self {
             composition,
             sync,
             credentials,
             snapshots,
+            skill_canary,
         })
     }
     pub fn into_headless(self) -> HeadlessDomainRegistry {
@@ -393,6 +463,9 @@ struct ProductionSyncDomain {
 }
 impl ProductionSyncDomain {
     fn states(&self) -> Result<Vec<MaterializedState>, DomainFailure> {
+        if let Some(config) = &self.config.provider_pipeline {
+            return self.materialize_configured(config);
+        }
         self.config
             .materialized_states
             .iter()
@@ -406,6 +479,175 @@ impl ProductionSyncDomain {
                     .map_err(|_| DomainFailure::OperationFailed)
             })
             .collect()
+    }
+
+    fn materialize_configured(
+        &self,
+        config: &ProviderPipelineConfig,
+    ) -> Result<Vec<MaterializedState>, DomainFailure> {
+        let mut repository = GitRepository::new(
+            ProcessGitRunner::new(&config.source.repository),
+            config.source.trusted_remote_url.clone(),
+            "origin",
+        );
+        let status = repository
+            .inspect(true)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        if status.revision.as_str() != config.source.revision
+            || matches!(
+                status.disposition,
+                GitSyncDisposition::Dirty
+                    | GitSyncDisposition::Behind
+                    | GitSyncDisposition::Diverged
+            )
+        {
+            return Err(DomainFailure::OperationFailed);
+        }
+        let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let rules = OwnershipRules::new(
+            self.config.case_sensitive,
+            self.config.declared_roots.clone(),
+            self.config.protected_roots.clone(),
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        let pipeline = ProviderPipeline::open(
+            &config.root,
+            artifacts,
+            rules,
+            vec![
+                self.config.target_root.clone(),
+                self.config.adapter_state.clone(),
+                config.source.repository.clone(),
+            ],
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        let context = ProviderContext {
+            target_id: self.config.target_id.clone(),
+            platform: std::env::consts::OS.to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
+            policy_digest: self.config.policy_digest.clone(),
+            declared_roots: self.config.declared_roots.clone(),
+            observed_fact_digests: BTreeMap::new(),
+        };
+        let mut providers: Vec<Box<dyn DesiredStateProvider>> = Vec::new();
+        for provider in &config.providers {
+            providers.push(self.configured_provider(provider, config, pipeline.artifacts())?);
+        }
+        let references = providers
+            .iter()
+            .map(|provider| provider.as_ref() as &dyn DesiredStateProvider)
+            .collect::<Vec<_>>();
+        pipeline
+            .materialize_all(&references, &context)
+            .map(|result| result.states)
+            .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn configured_provider(
+        &self,
+        config: &ConfiguredProvider,
+        pipeline: &ProviderPipelineConfig,
+        artifacts: &ArtifactStore,
+    ) -> Result<Box<dyn DesiredStateProvider>, DomainFailure> {
+        match config {
+            ConfiguredProvider::Native { version, files } => {
+                if files.is_empty() {
+                    return Err(DomainFailure::OperationFailed);
+                }
+                let mut input_digests = BTreeMap::from([(
+                    "repositoryRevision".into(),
+                    digest_text(
+                        "commonkit.git-provider-revision.v1",
+                        &pipeline.source.revision,
+                    )?,
+                )]);
+                let mut staged = Vec::new();
+                for file in files {
+                    let source =
+                        checked_repository_path(&pipeline.source.repository, file.source.as_str())?;
+                    let bytes = fs::read(&source).map_err(|_| DomainFailure::OperationFailed)?;
+                    input_digests.insert(
+                        format!("source:{}", file.source.as_str()),
+                        digest_bytes(&bytes)?,
+                    );
+                    let content = artifacts
+                        .put(&bytes, ContentSensitivity::Portable)
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                    staged.push((file, content));
+                }
+                let inputs = ProviderInputs::new(
+                    StableId::parse("native").map_err(|_| DomainFailure::OperationFailed)?,
+                    version.clone(),
+                    "commonkit.native-provider.v1".into(),
+                    input_digests,
+                    vec!["files".into()],
+                )
+                .map_err(|_| DomainFailure::OperationFailed)?;
+                let resources = staged
+                    .into_iter()
+                    .map(|(file, content)| NormalizedResource {
+                        intent: FilesystemIntent::File {
+                            path: file.path.clone(),
+                            content,
+                            mode: None,
+                            expected_before: None,
+                        },
+                        provenance: ResourceProvenance {
+                            provider_id: inputs.provider_id.clone(),
+                            provider_version: inputs.provider_version.to_string(),
+                            input_digest: inputs.input_set_digest.clone(),
+                            source: file.source.to_string(),
+                        },
+                    })
+                    .collect();
+                NativeProvider::new(inputs, resources)
+                    .map(|provider| Box::new(provider) as Box<dyn DesiredStateProvider>)
+                    .map_err(|_| DomainFailure::OperationFailed)
+            }
+            ConfiguredProvider::Apm {
+                executable,
+                version,
+                manifest,
+                lockfile,
+                policy,
+                targets,
+                managed_root,
+            } => ApmProvider::new(ApmProviderConfig {
+                executable: executable.clone(),
+                version: version.clone(),
+                manifest: checked_repository_path(
+                    &pipeline.source.repository,
+                    path_text(manifest)?,
+                )?,
+                lockfile: checked_repository_path(
+                    &pipeline.source.repository,
+                    path_text(lockfile)?,
+                )?,
+                policy: checked_repository_path(&pipeline.source.repository, path_text(policy)?)?,
+                targets: targets.clone(),
+                managed_root: managed_root.clone(),
+            })
+            .map(|provider| Box::new(provider) as Box<dyn DesiredStateProvider>)
+            .map_err(|_| DomainFailure::OperationFailed),
+            ConfiguredProvider::Chezmoi {
+                executable,
+                source,
+                config,
+            } => {
+                let workspace = pipeline.root.join("workspaces/chezmoi");
+                ChezmoiProvider::new(
+                    executable,
+                    checked_repository_path(&pipeline.source.repository, path_text(source)?)?,
+                    checked_repository_path(&pipeline.source.repository, path_text(config)?)?,
+                    workspace.join("cache"),
+                    workspace.join("state/chezmoi.db"),
+                    workspace.join("working-tree"),
+                )
+                .map(|provider| Box::new(provider) as Box<dyn DesiredStateProvider>)
+                .map_err(|_| DomainFailure::OperationFailed)
+            }
+        }
     }
     fn build(&self) -> Result<Plan, DomainFailure> {
         let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
@@ -451,6 +693,35 @@ impl ProductionSyncDomain {
             .map_err(|_| DomainFailure::OperationFailed)?;
         Ok(plan)
     }
+}
+
+fn path_text(path: &Path) -> Result<&str, DomainFailure> {
+    path.to_str().ok_or(DomainFailure::OperationFailed)
+}
+
+fn checked_repository_path(repository: &Path, relative: &str) -> Result<PathBuf, DomainFailure> {
+    let relative =
+        NormalizedManagedPath::parse(relative).map_err(|_| DomainFailure::OperationFailed)?;
+    let repository = repository
+        .canonicalize()
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    let path = repository.join(relative.as_str());
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    if !canonical.starts_with(&repository) {
+        return Err(DomainFailure::OperationFailed);
+    }
+    Ok(canonical)
+}
+
+fn digest_text(domain: &str, value: &str) -> Result<Sha256Digest, DomainFailure> {
+    digest_domain_json(domain, &value).map_err(|_| DomainFailure::OperationFailed)
+}
+
+fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, DomainFailure> {
+    Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(bytes)))
+        .map_err(|_| DomainFailure::OperationFailed)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

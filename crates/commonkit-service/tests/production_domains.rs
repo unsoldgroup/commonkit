@@ -369,6 +369,107 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
 }
 
 #[test]
+fn configured_git_provider_pipeline_materializes_native_state_before_local_planning() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let remote = root.join("remote.git");
+    let seed = root.join("seed");
+    let checkout = root.join("checkout");
+    git(root, &["init", "--bare", remote.to_str().unwrap()]);
+    git(root, &["init", seed.to_str().unwrap()]);
+    git(&seed, &["config", "user.email", "test@example.com"]);
+    git(&seed, &["config", "user.name", "CommonKit Test"]);
+    std::fs::create_dir_all(seed.join("portable")).unwrap();
+    std::fs::write(seed.join("portable/editor.conf"), b"from pinned git\n").unwrap();
+    git(&seed, &["add", "portable/editor.conf"]);
+    git(&seed, &["commit", "-m", "fixture"]);
+    git(&seed, &["branch", "-M", "main"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&seed, &["push", "-u", "origin", "main"]);
+    git(
+        root,
+        &[
+            "clone",
+            remote.to_str().unwrap(),
+            checkout.to_str().unwrap(),
+        ],
+    );
+    git(&checkout, &["checkout", "main"]);
+    let revision = git_output(&checkout, &["rev-parse", "HEAD"]);
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let config = serde_json::json!({
+      "sync": {
+        "targetId": "local", "targetRoot": target,
+        "adapterState": root.join("adapter"),
+        "providerArtifacts": root.join("artifacts"),
+        "providerPipeline": {
+          "root": root.join("pipeline"),
+          "source": {"repository": checkout, "trustedRemoteUrl": remote.to_str().unwrap(), "revision": revision},
+          "providers": [{"provider":"native", "version":"1.0.0", "files":[{
+            "path":"home/editor.conf", "source":"portable/editor.conf"
+          }]}]
+        },
+        "declaredRoots": ["home"], "protectedRoots": [], "caseSensitive": true,
+        "targetIdentityDigest": digest_domain_json("test", &"target").unwrap(),
+        "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
+        "policyDigest": digest_domain_json("test", &"policy").unwrap()
+      }
+    });
+    let config_path = root.join("headless-provider.json");
+    write_json(&config_path, &config);
+    let registry = ProductionDomainRegistry::load(
+        &config_path,
+        std::sync::Arc::new(PlanStore::open(root.join("plans-pipeline")).unwrap()),
+        root.join("receipts-pipeline"),
+    )
+    .unwrap();
+    let plan = registry
+        .sync
+        .unwrap()
+        .plan(serde_json::json!({"confirmed":true,"confirmationId":"provider-plan"}))
+        .unwrap();
+    assert_eq!(plan["operations"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        plan["operations"][0]["resource"]["managedPath"],
+        "home/editor.conf"
+    );
+    let states = std::fs::read_dir(root.join("pipeline/states"))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(states.len(), 1);
+}
+
+fn git(directory: &std::path::Path, arguments: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_output(directory: &std::path::Path, arguments: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[test]
 fn absent_configuration_installs_no_fabricated_domains() {
     let temporary = tempfile::tempdir().unwrap();
     let registry = ProductionDomainRegistry::load_optional(
