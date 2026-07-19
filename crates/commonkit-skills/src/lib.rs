@@ -211,6 +211,8 @@ pub struct SkillOptProviderManager {
     uv: PathBuf,
     root: PathBuf,
     harness: Option<(PathBuf, PathBuf)>,
+    provider_executables: BTreeSet<PathBuf>,
+    harness_executables: BTreeSet<PathBuf>,
 }
 
 impl SkillOptProviderManager {
@@ -225,7 +227,19 @@ impl SkillOptProviderManager {
             uv,
             root: root.as_ref().canonicalize()?,
             harness: None,
+            provider_executables: BTreeSet::new(),
+            harness_executables: BTreeSet::new(),
         })
+    }
+
+    pub fn with_declared_executables(
+        mut self,
+        provider: BTreeSet<PathBuf>,
+        harness: BTreeSet<PathBuf>,
+    ) -> Result<Self, SkillError> {
+        self.provider_executables = canonical_executable_declarations(provider)?;
+        self.harness_executables = canonical_executable_declarations(harness)?;
+        Ok(self)
     }
 
     pub fn with_harness(
@@ -405,8 +419,8 @@ impl SkillOptProviderManager {
             timeout_seconds: 60,
             harness_executable: harness_executable.clone(),
             harness_corpus: harness_corpus.clone(),
-            provider_executables: BTreeSet::new(),
-            harness_executables: BTreeSet::new(),
+            provider_executables: self.provider_executables.clone(),
+            harness_executables: self.harness_executables.clone(),
         })?;
         let output = optimizer.optimize(&manifest, &suite, &plan.fixture_skill)?;
         let source_unchanged = fs::read(&skill_path)? == plan.fixture_skill;

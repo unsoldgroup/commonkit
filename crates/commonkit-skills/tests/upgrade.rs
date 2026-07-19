@@ -36,7 +36,7 @@ while [ "$#" -gt 0 ]; do
   elif [ "$1" = "--tasks-file" ]; then tasks="$2"; shift 2
   else shift; fi
 done
-mkdir -p "$project/.skillopt-sleep/staging/contract"
+/bin/mkdir -p "$project/.skillopt-sleep/staging/contract"
 printf '# Contract fixture\n\nAnswer accurately. Always wrap the final answer in <answer>...</answer> tags.\n' > "$project/.skillopt-sleep/staging/contract/proposed_SKILL.md"
 printf '{"live_skill_path":"%s","live_memory_path":"","has_skill":true,"has_memory":false,"accepted":true}' "$skill" > "$project/.skillopt-sleep/staging/contract/manifest.json"
 printf '{"night":1,"accepted":true,"gate_action":"accept_new_best","no_edits_reason":"","baseline":0.0,"candidate":1.0,"n_tasks":2,"n_sessions":0,"n_accepted_edits":1,"n_rejected_edits":0,"edits":[{"target":"skill"}],"rejected_edits":[],"notes":[],"staging_dir":"%s/.skillopt-sleep/staging/contract","adopted":[],"tasks_file":"%s","tasks_reviewed":true}' "$project" "$tasks"
@@ -122,7 +122,12 @@ printf '{"schemaVersion":1,"suiteDigest":"%s","skillId":"%s","baselineDigest":"%
     let manager = SkillOptProviderManager::open(&uv, root.join("providers"))
         .expect("manager")
         .with_harness(&harness, &corpus)
-        .expect("harness");
+        .expect("harness")
+        .with_declared_executables(
+            BTreeSet::from([std::path::PathBuf::from("/bin/mkdir")]),
+            BTreeSet::new(),
+        )
+        .expect("declared executables");
     let plan = manager.plan_upgrade(lock.clone(), &fixtures).expect("plan");
     let report = manager.execute_upgrade(&plan).expect("upgrade report");
     assert!(report.compatible);
