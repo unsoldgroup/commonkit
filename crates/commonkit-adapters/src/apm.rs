@@ -120,20 +120,16 @@ impl ApmProvider {
         scratch: &Path,
         args: &[&str],
     ) -> Result<Output, ProviderFailure> {
-        let output = Command::new(&self.config.executable)
-            .args(args)
-            .current_dir(staging)
-            .env_clear()
-            .env("HOME", staging)
-            .env("TMPDIR", scratch)
-            .output()
-            .map_err(|error| {
-                ProviderFailure::Materialize(format!(
-                    "could not execute pinned APM {} at {}: {error}",
-                    self.config.version,
-                    self.config.executable.display()
-                ))
-            })?;
+        let mut command = Command::new(&self.config.executable);
+        command.args(args).current_dir(staging);
+        configure_provider_environment(&mut command, staging, scratch);
+        let output = command.output().map_err(|error| {
+            ProviderFailure::Materialize(format!(
+                "could not execute pinned APM {} at {}: {error}",
+                self.config.version,
+                self.config.executable.display()
+            ))
+        })?;
         if !output.status.success() {
             return Err(ProviderFailure::Materialize(format!(
                 "APM command `{}` failed with status {}; inspect the provider's private diagnostics, fix the inputs, and retry",
@@ -165,6 +161,78 @@ impl ApmProvider {
             copy_tree(&source, &staging.join(".apm"))?;
         }
         Ok(())
+    }
+}
+
+fn configure_provider_environment(command: &mut Command, staging: &Path, scratch: &Path) {
+    command
+        .env_clear()
+        .env("HOME", staging)
+        .env("TMPDIR", scratch)
+        .env("APM_TEMP_DIR", scratch)
+        .env("APM_CACHE_DIR", scratch.join("apm-cache"))
+        .env("APM_NON_INTERACTIVE", "1");
+    #[cfg(windows)]
+    {
+        // Python's Windows home lookup does not use HOME. Keep every writable
+        // provider location inside staging while restoring only OS runtime
+        // paths required by the official PyInstaller bundle.
+        command
+            .env("USERPROFILE", staging)
+            .env("APPDATA", staging.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", staging.join("AppData/Local"))
+            .env("TEMP", scratch)
+            .env("TMP", scratch);
+        if let Some(system_root) =
+            std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"))
+        {
+            command
+                .env("SystemRoot", &system_root)
+                .env("WINDIR", system_root);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_environment_tests {
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+
+    use super::*;
+
+    #[test]
+    fn pinned_bundle_receives_only_isolated_windows_profile_and_temp_paths() {
+        let staging = Path::new(r"C:\isolated\stage");
+        let scratch = Path::new(r"C:\isolated\scratch");
+        let mut command = Command::new("apm.exe");
+        configure_provider_environment(&mut command, staging, scratch);
+        let explicit = command
+            .get_envs()
+            .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
+            .collect::<BTreeMap<OsString, OsString>>();
+
+        for (key, expected) in [
+            ("HOME", staging.as_os_str()),
+            ("USERPROFILE", staging.as_os_str()),
+            ("TEMP", scratch.as_os_str()),
+            ("TMP", scratch.as_os_str()),
+            ("TMPDIR", scratch.as_os_str()),
+        ] {
+            assert_eq!(explicit.get(key), Some(&expected.to_owned()), "{key}");
+        }
+        assert_eq!(
+            explicit.get("APPDATA"),
+            Some(&staging.join("AppData/Roaming").into_os_string())
+        );
+        assert_eq!(
+            explicit.get("LOCALAPPDATA"),
+            Some(&staging.join("AppData/Local").into_os_string())
+        );
+        let system_root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"));
+        assert_eq!(explicit.get("SystemRoot"), system_root.as_ref());
+        assert_eq!(explicit.get("WINDIR"), system_root.as_ref());
+        assert!(!explicit.contains_key("PATH"));
+        assert!(!explicit.contains_key("GITHUB_TOKEN"));
     }
 }
 

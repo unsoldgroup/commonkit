@@ -113,16 +113,24 @@ fn rejects_materialization_for_a_different_target_platform_before_apply() {
 #[test]
 fn target_platform_facts_change_provider_inputs_not_controller_constants() {
     let fixture = Fixture::new("target-platform");
-    let mac = fixture.provider().inspect_inputs(&context()).unwrap();
-    let mut linux_context = context();
-    linux_context.platform = "linux".into();
-    linux_context.architecture = "x86_64".into();
-    let linux = fixture.provider().inspect_inputs(&linux_context).unwrap();
+    let controller = fixture.provider().inspect_inputs(&context()).unwrap();
+    let mut other_context = context();
+    other_context.platform = if std::env::consts::OS == "linux" {
+        "macos".into()
+    } else {
+        "linux".into()
+    };
+    other_context.architecture = if std::env::consts::ARCH == "x86_64" {
+        "aarch64".into()
+    } else {
+        "x86_64".into()
+    };
+    let other_target = fixture.provider().inspect_inputs(&other_context).unwrap();
 
-    assert_ne!(mac.input_set_digest, linux.input_set_digest);
+    assert_ne!(controller.input_set_digest, other_target.input_set_digest);
     assert_ne!(
-        mac.input_digests["targetPlatform"],
-        linux.input_digests["targetPlatform"]
+        controller.input_digests["targetPlatform"],
+        other_target.input_digests["targetPlatform"]
     );
 }
 

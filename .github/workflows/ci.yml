@@ -202,8 +202,8 @@ jobs:
           if ((Get-FileHash $apmArchive -Algorithm SHA256).Hash.ToLowerInvariant() -ne "1d9b3b44ffe031c331f4dfe33694bbb80d10d16165ca053110b96dbeb7365943") { throw "APM checksum mismatch" }
           $apmDir = Join-Path $providerDir "apm"
           Expand-Archive $apmArchive -DestinationPath $apmDir
-          $apmBin = (Get-ChildItem $apmDir -Recurse -Filter apm.exe | Select-Object -First 1).FullName
-          if (-not $apmBin) { throw "APM executable missing from verified archive" }
+          $apmBin = Join-Path $apmDir "apm-windows-x86_64\apm.exe"
+          if (-not (Test-Path -LiteralPath $apmBin -PathType Leaf)) { throw "APM executable missing from verified archive layout" }
           $chezmoiBin = Join-Path $providerDir "chezmoi.exe"
           Invoke-WebRequest "https://github.com/twpayne/chezmoi/releases/download/v$env:CHEZMOI_VERSION/chezmoi-windows-amd64.exe" -OutFile $chezmoiBin
           if ((Get-FileHash $chezmoiBin -Algorithm SHA256).Hash.ToLowerInvariant() -ne "531e4b3d1f0814c4e962cd1a380bd4ea85f97aee5cc81ee27eea551339380ff7") { throw "chezmoi checksum mismatch" }
