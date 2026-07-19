@@ -164,6 +164,7 @@ fn setup(
         "providerArtifacts":root.join("artifacts"), "materializedStates":[state_path],
         "targetTransport":{"type":"ssh","rootId":"home-root","host":"fixture","user":"al","port":22,
             "knownHosts":root.join("known_hosts"),"fingerprint":"SHA256:fixturefixturefixture"},
+        "targetPlatform":{"operatingSystem":"linux","architecture":"x86_64"},
         "declaredRoots":["home"],"protectedRoots":[],"caseSensitive":true,
         "targetIdentityDigest":digest("target"),"composedLoadoutDigest":digest("loadout"),"policyDigest":digest("policy")
     }});

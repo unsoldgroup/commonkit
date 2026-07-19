@@ -79,12 +79,42 @@ struct SyncConfig {
     materialized_states: Vec<PathBuf>,
     provider_pipeline: Option<ProviderPipelineConfig>,
     target_transport: Option<SyncTargetTransport>,
+    /// Explicit facts for the managed target. Legacy local configurations may
+    /// omit this and inherit the controller facts; SSH targets may not.
+    target_platform: Option<SyncTargetPlatform>,
     declared_roots: Vec<NormalizedManagedPath>,
     protected_roots: Vec<NormalizedManagedPath>,
     case_sensitive: bool,
     target_identity_digest: Sha256Digest,
     composed_loadout_digest: Sha256Digest,
     policy_digest: Sha256Digest,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SyncTargetPlatform {
+    operating_system: String,
+    architecture: String,
+}
+
+impl SyncConfig {
+    fn provider_platform(&self) -> Result<SyncTargetPlatform, DomainFailure> {
+        if let Some(platform) = &self.target_platform {
+            if platform.operating_system.trim().is_empty()
+                || platform.architecture.trim().is_empty()
+            {
+                return Err(DomainFailure::InvalidRequest);
+            }
+            return Ok(platform.clone());
+        }
+        match self.target_transport.as_ref().unwrap_or(&SyncTargetTransport::Local) {
+            SyncTargetTransport::Local => Ok(SyncTargetPlatform {
+                operating_system: std::env::consts::OS.to_owned(),
+                architecture: std::env::consts::ARCH.to_owned(),
+            }),
+            SyncTargetTransport::Ssh { .. } => Err(DomainFailure::InvalidRequest),
+        }
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -724,6 +754,9 @@ fn validate_sync_config(config: &SyncConfig) -> Result<(), ProductionDomainError
     {
         return Err(ProductionDomainError::EmptyCapability);
     }
+    config
+        .provider_platform()
+        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
     Ok(())
 }
 
@@ -905,10 +938,11 @@ impl ProductionSyncDomain {
             ],
         )
         .map_err(|_| DomainFailure::OperationFailed)?;
+        let target_platform = self.config.provider_platform()?;
         let context = ProviderContext {
             target_id: self.config.target_id.clone(),
-            platform: std::env::consts::OS.to_owned(),
-            architecture: std::env::consts::ARCH.to_owned(),
+            platform: target_platform.operating_system,
+            architecture: target_platform.architecture,
             policy_digest: self.config.policy_digest.clone(),
             declared_roots: self.config.declared_roots.clone(),
             observed_fact_digests: BTreeMap::new(),

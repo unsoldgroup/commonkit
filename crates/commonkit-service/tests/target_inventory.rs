@@ -373,6 +373,7 @@ fn production_config_builds_a_sync_domain_for_each_local_and_ssh_target() {
     let root = temporary.path();
     let digest = |name: &str| digest_domain_json("test.multi-target", &name).unwrap();
     let sync = |id: &str, transport: serde_json::Value| {
+        let remote = transport.get("type").and_then(serde_json::Value::as_str) == Some("ssh");
         serde_json::json!({
             "targetId": id,
             "targetRoot": root.join(format!("target-{id}")),
@@ -380,6 +381,9 @@ fn production_config_builds_a_sync_domain_for_each_local_and_ssh_target() {
             "providerArtifacts": root.join("artifacts"),
             "materializedStates": [root.join(format!("{id}.state.json"))],
             "targetTransport": transport,
+            "targetPlatform": remote.then(|| serde_json::json!({
+                "operatingSystem":"linux", "architecture":"x86_64"
+            })),
             "declaredRoots": ["home"],
             "protectedRoots": [".commonkit"],
             "caseSensitive": true,
@@ -411,6 +415,32 @@ fn production_config_builds_a_sync_domain_for_each_local_and_ssh_target() {
     .unwrap();
     assert_eq!(registry.target_sync_domains.len(), 2);
     assert_eq!(registry.targets.as_ref().unwrap().targets().len(), 2);
+}
+
+#[test]
+fn production_config_rejects_ssh_provider_targets_without_platform_facts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let digest = |name: &str| digest_domain_json("test.remote-platform", &name).unwrap();
+    let config = root.join("headless.json");
+    fs::write(root.join("known_hosts"), "fixture").unwrap();
+    fs::write(&config, serde_json::to_vec(&serde_json::json!({"sync":{
+        "targetId":"remote", "targetRoot":root.join("target"),
+        "adapterState":root.join("adapter"), "providerArtifacts":root.join("artifacts"),
+        "materializedStates":[root.join("state.json")], "targetTransport":{
+            "type":"ssh", "rootId":"home-root", "host":"remote.internal", "user":"al",
+            "port":22, "knownHosts":root.join("known_hosts"), "fingerprint":"SHA256:test"
+        },
+        "declaredRoots":["home"], "protectedRoots":[], "caseSensitive":true,
+        "targetIdentityDigest":digest("identity"), "composedLoadoutDigest":digest("loadout"),
+        "policyDigest":digest("policy")
+    }})).unwrap()).unwrap();
+
+    assert!(ProductionDomainRegistry::load(
+        &config,
+        Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    ).is_err());
 }
 
 #[test]

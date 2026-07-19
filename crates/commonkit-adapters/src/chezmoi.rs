@@ -153,7 +153,7 @@ impl ChezmoiProvider {
         Ok(())
     }
 
-    fn inputs(&self) -> Result<ProviderInputs, ProviderFailure> {
+    fn inputs(&self, context: &ProviderContext) -> Result<ProviderInputs, ProviderFailure> {
         let source_digest = digest_source_tree(&self.source)?;
         let config = fs::read(&self.config).map_err(|error| {
             ProviderFailure::Inspect(format!("{}: {error}", self.config.display()))
@@ -167,6 +167,7 @@ impl ChezmoiProvider {
             BTreeMap::from([
                 ("config".into(), config_digest),
                 ("source".into(), source_digest),
+                ("targetPlatform".into(), context.platform_facts_digest()?),
             ]),
             vec!["filesystem".into(), "isolated_materialization".into()],
         )
@@ -181,11 +182,11 @@ impl DesiredStateProvider for ChezmoiProvider {
 
     fn inspect_inputs(
         &self,
-        _context: &ProviderContext,
+        context: &ProviderContext,
     ) -> Result<ProviderInputs, ProviderFailure> {
         self.preflight()?;
         self.validate_version()?;
-        self.inputs()
+        self.inputs(context)
     }
 
     fn materialize(
@@ -196,7 +197,7 @@ impl DesiredStateProvider for ChezmoiProvider {
     ) -> Result<MaterializedState, ProviderFailure> {
         self.preflight()?;
         self.validate_version()?;
-        let inputs = self.inputs()?;
+        let inputs = self.inputs(context)?;
         let root = context.declared_roots.first().ok_or_else(|| {
             ProviderFailure::Materialize("chezmoi requires one declared target root".into())
         })?;
@@ -256,6 +257,10 @@ impl DesiredStateProvider for ChezmoiProvider {
             .arg("--no-tty")
             .arg("--no-pager")
             .arg("--color=off")
+            .arg("--os")
+            .arg(&context.platform)
+            .arg("--arch")
+            .arg(&context.architecture)
             .arg("--refresh-externals=never")
             .arg("apply")
             .arg("--force")

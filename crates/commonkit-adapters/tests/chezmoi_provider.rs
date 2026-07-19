@@ -58,6 +58,8 @@ fn materializes_only_into_isolated_destination_with_fixed_flags() {
         "--no-tty",
         "--no-pager",
         "--color=off",
+        "--os macos",
+        "--arch aarch64",
         "--refresh-externals=never",
         "--exclude=scripts",
         "apply",
@@ -73,6 +75,19 @@ fn materializes_only_into_isolated_destination_with_fixed_flags() {
         .materialize(&context(), &fixture.workspace(), &fixture.artifacts())
         .unwrap();
     assert_eq!(state.digest, repeated.digest);
+}
+
+#[test]
+fn target_platform_facts_change_provider_inputs_not_controller_constants() {
+    let fixture = Fixture::new("target-platform");
+    let mac = fixture.provider().inspect_inputs(&context()).unwrap();
+    let mut linux_context = context();
+    linux_context.platform = "linux".into();
+    linux_context.architecture = "x86_64".into();
+    let linux = fixture.provider().inspect_inputs(&linux_context).unwrap();
+
+    assert_ne!(mac.input_set_digest, linux.input_set_digest);
+    assert_ne!(mac.input_digests["targetPlatform"], linux.input_digests["targetPlatform"]);
 }
 
 #[test]

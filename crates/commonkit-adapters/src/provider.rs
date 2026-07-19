@@ -230,6 +230,27 @@ pub struct ProviderContext {
     pub observed_fact_digests: BTreeMap<String, Sha256Digest>,
 }
 
+impl ProviderContext {
+    /// Stable binding used by providers whose output can vary by target OS or
+    /// architecture. This is target data, never controller process data.
+    pub fn platform_facts_digest(&self) -> Result<Sha256Digest, ProviderContractError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Facts<'a> {
+            platform: &'a str,
+            architecture: &'a str,
+        }
+        if self.platform.trim().is_empty() || self.architecture.trim().is_empty() {
+            return Err(ProviderContractError::IncompleteInputs);
+        }
+        digest_domain_json(
+            "commonkit.provider-target-platform.v1",
+            &Facts { platform: &self.platform, architecture: &self.architecture },
+        )
+        .map_err(Into::into)
+    }
+}
+
 /// Runtime-only capability that exposes an isolated provider destination.
 /// It deliberately contains no live-target path or mutation interface.
 #[derive(Debug, Clone)]

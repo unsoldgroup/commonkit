@@ -97,6 +97,7 @@ impl ApmProvider {
                 )?,
             ),
             ("targetPolicy".into(), context.policy_digest.clone()),
+            ("targetPlatform".into(), context.platform_facts_digest()?),
         ]);
         if let Some(bytes) = bound_source {
             input_digests.insert("promotedSource".into(), digest_bytes(&bytes)?);
