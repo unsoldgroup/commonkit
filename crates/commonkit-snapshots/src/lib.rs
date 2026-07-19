@@ -220,9 +220,11 @@ pub struct AuthorityStore {
 }
 
 /// Portable, authenticated source of truth for a mutable database's single writer and accepted
-/// snapshot head. The `revision` returned alongside a record is the compare-and-swap token that a
-/// Git integration must bind to the repository revision it fetched. A push must use the fetched
-/// Git commit as its expected parent; a non-fast-forward push is the repository-level CAS failure.
+/// snapshot head. Each transition is also retained in authenticated immutable history, which
+/// detects replay of an older mutable pointer when newer history is present. The `revision`
+/// returned alongside a record is the compare-and-swap token that a Git integration must bind to
+/// the repository revision it fetched. A push must use the fetched Git commit as its expected
+/// parent; a non-fast-forward push protects against rollback of the complete portable tree.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PortableAuthorityRecord {
@@ -268,6 +270,38 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
         self.root.join("authority").join(format!("{database}.json"))
     }
 
+    fn history_root(&self, database: &DatabaseId) -> PathBuf {
+        self.root
+            .join("authority-history")
+            .join(database.to_string())
+    }
+
+    fn write_record(
+        &self,
+        database: &DatabaseId,
+        record: &PortableAuthorityRecord,
+    ) -> Result<String, SnapshotError> {
+        let revision =
+            sha256(&serde_jcs::to_vec(record).map_err(|_| SnapshotError::TransactionIntegrity)?);
+        // Publish immutable authenticated history before the mutable pointer. A crash between
+        // these writes fails closed; it can never make an older pointer appear current.
+        write_authenticated_envelope(
+            &self
+                .history_root(database)
+                .join(format!("{}.json", &revision[7..])),
+            record,
+            self.cipher,
+            Self::aad(database).as_bytes(),
+        )?;
+        write_authenticated_envelope(
+            &self.path(database),
+            record,
+            self.cipher,
+            Self::aad(database).as_bytes(),
+        )?;
+        Ok(revision)
+    }
+
     fn lock(&self, database: &DatabaseId) -> Result<PortableAuthorityLock, SnapshotError> {
         let path = self
             .root
@@ -307,11 +341,13 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
             // different local target ID and must not reinterpret that as initialization input.
             return self.read_unlocked(database);
         }
-        // A missing authority beside any portable descriptor is deletion/rollback, not a fresh kit.
-        if std::fs::read_dir(self.root.join("snapshots"))
-            .map_err(|_| SnapshotError::ObjectStoreFailed)?
-            .next()
-            .is_some()
+        // Missing mutable authority beside immutable descriptors or authority history is
+        // deletion/rollback, not a fresh kit.
+        if self.history_root(database).exists()
+            || std::fs::read_dir(self.root.join("snapshots"))
+                .map_err(|_| SnapshotError::ObjectStoreFailed)?
+                .next()
+                .is_some()
         {
             return Err(SnapshotError::PortableAuthorityRollback);
         }
@@ -324,12 +360,7 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
             generation: 0,
             previous_revision: None,
         };
-        let revision = write_authenticated_envelope(
-            &self.path(database),
-            &record,
-            self.cipher,
-            Self::aad(database).as_bytes(),
-        )?;
+        let revision = self.write_record(database, &record)?;
         Ok(VersionedPortableAuthority { record, revision })
     }
 
@@ -373,7 +404,78 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
                 return Err(SnapshotError::PortableAuthorityRollback);
             }
         }
+        self.validate_history_tip(database, &record, &revision)?;
         Ok(VersionedPortableAuthority { record, revision })
+    }
+
+    fn validate_history_tip(
+        &self,
+        database: &DatabaseId,
+        current: &PortableAuthorityRecord,
+        current_revision: &str,
+    ) -> Result<(), SnapshotError> {
+        let history_root = self.history_root(database);
+        let mut history = BTreeMap::<String, PortableAuthorityRecord>::new();
+        for entry in std::fs::read_dir(&history_root)
+            .map_err(|_| SnapshotError::PortableAuthorityRollback)?
+        {
+            let entry = entry.map_err(|_| SnapshotError::PortableAuthorityRollback)?;
+            if !entry
+                .file_type()
+                .map_err(|_| SnapshotError::PortableAuthorityRollback)?
+                .is_file()
+            {
+                return Err(SnapshotError::PortableAuthorityRollback);
+            }
+            let (record, revision): (PortableAuthorityRecord, String) =
+                read_authenticated_envelope(
+                    &entry.path(),
+                    self.cipher,
+                    Self::aad(database).as_bytes(),
+                )
+                .map_err(|_| SnapshotError::PortableAuthorityRollback)?;
+            if entry.file_name().to_string_lossy() != format!("{}.json", &revision[7..])
+                || record.database != *database
+                || history.insert(revision, record).is_some()
+            {
+                return Err(SnapshotError::PortableAuthorityRollback);
+            }
+        }
+        let (tip_revision, tip) = history
+            .iter()
+            .max_by_key(|(_, record)| record.generation)
+            .ok_or(SnapshotError::PortableAuthorityRollback)?;
+        if history
+            .values()
+            .filter(|record| record.generation == tip.generation)
+            .count()
+            != 1
+            || tip_revision != current_revision
+            || tip != current
+        {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        let mut cursor_revision = tip_revision;
+        let mut cursor = tip;
+        while cursor.generation > 0 {
+            let previous = cursor
+                .previous_revision
+                .as_ref()
+                .and_then(|revision| history.get_key_value(revision))
+                .ok_or(SnapshotError::PortableAuthorityRollback)?;
+            if previous.1.generation + 1 != cursor.generation {
+                return Err(SnapshotError::PortableAuthorityRollback);
+            }
+            cursor_revision = previous.0;
+            cursor = previous.1;
+        }
+        if cursor.generation != 0
+            || cursor.previous_revision.is_some()
+            || cursor_revision.is_empty()
+        {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        Ok(())
     }
 
     pub fn compare_and_swap_writer(
@@ -430,12 +532,7 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
             .checked_add(1)
             .ok_or(SnapshotError::TransactionIntegrity)?;
         record.previous_revision = Some(current.revision);
-        let revision = write_authenticated_envelope(
-            &self.path(database),
-            &record,
-            self.cipher,
-            Self::aad(database).as_bytes(),
-        )?;
+        let revision = self.write_record(database, &record)?;
         Ok(VersionedPortableAuthority { record, revision })
     }
 }
@@ -491,11 +588,61 @@ impl AuthorityStore {
         self.promote_with_failpoint(plan, PromotionFailpoint::None)
     }
 
+    /// Durably records a validated promotion before any shared portable authority is changed.
+    /// Once this returns, recovery needs only this plan and the authenticated portable writer.
+    pub fn prepare_promotion(&self, plan: PromotionPlan) -> Result<String, SnapshotError> {
+        self.validate_promotion(&plan)?;
+        let run = self.root.join("promotions").join(&plan.run_id);
+        std::fs::create_dir_all(&run).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        let path = run.join("plan.json");
+        if path.exists() {
+            let (existing, digest): (PromotionPlan, String) = read_envelope(&path)?;
+            return if existing == plan {
+                Ok(digest)
+            } else {
+                Err(SnapshotError::TransactionIntegrity)
+            };
+        }
+        write_envelope(&path, &plan)
+    }
+
+    /// Commits an already prepared promotion after the portable writer CAS has succeeded.
+    pub fn commit_prepared_promotion(
+        &self,
+        run_id: &str,
+    ) -> Result<PromotionReceipt, SnapshotError> {
+        let run = self.root.join("promotions").join(run_id);
+        let (plan, plan_digest): (PromotionPlan, String) = read_envelope(&run.join("plan.json"))?;
+        if plan.run_id != run_id {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        if self.authority(&plan.database)?
+            != (Authority::Writer {
+                target: plan.candidate_writer.clone(),
+            })
+        {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        if run.join("receipt.json").exists() {
+            let (receipt, _): (PromotionReceipt, String) =
+                read_envelope(&run.join("receipt.json"))?;
+            if receipt.plan_digest != plan_digest {
+                return Err(SnapshotError::TransactionIntegrity);
+            }
+            return Ok(receipt);
+        }
+        self.finish_promotion(plan, plan_digest, &run)
+    }
+
     /// Validates a promotion without writing plans, receipts, or authority. Callers coordinating
     /// a portable compare-and-swap use this before publishing the portable writer transition.
     pub fn validate_promotion(&self, plan: &PromotionPlan) -> Result<(), SnapshotError> {
         if plan.schema != "commonkit.promotion-plan.v1"
             || plan.run_id.is_empty()
+            || !plan
+                .run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
             || plan.candidate_writer.is_empty()
             || plan.current_writer_digest != plan.latest_snapshot_digest
         {
@@ -520,10 +667,7 @@ impl AuthorityStore {
         plan: PromotionPlan,
         failpoint: PromotionFailpoint,
     ) -> Result<PromotionReceipt, SnapshotError> {
-        self.validate_promotion(&plan)?;
-        let run = self.root.join("promotions").join(&plan.run_id);
-        std::fs::create_dir_all(&run).map_err(|_| SnapshotError::ObjectStoreFailed)?;
-        let plan_digest = write_envelope(&run.join("plan.json"), &plan)?;
+        self.prepare_promotion(plan.clone())?;
         let new_authority = Authority::Writer {
             target: plan.candidate_writer.clone(),
         };
@@ -534,28 +678,11 @@ impl AuthorityStore {
         if failpoint == PromotionFailpoint::AfterAuthorityWrite {
             return Err(SnapshotError::Interrupted);
         }
-        self.finish_promotion(plan, plan_digest, &run)
+        self.commit_prepared_promotion(&plan.run_id)
     }
 
     pub fn recover_promotion(&self, run_id: &str) -> Result<PromotionReceipt, SnapshotError> {
-        let run = self.root.join("promotions").join(run_id);
-        let (plan, plan_digest): (PromotionPlan, String) = read_envelope(&run.join("plan.json"))?;
-        if self.authority(&plan.database)?
-            != (Authority::Writer {
-                target: plan.candidate_writer.clone(),
-            })
-        {
-            return Err(SnapshotError::TransactionIntegrity);
-        }
-        if run.join("receipt.json").exists() {
-            let (receipt, _): (PromotionReceipt, String) =
-                read_envelope(&run.join("receipt.json"))?;
-            if receipt.plan_digest != plan_digest {
-                return Err(SnapshotError::TransactionIntegrity);
-            }
-            return Ok(receipt);
-        }
-        self.finish_promotion(plan, plan_digest, &run)
+        self.commit_prepared_promotion(run_id)
     }
 
     /// Enumerates authenticated promotion plans that do not yet have a receipt. Any malformed,

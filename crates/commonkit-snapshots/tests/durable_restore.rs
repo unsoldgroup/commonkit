@@ -316,6 +316,42 @@ fn fresh_process_finishes_a_promotion_interrupted_after_authority_write() {
 }
 
 #[test]
+fn fresh_process_finishes_a_promotion_prepared_before_portable_authority_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let database = DatabaseId::new("context-mode").unwrap();
+    let store = AuthorityStore::open(root.path()).unwrap();
+    store.initialize(&database, "writer-a").unwrap();
+    let plan = PromotionPlan {
+        schema: "commonkit.promotion-plan.v1".into(),
+        run_id: "promotion-portable-cas-crash".into(),
+        database: database.clone(),
+        previous_writer: "writer-a".into(),
+        candidate_writer: "writer-b".into(),
+        latest_snapshot_digest: "sha256:snapshot".into(),
+        current_writer_digest: "sha256:snapshot".into(),
+        candidate_digest: "sha256:snapshot".into(),
+    };
+
+    store.prepare_promotion(plan).unwrap();
+    assert_eq!(
+        store.unfinished_promotions().unwrap(),
+        ["promotion-portable-cas-crash"]
+    );
+
+    // Models restart discovery synchronizing the authenticated portable CAS before recovery.
+    let restarted = AuthorityStore::open(root.path()).unwrap();
+    restarted
+        .synchronize_from_portable(&database, "writer-b")
+        .unwrap();
+    let receipt = restarted
+        .recover_promotion("promotion-portable-cas-crash")
+        .unwrap();
+
+    assert_eq!(receipt.previous_writer, "writer-a");
+    assert_eq!(receipt.authoritative_writer, "writer-b");
+}
+
+#[test]
 fn startup_discovery_finds_unfinished_promotions() {
     let root = tempfile::tempdir().unwrap();
     let database = DatabaseId::new("context-mode").unwrap();

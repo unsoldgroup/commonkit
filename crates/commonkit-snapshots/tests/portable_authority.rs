@@ -165,6 +165,37 @@ fn recomputing_an_unkeyed_digest_cannot_forge_portable_writer_authority() {
     );
 }
 
+#[test]
+fn replaying_an_older_authenticated_authority_is_rejected_when_history_remains() {
+    let portable = tempfile::tempdir().unwrap();
+    let cipher = DeterministicTestCipher::new([75; 32]);
+    let database = DatabaseId::new("context-mode").unwrap();
+    let store = PortableAuthorityStore::open(portable.path(), &cipher).unwrap();
+    let initial = store.initialize(&database, "machine-a").unwrap();
+    let old_authority = fs::read(portable.path().join("authority/context-mode.json")).unwrap();
+    let first_descriptor = descriptor(portable.path(), br#"{"snapshot":"one"}"#);
+    store
+        .compare_and_swap_head(
+            &database,
+            &initial.revision,
+            "machine-a",
+            &digest(b"one"),
+            &first_descriptor,
+        )
+        .unwrap();
+
+    fs::write(
+        portable.path().join("authority/context-mode.json"),
+        old_authority,
+    )
+    .unwrap();
+
+    assert_eq!(
+        store.read(&database),
+        Err(SnapshotError::PortableAuthorityRollback)
+    );
+}
+
 fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
     fs::create_dir_all(destination).unwrap();
     for entry in fs::read_dir(source).unwrap() {
