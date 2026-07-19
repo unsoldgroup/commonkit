@@ -10,6 +10,8 @@ The initial provider supports ordinary files, directories, portable modes, safe 
 
 Chezmoi runs with an empty environment, private workspace-scoped home/cache/state/working/destination paths, external refresh disabled, and scripts explicitly excluded. CommonKit scans staged output into normalized resources; only CommonKit adapters may mutate the target.
 
+Chezmoi 2.70.4 derives `.chezmoi.os` and `.chezmoi.arch` from the Go runtime and does not document CLI overrides for either value. Materialization therefore requires the CommonKit target platform and architecture to match the controller executing chezmoi. A mismatch fails before `chezmoi apply`; use a matching controller or the native provider. CommonKit must not invent provider flags or silently render target-conditional templates with controller facts.
+
 ## Rationale
 
 Chezmoi defines target state partly from the current destination and does not expose a documented “compute against live A, emit into isolated B” interface. Supporting destination-dependent features would either change their meaning or require live `chezmoi apply`, violating CommonKit transactionality.
@@ -21,3 +23,4 @@ Unsupported features may graduate only after fixtures prove staged/live semantic
 - Existing advanced chezmoi sources receive source-linked remediation instead of partial output.
 - Native CommonKit resources remain the fallback for denied capabilities.
 - CommonKit does not redistribute chezmoi in the current design. If that changes, its MIT notice must ship in every artifact.
+- Cross-platform SSH targets cannot use the chezmoi provider from a differently shaped controller in v1; native resources remain available for that case.

@@ -18,8 +18,8 @@ fn digest(seed: char) -> Sha256Digest {
 fn context() -> ProviderContext {
     ProviderContext {
         target_id: StableId::parse("laptop").unwrap(),
-        platform: "macos".into(),
-        architecture: "aarch64".into(),
+        platform: std::env::consts::OS.into(),
+        architecture: std::env::consts::ARCH.into(),
         policy_digest: digest('a'),
         declared_roots: vec![NormalizedManagedPath::parse("home").unwrap()],
         observed_fact_digests: BTreeMap::new(),
@@ -58,8 +58,6 @@ fn materializes_only_into_isolated_destination_with_fixed_flags() {
         "--no-tty",
         "--no-pager",
         "--color=off",
-        "--os macos",
-        "--arch aarch64",
         "--refresh-externals=never",
         "--exclude=scripts",
         "apply",
@@ -69,12 +67,47 @@ fn materializes_only_into_isolated_destination_with_fixed_flags() {
             "missing fixed argument {required}: {apply}"
         );
     }
+    assert!(!apply.contains("--os"), "unsupported --os flag: {apply}");
+    assert!(
+        !apply.contains("--arch"),
+        "unsupported --arch flag: {apply}"
+    );
     assert!(!apply.contains(&fixture.live.display().to_string()));
 
     let repeated = provider
         .materialize(&context(), &fixture.workspace(), &fixture.artifacts())
         .unwrap();
     assert_eq!(state.digest, repeated.digest);
+}
+
+#[test]
+fn rejects_materialization_for_a_different_target_platform_before_apply() {
+    let fixture = Fixture::new("cross-platform-target");
+    fs::write(
+        fixture.source.join("dot_machine.tmpl"),
+        "{{ .chezmoi.os }}\n",
+    )
+    .unwrap();
+    let mut remote = context();
+    remote.platform = if std::env::consts::OS == "linux" {
+        "macos".into()
+    } else {
+        "linux".into()
+    };
+
+    let error = fixture
+        .provider()
+        .materialize(&remote, &fixture.workspace(), &fixture.artifacts())
+        .expect_err("chezmoi cannot emulate another target platform")
+        .to_string();
+
+    assert!(error.contains("cannot emulate target platform"), "{error}");
+    let calls = fs::read_to_string(&fixture.calls).unwrap_or_default();
+    assert!(
+        !calls.lines().any(|line| line.contains(" apply")),
+        "{calls}"
+    );
+    assert_eq!(fs::read_dir(&fixture.live).unwrap().count(), 0);
 }
 
 #[test]
@@ -186,6 +219,27 @@ fn real_chezmoi_release_materializes_supported_fixtures_deterministically() {
         .materialize(&context(), &fixture.workspace(), &fixture.artifacts())
         .unwrap();
     assert_eq!(first.digest, second.digest);
+    let go_os = if std::env::consts::OS == "macos" {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    };
+    let go_arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        architecture => architecture,
+    };
+    let machine = first
+        .resources
+        .iter()
+        .find_map(|resource| match &resource.intent {
+            FilesystemIntent::File { path, content, .. } if path.as_str() == "home/.machine" => {
+                Some(fixture.artifacts().load(content).unwrap())
+            }
+            _ => None,
+        })
+        .expect("machine-conditional output");
+    assert_eq!(machine, format!("{go_os}-{go_arch}\n").as_bytes());
     assert!(first.resources.iter().any(|resource| matches!(
         &resource.intent,
         FilesystemIntent::Symlink { path, target, .. }

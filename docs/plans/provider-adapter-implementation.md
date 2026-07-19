@@ -197,9 +197,12 @@ APM 0.25.0 uses the same inputs, materialized sets, ownership, bindings, artifac
 
 ## SSH target staging
 
-APM and chezmoi execute in an isolated workspace on the trusted controller, parameterized by the
-remote target's declared platform, architecture, policy, roots, and read-only observed-fact
-digests. CommonKit validates the complete materialized state before contacting the target. It then
+APM executes in an isolated workspace on the trusted controller, parameterized by the remote
+target's declared platform, architecture, policy, roots, and read-only observed-fact digests.
+Chezmoi 2.70.4 may use that path only when the target platform and architecture match the
+controller: its documented `.chezmoi.os` and `.chezmoi.arch` values come from Go's runtime and it
+has no documented platform-emulation flags. A mismatch fails closed before provider apply and
+requires a matching controller or native resources. CommonKit validates the complete materialized state before contacting the target. It then
 copies only deduplicated portable content-addressed artifacts through the pinned, typed SSH helper
 and verifies each artifact remotely. The returned durable receipt binds target, provider ID and
 exact version, provider-input digest, materialized-state digest, and ordered artifact digests.

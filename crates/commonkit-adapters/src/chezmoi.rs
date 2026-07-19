@@ -173,6 +173,26 @@ impl ChezmoiProvider {
         )
         .map_err(Into::into)
     }
+
+    /// v2.70.4 exposes `.chezmoi.os`/`.chezmoi.arch` from runtime.GOOS/GOARCH
+    /// and documents no CLI overrides. Rendering for another target would
+    /// produce controller state while claiming target provenance.
+    fn validate_execution_platform(
+        &self,
+        context: &ProviderContext,
+    ) -> Result<(), ProviderFailure> {
+        let controller_platform = std::env::consts::OS;
+        let controller_architecture = std::env::consts::ARCH;
+        if context.platform != controller_platform
+            || context.architecture != controller_architecture
+        {
+            return Err(ProviderFailure::Materialize(format!(
+                "chezmoi {TESTED_CHEZMOI_VERSION} cannot emulate target platform {}/{} from controller {controller_platform}/{controller_architecture}; run CommonKit on a matching controller or use the native provider for this target",
+                context.platform, context.architecture
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl DesiredStateProvider for ChezmoiProvider {
@@ -192,6 +212,7 @@ impl DesiredStateProvider for ChezmoiProvider {
         workspace: &ProviderWorkspace,
         artifacts: &ArtifactStore,
     ) -> Result<MaterializedState, ProviderFailure> {
+        self.validate_execution_platform(context)?;
         self.preflight()?;
         self.validate_version()?;
         let inputs = self.inputs(context)?;
@@ -254,10 +275,6 @@ impl DesiredStateProvider for ChezmoiProvider {
             .arg("--no-tty")
             .arg("--no-pager")
             .arg("--color=off")
-            .arg("--os")
-            .arg(&context.platform)
-            .arg("--arch")
-            .arg(&context.architecture)
             .arg("--refresh-externals=never")
             .arg("apply")
             .arg("--force")
