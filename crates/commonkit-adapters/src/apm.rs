@@ -375,6 +375,14 @@ mod windows_environment_tests {
         );
     }
 
+    #[test]
+    fn provider_output_paths_use_portable_separators() {
+        assert_eq!(
+            super::portable_relative_path(Path::new(r"rules\base.md")).unwrap(),
+            "rules/base.md"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -730,7 +738,7 @@ fn scan_outputs(
         let mut staged = Vec::new();
         collect_files(&root, &root, &mut staged)?;
         for (relative, bytes) in staged {
-            let source = format!("{output_root}/{}", relative.to_string_lossy());
+            let source = format!("{output_root}/{}", portable_relative_path(&relative)?);
             let path = NormalizedManagedPath::parse(format!("{}/{source}", managed_root.as_str()))
                 .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
             let content = artifacts
@@ -790,6 +798,34 @@ fn scan_outputs(
     }
     resources.sort_by(|left, right| left.intent.path().cmp(right.intent.path()));
     Ok(resources)
+}
+
+fn portable_relative_path(path: &Path) -> Result<String, ProviderFailure> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => parts.push(
+                part.to_str()
+                    .ok_or_else(|| {
+                        ProviderFailure::Materialize(
+                            "APM output path cannot be represented as portable UTF-8".into(),
+                        )
+                    })?
+                    .to_owned(),
+            ),
+            _ => {
+                return Err(ProviderFailure::Materialize(
+                    "APM output path is not a portable relative path".into(),
+                ));
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(ProviderFailure::Materialize(
+            "APM output path cannot be empty".into(),
+        ));
+    }
+    Ok(parts.join("/"))
 }
 
 fn copy_tree(source: &Path, destination: &Path) -> Result<(), ProviderFailure> {
