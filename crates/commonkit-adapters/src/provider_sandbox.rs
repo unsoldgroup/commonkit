@@ -1327,6 +1327,40 @@ mod windows_sandbox_tests {
     }
 
     #[test]
+    fn completed_appcontainer_terminates_started_descendants() {
+        let executable = system_executable("cmd.exe");
+        let root = tempfile::tempdir().expect("workspace");
+        std::fs::write(
+            root.path().join("parent.cmd"),
+            "@start \"\" /b cmd.exe /d /c child.cmd\r\n:wait\r\n@if not exist descendant-started goto wait\r\n@exit /b 0\r\n",
+        )
+        .expect("parent script");
+        std::fs::write(
+            root.path().join("child.cmd"),
+            "@echo started>descendant-started\r\n:wait\r\n@if not exist descendant-release goto wait\r\n@echo survived>descendant-marker\r\n",
+        )
+        .expect("child script");
+        let mut command = ProviderSandbox::new(&executable, root.path());
+        command.args(["/D", "/C", "parent.cmd"]);
+        command.test_limits(Duration::from_secs(2), 1024);
+        configure_runtime(&mut command, root.path());
+
+        let output = command.output().expect("contained parent launch");
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            root.path().join("descendant-started").is_file(),
+            "test descendant never started"
+        );
+        std::fs::write(root.path().join("descendant-release"), b"").expect("release marker");
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(
+            !root.path().join("descendant-marker").exists(),
+            "provider descendant survived AppContainer completion"
+        );
+    }
+
+    #[test]
     fn appcontainer_without_capabilities_cannot_connect_to_loopback() {
         let executable = system_executable("curl.exe");
         if !executable.is_file() {
