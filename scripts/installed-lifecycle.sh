@@ -9,13 +9,25 @@ mkdir -p "$scratch/source/layers" "$scratch/source/portable" "$scratch/tools" "$
 
 commonkit="$installed_bin/commonkit"
 commonkitd="$installed_bin/commonkitd"
+target_helper="$installed_bin/commonkit-target-helper"
 recovery_fixture="$installed_bin/commonkit-snapshot-recovery-fixture"
 if [[ "${RUNNER_OS:-}" == Windows ]]; then
   commonkit="$commonkit.exe"
   commonkitd="$commonkitd.exe"
+  target_helper="$target_helper.exe"
   recovery_fixture="$recovery_fixture.exe"
 fi
-for executable in "$commonkit" "$commonkitd" "$recovery_fixture"; do test -x "$executable"; done
+for executable in "$commonkit" "$commonkitd" "$target_helper" "$recovery_fixture"; do test -x "$executable"; done
+
+# Keep every installed smoke artifact and service definition inside the runner scratch root.
+export HOME="$scratch/home"
+export USERPROFILE="$scratch/home"
+export XDG_CONFIG_HOME="$scratch/home/.config"
+export XDG_DATA_HOME="$scratch/home/.local/share"
+export XDG_CACHE_HOME="$scratch/home/.cache"
+export COMMONKIT_SERVICE_BACKEND=process_fallback
+export COMMONKIT_SERVICE_ROOT="$scratch/service"
+mkdir -p "$HOME"
 
 zero_digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
 cat > "$scratch/source/layers/public-base.json" <<JSON
@@ -88,6 +100,23 @@ export COMMONKIT_REAL_GIT="$real_git"
 export COMMONKIT_GIT_HELPER_LOG="$scratch/git-helper.log"
 export PATH="$scratch/tools:$installed_bin:$PATH"
 
+stop_daemon() {
+  "$commonkit" daemon uninstall >/dev/null 2>&1 || true
+}
+start_daemon() {
+  "$commonkit" daemon install >/dev/null
+  "$commonkit" daemon start >/dev/null
+  for _ in $(seq 1 150); do
+    if "$commonkit" relay status >/dev/null 2>&1; then return; fi
+    sleep 0.1
+  done
+  cat "$scratch/service/commonkitd.log" >&2
+  return 1
+}
+trap stop_daemon EXIT
+start_daemon
+"$commonkit" daemon status | node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>{const s=JSON.parse(b);if(!s.installed||!s.running)process.exit(1)})'
+
 init_json="$scratch/init.json"
 "$commonkit" init connect \
   --repository owner/installed-fixture \
@@ -121,23 +150,10 @@ config.snapshots = {
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 JS
 
-daemon_pid=
-stop_daemon() {
-  if [[ -n "$daemon_pid" ]]; then kill "$daemon_pid" 2>/dev/null || true; wait "$daemon_pid" 2>/dev/null || true; fi
-  daemon_pid=
-}
-start_daemon() {
-  "$commonkitd" --port 0 --relay-port 0 > "$scratch/commonkitd.log" 2>&1 &
-  daemon_pid=$!
-  for _ in $(seq 1 150); do
-    if "$commonkit" relay status >/dev/null 2>&1; then return; fi
-    sleep 0.1
-  done
-  cat "$scratch/commonkitd.log" >&2
-  return 1
-}
-trap stop_daemon EXIT
-start_daemon
+# Desktop-owned onboarding reload boundary: the process began without
+# headless.json, so reload it before consuming the first materialized plan.
+"$commonkit" daemon restart >/dev/null
+for _ in $(seq 1 150); do "$commonkit" relay status >/dev/null 2>&1 && break; sleep 0.1; done
 
 "$commonkit" status >/dev/null
 "$commonkit" compose >/dev/null
@@ -174,8 +190,21 @@ test "$(cat "$database")" = 'pre-interruption database'
 stop_daemon
 "$recovery_fixture" recover "$snapshot_root"
 
-# Portable SSH-helper simulation: assert a helper can receive an argv-safe, stdin-only payload.
-ssh_log="$scratch/ssh-helper.log"
-printf '%s\n' '{"operation":"inspect","path":"portable/editor.conf"}' |
-  node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>require("fs").writeFileSync(process.argv[1],b))' "$ssh_log"
-grep -q 'portable/editor.conf' "$ssh_log"
+# Exercise the actual installed, typed stdin-only ssh remote helper protocol.
+helper_target="$scratch/helper-target"
+helper_state="$scratch/helper-state"
+mkdir -p "$HOME/.config/commonkit" "$helper_target"
+node - "$HOME/.config/commonkit/target-helper.json" "$helper_state" "$helper_target" <<'JS'
+const fs = require("fs");
+fs.writeFileSync(process.argv[2], JSON.stringify({
+  stateRoot: process.argv[3],
+  roots: [{ id: "home", path: process.argv[4], access: "read_write" }],
+}));
+JS
+printf '%s' '{"operation":"write_file","root_id":"home","path":"portable/helper-proof.txt","content":[104,101,108,112,101,114,10]}' |
+  "$target_helper" --stdio-v1 > "$scratch/helper-response.json"
+node -e 'const r=require(process.argv[1]);if(r.result!=="applied")process.exit(1)' "$scratch/helper-response.json"
+test "$(cat "$helper_target/portable/helper-proof.txt")" = helper
+
+stop_daemon
+"$commonkit" daemon status | node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>{const s=JSON.parse(b);if(s.installed||s.running)process.exit(1)})'

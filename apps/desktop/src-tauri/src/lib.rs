@@ -23,6 +23,7 @@ struct ServiceClient {
 struct RuntimeBinaryLayout {
     cli: PathBuf,
     daemon: PathBuf,
+    target_helper: PathBuf,
 }
 
 impl RuntimeBinaryLayout {
@@ -32,6 +33,7 @@ impl RuntimeBinaryLayout {
         Self {
             cli: directory.join(format!("commonkit{extension}")),
             daemon: directory.join(format!("commonkitd{extension}")),
+            target_helper: directory.join(format!("commonkit-target-helper{extension}")),
         }
     }
 
@@ -56,7 +58,7 @@ impl RuntimeBinaryLayout {
     }
 
     fn validate(&self) -> Result<(), DesktopError> {
-        for path in [&self.cli, &self.daemon] {
+        for path in [&self.cli, &self.daemon, &self.target_helper] {
             let metadata = std::fs::symlink_metadata(path)
                 .map_err(|_| DesktopError::RuntimeBinaryMissing)?;
             if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -110,6 +112,65 @@ impl ServiceSupervisor {
             Some(child) => child.try_wait()?.is_some(),
             None => false,
         })
+    }
+
+    /// Replace the daemon only when this desktop instance owns its process.
+    ///
+    /// An empty slot means Desktop attached to an independently managed daemon;
+    /// callers must never terminate or replace that process.
+    fn replace_owned_child(
+        &self,
+        spawn: impl FnOnce() -> Result<Child, DesktopError>,
+    ) -> Result<bool, DesktopError> {
+        let mut slot = self
+            .child
+            .lock()
+            .map_err(|_| DesktopError::ServiceLaunchFailed)?;
+        let Some(mut previous) = slot.take() else {
+            return Ok(false);
+        };
+        let _ = previous.kill();
+        let _ = previous.wait();
+        let replacement = spawn()?;
+        *slot = Some(replacement);
+        Ok(true)
+    }
+
+    fn reload_owned_after_onboarding(&self, client: &ServiceClient) -> Result<(), DesktopError> {
+        if self
+            .child
+            .lock()
+            .map_err(|_| DesktopError::ServiceLaunchFailed)?
+            .is_none()
+        {
+            return Err(DesktopError::ExternalServiceReloadRequired);
+        }
+        let runtime = RuntimeBinaryLayout::discover()?;
+        let replaced = self.replace_owned_child(|| {
+            Command::new(&runtime.daemon)
+                .args(["--port", "0", "--relay-port", "0"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(|_| DesktopError::ServiceLaunchFailed)
+        })?;
+        if !replaced {
+            return Err(DesktopError::ExternalServiceReloadRequired);
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if service_is_authenticated(client) {
+                return Ok(());
+            }
+            if self.child_exited()? {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.stop();
+        Err(DesktopError::ServiceReloadFailed)
     }
 
     fn stop(&self) {
@@ -387,7 +448,11 @@ fn path_string(path: &std::path::Path) -> Result<String, DesktopError> {
 }
 
 #[tauri::command]
-fn onboarding_initialize(request: OnboardingRequest) -> Result<serde_json::Value, DesktopError> {
+fn onboarding_initialize(
+    request: OnboardingRequest,
+    supervisor: tauri::State<'_, ServiceSupervisor>,
+    client: tauri::State<'_, ServiceClient>,
+) -> Result<serde_json::Value, DesktopError> {
     let _ = onboarding_arguments(&request)?;
     use commonkit_cli::onboarding::{
         InitMode, InitRequest, ProcessRunner, ProviderSelection, initialize,
@@ -432,6 +497,7 @@ fn onboarding_initialize(request: OnboardingRequest) -> Result<serde_json::Value
         &ProcessRunner::from_path(),
     )
     .map_err(|_| DesktopError::OnboardingFailed)?;
+    supervisor.reload_owned_after_onboarding(client.inner())?;
     serde_json::to_value(result).map_err(Into::into)
 }
 
@@ -595,6 +661,10 @@ enum DesktopError {
     RuntimeBinaryMissing,
     #[error("the bundled CommonKit service could not be started")]
     ServiceLaunchFailed,
+    #[error("CommonKit saved the new configuration, but the independently managed service must be restarted by its service manager before continuing")]
+    ExternalServiceReloadRequired,
+    #[error("CommonKit saved the new configuration, but its managed service could not reload it; reopen CommonKit and retry")]
+    ServiceReloadFailed,
     #[error("local control state is invalid")]
     InvalidControlState,
     #[error("input is invalid")]
@@ -1070,6 +1140,7 @@ async fn refresh_tray(app: tauri::AppHandle) {
             "runtimeVersion": status.runtime_version,
             "bundledCli": runtime.as_ref().ok().map(|value| &value.cli),
             "bundledDaemon": runtime.as_ref().ok().map(|value| &value.daemon),
+            "bundledTargetHelper": runtime.as_ref().ok().map(|value| &value.target_helper),
             "tray": summary,
         });
         if runtime.is_ok()
@@ -1192,6 +1263,39 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn onboarding_replaces_only_a_desktop_owned_daemon_process() {
+        let first = Command::new("sleep").arg("60").spawn().unwrap();
+        let first_id = first.id();
+        let supervisor = ServiceSupervisor {
+            child: Mutex::new(Some(first)),
+        };
+
+        let replaced = supervisor
+            .replace_owned_child(|| Command::new("sleep").arg("60").spawn().map_err(Into::into))
+            .unwrap();
+
+        assert!(replaced);
+        let second_id = supervisor
+            .child
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("replacement process")
+            .id();
+        assert_ne!(first_id, second_id);
+
+        supervisor.stop();
+        let attached = ServiceSupervisor {
+            child: Mutex::new(None),
+        };
+        assert!(!attached
+            .replace_owned_child(|| panic!("an externally managed daemon must not be replaced"))
+            .unwrap());
+    }
+
     #[test]
     fn packaged_runtime_binaries_are_resolved_only_beside_the_installed_desktop() {
         let executable = if cfg!(windows) { "commonkit-desktop.exe" } else { "commonkit-desktop" };
@@ -1199,6 +1303,7 @@ mod tests {
         let layout = RuntimeBinaryLayout::beside(&root.join(executable));
         assert_eq!(layout.cli, root.join(if cfg!(windows) { "commonkit.exe" } else { "commonkit" }));
         assert_eq!(layout.daemon, root.join(if cfg!(windows) { "commonkitd.exe" } else { "commonkitd" }));
+        assert_eq!(layout.target_helper, root.join(if cfg!(windows) { "commonkit-target-helper.exe" } else { "commonkit-target-helper" }));
     }
 
     #[test]

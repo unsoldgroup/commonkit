@@ -2,6 +2,8 @@
 
 `commonkitd` loads optional production capability configuration from `headless.json` in CommonKit's private configuration directory. A missing file, or an omitted top-level capability, leaves only that capability unavailable. A present but malformed or incomplete capability fails daemon startup; CommonKit does not install an echo implementation or report fabricated success.
 
+The daemon loads this file at process start. Desktop first-run onboarding writes it atomically and, when Desktop launched the bundled daemon, replaces only that owned process and waits for authenticated health before reporting success. If Desktop attached to a daemon managed by launchd, systemd, Windows Services, or another supervisor, it never terminates that process; onboarding reports that the external service manager must reload it instead of falsely claiming the new domains are active.
+
 The configuration has three independent sections:
 
 - `sync` identifies the target root, adapter state, declared and protected portable roots, composed-loadout and policy bindings, and a provider artifact store. Production loadouts use `providerPipeline`: CommonKit fetches and validates the trusted Git remote and exact pinned revision, runs configured native/APM/chezmoi providers in isolated controller workspaces, validates the combined ownership map, and persists digest-addressed `MaterializedState` records before planning. `materializedStates` remains a migration path and is mutually exclusive with `providerPipeline`. Provider code never runs during apply, recovery, or rollback.

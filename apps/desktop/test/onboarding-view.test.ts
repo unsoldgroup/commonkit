@@ -18,3 +18,7 @@ test("guided onboarding exposes only pinned provider-specific inputs", () => {
 test("onboarding status is escaped", () => {
   assert.doesNotMatch(onboardingPanel("native", "<script>alert(1)</script>"), /<script>/);
 });
+
+test("onboarding explains that the managed service reload is part of completion", () => {
+  assert.match(onboardingPanel("native"), /reloads its managed service/i);
+});

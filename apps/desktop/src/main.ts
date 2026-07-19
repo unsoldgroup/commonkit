@@ -81,7 +81,7 @@ function bindOnboardingActions(): void {
     event.preventDefault();
     const values: Record<string, unknown> = Object.fromEntries(new FormData(event.currentTarget as HTMLFormElement).entries());
     values.publishRegistration = values.publishRegistration === "true";
-    onboardingMessage = "Validating pinned provider and materializing…";
+    onboardingMessage = "Validating the pinned provider, materializing, and reloading the managed service…";
     render();
     try {
       const result = await desktopApi.onboardingInitialize(values);

@@ -13,7 +13,7 @@ export function onboardingPanel(provider: OnboardingProvider = "native", message
     <label>Config path<input name="chezmoiConfig" value="chezmoi.toml" required><button type="button" data-pick="chezmoiConfig">Choose file</button></label>
     <input name="providerVersion" type="hidden" value="2.70.4">` : "";
   return `<section class="panel onboarding-panel"><p class="eyebrow">Get started</p><h1>Create or connect your kit</h1>
-    <p>Provider output is staged and shown as a CommonKit plan before this machine changes.</p>
+    <p>Provider output is staged and shown as a CommonKit plan before this machine changes. CommonKit reloads its managed service before onboarding completes.</p>
     <form id="onboarding-form">
       <label>Action<select name="mode"><option value="connect">Connect</option><option value="create">Create private repository</option></select></label>
       <label>GitHub repository<input name="repository" placeholder="owner/commonkit" required></label>

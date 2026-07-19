@@ -18,7 +18,11 @@ test("desktop is single-window, CSP-bound, and emits updater artifacts", async (
   assert.match(config.app.security.csp, /default-src 'self'/);
   assert.equal(config.bundle.createUpdaterArtifacts, true);
   assert.equal(config.app.withGlobalTauri, false);
-  assert.deepEqual(config.bundle.externalBin, ["binaries/commonkit", "binaries/commonkitd"]);
+  assert.deepEqual(config.bundle.externalBin, [
+    "binaries/commonkit",
+    "binaries/commonkitd",
+    "binaries/commonkit-target-helper",
+  ]);
 });
 
 test("published installer lifecycle launches the installed desktop and waits for daemon health", async () => {
@@ -27,6 +31,16 @@ test("published installer lifecycle launches the installed desktop and waits for
   assert.match(workflow, /Applications\/CommonKit\.app\/Contents\/MacOS\/commonkit-desktop/);
   assert.match(workflow, /commonkit-desktop-smoke\.json/);
   assert.match(workflow, /serviceState/);
+});
+
+test("installed lifecycle proves onboarding reloads a daemon that started unconfigured", async () => {
+  const lifecycle = await readFile(new URL("../../../scripts/installed-lifecycle.sh", import.meta.url), "utf8");
+  const firstStart = lifecycle.indexOf("trap stop_daemon EXIT\nstart_daemon");
+  const initialized = lifecycle.indexOf('"$commonkit" init connect');
+  const reload = lifecycle.indexOf("# Desktop-owned onboarding reload boundary");
+  const firstPlan = lifecycle.indexOf('"$commonkit" sync --confirmed');
+  assert.ok(firstStart >= 0 && firstStart < initialized, "daemon must start before onboarding writes headless.json");
+  assert.ok(reload > initialized && reload < firstPlan, "owned daemon must reload before the first plan is used");
 });
 
 test("release builds bundle target-matched CLI and daemon before Tauri packaging", async () => {
