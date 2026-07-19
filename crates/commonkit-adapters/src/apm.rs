@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::OpenOptions as StdOpenOptions;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -158,6 +160,7 @@ impl ApmProvider {
                 self.config.executable.display()
             ))
         })?;
+        persist_private_diagnostics(scratch, args[0], &output)?;
         if !output.status.success() {
             return Err(ProviderFailure::Materialize(format!(
                 "APM command `{}` failed with status {}; inspect the provider's private diagnostics, fix the inputs, and retry",
@@ -189,6 +192,100 @@ impl ApmProvider {
             copy_tree(&source, &staging.join(".apm"))?;
         }
         Ok(())
+    }
+}
+
+fn persist_private_diagnostics(
+    scratch: &Path,
+    command: &str,
+    output: &Output,
+) -> Result<(), ProviderFailure> {
+    validate_diagnostic_command(command)?;
+    for (stream, bytes) in [("stdout", &output.stdout), ("stderr", &output.stderr)] {
+        let path = scratch.join(format!("apm-{command}.{stream}"));
+        let mut options = StdOpenOptions::new();
+        options.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path).map_err(materialize_io)?;
+        file.write_all(bytes).map_err(materialize_io)?;
+        file.sync_all().map_err(materialize_io)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file
+                .metadata()
+                .map_err(materialize_io)?
+                .permissions()
+                .mode()
+                & 0o777
+                != 0o600
+            {
+                return Err(ProviderFailure::Materialize(
+                    "APM private diagnostic permissions are unsafe".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns a bounded, line-redacted diagnostic for an explicitly secret-free
+/// troubleshooting context. Raw provider output remains private in scratch.
+pub fn redacted_apm_diagnostic_summary(
+    scratch: &Path,
+    command: &str,
+) -> Result<String, ProviderFailure> {
+    validate_diagnostic_command(command)?;
+    const MAX_BYTES: usize = 4096;
+    let mut summary = String::new();
+    for stream in ["stdout", "stderr"] {
+        let bytes =
+            fs::read(scratch.join(format!("apm-{command}.{stream}"))).map_err(materialize_io)?;
+        let bounded = &bytes[..bytes.len().min(MAX_BYTES)];
+        summary.push_str(stream);
+        summary.push_str(":\n");
+        for line in String::from_utf8_lossy(bounded).lines() {
+            let lowercase = line.to_ascii_lowercase();
+            if [
+                "authorization",
+                "bearer ",
+                "token",
+                "secret",
+                "password",
+                "api_key",
+                "apikey",
+            ]
+            .iter()
+            .any(|marker| lowercase.contains(marker))
+            {
+                summary.push_str("[REDACTED SENSITIVE LINE]\n");
+            } else {
+                summary.push_str(line);
+                summary.push('\n');
+            }
+        }
+        if bytes.len() > MAX_BYTES {
+            summary.push_str("[TRUNCATED]\n");
+        }
+    }
+    Ok(summary)
+}
+
+fn validate_diagnostic_command(command: &str) -> Result<(), ProviderFailure> {
+    if !command.is_empty()
+        && command
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(ProviderFailure::Materialize(
+            "invalid APM diagnostic command label".into(),
+        ))
     }
 }
 

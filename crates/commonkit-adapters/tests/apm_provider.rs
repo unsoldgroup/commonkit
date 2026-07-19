@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use commonkit_adapters::{
     ApmProvider, ApmProviderConfig, ArtifactStore, DesiredStateProvider, ExactProviderVersion,
     FilesystemIntent, NormalizedManagedPath, ProviderCapability, ProviderContext,
-    ProviderWorkspace,
+    ProviderWorkspace, redacted_apm_diagnostic_summary,
 };
 use commonkit_contracts::{Sha256Digest, StableId};
 
@@ -185,6 +185,48 @@ fn invalid_inputs_fail_before_provider_execution() {
     );
 
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn failed_provider_output_stays_private_and_exported_diagnostics_are_bounded_and_redacted() {
+    let root = fixture("private-diagnostics");
+    let executable = root.join("apm");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\n'; exit 0; fi
+if [ "$1" = "install" ]; then printf 'ordinary failure detail\ntoken=super-secret-value\n' >&2; exit 1; fi
+"#,
+    );
+    let provider = configured(&root, executable);
+    let stage = root.join("stage");
+    let live = root.join("live");
+    fs::create_dir_all(&stage).unwrap();
+    fs::create_dir_all(&live).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, std::slice::from_ref(&live)).unwrap();
+    let scratch = workspace.scratch_root().to_path_buf();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+
+    let error = provider
+        .materialize(&context(), &workspace, &artifacts)
+        .unwrap_err()
+        .to_string();
+    assert!(!error.contains("super-secret-value"));
+    let raw = fs::read_to_string(scratch.join("apm-install.stderr")).unwrap();
+    assert!(raw.contains("super-secret-value"));
+    assert_eq!(
+        fs::metadata(scratch.join("apm-install.stderr"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    let summary = redacted_apm_diagnostic_summary(&scratch, "install").unwrap();
+    assert!(summary.contains("ordinary failure detail"));
+    assert!(summary.contains("[REDACTED SENSITIVE LINE]"));
+    assert!(!summary.contains("super-secret-value"));
+    assert!(redacted_apm_diagnostic_summary(&scratch, "../outside").is_err());
 }
 
 #[test]

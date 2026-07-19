@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_adapters::{
     ApmProvider, ApmProviderConfig, ArtifactStore, DesiredStateProvider, ExactProviderVersion,
-    NormalizedManagedPath, ProviderContext, ProviderWorkspace,
+    NormalizedManagedPath, ProviderContext, ProviderWorkspace, redacted_apm_diagnostic_summary,
 };
 use commonkit_contracts::{Sha256Digest, StableId};
 
@@ -57,13 +57,15 @@ fn checksum_pinned_apm_release_materializes_without_touching_live_target() {
         declared_roots: vec![NormalizedManagedPath::parse("home").unwrap()],
         observed_fact_digests: BTreeMap::new(),
     };
+    let workspace = ProviderWorkspace::open(&stage, std::slice::from_ref(&live)).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
     let state = provider
-        .materialize(
-            &context,
-            &ProviderWorkspace::open(&stage, std::slice::from_ref(&live)).unwrap(),
-            &ArtifactStore::open(root.join("artifacts")).unwrap(),
-        )
-        .unwrap();
+        .materialize(&context, &workspace, &artifacts)
+        .unwrap_or_else(|error| {
+            let summary = redacted_apm_diagnostic_summary(workspace.scratch_root(), "install")
+                .unwrap_or_else(|_| "private diagnostic unavailable".into());
+            panic!("{error}\nredacted bounded APM install diagnostic:\n{summary}");
+        });
     state.verify().unwrap();
     assert!(
         state
@@ -79,5 +81,6 @@ fn checksum_pinned_apm_release_materializes_without_touching_live_target() {
             .starts_with("home/.claude/"))
     );
     assert_eq!(fs::read_dir(live).unwrap().count(), 0);
+    drop(artifacts);
     fs::remove_dir_all(root).unwrap();
 }

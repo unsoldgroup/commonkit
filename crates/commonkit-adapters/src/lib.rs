@@ -19,7 +19,7 @@ mod ssh;
 mod ssh_files;
 mod target;
 
-pub use apm::{ApmProvider, ApmProviderConfig};
+pub use apm::{ApmProvider, ApmProviderConfig, redacted_apm_diagnostic_summary};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
 pub use chezmoi::{ChezmoiProvider, TESTED_CHEZMOI_VERSION};
 pub use credentials::{
