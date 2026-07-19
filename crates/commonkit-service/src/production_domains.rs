@@ -9,10 +9,11 @@ use commonkit_adapters::{
     ContentSensitivity, CredentialReference, CredentialResolver, DesiredStateProvider,
     ExactProviderVersion, FileAdapter, FilesystemIntent, GitRepository, GitSyncDisposition,
     LocalSensitiveFileStore, MaterializedState, NativeProvider, NormalizedManagedPath,
-    NormalizedResource, OwnershipRules, PlatformKeychain, PlatformKeychainCredentialResolver,
-    ProcessBwsRunner, ProcessGitRunner, ProcessPlatformSecretCommandRunner, ProviderContext,
-    ProviderInputs, ProviderPipeline, ProviderPlanRequest, ResourceProvenance, SecretValue,
-    build_provider_plan, validate_ownership,
+    NormalizedResource, OpenSshConfig, OpenSshTransport, OwnershipRules, PlatformKeychain,
+    PlatformKeychainCredentialResolver, ProcessBwsRunner, ProcessGitRunner,
+    ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderContext, ProviderInputs,
+    ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner, RemoteProviderStager,
+    ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan, validate_ownership,
 };
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{
@@ -62,12 +63,27 @@ struct SyncConfig {
     #[serde(default)]
     materialized_states: Vec<PathBuf>,
     provider_pipeline: Option<ProviderPipelineConfig>,
+    target_transport: Option<SyncTargetTransport>,
     declared_roots: Vec<NormalizedManagedPath>,
     protected_roots: Vec<NormalizedManagedPath>,
     case_sensitive: bool,
     target_identity_digest: Sha256Digest,
     composed_loadout_digest: Sha256Digest,
     policy_digest: Sha256Digest,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum SyncTargetTransport {
+    Local,
+    Ssh {
+        root_id: StableId,
+        host: String,
+        user: String,
+        port: u16,
+        known_hosts: PathBuf,
+        fingerprint: String,
+    },
 }
 
 #[derive(Clone, Deserialize)]
@@ -627,6 +643,7 @@ impl ProductionSyncDomain {
                 policy: checked_repository_path(&pipeline.source.repository, path_text(policy)?)?,
                 targets: targets.clone(),
                 managed_root: managed_root.clone(),
+                bound_source: None,
             })
             .map(|provider| Box::new(provider) as Box<dyn DesiredStateProvider>)
             .map_err(|_| DomainFailure::OperationFailed),
@@ -650,9 +667,9 @@ impl ProductionSyncDomain {
         }
     }
     fn build(&self) -> Result<Plan, DomainFailure> {
-        let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
+        fs::create_dir_all(&self.config.adapter_state)
             .map_err(|_| DomainFailure::OperationFailed)?;
-        let mut files = FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
+        let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let rules = OwnershipRules::new(
             self.config.case_sensitive,
@@ -666,13 +683,63 @@ impl ProductionSyncDomain {
             .flat_map(|state| state.resources.iter().cloned())
             .collect::<Vec<_>>();
         validate_ownership(&resources, &rules).map_err(|_| DomainFailure::OperationFailed)?;
-        let observed_digest = files
-            .observed_state_digest(
-                states
-                    .iter()
-                    .flat_map(|state| state.resources.iter().map(|resource| &resource.intent)),
-            )
+        let intents = || {
+            states
+                .iter()
+                .flat_map(|state| state.resources.iter().map(|resource| &resource.intent))
+        };
+        let plan = match self
+            .config
+            .target_transport
+            .as_ref()
+            .unwrap_or(&SyncTargetTransport::Local)
+        {
+            SyncTargetTransport::Local => {
+                let mut files =
+                    FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                let observed = files
+                    .observed_state_digest(intents())
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+                self.finish_plan(&states, &artifacts, &rules, observed, &mut files)?
+            }
+            transport @ SyncTargetTransport::Ssh { root_id, .. } => {
+                let mut ssh = open_ssh_transport(transport)?;
+                for state in &states {
+                    let suffix = &state.digest.as_str()[7..39];
+                    RemoteProviderStager::new(&mut ssh)
+                        .stage_materialized(
+                            state,
+                            &artifacts,
+                            self.config.target_id.clone(),
+                            StableId::parse(format!("provider-stage-{suffix}"))
+                                .map_err(|_| DomainFailure::OperationFailed)?,
+                        )
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                }
+                let mut files =
+                    SshFileAdapter::open(root_id.clone(), &self.config.adapter_state, ssh)
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                let observed = files
+                    .observed_state_digest(intents())
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+                self.finish_plan(&states, &artifacts, &rules, observed, &mut files)?
+            }
+        };
+        self.plan_store
+            .persist(&plan)
             .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(plan)
+    }
+
+    fn finish_plan<P: ProviderResourcePlanner + ?Sized>(
+        &self,
+        states: &[MaterializedState],
+        artifacts: &ArtifactStore,
+        rules: &OwnershipRules,
+        observed_digest: Sha256Digest,
+        files: &mut P,
+    ) -> Result<Plan, DomainFailure> {
         let plan = build_provider_plan(
             ProviderPlanRequest {
                 target_id: self.config.target_id.clone(),
@@ -683,16 +750,35 @@ impl ProductionSyncDomain {
                 ownership_rules: &rules,
                 mapped_side_effects: BTreeSet::new(),
             },
-            &states,
-            &artifacts,
-            &mut files,
+            states,
+            artifacts,
+            files,
         )
         .map_err(|_| DomainFailure::OperationFailed)?;
-        self.plan_store
-            .persist(&plan)
-            .map_err(|_| DomainFailure::OperationFailed)?;
         Ok(plan)
     }
+}
+
+fn open_ssh_transport(
+    config: &SyncTargetTransport,
+) -> Result<OpenSshTransport<ProcessRemoteRunner>, DomainFailure> {
+    let SyncTargetTransport::Ssh {
+        host,
+        user,
+        port,
+        known_hosts,
+        fingerprint,
+        ..
+    } = config
+    else {
+        return Err(DomainFailure::OperationFailed);
+    };
+    OpenSshTransport::new(
+        OpenSshConfig::new(host, user, *port, known_hosts.clone(), fingerprint)
+            .map_err(|_| DomainFailure::OperationFailed)?,
+        ProcessRemoteRunner,
+    )
+    .map_err(|_| DomainFailure::OperationFailed)
 }
 
 fn path_text(path: &Path) -> Result<&str, DomainFailure> {
@@ -776,12 +862,35 @@ impl SyncDomain for ProductionSyncDomain {
                 .map_err(|_| DomainFailure::InvalidRequest)?,
             None => self.build()?,
         };
-        let mut adapter = FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
-            .map_err(|_| DomainFailure::OperationFailed)?;
-        for operation in &plan.operations {
-            adapter
-                .verify(operation)
-                .map_err(|_| DomainFailure::VerificationFailed)?;
+        match self
+            .config
+            .target_transport
+            .as_ref()
+            .unwrap_or(&SyncTargetTransport::Local)
+        {
+            SyncTargetTransport::Local => {
+                let mut adapter =
+                    FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                for operation in &plan.operations {
+                    adapter
+                        .verify(operation)
+                        .map_err(|_| DomainFailure::VerificationFailed)?;
+                }
+            }
+            transport @ SyncTargetTransport::Ssh { root_id, .. } => {
+                let mut adapter = SshFileAdapter::open(
+                    root_id.clone(),
+                    &self.config.adapter_state,
+                    open_ssh_transport(transport)?,
+                )
+                .map_err(|_| DomainFailure::OperationFailed)?;
+                for operation in &plan.operations {
+                    adapter
+                        .verify(operation)
+                        .map_err(|_| DomainFailure::VerificationFailed)?;
+                }
+            }
         }
         Ok(serde_json::json!({"planId":plan.id,"verified":true}))
     }
@@ -803,10 +912,25 @@ impl SyncDomain for ProductionSyncDomain {
             .plan_store
             .load(&receipt.receipt().plan_id)
             .map_err(|_| DomainFailure::OperationFailed)?;
-        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(
-            FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
+        let mut adapters: Vec<Box<dyn Adapter>> = match self
+            .config
+            .target_transport
+            .as_ref()
+            .unwrap_or(&SyncTargetTransport::Local)
+        {
+            SyncTargetTransport::Local => vec![Box::new(
+                FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
+                    .map_err(|_| DomainFailure::OperationFailed)?,
+            )],
+            transport @ SyncTargetTransport::Ssh { root_id, .. } => vec![Box::new(
+                SshFileAdapter::open(
+                    root_id.clone(),
+                    &self.config.adapter_state,
+                    open_ssh_transport(transport)?,
+                )
                 .map_err(|_| DomainFailure::OperationFailed)?,
-        )];
+            )],
+        };
         let outcome = Reconciler::with_store(&receipts)
             .rollback_succeeded_run(run_id.clone(), &plan, &mut adapters)
             .map_err(|_| DomainFailure::OperationFailed)?;

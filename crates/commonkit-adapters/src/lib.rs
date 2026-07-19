@@ -7,14 +7,15 @@ mod credentials;
 mod files;
 mod git_sync;
 mod native;
-mod planning;
 mod pipeline;
+mod planning;
 mod provider;
 mod remote_helper;
 mod remote_provider;
 mod resources;
 mod service_lifecycle;
 mod ssh;
+mod ssh_files;
 mod target;
 
 pub use apm::{ApmProvider, ApmProviderConfig};
@@ -35,8 +36,10 @@ pub use git_sync::{
     GitRevision, GitSyncDisposition, GitSyncError, GitSyncStatus, ProcessGitRunner,
 };
 pub use native::NativeProvider;
-pub use planning::{ProviderPlanError, ProviderPlanRequest, build_provider_plan};
 pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutput};
+pub use planning::{
+    ProviderPlanError, ProviderPlanRequest, ProviderResourcePlanner, build_provider_plan,
+};
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,
     ProviderContext, ProviderContractError, ProviderFailure, ProviderInputs, ProviderWorkspace,
@@ -58,6 +61,7 @@ pub use service_lifecycle::{
 pub use ssh::{
     OpenSshConfig, OpenSshTransport, ProcessOutput, ProcessRemoteRunner, RemoteProcessRunner,
 };
+pub use ssh_files::{SshFileAdapter, SshFileAdapterError};
 pub use target::{
     LocalTargetFilesystem, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
     TargetFilesystem, TargetFilesystemError,

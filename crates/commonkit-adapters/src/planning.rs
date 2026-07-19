@@ -9,8 +9,45 @@ use thiserror::Error;
 use crate::{
     ArtifactError, ArtifactStore, DeclaredSideEffect, FileAdapter, FileAdapterError,
     FilesystemIntent, MaterializedState, NormalizedResource, OwnershipError, OwnershipRules,
-    ProviderContractError, validate_ownership,
+    ProviderContractError, SshFileAdapter, SshFileAdapterError, SshFilesystemTransport,
+    validate_ownership,
 };
+
+pub trait ProviderResourcePlanner {
+    fn register_provider_resource(
+        &mut self,
+        id: StableId,
+        resource: &NormalizedResource,
+        provider_artifacts: &ArtifactStore,
+    ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError>;
+}
+
+impl ProviderResourcePlanner for FileAdapter {
+    fn register_provider_resource(
+        &mut self,
+        id: StableId,
+        resource: &NormalizedResource,
+        provider_artifacts: &ArtifactStore,
+    ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
+        match self.register_materialized_resource(id, resource.intent.clone(), provider_artifacts) {
+            Ok(operation) => Ok(Some(operation)),
+            Err(FileAdapterError::NoChange) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl<T: SshFilesystemTransport> ProviderResourcePlanner for SshFileAdapter<T> {
+    fn register_provider_resource(
+        &mut self,
+        id: StableId,
+        resource: &NormalizedResource,
+        provider_artifacts: &ArtifactStore,
+    ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
+        self.register_materialized_resource(id, resource, provider_artifacts)
+            .map_err(Into::into)
+    }
+}
 
 pub struct ProviderPlanRequest<'a> {
     pub target_id: StableId,
@@ -22,11 +59,11 @@ pub struct ProviderPlanRequest<'a> {
     pub mapped_side_effects: BTreeSet<DeclaredSideEffect>,
 }
 
-pub fn build_provider_plan(
+pub fn build_provider_plan<P: ProviderResourcePlanner + ?Sized>(
     request: ProviderPlanRequest<'_>,
     states: &[MaterializedState],
     provider_artifacts: &ArtifactStore,
-    files: &mut FileAdapter,
+    files: &mut P,
 ) -> Result<Plan, ProviderPlanError> {
     let mut resources = Vec::new();
     let mut state_digests = Vec::new();
@@ -94,14 +131,12 @@ pub fn build_provider_plan(
 
     let mut operations = Vec::new();
     for resource in ordered {
-        match files.register_materialized_resource(
+        if let Some(operation) = files.register_provider_resource(
             resource_id(resource)?,
-            resource.intent.clone(),
+            resource,
             provider_artifacts,
-        ) {
-            Ok(operation) => operations.push(operation),
-            Err(FileAdapterError::NoChange) => {}
-            Err(error) => return Err(error.into()),
+        )? {
+            operations.push(operation);
         }
     }
     build_plan(PlanDraft {
@@ -154,6 +189,8 @@ pub enum ProviderPlanError {
     Artifact(#[from] ArtifactError),
     #[error(transparent)]
     Adapter(#[from] FileAdapterError),
+    #[error(transparent)]
+    RemoteAdapter(#[from] SshFileAdapterError),
     #[error(transparent)]
     Plan(#[from] PlanBuildError),
     #[error(transparent)]
