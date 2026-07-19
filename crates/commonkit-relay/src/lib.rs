@@ -747,6 +747,14 @@ fn normalize_server(value: &Value) -> Result<RelayServerConfig, RelayConfigError
         _ => RelayMode::GenericCached,
     };
     let menu = value.get("menu").map(normalize_menu).transpose()?;
+    let env_file = value
+        .get("envFile")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    #[cfg(windows)]
+    if env_file.is_some() {
+        return Err(RelayConfigError::UnsupportedEnvFilePlatform);
+    }
     Ok(RelayServerConfig {
         id: id.clone(),
         name: string_or(value.get("name"), id.as_str()),
@@ -759,10 +767,7 @@ fn normalize_server(value: &Value) -> Result<RelayServerConfig, RelayConfigError
             url: remote_url.into(),
             headers,
         },
-        env_file: value
-            .get("envFile")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        env_file,
         cache: RelayCacheConfig {
             tools_ttl_ms,
             auto_refresh_ms,
@@ -915,6 +920,8 @@ pub enum RelayConfigError {
     InvalidRemoteUrl,
     #[error("literal relay header values are forbidden; use a secret reference")]
     LiteralHeaderSecret,
+    #[error("relay env files are unavailable without a platform-private credential loader")]
+    UnsupportedEnvFilePlatform,
     #[error("relay menu config is invalid")]
     InvalidMenu,
     #[error("relay menu action is invalid")]

@@ -168,6 +168,26 @@ fn accepts_only_secret_references_for_remote_headers() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_rejects_env_files_before_runtime_without_an_acl_loader() {
+    assert_eq!(
+        RelayConfig::normalize(json!({
+            "servers": [{
+                "id": "docs",
+                "envFile": "docs.env",
+                "remote": {
+                    "type": "streamable_http",
+                    "url": "https://example.com/mcp",
+                    "headers": {"Authorization": "env:DOCS_TOKEN"}
+                }
+            }]
+        }))
+        .expect_err("unsupported credential source"),
+        RelayConfigError::UnsupportedEnvFilePlatform
+    );
+}
+
 #[test]
 fn preserves_local_menu_shape_but_rejects_network_actions() {
     let config = RelayConfig::normalize(json!({
