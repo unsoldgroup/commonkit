@@ -46,6 +46,7 @@ cleanup() {
   sudo userdel "$user" 2>/dev/null || true
 }
 trap cleanup EXIT
+sudo install -d -m 0755 /run/sshd
 sudo /usr/sbin/sshd -f "$scratch/sshd/config"
 known_hosts="$scratch/known_hosts"
 ssh-keyscan -p "$port" 127.0.0.1 > "$known_hosts" 2>/dev/null
