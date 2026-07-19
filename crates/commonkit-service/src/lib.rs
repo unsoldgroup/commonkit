@@ -2590,6 +2590,8 @@ struct SkillOptimizeRequest {
     harness: PathBuf,
     corpus: PathBuf,
     backend: String,
+    #[serde(default)]
+    allow_mock_backend: bool,
     model: Option<String>,
     #[serde(default)]
     provider_executables: BTreeSet<PathBuf>,
@@ -2603,7 +2605,12 @@ async fn skill_optimize(
 ) -> Result<Json<Value>, ApiError> {
     require_skill_confirmation(request.confirmed, &request.confirmation_id)?;
     let backend = match request.backend.as_str() {
-        "mock" => SkillOptBackend::Mock,
+        "mock" if request.allow_mock_backend => SkillOptBackend::Mock,
+        "mock" => {
+            return Err(ApiError::bad_request(
+                "mock_skillopt_backend_not_authorized",
+            ));
+        }
         "claude" => SkillOptBackend::Claude,
         "codex" => SkillOptBackend::Codex,
         "handoff" => SkillOptBackend::Handoff,

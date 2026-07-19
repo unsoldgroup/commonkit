@@ -7,6 +7,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| PathBuf::from("schemas"));
     fs::create_dir_all(&root)?;
     for (name, schema) in [
+        (
+            "commonkit.schema.json",
+            commonkit_contracts::commonkit_schema()?,
+        ),
         ("layer.schema.json", commonkit_contracts::layer_schema()?),
         ("error.schema.json", commonkit_contracts::error_schema()?),
         (

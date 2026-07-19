@@ -1105,6 +1105,30 @@ pub fn diagnostics_schema() -> Result<Value, ContractError> {
     )
 }
 
+/// Public entry point for the versioned CommonKit document family.
+///
+/// Individual contracts remain independently addressable so tools can select
+/// the narrowest schema, while this catalog gives editors and registries one
+/// stable v1 schema URL.
+pub fn commonkit_schema() -> Result<Value, ContractError> {
+    Ok(serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://schemas.commonkit.dev/v1/commonkit.schema.json",
+        "title": "CommonKit v1 public contracts",
+        "description": "A CommonKit layer, lock, plan, receipt, diagnostic, error, provenance, or skill lifecycle document.",
+        "oneOf": [
+            { "$ref": "layer.schema.json" },
+            { "$ref": "commonkit-lock.schema.json" },
+            { "$ref": "plan.schema.json" },
+            { "$ref": "receipt.schema.json" },
+            { "$ref": "diagnostics.schema.json" },
+            { "$ref": "error.schema.json" },
+            { "$ref": "provenance.schema.json" },
+            { "$ref": "skills.schema.json" }
+        ]
+    }))
+}
+
 pub fn skills_schema() -> Result<Value, ContractError> {
     schema_with_id(
         schema_for!(SkillLifecycleSchema),

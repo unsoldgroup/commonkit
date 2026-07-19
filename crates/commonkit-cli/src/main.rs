@@ -297,8 +297,11 @@ enum SkillsCommand {
         harness: PathBuf,
         #[arg(long)]
         corpus: PathBuf,
-        #[arg(long, default_value = "mock")]
+        #[arg(long)]
         backend: String,
+        /// Permit the deterministic mock optimizer for local development only.
+        #[arg(long)]
+        allow_mock_backend: bool,
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
@@ -1004,10 +1007,14 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
             harness,
             corpus,
             backend,
+            allow_mock_backend,
             model,
             confirmed,
         } => {
             require_skill_confirmation(confirmed)?;
+            if backend == "mock" && !allow_mock_backend {
+                return Err("the mock SkillOpt backend is development-only; pass --allow-mock-backend explicitly or select a production backend".into());
+            }
             let manifest: commonkit_contracts::SkillOptimizationManifest =
                 read_json_file(&manifest)?;
             let suite: commonkit_contracts::SkillEvaluationSuite = read_json_file(&suite)?;
@@ -1019,6 +1026,7 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
                     "confirmed": true, "confirmationId": nonce("skill-optimize"), "manifest": manifest,
                     "suite": suite, "environment": environment, "tasks": tasks, "harness": harness,
                     "corpus": corpus, "backend": backend, "model": model,
+                    "allowMockBackend": allow_mock_backend,
                 })),
                 None,
             )?)?;

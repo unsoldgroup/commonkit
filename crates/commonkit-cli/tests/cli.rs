@@ -52,6 +52,74 @@ fn reports_versioned_machine_readable_status() {
 }
 
 #[test]
+fn skill_optimization_requires_an_explicit_production_backend() {
+    let help = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["skills", "optimize", "--help"])
+        .output()
+        .expect("skill optimize help");
+    assert!(help.status.success());
+    let help = String::from_utf8(help.stdout).expect("utf8");
+    assert!(help.contains("--backend <BACKEND>"));
+    assert!(!help.contains("[default: mock]"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args([
+            "skills",
+            "optimize",
+            "--repository",
+            "repo",
+            "--state",
+            "state",
+            "--manifest",
+            "manifest.json",
+            "--suite",
+            "suite.json",
+            "--environment",
+            "environment",
+            "--tasks",
+            "tasks.json",
+            "--harness",
+            "harness",
+            "--corpus",
+            "corpus.json",
+            "--confirmed",
+        ])
+        .output()
+        .expect("skill optimize parse");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--backend"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args([
+            "skills",
+            "optimize",
+            "--repository",
+            "repo",
+            "--state",
+            "state",
+            "--manifest",
+            "manifest.json",
+            "--suite",
+            "suite.json",
+            "--environment",
+            "environment",
+            "--tasks",
+            "tasks.json",
+            "--harness",
+            "harness",
+            "--corpus",
+            "corpus.json",
+            "--backend",
+            "mock",
+            "--confirmed",
+        ])
+        .output()
+        .expect("mock backend authorization");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("development-only"));
+}
+
+#[test]
 fn init_exposes_create_connect_and_rejects_malformed_repository_before_gh() {
     let help = Command::new(env!("CARGO_BIN_EXE_commonkit"))
         .args(["init", "--help"])

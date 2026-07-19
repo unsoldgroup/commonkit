@@ -2,6 +2,10 @@ use std::{fs, path::PathBuf};
 
 #[test]
 fn checked_in_layer_schema_matches_the_rust_contract() {
+    assert_schema(
+        "commonkit.schema.json",
+        commonkit_contracts::commonkit_schema(),
+    );
     assert_schema("layer.schema.json", commonkit_contracts::layer_schema());
     assert_schema("error.schema.json", commonkit_contracts::error_schema());
     assert_schema(
