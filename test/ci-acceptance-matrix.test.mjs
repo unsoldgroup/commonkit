@@ -23,9 +23,9 @@ test("provider gates use exact releases and verify downloaded bytes", async () =
 
   assert.match(workflow, /APM_VERSION:\s*["']?0\.25\.0/);
   assert.match(workflow, /CHEZMOI_VERSION:\s*["']?2\.70\.4/);
-  assert.match(workflow, /8b1c43543113550e49939c7970429e19881d6347c90c44185eb55ea73d0eca73/);
   assert.match(workflow, /7a4281ef915e9609f8841eced19285bf2dcf702862302171f7e893c30e1b3244/);
   assert.match(workflow, /1d9b3b44ffe031c331f4dfe33694bbb80d10d16165ca053110b96dbeb7365943/);
+  assert.doesNotMatch(workflow, /apm-darwin|chezmoi-darwin|sandbox-exec/);
   assert.match(workflow, /checksum_pinned_apm_release_materializes_without_touching_live_target/);
   assert.match(workflow, /real_chezmoi_release_materializes_supported_fixtures_deterministically/);
   assert.doesNotMatch(workflow, /continue-on-error:\s*true/);
