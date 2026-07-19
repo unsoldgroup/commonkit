@@ -63,39 +63,38 @@ pub async fn run_once(
         JobState::Running,
         now_ms(),
     )?;
-    let mut process = match supervisor.spawn(&snapshot.job.manifest, workspace) {
+    let (task_environment, secret_values) =
+        match task_environment(&snapshot.job.manifest.secret_refs, resolved_secrets) {
+            Ok(values) => values,
+            Err(error) => {
+                fail_enforcement(state, &lease, target, "execution_secret_denied")?;
+                return Err(error);
+            }
+        };
+    let mut process = match supervisor.spawn_with_environment(
+        &snapshot.job.manifest,
+        workspace,
+        &task_environment,
+    ) {
         Ok(process) => process,
         Err(error) => {
-            state
-                .scheduler
-                .lock()
-                .unwrap()
-                .complete(&lease, JobState::Failed, None, now_ms())?;
+            fail_enforcement(state, &lease, target, error.audit_code())?;
             return Err(error.into());
         }
     };
-    let secret_values: Vec<String> = snapshot
-        .job
-        .manifest
-        .secret_refs
-        .iter()
-        .filter_map(|reference| resolved_secrets.get(reference).cloned())
-        .collect();
     let _ = running;
     let outcome = loop {
         match process.try_wait() {
             Ok(Some(status)) => break process.finish(status, &secret_values)?,
             Ok(None) => {}
             Err(error @ (SupervisorError::TimedOut | SupervisorError::DiskLimitExceeded)) => {
-                state.scheduler.lock().unwrap().complete(
-                    &lease,
-                    JobState::Failed,
-                    None,
-                    now_ms(),
-                )?;
+                fail_enforcement(state, &lease, target, error.audit_code())?;
                 return Err(error.into());
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                fail_enforcement(state, &lease, target, error.audit_code())?;
+                return Err(error.into());
+            }
         }
         let current = state
             .scheduler
@@ -159,6 +158,59 @@ pub async fn run_once(
         .complete(&lease, terminal, outcome.status.code(), now_ms())?;
     Ok(Some(lease.job_id))
 }
+
+fn task_environment(
+    references: &[String],
+    resolved: &BTreeMap<String, String>,
+) -> Result<(BTreeMap<String, String>, Vec<String>), WorkerError> {
+    let mut environment = BTreeMap::new();
+    let mut secret_values = Vec::new();
+    for reference in references {
+        let name = reference
+            .strip_prefix("env://")
+            .filter(|name| valid_environment_name(name) && !reserved_environment_name(name))
+            .ok_or_else(|| WorkerError::UnsupportedSecretReference(reference.clone()))?;
+        let value = resolved
+            .get(reference)
+            .cloned()
+            .ok_or_else(|| WorkerError::MissingResolvedSecret(reference.clone()))?;
+        environment.insert(name.to_owned(), value.clone());
+        secret_values.push(value);
+    }
+    Ok((environment, secret_values))
+}
+
+fn valid_environment_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+}
+
+fn reserved_environment_name(name: &str) -> bool {
+    matches!(name, "PATH" | "LANG" | "LC_ALL" | "HOME" | "TMPDIR")
+        || name.starts_with("COMMONKIT_EXECD_")
+}
+
+fn fail_enforcement(
+    state: &ApiState,
+    lease: &commonkit_contracts::Lease,
+    target: &ExecutionTarget,
+    code: &'static str,
+) -> Result<(), ExecutionError> {
+    let mut scheduler = state.scheduler.lock().unwrap();
+    scheduler.audit(
+        now_ms(),
+        target.id.as_str(),
+        "execute",
+        &lease.job_id,
+        false,
+        code,
+    )?;
+    scheduler.complete(lease, JobState::Failed, None, now_ms())?;
+    Ok(())
+}
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -173,4 +225,8 @@ pub enum WorkerError {
     Supervisor(#[from] SupervisorError),
     #[error("current execution policy denied the leased manifest")]
     RuntimePolicyDenied,
+    #[error("execution secret reference is unsupported: {0}")]
+    UnsupportedSecretReference(String),
+    #[error("execution secret was not resolved: {0}")]
+    MissingResolvedSecret(String),
 }

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 mod support;
 use commonkit_execution::supervisor::{ProcessSupervisor, SupervisorMode};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -29,6 +30,37 @@ fn cancellation_kills_the_process_group_and_retains_redacted_diagnostics() {
     assert!(!outcome.status.success());
     assert!(outcome.stdout.contains("[REDACTED]"));
     assert!(!outcome.stdout.contains("super-secret"));
+}
+
+#[test]
+fn child_environment_is_allowlisted_and_task_secrets_are_redacted() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("work")).unwrap();
+    let mut manifest = support::manifest();
+    manifest.repository_revision = support::init_repository(directory.path());
+    manifest.argv = vec!["env".into()];
+    let supervisor = ProcessSupervisor::new(
+        SupervisorMode::ProcessGroup,
+        directory.path().join("diagnostics"),
+    )
+    .unwrap();
+    let environment = BTreeMap::from([("TASK_TOKEN".into(), "task-secret-value".into())]);
+    let outcome = supervisor
+        .spawn_with_environment(&manifest, directory.path(), &environment)
+        .unwrap()
+        .wait(&["task-secret-value".into()])
+        .unwrap();
+    assert!(outcome.status.success());
+    assert!(outcome.stdout.contains("TASK_TOKEN=[REDACTED]"));
+    for forbidden in [
+        "COMMONKIT_EXECD_CLIENT_TOKEN",
+        "COMMONKIT_EXECD_WORKER_TOKEN",
+        "COMMONKIT_EXECD_ARTIFACT_SIGNING_KEY",
+        "COMMONKIT_EXECD_OBJECT_ENCRYPTION_KEY",
+        "CARGO_MANIFEST_DIR",
+    ] {
+        assert!(!outcome.stdout.contains(forbidden), "inherited {forbidden}");
+    }
 }
 
 #[test]
@@ -244,6 +276,87 @@ fn read_only_repository_cannot_be_modified() {
     assert!(!directory.path().join("work/forbidden").exists());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_cannot_read_undeclared_host_files() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("work")).unwrap();
+    let mut manifest = support::manifest();
+    manifest.repository_revision = support::init_repository(directory.path());
+    manifest.argv = vec!["sh".into(), "-c".into(), "test ! -e /etc/passwd".into()];
+    let supervisor = ProcessSupervisor::new(
+        SupervisorMode::LinuxSandbox,
+        directory.path().join("diagnostics"),
+    )
+    .unwrap();
+    let outcome = supervisor
+        .spawn(&manifest, directory.path())
+        .unwrap()
+        .wait(&[])
+        .unwrap();
+    assert!(
+        outcome.status.success(),
+        "host file was exposed: {}",
+        outcome.stderr
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tmp_flood_is_bounded_and_scratch_is_cleaned() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("work")).unwrap();
+    let mut manifest = support::manifest();
+    manifest.repository_revision = support::init_repository(directory.path());
+    manifest.resources.disk_mib = 1;
+    manifest.argv = vec![
+        "sh".into(),
+        "-c".into(),
+        "! dd if=/dev/zero of=/tmp/flood bs=1M count=2 2>/dev/null".into(),
+    ];
+    let diagnostics = directory.path().join("diagnostics");
+    let supervisor = ProcessSupervisor::new(SupervisorMode::LinuxSandbox, &diagnostics).unwrap();
+    let outcome = supervisor
+        .spawn(&manifest, directory.path())
+        .unwrap()
+        .wait(&[])
+        .unwrap();
+    assert!(outcome.status.success(), "tmp flood escaped its bound");
+    assert!(!std::fs::read_dir(&diagnostics).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .path()
+            .extension()
+            .is_some_and(|ext| ext == "scratch")
+    }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_cancellation_kills_scope_descendants() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("work")).unwrap();
+    let marker = directory.path().join("late-marker");
+    let mut manifest = support::manifest();
+    manifest.repository_revision = support::init_repository(directory.path());
+    manifest.argv = vec![
+        "sh".into(),
+        "-c".into(),
+        format!("(sleep 2; touch {}) & wait", marker.display()),
+    ];
+    let supervisor = ProcessSupervisor::new(
+        SupervisorMode::SystemdScope,
+        directory.path().join("diagnostics"),
+    )
+    .unwrap();
+    let process = supervisor.spawn(&manifest, directory.path()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let outcome = process.cancel(Duration::from_millis(100), &[]).unwrap();
+    assert!(!outcome.status.success());
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(!marker.exists(), "scope descendant survived cancellation");
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn production_isolation_fails_closed_off_linux() {
@@ -264,4 +377,26 @@ fn production_isolation_fails_closed_off_linux() {
         error,
         commonkit_execution::supervisor::SupervisorError::UnsupportedIsolation
     ));
+}
+
+#[test]
+fn enforcement_failures_have_stable_audit_categories() {
+    use commonkit_execution::supervisor::SupervisorError;
+    assert_eq!(
+        SupervisorError::RepositoryRevisionMismatch.audit_code(),
+        "workspace_revision_denied"
+    );
+    assert_eq!(
+        SupervisorError::WorkspaceBundleMismatch.audit_code(),
+        "workspace_bundle_denied"
+    );
+    assert_eq!(
+        SupervisorError::UnsupportedNetworkPolicy.audit_code(),
+        "execution_isolation_denied"
+    );
+    assert_eq!(SupervisorError::TimedOut.audit_code(), "execution_timeout");
+    assert_eq!(
+        SupervisorError::DiskLimitExceeded.audit_code(),
+        "execution_disk_limit"
+    );
 }

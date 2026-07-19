@@ -2,6 +2,7 @@
 use commonkit_contracts::NetworkPolicy;
 use commonkit_contracts::{ExecutionManifest, Sha256Digest};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -27,10 +28,10 @@ pub struct RunningProcess {
     stderr: PathBuf,
     started: Instant,
     timeout: Duration,
-    disk_root: PathBuf,
-    initial_disk_bytes: u64,
+    writable_roots: Vec<(PathBuf, u64)>,
     disk_limit_bytes: u64,
     systemd_unit: Option<String>,
+    scratch: PathBuf,
 }
 #[derive(Debug)]
 pub struct ProcessOutcome {
@@ -56,6 +57,15 @@ impl ProcessSupervisor {
         manifest: &ExecutionManifest,
         workspace: &Path,
     ) -> Result<RunningProcess, SupervisorError> {
+        self.spawn_with_environment(manifest, workspace, &BTreeMap::new())
+    }
+
+    pub fn spawn_with_environment(
+        &self,
+        manifest: &ExecutionManifest,
+        workspace: &Path,
+        task_environment: &BTreeMap<String, String>,
+    ) -> Result<RunningProcess, SupervisorError> {
         manifest.validate()?;
         let workdir = workspace.join(manifest.workdir.as_str());
         let canonical_workspace = workspace.canonicalize()?;
@@ -64,22 +74,24 @@ impl ProcessSupervisor {
             return Err(SupervisorError::WorkspaceEscape);
         }
         verify_workspace(manifest, &canonical_workspace)?;
-        let initial_disk_bytes = directory_size(&canonical_workspace)?;
         let id = Uuid::new_v4();
         let systemd_unit = (self.mode == SupervisorMode::SystemdScope)
             .then(|| format!("commonkit-execution-{id}.scope"));
         let stdout = self.diagnostic_root.join(format!("{id}.stdout"));
         let stderr = self.diagnostic_root.join(format!("{id}.stderr"));
+        let scratch = self.diagnostic_root.join(format!("{id}.scratch"));
+        std::fs::create_dir(&scratch)?;
         let mut command = match self.mode {
             SupervisorMode::SystemdScope => systemd_command(
                 manifest,
                 &canonical_workspace,
                 &canonical_workdir,
                 systemd_unit.as_deref().expect("systemd unit"),
+                &scratch,
             )?,
             #[cfg(target_os = "linux")]
             SupervisorMode::LinuxSandbox => {
-                sandbox_command(manifest, &canonical_workspace, &canonical_workdir)?
+                sandbox_command(manifest, &canonical_workspace, &canonical_workdir, &scratch)?
             }
             SupervisorMode::ProcessGroup => {
                 let mut command = Command::new(&manifest.argv[0]);
@@ -88,10 +100,22 @@ impl ProcessSupervisor {
             }
         };
         command
+            .env_clear()
+            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+            .env("LANG", "C.UTF-8")
+            .env("LC_ALL", "C.UTF-8")
+            .env("HOME", "/tmp")
+            .env("TMPDIR", "/tmp")
+            .envs(task_environment)
             .current_dir(canonical_workdir)
             .stdin(Stdio::null())
             .stdout(File::create(&stdout)?)
             .stderr(File::create(&stderr)?);
+        #[cfg(target_os = "linux")]
+        command.env(
+            "XDG_RUNTIME_DIR",
+            format!("/run/user/{}", unsafe { libc::geteuid() }),
+        );
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -114,14 +138,22 @@ impl ProcessSupervisor {
         }
         Ok(RunningProcess {
             child: command.spawn()?,
-            stdout,
-            stderr,
+            stdout: stdout.clone(),
+            stderr: stderr.clone(),
             started: Instant::now(),
             timeout: Duration::from_secs(manifest.timeout_seconds),
-            disk_root: canonical_workspace,
-            initial_disk_bytes,
+            writable_roots: vec![
+                (
+                    canonical_workspace.clone(),
+                    directory_size(&canonical_workspace)?,
+                ),
+                (scratch.clone(), 0),
+                (stdout.clone(), 0),
+                (stderr.clone(), 0),
+            ],
             disk_limit_bytes: manifest.resources.disk_mib.saturating_mul(1024 * 1024),
             systemd_unit,
+            scratch,
         })
     }
 }
@@ -131,9 +163,15 @@ impl RunningProcess {
             self.kill_group()?;
             return Err(SupervisorError::TimedOut);
         }
-        if directory_size(&self.disk_root)?.saturating_sub(self.initial_disk_bytes)
-            > self.disk_limit_bytes
-        {
+        let allocated = self
+            .writable_roots
+            .iter()
+            .try_fold(0_u64, |total, (root, initial)| {
+                Ok::<_, SupervisorError>(
+                    total.saturating_add(path_size(root)?.saturating_sub(*initial)),
+                )
+            })?;
+        if allocated > self.disk_limit_bytes {
             self.kill_group()?;
             return Err(SupervisorError::DiskLimitExceeded);
         }
@@ -160,18 +198,21 @@ impl RunningProcess {
         grace: Duration,
         secrets: &[String],
     ) -> Result<ProcessOutcome, SupervisorError> {
+        let systemd_result = self.kill_systemd_unit("SIGTERM");
         #[cfg(unix)]
         unsafe {
             libc::kill(-(self.child.id() as i32), libc::SIGTERM);
         }
         #[cfg(not(unix))]
         self.child.kill()?;
+        systemd_result?;
         let deadline = Instant::now() + grace;
         let status = loop {
             if let Some(status) = self.child.try_wait()? {
                 break status;
             }
             if Instant::now() >= deadline {
+                self.kill_systemd_unit("SIGKILL")?;
                 #[cfg(unix)]
                 unsafe {
                     libc::kill(-(self.child.id() as i32), libc::SIGKILL);
@@ -185,7 +226,7 @@ impl RunningProcess {
         self.outcome(status, secrets)
     }
     fn kill_group(&mut self) -> Result<(), SupervisorError> {
-        self.kill_systemd_unit("SIGKILL")?;
+        let systemd_result = self.kill_systemd_unit("SIGKILL");
         #[cfg(unix)]
         unsafe {
             if libc::kill(-(self.child.id() as i32), libc::SIGKILL) == -1 {
@@ -198,6 +239,7 @@ impl RunningProcess {
         #[cfg(not(unix))]
         self.child.kill()?;
         let _ = self.child.wait()?;
+        systemd_result?;
         Ok(())
     }
     fn kill_systemd_unit(&self, signal: &str) -> Result<(), SupervisorError> {
@@ -229,6 +271,15 @@ impl RunningProcess {
             stderr: read_redacted(&self.stderr, secrets)?,
             elapsed: self.started.elapsed(),
         })
+    }
+}
+
+impl Drop for RunningProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.kill_group();
+        }
+        let _ = std::fs::remove_dir_all(&self.scratch);
     }
 }
 fn read_redacted(path: &Path, secrets: &[String]) -> Result<String, SupervisorError> {
@@ -357,6 +408,15 @@ fn directory_size(root: &Path) -> Result<u64, SupervisorError> {
     Ok(total)
 }
 
+fn path_size(path: &Path) -> Result<u64, SupervisorError> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_dir() {
+        directory_size(path)
+    } else {
+        Ok(metadata.len())
+    }
+}
+
 fn path_arg(path: &Path) -> Result<&str, SupervisorError> {
     path.to_str().ok_or(SupervisorError::NonUtf8Path)
 }
@@ -367,6 +427,7 @@ fn systemd_command(
     workspace: &Path,
     workdir: &Path,
     unit: &str,
+    scratch: &Path,
 ) -> Result<Command, SupervisorError> {
     let mut command = Command::new("systemd-run");
     let cpu = manifest.resources.cpu_millis.div_ceil(10);
@@ -385,7 +446,7 @@ fn systemd_command(
         &format!("CPUQuota={cpu}%"),
         "--",
     ]);
-    command.args(sandbox_args(manifest, workspace, workdir)?);
+    command.args(sandbox_args(manifest, workspace, workdir, scratch)?);
     Ok(command)
 }
 
@@ -394,46 +455,94 @@ fn sandbox_command(
     manifest: &ExecutionManifest,
     workspace: &Path,
     workdir: &Path,
+    scratch: &Path,
 ) -> Result<Command, SupervisorError> {
     let mut command = Command::new("bwrap");
-    let mut args = sandbox_args(manifest, workspace, workdir)?;
+    let mut args = sandbox_args(manifest, workspace, workdir, scratch)?;
     args.remove(0);
     command.args(args);
     Ok(command)
 }
 
 #[cfg(target_os = "linux")]
-fn sandbox_args<'a>(
-    manifest: &'a ExecutionManifest,
-    workspace: &'a Path,
-    workdir: &'a Path,
-) -> Result<Vec<&'a str>, SupervisorError> {
+fn sandbox_args(
+    manifest: &ExecutionManifest,
+    workspace: &Path,
+    workdir: &Path,
+    scratch: &Path,
+) -> Result<Vec<std::ffi::OsString>, SupervisorError> {
     if manifest.network_policy == NetworkPolicy::Restricted {
         return Err(SupervisorError::UnsupportedNetworkPolicy);
     }
     if Command::new("bwrap").arg("--version").output().is_err() {
         return Err(SupervisorError::IsolationUnavailable);
     }
-    let mut args = vec!["bwrap", "--die-with-parent", "--new-session"];
+    let mut args: Vec<std::ffi::OsString> = [
+        "bwrap",
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
+        "--unsetenv",
+        "XDG_RUNTIME_DIR",
+    ]
+    .into_iter()
+    .map(Into::into)
+    .collect();
     if manifest.network_policy == NetworkPolicy::Deny {
-        args.push("--unshare-net");
+        args.push("--unshare-net".into());
     }
-    args.extend(["--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"]);
+    for path in ["/usr", "/usr/local", "/lib", "/lib64"] {
+        if Path::new(path).exists() {
+            args.extend(["--ro-bind".into(), path.into(), path.into()]);
+        }
+    }
+    if Path::new("/bin").is_symlink() {
+        args.extend(["--symlink".into(), "usr/bin".into(), "/bin".into()]);
+    } else if Path::new("/bin").exists() {
+        args.extend(["--ro-bind".into(), "/bin".into(), "/bin".into()]);
+    }
+    args.extend(["--dir".into(), "/etc".into()]);
+    for path in [
+        "/etc/ld.so.cache",
+        "/etc/ssl/certs",
+        "/etc/resolv.conf",
+        "/etc/hosts",
+        "/etc/nsswitch.conf",
+        "/etc/gai.conf",
+    ] {
+        if Path::new(path).exists() {
+            args.extend(["--ro-bind".into(), path.into(), path.into()]);
+        }
+    }
+    args.extend([
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+    ]);
     let binding = if manifest.repository_write {
         "--bind"
     } else {
         "--ro-bind"
     };
-    args.extend([binding, path_arg(workspace)?, path_arg(workspace)?]);
     args.extend([
-        "--tmpfs",
-        "/tmp",
-        "--chdir",
-        path_arg(workdir)?,
-        "--",
-        &manifest.argv[0],
+        binding.into(),
+        workspace.as_os_str().into(),
+        workspace.as_os_str().into(),
     ]);
-    args.extend(manifest.argv[1..].iter().map(String::as_str));
+    args.extend([
+        "--bind".into(),
+        scratch.as_os_str().into(),
+        "/tmp".into(),
+        "--chdir".into(),
+        workdir.as_os_str().into(),
+        "--".into(),
+        manifest.argv[0].clone().into(),
+    ]);
+    args.extend(manifest.argv[1..].iter().map(Into::into));
     Ok(args)
 }
 
@@ -443,8 +552,27 @@ fn systemd_command(
     _workspace: &Path,
     _workdir: &Path,
     _unit: &str,
+    _scratch: &Path,
 ) -> Result<Command, SupervisorError> {
     Err(SupervisorError::UnsupportedIsolation)
+}
+
+impl SupervisorError {
+    pub fn audit_code(&self) -> &'static str {
+        match self {
+            Self::RepositoryRevisionMismatch
+            | Self::RepositoryMismatch
+            | Self::WorkspaceNotClean => "workspace_revision_denied",
+            Self::WorkspaceBundleMismatch | Self::WorkspaceSymlink(_) => "workspace_bundle_denied",
+            Self::TimedOut => "execution_timeout",
+            Self::DiskLimitExceeded => "execution_disk_limit",
+            Self::UnsupportedNetworkPolicy
+            | Self::UnsupportedIsolation
+            | Self::IsolationUnavailable
+            | Self::SystemdControlFailed => "execution_isolation_denied",
+            _ => "execution_enforcement_failed",
+        }
+    }
 }
 #[derive(Debug, Error)]
 pub enum SupervisorError {

@@ -20,9 +20,13 @@ fn manifest() -> ExecutionManifest {
         repository: "https://example.invalid/repo.git".into(),
         repository_revision: GitRevision::parse("a".repeat(40)).unwrap(),
         workspace_bundle_digest: None,
-        argv: vec!["sh".into(), "-c".into(), "printf worker-ok".into()],
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            "printf 'worker-ok:%s' \"$TASK_TOKEN\"".into(),
+        ],
         workdir: PortableSourcePath::parse("work").unwrap(),
-        secret_refs: vec![],
+        secret_refs: vec!["env://TASK_TOKEN".into()],
         timeout_seconds: 30,
         cancel_grace_seconds: 1,
         resources: ResourceRequirements {
@@ -57,7 +61,7 @@ fn target() -> ExecutionTarget {
         loadout_digest: digest('b'),
         execution_profile_digest: digest('c'),
         capabilities: BTreeSet::new(),
-        ready_secret_refs: BTreeSet::new(),
+        ready_secret_refs: BTreeSet::from(["env://TASK_TOKEN".into()]),
         free: ResourceRequirements {
             cpu_millis: 1000,
             memory_mib: 1024,
@@ -146,7 +150,7 @@ async fn submitted_job_runs_after_client_disconnect_and_returns_artifacts() {
         StableId::parse("linux-vps").unwrap(),
         &directory.path().join("workspace"),
         &objects,
-        &BTreeMap::new(),
+        &BTreeMap::from([("env://TASK_TOKEN".into(), "resolved-task-secret".into())]),
         &supervisor,
     )
     .await
@@ -197,6 +201,60 @@ async fn submitted_job_runs_after_client_disconnect_and_returns_artifacts() {
             .await
             .unwrap()
             .as_ref(),
-        b"worker-ok"
+        b"worker-ok:[REDACTED]"
+    );
+}
+
+#[tokio::test]
+async fn workspace_revision_denial_is_failed_and_audited() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(directory.path().join("workspace/work")).unwrap();
+    init_repository(&directory.path().join("workspace"));
+    let objects = LocalObjectStore::open(directory.path().join("objects")).unwrap();
+    let state = ApiState::new(
+        Scheduler::open(directory.path().join("jobs.db")).unwrap(),
+        vec![(
+            "client-token".into(),
+            "client".into(),
+            BTreeSet::from([Capability::Submit]),
+        )],
+        false,
+    );
+    let body = json!({"manifest":manifest(),"idempotencyKey":"stale-workspace"}).to_string();
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/execution/v1/jobs")
+                .header("authorization", "Bearer client-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let supervisor = ProcessSupervisor::new(
+        SupervisorMode::ProcessGroup,
+        directory.path().join("diagnostics"),
+    )
+    .unwrap();
+    let error = run_once(
+        &state,
+        &target(),
+        StableId::parse("linux-vps").unwrap(),
+        &directory.path().join("workspace"),
+        &objects,
+        &BTreeMap::from([("env://TASK_TOKEN".into(), "resolved-task-secret".into())]),
+        &supervisor,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("supervisor failed"));
+    let audit = state.audit_entries().unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|entry| !entry.allowed && entry.reason == "workspace_revision_denied")
     );
 }
