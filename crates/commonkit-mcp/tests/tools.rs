@@ -5,13 +5,14 @@ use commonkit_mcp::{
     ProposeSkillCanaryApplyInput, ProposeSkillCanaryRollbackInput, ProposeSkillPromotionInput,
     ReadInput, RelayReconcileInput, ShowSkillCandidateInput, SkillEvidencePreviewInput,
     SkillOpportunitiesInput,
+    TargetConsentInput,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
 
 #[derive(Default)]
 struct FakeBackend {
-    applies: Mutex<Vec<String>>,
+    applies: Mutex<Vec<(String, String)>>,
     posts: Mutex<Vec<String>>,
 }
 
@@ -24,7 +25,7 @@ impl ControlBackend for FakeBackend {
         self.applies
             .lock()
             .expect("applies")
-            .push(input.plan_id.clone());
+            .push((input.target_id.clone(), input.plan_id.clone()));
         Box::pin(async move { Ok(json!({"planId": input.plan_id, "status": "running"})) })
     }
 
@@ -171,6 +172,7 @@ async fn apply_refuses_missing_confirmation_before_calling_the_backend() {
     let server = CommonKitMcp::new(backend.clone());
     let denied = server
         .apply_plan(Parameters(ApplyPlanInput {
+            target_id: "workstation-a".into(),
             plan_id: format!("sha256:{}", "a".repeat(64)),
             confirmed: false,
             confirmation_id: "user-approved".into(),
@@ -184,11 +186,72 @@ async fn apply_refuses_missing_confirmation_before_calling_the_backend() {
 }
 
 #[tokio::test]
+async fn plan_verify_and_apply_are_bound_to_one_explicit_target() {
+    let backend = Arc::new(FakeBackend::default());
+    let server = CommonKitMcp::new(backend.clone());
+
+    server
+        .plan_sync(Parameters(TargetConsentInput {
+            target_id: "workstation-a".into(),
+            confirmed: true,
+            confirmation_id: "plan-a".into(),
+            idempotency_key: "plan-request-a".into(),
+        }))
+        .await
+        .expect("plan");
+    server
+        .verify(Parameters(ReadInput {
+            target_id: Some("workstation-a".into()),
+            pointer: None,
+        }))
+        .await
+        .expect("verify");
+    server
+        .apply_plan(Parameters(ApplyPlanInput {
+            target_id: "workstation-a".into(),
+            plan_id: format!("sha256:{}", "a".repeat(64)),
+            confirmed: true,
+            confirmation_id: "apply-a".into(),
+            idempotency_key: "apply-request-a".into(),
+        }))
+        .await
+        .expect("apply");
+
+    assert_eq!(
+        *backend.posts.lock().expect("posts"),
+        [
+            "/control/v1/targets/workstation-a/sync/plan",
+            "/control/v1/targets/workstation-a/verify",
+        ]
+    );
+    assert_eq!(
+        *backend.applies.lock().expect("applies"),
+        [("workstation-a".into(), format!("sha256:{}", "a".repeat(64)))]
+    );
+}
+
+#[tokio::test]
+async fn verify_rejects_an_omitted_target_before_contacting_the_backend() {
+    let backend = Arc::new(FakeBackend::default());
+    let server = CommonKitMcp::new(backend.clone());
+    let result = server
+        .verify(Parameters(ReadInput {
+            target_id: None,
+            pointer: None,
+        }))
+        .await
+        .expect("structured rejection");
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(result.structured_content.expect("content")["code"], "target_required");
+    assert!(backend.posts.lock().expect("posts").is_empty());
+}
+
+#[tokio::test]
 async fn every_mutation_tool_requires_consent_before_backend_execution() {
     let backend = Arc::new(FakeBackend::default());
     let server = CommonKitMcp::new(backend.clone());
     for result in [
-        server.plan_sync(Parameters(ConsentInput::denied())).await,
+        server.plan_sync(Parameters(TargetConsentInput::denied("local"))).await,
         server
             .snapshot_create(Parameters(ConsentInput::denied()))
             .await,

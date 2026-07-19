@@ -75,7 +75,10 @@ impl ControlBackend for DaemonBackend {
             let (base, authorization) = self.connection().await?;
             let response = self
                 .client
-                .post(format!("{base}/control/v1/plans/{}/apply", input.plan_id))
+                .post(format!(
+                    "{base}/control/v1/targets/{}/plans/{}/apply",
+                    input.target_id, input.plan_id
+                ))
                 .header(AUTHORIZATION, authorization)
                 .header("idempotency-key", &input.idempotency_key)
                 .json(&json!({
@@ -123,6 +126,7 @@ async fn decode(response: reqwest::Response) -> Result<Value, BackendError> {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ApplyPlanInput {
+    pub target_id: String,
     pub plan_id: String,
     pub confirmed: bool,
     pub confirmation_id: String,
@@ -139,6 +143,15 @@ pub struct ReadInput {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConsentInput {
+    pub confirmed: bool,
+    pub confirmation_id: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TargetConsentInput {
+    pub target_id: String,
     pub confirmed: bool,
     pub confirmation_id: String,
     pub idempotency_key: String,
@@ -221,6 +234,17 @@ pub struct ProposeSkillCanaryRollbackInput {
 impl ConsentInput {
     pub fn denied() -> Self {
         Self {
+            confirmed: false,
+            confirmation_id: "not-confirmed".into(),
+            idempotency_key: "not-confirmed".into(),
+        }
+    }
+}
+
+impl TargetConsentInput {
+    pub fn denied(target_id: impl Into<String>) -> Self {
+        Self {
+            target_id: target_id.into(),
             confirmed: false,
             confirmation_id: "not-confirmed".into(),
             idempotency_key: "not-confirmed".into(),
@@ -482,13 +506,14 @@ impl CommonKitMcp {
         &self,
         Parameters(input): Parameters<ReadInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(error) = read_input_error(&input) {
+        if let Some(error) = target_read_input_error(&input) {
             return Ok(error);
         }
+        let target = input.target_id.as_deref().expect("validated target");
         tool_result(
             self.backend
                 .post(
-                    "/control/v1/verify",
+                    &format!("/control/v1/targets/{target}/verify"),
                     serde_json::to_value(&input).unwrap_or(Value::Null),
                 )
                 .await,
@@ -551,15 +576,16 @@ impl CommonKitMcp {
     )]
     pub async fn plan_sync(
         &self,
-        Parameters(input): Parameters<ConsentInput>,
+        Parameters(input): Parameters<TargetConsentInput>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Some(error) = consent_input_error(&input) {
+        if let Some(error) = target_consent_input_error(&input) {
             return Ok(error);
         }
+        let path = format!("/control/v1/targets/{}/sync/plan", input.target_id);
         tool_result(
             self.backend
                 .post(
-                    "/control/v1/sync/plan",
+                    &path,
                     serde_json::to_value(&input).unwrap_or(Value::Null),
                 )
                 .await,
@@ -644,6 +670,9 @@ impl CommonKitMcp {
                 "retryable": false,
             })));
         }
+        if !valid_target_id(&input.target_id) {
+            return Ok(input_error("invalid_target", "Target ID is invalid"));
+        }
         tool_result(self.backend.apply(input).await)
     }
 }
@@ -681,6 +710,38 @@ fn read_input_error(input: &ReadInput) -> Option<CallToolResult> {
         ));
     }
     None
+}
+
+fn target_read_input_error(input: &ReadInput) -> Option<CallToolResult> {
+    let Some(target) = input.target_id.as_deref() else {
+        return Some(input_error(
+            "target_required",
+            "An explicit target ID is required",
+        ));
+    };
+    if !valid_target_id(target) {
+        return Some(input_error("invalid_target", "Target ID is invalid"));
+    }
+    read_input_error(input)
+}
+
+fn target_consent_input_error(input: &TargetConsentInput) -> Option<CallToolResult> {
+    if !valid_target_id(&input.target_id) {
+        return Some(input_error("invalid_target", "Target ID is invalid"));
+    }
+    consent_input_error(&ConsentInput {
+        confirmed: input.confirmed,
+        confirmation_id: input.confirmation_id.clone(),
+        idempotency_key: input.idempotency_key.clone(),
+    })
+}
+
+fn valid_target_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn consent_input_error(input: &ConsentInput) -> Option<CallToolResult> {
