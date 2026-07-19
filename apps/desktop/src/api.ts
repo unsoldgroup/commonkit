@@ -2,8 +2,14 @@ import { invoke } from "@tauri-apps/api/core";
 import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } from "./contracts.ts";
 import type { UpdateSummary } from "./updater-view.ts";
 
+export type GithubAuthStatus =
+  | { state: "authenticated"; login: string; method: "githubCli" }
+  | { state: "signedOut" };
+
 export const desktopApi = {
   onboardingInitialize: (request: Record<string, unknown>) => invoke<unknown>("onboarding_initialize", { request }),
+  githubAuthStatus: () => invoke<GithubAuthStatus>("github_auth_status"),
+  githubAuthLogin: () => invoke<GithubAuthStatus>("github_auth_login"),
   snapshot: () => invoke<DesktopSnapshot>("desktop_snapshot"),
   managementSnapshot: () => invoke<ManagementSnapshot>("desktop_management_snapshot"),
   targets: () => invoke<TargetInventorySnapshot>("targets_list"),

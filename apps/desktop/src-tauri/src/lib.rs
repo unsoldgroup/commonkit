@@ -26,6 +26,168 @@ struct RuntimeBinaryLayout {
     target_helper: PathBuf,
 }
 
+const GITHUB_OUTPUT_LIMIT: usize = 16 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubCommand {
+    AuthStatus,
+    CurrentUser,
+    Login,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubCommandFailure {
+    Unavailable,
+    Failed,
+}
+
+trait GithubCommandRunner {
+    fn run(&mut self, command: GithubCommand) -> Result<Vec<u8>, GithubCommandFailure>;
+}
+
+#[derive(Debug, Default)]
+struct ProcessGithubCommandRunner;
+
+fn github_command_arguments(command: GithubCommand) -> &'static [&'static str] {
+    match command {
+        GithubCommand::AuthStatus => &["auth", "status", "--hostname", "github.com"],
+        GithubCommand::CurrentUser => &["api", "--hostname", "github.com", "user"],
+        GithubCommand::Login => &[
+            "auth",
+            "login",
+            "--hostname",
+            "github.com",
+            "--git-protocol",
+            "https",
+            "--web",
+            "--clipboard",
+            "--skip-ssh-key",
+        ],
+    }
+}
+
+impl GithubCommandRunner for ProcessGithubCommandRunner {
+    fn run(&mut self, command: GithubCommand) -> Result<Vec<u8>, GithubCommandFailure> {
+        let executable = github_cli_executable()?;
+        let mut process = Command::new(executable);
+        process
+            .args(github_command_arguments(command))
+            .stdin(Stdio::null());
+        if command == GithubCommand::Login {
+            process.stdout(Stdio::null()).stderr(Stdio::null());
+        } else {
+            process.stderr(Stdio::null());
+        }
+        let output = process
+            .output()
+            .map_err(|_| GithubCommandFailure::Unavailable)?;
+        if !output.status.success() || output.stdout.len() > GITHUB_OUTPUT_LIMIT {
+            return Err(GithubCommandFailure::Failed);
+        }
+        Ok(output.stdout)
+    }
+}
+
+fn github_cli_executable() -> Result<PathBuf, GithubCommandFailure> {
+    github_cli_candidates(std::env::var_os("PATH"))
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or(GithubCommandFailure::Unavailable)
+}
+
+fn github_cli_candidates(path: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let executable = format!("gh{}", std::env::consts::EXE_SUFFIX);
+    let mut candidates = path
+        .as_deref()
+        .map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .map(|directory| directory.join(&executable))
+        .collect::<Vec<_>>();
+    #[cfg(target_os = "macos")]
+    candidates.extend([
+        PathBuf::from("/opt/homebrew/bin/gh"),
+        PathBuf::from("/usr/local/bin/gh"),
+    ]);
+    #[cfg(target_os = "linux")]
+    candidates.extend([
+        PathBuf::from("/usr/bin/gh"),
+        PathBuf::from("/usr/local/bin/gh"),
+        PathBuf::from("/snap/bin/gh"),
+        PathBuf::from("/home/linuxbrew/.linuxbrew/bin/gh"),
+    ]);
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(root) = std::env::var_os("ProgramFiles") {
+            candidates.push(PathBuf::from(root).join("GitHub CLI/gh.exe"));
+        }
+        if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+            candidates.push(PathBuf::from(root).join("GitHub CLI/gh.exe"));
+        }
+    }
+    candidates
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum GithubAuthStatus {
+    SignedOut,
+    Authenticated { login: String, method: &'static str },
+}
+
+fn github_auth_status_with(
+    runner: &mut dyn GithubCommandRunner,
+) -> Result<GithubAuthStatus, DesktopError> {
+    match runner.run(GithubCommand::AuthStatus) {
+        Ok(_) => {}
+        Err(GithubCommandFailure::Failed) => return Ok(GithubAuthStatus::SignedOut),
+        Err(GithubCommandFailure::Unavailable) => return Err(DesktopError::GithubCliUnavailable),
+    }
+    let bytes = runner
+        .run(GithubCommand::CurrentUser)
+        .map_err(github_command_error)?;
+    if bytes.len() > GITHUB_OUTPUT_LIMIT {
+        return Err(DesktopError::GithubAuthenticationFailed);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| DesktopError::GithubAuthenticationFailed)?;
+    let login = value
+        .get("login")
+        .and_then(serde_json::Value::as_str)
+        .filter(|login| valid_github_login(login))
+        .ok_or(DesktopError::GithubAuthenticationFailed)?;
+    Ok(GithubAuthStatus::Authenticated {
+        login: login.to_owned(),
+        method: "githubCli",
+    })
+}
+
+fn valid_github_login(login: &str) -> bool {
+    !login.is_empty()
+        && login.len() <= 39
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+        && login
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn github_auth_login_with(
+    runner: &mut dyn GithubCommandRunner,
+) -> Result<GithubAuthStatus, DesktopError> {
+    runner
+        .run(GithubCommand::Login)
+        .map_err(github_command_error)?;
+    github_auth_status_with(runner)
+}
+
+fn github_command_error(error: GithubCommandFailure) -> DesktopError {
+    match error {
+        GithubCommandFailure::Unavailable => DesktopError::GithubCliUnavailable,
+        GithubCommandFailure::Failed => DesktopError::GithubAuthenticationFailed,
+    }
+}
+
 impl RuntimeBinaryLayout {
     fn beside(desktop: &Path) -> Self {
         let directory = desktop.parent().unwrap_or_else(|| Path::new("."));
@@ -270,10 +432,16 @@ impl TraySummary {
             .and_then(|value| value.get("state"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unavailable");
-        let ahead = git.and_then(|value| value.get("ahead")).and_then(serde_json::Value::as_u64);
-        let behind = git.and_then(|value| value.get("behind")).and_then(serde_json::Value::as_u64);
+        let ahead = git
+            .and_then(|value| value.get("ahead"))
+            .and_then(serde_json::Value::as_u64);
+        let behind = git
+            .and_then(|value| value.get("behind"))
+            .and_then(serde_json::Value::as_u64);
         let git_sync = match (ahead, behind) {
-            (Some(ahead), Some(behind)) => format!("Git: {git_state} · {ahead} ahead · {behind} behind"),
+            (Some(ahead), Some(behind)) => {
+                format!("Git: {git_state} · {ahead} ahead · {behind} behind")
+            }
             _ => format!("Git: {git_state}"),
         };
         let violations = diagnostics
@@ -284,8 +452,12 @@ impl TraySummary {
             health: format!("Health: {}", status.state),
             loadout: format!("Loadout: {loadout} · {target}"),
             git_sync,
-            policy: format!("Policy: {violations} violation{}", if violations == 1 { "" } else { "s" }),
-            drift: status.last_drift_check_unix_ms
+            policy: format!(
+                "Policy: {violations} violation{}",
+                if violations == 1 { "" } else { "s" }
+            ),
+            drift: status
+                .last_drift_check_unix_ms
                 .map(|value| format!("Last drift check: {value} ms since epoch"))
                 .unwrap_or_else(|| "Last drift check: never".into()),
             relay: format!("Relay: {relay}"),
@@ -323,6 +495,26 @@ struct OnboardingRequest {
     chezmoi_source: Option<PathBuf>,
     chezmoi_config: Option<PathBuf>,
     publish_registration: bool,
+}
+
+fn authorize_github_repository(
+    mode: &str,
+    repository: &str,
+    status: &GithubAuthStatus,
+) -> Result<(), DesktopError> {
+    if mode != "create" {
+        return Ok(());
+    }
+    let owner = repository
+        .split_once('/')
+        .map(|(owner, _)| owner)
+        .ok_or(DesktopError::InvalidInput)?;
+    match status {
+        GithubAuthStatus::Authenticated { login, .. } if owner.eq_ignore_ascii_case(login) => {
+            Ok(())
+        }
+        _ => Err(DesktopError::GithubAuthenticationFailed),
+    }
 }
 
 fn onboarding_arguments(request: &OnboardingRequest) -> Result<Vec<String>, DesktopError> {
@@ -450,6 +642,10 @@ fn onboarding_initialize(
     client: tauri::State<'_, ServiceClient>,
 ) -> Result<serde_json::Value, DesktopError> {
     let _ = onboarding_arguments(&request)?;
+    if request.mode == "create" {
+        let status = github_auth_status_with(&mut ProcessGithubCommandRunner)?;
+        authorize_github_repository(&request.mode, &request.repository, &status)?;
+    }
     use commonkit_cli::onboarding::{
         InitMode, InitRequest, ProcessRunner, ProviderSelection, initialize,
     };
@@ -721,6 +917,10 @@ enum DesktopError {
     InvalidControlState,
     #[error("input is invalid")]
     InvalidInput,
+    #[error("GitHub CLI is unavailable; install GitHub CLI and retry")]
+    GithubCliUnavailable,
+    #[error("GitHub authentication failed; retry sign-in from CommonKit")]
+    GithubAuthenticationFailed,
     #[error(
         "CommonKit onboarding failed; review the selected provider inputs and local CLI diagnostics"
     )]
@@ -743,6 +943,22 @@ impl Serialize for DesktopError {
 }
 
 #[tauri::command]
+async fn github_auth_status() -> Result<GithubAuthStatus, DesktopError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        github_auth_status_with(&mut ProcessGithubCommandRunner)
+    })
+    .await
+    .map_err(|_| DesktopError::GithubAuthenticationFailed)?
+}
+
+#[tauri::command]
+async fn github_auth_login() -> Result<GithubAuthStatus, DesktopError> {
+    tauri::async_runtime::spawn_blocking(|| github_auth_login_with(&mut ProcessGithubCommandRunner))
+        .await
+        .map_err(|_| DesktopError::GithubAuthenticationFailed)?
+}
+
+#[tauri::command]
 async fn desktop_snapshot(
     client: tauri::State<'_, ServiceClient>,
 ) -> Result<DesktopSnapshot, DesktopError> {
@@ -755,15 +971,31 @@ async fn desktop_snapshot(
         .await
         .unwrap_or_else(|_| serde_json::json!({"events": []}));
     let git_sync = match status.active_target.as_deref() {
-        Some(target) => client.json(reqwest::Method::GET, &format!("/targets/{target}/git"), None).await.unwrap_or_else(unavailable),
+        Some(target) => client
+            .json(
+                reqwest::Method::GET,
+                &format!("/targets/{target}/git"),
+                None,
+            )
+            .await
+            .unwrap_or_else(unavailable),
         None => serde_json::json!({"state":"unavailable"}),
     };
-    let policy = client.json(reqwest::Method::GET, "/policy/summary", None).await.unwrap_or_else(unavailable);
+    let policy = client
+        .json(reqwest::Method::GET, "/policy/summary", None)
+        .await
+        .unwrap_or_else(unavailable);
     let online = status.state != "offline";
     Ok(DesktopSnapshot {
         status,
-        last_event_id: event_snapshot.get("lastEventId").and_then(serde_json::Value::as_u64),
-        events: event_snapshot.get("events").and_then(serde_json::Value::as_array).cloned().unwrap_or_default(),
+        last_event_id: event_snapshot
+            .get("lastEventId")
+            .and_then(serde_json::Value::as_u64),
+        events: event_snapshot
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
         git_sync,
         policy,
         capabilities: vec![
@@ -1296,7 +1528,13 @@ async fn tray_verify(app: tauri::AppHandle) {
     if let Ok(status) = client.status().await {
         if let Some(target) = status.active_target {
             if let Ok(path) = target_convergence_route(&target, "verify") {
-                let _ = client.json(reqwest::Method::POST, &path, Some(serde_json::json!({"targetId": target, "pointer": null}))).await;
+                let _ = client
+                    .json(
+                        reqwest::Method::POST,
+                        &path,
+                        Some(serde_json::json!({"targetId": target, "pointer": null})),
+                    )
+                    .await;
             }
         }
     }
@@ -1307,7 +1545,13 @@ async fn tray_fetch(app: tauri::AppHandle) {
     let client = app.state::<ServiceClient>().inner().clone();
     if let Ok(status) = client.status().await {
         if let Some(target) = status.active_target {
-            let _ = client.json(reqwest::Method::POST, &format!("/targets/{target}/git"), Some(serde_json::json!({}))).await;
+            let _ = client
+                .json(
+                    reqwest::Method::POST,
+                    &format!("/targets/{target}/git"),
+                    Some(serde_json::json!({})),
+                )
+                .await;
         }
     }
     refresh_tray(app).await;
@@ -1325,15 +1569,26 @@ async fn refresh_tray(app: tauri::AppHandle) {
         .await
         .ok();
     let git_sync = match status.active_target.as_deref() {
-        Some(target) => client.json(reqwest::Method::GET, &format!("/targets/{target}/git"), None).await.ok(),
+        Some(target) => client
+            .json(
+                reqwest::Method::GET,
+                &format!("/targets/{target}/git"),
+                None,
+            )
+            .await
+            .ok(),
         None => None,
     };
-    let policy = client.json(reqwest::Method::GET, "/policy/summary", None).await.ok();
+    let policy = client
+        .json(reqwest::Method::GET, "/policy/summary", None)
+        .await
+        .ok();
     let peer = serde_json::json!({
         "gitSync": git_sync,
         "organizationPolicyViolations": policy.as_ref().and_then(|value| value.get("violations")).cloned().unwrap_or_else(|| serde_json::json!([]))
     });
-    let summary = TraySummary::from_observed(&status, relay.as_ref(), snapshots.as_ref(), Some(&peer));
+    let summary =
+        TraySummary::from_observed(&status, relay.as_ref(), snapshots.as_ref(), Some(&peer));
     let items = app.state::<TrayItems>();
     let _ = items.health.set_text(&summary.health);
     let _ = items.loadout.set_text(&summary.loadout);
@@ -1391,6 +1646,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             desktop_snapshot,
+            github_auth_status,
+            github_auth_login,
             onboarding_initialize,
             desktop_management_snapshot,
             apply_plan,
@@ -1430,14 +1687,46 @@ pub fn run() {
                 false,
                 None::<&str>,
             )?;
-            let git_sync = MenuItem::with_id(app, "git-status", "Git: loading", false, None::<&str>)?;
-            let policy = MenuItem::with_id(app, "policy-status", "Policy: loading", false, None::<&str>)?;
-            let drift = MenuItem::with_id(app, "drift-status", "Last drift check: loading", false, None::<&str>)?;
+            let git_sync =
+                MenuItem::with_id(app, "git-status", "Git: loading", false, None::<&str>)?;
+            let policy =
+                MenuItem::with_id(app, "policy-status", "Policy: loading", false, None::<&str>)?;
+            let drift = MenuItem::with_id(
+                app,
+                "drift-status",
+                "Last drift check: loading",
+                false,
+                None::<&str>,
+            )?;
             let refresh = MenuItem::with_id(app, "refresh", "Refresh health", true, None::<&str>)?;
-            let fetch_now = MenuItem::with_id(app, "quick-fetch", "Fetch trusted Git remote", true, None::<&str>)?;
-            let plan_now = MenuItem::with_id(app, "quick-plan", "Plan selected target", true, None::<&str>)?;
-            let verify_now = MenuItem::with_id(app, "quick-verify", "Verify selected target", true, None::<&str>)?;
-            let snapshot_review = MenuItem::with_id(app, "quick-snapshot", "Create snapshot…", true, None::<&str>)?;
+            let fetch_now = MenuItem::with_id(
+                app,
+                "quick-fetch",
+                "Fetch trusted Git remote",
+                true,
+                None::<&str>,
+            )?;
+            let plan_now = MenuItem::with_id(
+                app,
+                "quick-plan",
+                "Plan selected target",
+                true,
+                None::<&str>,
+            )?;
+            let verify_now = MenuItem::with_id(
+                app,
+                "quick-verify",
+                "Verify selected target",
+                true,
+                None::<&str>,
+            )?;
+            let snapshot_review = MenuItem::with_id(
+                app,
+                "quick-snapshot",
+                "Create snapshot…",
+                true,
+                None::<&str>,
+            )?;
             let review = MenuItem::with_id(app, "review", "Review plan…", true, None::<&str>)?;
             let manage_relay =
                 MenuItem::with_id(app, "manage-relay", "Manage relay…", true, None::<&str>)?;
@@ -1563,6 +1852,190 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct FakeGithubRunner {
+        calls: Vec<GithubCommand>,
+        responses: Vec<Result<Vec<u8>, GithubCommandFailure>>,
+    }
+
+    impl GithubCommandRunner for FakeGithubRunner {
+        fn run(&mut self, command: GithubCommand) -> Result<Vec<u8>, GithubCommandFailure> {
+            self.calls.push(command);
+            self.responses.remove(0)
+        }
+    }
+
+    #[test]
+    fn github_status_returns_only_the_authenticated_login_from_fixed_commands() {
+        let mut runner = FakeGithubRunner {
+            responses: vec![
+                Ok(Vec::new()),
+                Ok(br#"{"login":"al-unsoldgroup"}"#.to_vec()),
+            ],
+            ..Default::default()
+        };
+
+        let status = github_auth_status_with(&mut runner).unwrap();
+
+        assert_eq!(
+            status,
+            GithubAuthStatus::Authenticated {
+                login: "al-unsoldgroup".into(),
+                method: "githubCli",
+            }
+        );
+        assert_eq!(
+            runner.calls,
+            vec![GithubCommand::AuthStatus, GithubCommand::CurrentUser]
+        );
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.to_ascii_lowercase().contains("token"));
+    }
+
+    #[test]
+    fn github_login_uses_the_browser_flow_then_rechecks_the_account() {
+        let mut runner = FakeGithubRunner {
+            responses: vec![
+                Ok(Vec::new()),
+                Ok(Vec::new()),
+                Ok(br#"{"login":"al-unsoldgroup"}"#.to_vec()),
+            ],
+            ..Default::default()
+        };
+
+        let status = github_auth_login_with(&mut runner).unwrap();
+
+        assert!(matches!(status, GithubAuthStatus::Authenticated { .. }));
+        assert_eq!(
+            runner.calls,
+            vec![
+                GithubCommand::Login,
+                GithubCommand::AuthStatus,
+                GithubCommand::CurrentUser,
+            ]
+        );
+    }
+
+    #[test]
+    fn github_commands_are_bound_to_github_dot_com_and_fixed_arguments() {
+        assert_eq!(
+            github_command_arguments(GithubCommand::AuthStatus),
+            ["auth", "status", "--hostname", "github.com"]
+        );
+        assert_eq!(
+            github_command_arguments(GithubCommand::CurrentUser),
+            ["api", "--hostname", "github.com", "user"]
+        );
+        assert_eq!(
+            github_command_arguments(GithubCommand::Login),
+            [
+                "auth",
+                "login",
+                "--hostname",
+                "github.com",
+                "--git-protocol",
+                "https",
+                "--web",
+                "--clipboard",
+                "--skip-ssh-key",
+            ]
+        );
+    }
+
+    #[test]
+    fn github_cli_discovery_keeps_fixed_executable_names_and_path_order() {
+        let path = std::env::join_paths([PathBuf::from("/first"), PathBuf::from("/second")])
+            .expect("portable path list");
+        let candidates = github_cli_candidates(Some(path));
+        let executable = format!("gh{}", std::env::consts::EXE_SUFFIX);
+
+        assert_eq!(candidates[0], PathBuf::from("/first").join(&executable));
+        assert_eq!(candidates[1], PathBuf::from("/second").join(executable));
+        #[cfg(target_os = "macos")]
+        assert!(candidates.contains(&PathBuf::from("/opt/homebrew/bin/gh")));
+    }
+
+    #[test]
+    fn github_status_distinguishes_signed_out_from_an_unavailable_cli() {
+        let mut signed_out = FakeGithubRunner {
+            responses: vec![Err(GithubCommandFailure::Failed)],
+            ..Default::default()
+        };
+        assert_eq!(
+            github_auth_status_with(&mut signed_out).unwrap(),
+            GithubAuthStatus::SignedOut
+        );
+
+        let mut unavailable = FakeGithubRunner {
+            responses: vec![Err(GithubCommandFailure::Unavailable)],
+            ..Default::default()
+        };
+        assert!(matches!(
+            github_auth_status_with(&mut unavailable),
+            Err(DesktopError::GithubCliUnavailable)
+        ));
+    }
+
+    #[test]
+    fn github_status_rejects_untrusted_identity_output_without_echoing_it() {
+        let mut runner = FakeGithubRunner {
+            responses: vec![
+                Ok(Vec::new()),
+                Ok(br#"{"login":"bad/name","credential":"sensitive-provider-output"}"#.to_vec()),
+            ],
+            ..Default::default()
+        };
+
+        let error = github_auth_status_with(&mut runner)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            error,
+            "GitHub authentication failed; retry sign-in from CommonKit"
+        );
+        assert!(!error.contains("sensitive-provider-output"));
+    }
+
+    #[test]
+    fn github_status_rejects_oversized_identity_output() {
+        let mut runner = FakeGithubRunner {
+            responses: vec![Ok(Vec::new()), Ok(vec![b'x'; GITHUB_OUTPUT_LIMIT + 1])],
+            ..Default::default()
+        };
+
+        assert!(matches!(
+            github_auth_status_with(&mut runner),
+            Err(DesktopError::GithubAuthenticationFailed)
+        ));
+    }
+
+    #[test]
+    fn repository_creation_is_bound_to_the_authenticated_github_owner() {
+        let authenticated = GithubAuthStatus::Authenticated {
+            login: "al-unsoldgroup".into(),
+            method: "githubCli",
+        };
+
+        assert!(
+            authorize_github_repository("create", "al-unsoldgroup/my-kit", &authenticated).is_ok()
+        );
+        assert!(
+            authorize_github_repository("create", "someone-else/my-kit", &authenticated).is_err()
+        );
+        assert!(
+            authorize_github_repository("connect", "shared-owner/my-kit", &authenticated).is_ok()
+        );
+        assert!(
+            authorize_github_repository(
+                "create",
+                "al-unsoldgroup/my-kit",
+                &GithubAuthStatus::SignedOut
+            )
+            .is_err()
+        );
+    }
 
     #[cfg(unix)]
     #[test]

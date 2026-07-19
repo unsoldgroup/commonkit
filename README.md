@@ -59,6 +59,19 @@ For unattended operation, run `commonkit daemon install` and `commonkit daemon s
 [the service guide](docs/DAEMON-SERVICE.md). SSH targets use the separately packaged helper in
 [the target-helper guide](docs/TARGET-HELPER.md).
 
+### Desktop first run
+
+Open CommonKit from the menu bar and choose **Get started**. The four-step setup connects your
+GitHub account, creates or connects a private setup repository, names this computer, and starts
+with a safe managed folder. Existing APM or chezmoi settings are optional advanced imports.
+CommonKit prepares a preview first; it does not change the selected folder until you review and
+explicitly apply that plan.
+
+The development build uses the installed GitHub CLI as its credential broker. If you are already
+signed in with `gh`, CommonKit detects that account. Otherwise **Sign in with GitHub** opens the
+browser flow and copies its one-time code for you to paste. Tokens remain in GitHub CLI's native
+credential storage and are never returned to the desktop webview.
+
 The daemon creates private, platform-native config and state roots plus a
 0600/ACL-protected control token. In a second terminal, create or connect a kit:
 

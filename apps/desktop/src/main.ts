@@ -5,8 +5,10 @@ import { statusView } from "./view-model.ts";
 import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } from "./contracts.ts";
 import { updatePanel, type UpdateUiState } from "./updater-view.ts";
 import { managementPanel } from "./management-view.ts";
-import { onboardingPanel, type OnboardingProvider } from "./onboarding-view.ts";
+import { defaultOnboardingDraft, onboardingPanel, type OnboardingViewState } from "./onboarding-view.ts";
+import { applyOnboardingValues, onboardingRequest } from "./onboarding-controller.ts";
 import { open } from "@tauri-apps/plugin-dialog";
+import { homeDir } from "@tauri-apps/api/path";
 import { assertPlanTarget, convergenceTarget } from "./target-selection.ts";
 import { refreshDesktopState } from "./live-refresh.ts";
 
@@ -15,8 +17,13 @@ let snapshot: DesktopSnapshot | null = null;
 let management: ManagementSnapshot | null = null;
 let targets: TargetInventorySnapshot | null = null;
 let updateState: UpdateUiState = { kind: "idle" };
-let onboardingProvider: OnboardingProvider = "native";
-let onboardingMessage = "";
+let onboardingState: OnboardingViewState = {
+  step: 1,
+  auth: { state: "checking" },
+  draft: defaultOnboardingDraft(),
+  message: "",
+  submitting: false,
+};
 
 function placeholder(route: Route): string {
   const copy: Record<Route, [string, string]> = {
@@ -36,7 +43,7 @@ function placeholder(route: Route): string {
 
 function render(): void {
   const route = routeFromHash(location.hash);
-  const body = route === "onboarding" ? onboardingPanel(onboardingProvider, onboardingMessage) : route === "settings" ? updatePanel(updateState) : route === "status" && snapshot ? (() => {
+  const body = route === "onboarding" ? onboardingPanel(onboardingState) : route === "settings" ? updatePanel(updateState) : route === "status" && snapshot ? (() => {
     const view = statusView(snapshot.status);
     const inventory = targets ? `<fieldset><legend>Managed targets</legend>${targets.targets.map((target) => `<label><input type="checkbox" name="managed-target" value="${target.id}" ${targets?.selected.includes(target.id) ? "checked" : ""}> ${target.id} · ${target.transport.type}</label>`).join("")}<button id="save-target-selection" type="button">Save target selection</button></fieldset>` : "";
     return `<section class="panel"><p class="eyebrow">Selected targets</p><h1>${view.heading}</h1><p>${view.detail}</p><dl><dt>Active target</dt><dd>${snapshot.status.activeTarget ?? "Multiple or not selected"}</dd><dt>Loadout</dt><dd>${snapshot.status.activeLoadout ?? "Not selected"}</dd><dt>Runtime</dt><dd>${snapshot.status.runtimeVersion}</dd></dl>${inventory}${view.primaryRoute !== "status" ? `<a class="primary" href="#${view.primaryRoute}">Continue</a>` : ""}</section>`;
@@ -69,30 +76,84 @@ function bindOnboardingActions(): void {
       const selected = await open({ directory: Boolean(button.dataset.pickDirectory), multiple: false });
       if (typeof selected === "string") {
         const input = document.querySelector<HTMLInputElement>(`[name="${name}"]`);
-        if (input) input.value = selected;
+        if (input) {
+          input.value = selected;
+          applyOnboardingValues(onboardingState.draft, new Map([[name, selected]]));
+        }
       }
     });
   }
-  document.querySelector<HTMLSelectElement>("#onboarding-provider")?.addEventListener("change", (event) => {
-    onboardingProvider = (event.currentTarget as HTMLSelectElement).value as OnboardingProvider;
-    onboardingMessage = "";
-    render();
-  });
-  document.querySelector<HTMLFormElement>("#onboarding-form")?.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const values: Record<string, unknown> = Object.fromEntries(new FormData(event.currentTarget as HTMLFormElement).entries());
-    values.publishRegistration = values.publishRegistration === "true";
-    onboardingMessage = "Validating the pinned provider, materializing, and reloading the managed service…";
+  document.querySelector<HTMLButtonElement>("#github-sign-in")?.addEventListener("click", async () => {
+    onboardingState.auth = { state: "authenticating" };
+    onboardingState.message = "Finish signing in in the GitHub window. Your one-time code is copied and ready to paste; CommonKit never sees your password.";
     render();
     try {
-      const result = await desktopApi.onboardingInitialize(values);
-      const plan = (result as { firstPlanId?: string }).firstPlanId ?? "ready";
-      onboardingMessage = `First plan ${plan} is ready for review.`;
+      const status = await desktopApi.githubAuthLogin();
+      onboardingState.auth = status;
+      onboardingState.message = status.state === "authenticated" ? "GitHub connected. Your setup repository will be private." : "GitHub sign-in was not completed.";
     } catch (error) {
-      onboardingMessage = errorMessage(error);
+      onboardingState.auth = { state: "error", message: errorMessage(error) };
+      onboardingState.message = "";
     }
     render();
   });
+  document.querySelectorAll<HTMLInputElement>('input[name="mode"], input[name="provider"]').forEach((input) => input.addEventListener("change", () => {
+    captureOnboardingDraft();
+    onboardingState.message = "";
+    render();
+  }));
+  document.querySelector<HTMLButtonElement>("#safe-test-folder")?.addEventListener("change", (event) => {
+    const checked = (event.currentTarget as HTMLInputElement).checked;
+    if (checked) {
+      const home = onboardingState.draft.kitDirectory.match(/^(.*)\/\.config\//)?.[1];
+      if (home) onboardingState.draft.targetRoot = `${home}/CommonKitManaged`;
+    }
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#setup-back")?.addEventListener("click", () => {
+    captureOnboardingDraft();
+    if (onboardingState.step > 1) onboardingState.step = (onboardingState.step - 1) as OnboardingViewState["step"];
+    onboardingState.message = "";
+    renderAndFocusSetup();
+  });
+  document.querySelector<HTMLFormElement>("#onboarding-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget as HTMLFormElement;
+    if (!form.reportValidity()) return;
+    captureOnboardingDraft(form);
+    if (onboardingState.step < 4) {
+      onboardingState.step = (onboardingState.step + 1) as OnboardingViewState["step"];
+      onboardingState.message = "";
+      renderAndFocusSetup();
+      return;
+    }
+    if (onboardingState.submitting || onboardingState.auth.state !== "authenticated") return;
+    onboardingState.draft.publishRegistration = new FormData(form).get("publishRegistration") === "true";
+    onboardingState.submitting = true;
+    onboardingState.message = "Checking your setup and preparing the preview…";
+    render();
+    try {
+      const result = await desktopApi.onboardingInitialize(onboardingRequest(onboardingState.draft, onboardingState.auth.login));
+      const plan = (result as { firstPlanId?: string }).firstPlanId ?? "ready";
+      onboardingState.message = `Your setup preview ${plan} is ready. Review it before applying any changes.`;
+      location.hash = "#plans";
+    } catch (error) {
+      onboardingState.message = errorMessage(error);
+    } finally {
+      onboardingState.submitting = false;
+    }
+    render();
+  });
+}
+
+function captureOnboardingDraft(form = document.querySelector<HTMLFormElement>("#onboarding-form")): void {
+  if (!form) return;
+  applyOnboardingValues(onboardingState.draft, new FormData(form).entries());
+}
+
+function renderAndFocusSetup(): void {
+  render();
+  document.querySelector<HTMLElement>("#setup-heading")?.focus();
 }
 
 function errorMessage(error: unknown): string {
@@ -250,6 +311,19 @@ function bindManagementActions(route: Route): void {
 
 addEventListener("hashchange", render);
 render();
+async function initializeOnboarding(): Promise<void> {
+  try {
+    const [auth, home] = await Promise.all([desktopApi.githubAuthStatus(), homeDir()]);
+    onboardingState.auth = auth;
+    const cleanHome = home.replace(/[\\/]$/, "");
+    if (!onboardingState.draft.kitDirectory) onboardingState.draft.kitDirectory = `${cleanHome}/.config/commonkit/setup`;
+    if (!onboardingState.draft.targetRoot) onboardingState.draft.targetRoot = `${cleanHome}/CommonKitManaged`;
+  } catch (error) {
+    onboardingState.auth = { state: "error", message: errorMessage(error) };
+  }
+  render();
+}
+void initializeOnboarding();
 let refreshRunning = false;
 async function refreshLiveState(): Promise<void> {
   if (refreshRunning) return;
