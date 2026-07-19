@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 
 use commonkit_contracts::{Sha256Digest, StableId};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,7 @@ pub struct TargetInventory {
     state_path: PathBuf,
     targets: BTreeMap<StableId, TargetRecord>,
     selected: RwLock<Vec<StableId>>,
+    selection_lock: Mutex<()>,
 }
 
 impl TargetInventory {
@@ -73,9 +74,10 @@ impl TargetInventory {
             state_path,
             targets: by_id,
             selected: RwLock::new(selected),
+            selection_lock: Mutex::new(()),
         };
         if !inventory.state_path.exists() {
-            inventory.persist()?;
+            inventory.persist_selection(&inventory.selected())?;
         }
         Ok(inventory)
     }
@@ -89,12 +91,17 @@ impl TargetInventory {
     }
 
     pub fn select(&self, selected: Vec<StableId>) -> Result<(), TargetInventoryError> {
+        let _guard = self
+            .selection_lock
+            .lock()
+            .map_err(|_| TargetInventoryError::Lock)?;
         validate_selection(&self.targets, &selected)?;
+        self.persist_selection(&selected)?;
         *self.selected.write().expect("target selection lock") = selected;
-        self.persist()
+        Ok(())
     }
 
-    fn persist(&self) -> Result<(), TargetInventoryError> {
+    fn persist_selection(&self, selected: &[StableId]) -> Result<(), TargetInventoryError> {
         let parent = self
             .state_path
             .parent()
@@ -102,7 +109,7 @@ impl TargetInventory {
         fs::create_dir_all(parent)?;
         let temporary = self.state_path.with_extension("tmp");
         let bytes = serde_json::to_vec(&SelectionState {
-            selected: self.selected(),
+            selected: selected.to_vec(),
         })?;
         fs::write(&temporary, bytes)?;
         fs::rename(temporary, &self.state_path)?;
@@ -144,4 +151,6 @@ pub enum TargetInventoryError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    #[error("target selection lock is poisoned")]
+    Lock,
 }
