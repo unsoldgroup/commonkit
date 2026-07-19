@@ -15,22 +15,25 @@ use commonkit_adapters::{
     ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
     ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
-    materialize_mcp_client_state, provider_plan_bindings, validate_ownership,
+    materialize_mcp_client_state, validate_ownership,
 };
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
 use commonkit_contracts::{
     LayerDocument, Plan, ReceiptState, Sha256Digest, StableId, assert_no_embedded_secrets,
     digest_domain_json,
 };
+use commonkit_core::{PlanDraft, build_plan};
 use commonkit_reconcile::{
     Adapter, PlanStore, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
 };
 use commonkit_snapshots::{
     AuthenticatedCipher, AuthorityStore, ConsistentBackup, DatabaseId, DatabaseLifecycle,
-    DurableRestore, ObjectStore, PortableAuthorityStore, ProcessObjectCommandRunner, PromotionPlan,
-    RestoreFailpoint, RestorePlan, S3CompatibleObjectStore, SnapshotError, SnapshotManifest,
-    SnapshotService, SqliteBackup, StaticBackup, XChaCha20Cipher, manifest_digest,
+    DurableRestore, ObjectStore, PortableAuthorityStore, ProcessGitAuthorityPublisher,
+    ProcessObjectCommandRunner, PromotionPlan, RestoreFailpoint, RestorePlan,
+    S3CompatibleObjectStore, SnapshotError, SnapshotManifest, SnapshotService, SqliteBackup,
+    StaticBackup, XChaCha20Cipher, manifest_digest,
 };
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -99,7 +102,7 @@ struct SyncConfig {
     relay_endpoint: Option<String>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SyncTargetPlatform {
     operating_system: String,
@@ -130,7 +133,7 @@ impl SyncConfig {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum SyncTargetTransport {
     Local,
@@ -146,7 +149,7 @@ enum SyncTargetTransport {
     },
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderPipelineConfig {
     root: PathBuf,
@@ -154,7 +157,7 @@ struct ProviderPipelineConfig {
     providers: Vec<ConfiguredProvider>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct GitProviderSource {
     repository: PathBuf,
@@ -162,7 +165,7 @@ struct GitProviderSource {
     revision: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "snake_case", deny_unknown_fields)]
 enum ConfiguredProvider {
     Native {
@@ -185,7 +188,7 @@ enum ConfiguredProvider {
     },
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NativeProviderFile {
     path: NormalizedManagedPath,
@@ -969,14 +972,25 @@ struct ProductionSyncDomain {
     ssh_factory: Arc<dyn ProductionSshTransportFactory>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderAuthorityRecord {
+    plan: Plan,
     states: Vec<MaterializedState>,
     relay_endpoint: Option<String>,
     executable_digests: BTreeMap<PathBuf, Sha256Digest>,
     external_state_digests: BTreeMap<PathBuf, Sha256Digest>,
+    provider_input_digests: BTreeMap<PathBuf, Sha256Digest>,
+    provider_configuration_digest: Sha256Digest,
     source_revision: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AuthenticatedProviderAuthority {
+    schema: String,
+    algorithm: String,
+    ciphertext: Vec<u8>,
 }
 
 impl ProductionSyncDomain {
@@ -1008,6 +1022,92 @@ impl ProductionSyncDomain {
         Ok(digests)
     }
 
+    fn provider_configuration_digest(&self) -> Result<Sha256Digest, DomainFailure> {
+        let providers = self
+            .config
+            .provider_pipeline
+            .as_ref()
+            .map(|pipeline| {
+                pipeline
+                    .providers
+                    .iter()
+                    .map(|provider| match provider {
+                        ConfiguredProvider::Native { version, files } => serde_json::json!({
+                            "provider":"native", "version":version, "files":files.iter().map(|file| {
+                                serde_json::json!({"path":file.path,"source":file.source})
+                            }).collect::<Vec<_>>()
+                        }),
+                        ConfiguredProvider::Apm { executable, version, manifest, lockfile, policy, targets, managed_root } => serde_json::json!({
+                            "provider":"apm", "executable":executable, "version":version,
+                            "manifest":manifest, "lockfile":lockfile, "policy":policy,
+                            "targets":targets, "managedRoot":managed_root
+                        }),
+                        ConfiguredProvider::Chezmoi { executable, source, config } => serde_json::json!({
+                            "provider":"chezmoi", "executable":executable,
+                            "version":commonkit_adapters::TESTED_CHEZMOI_VERSION,
+                            "source":source, "config":config
+                        }),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        digest_domain_json(
+            "commonkit.provider-execution-configuration.v1",
+            &serde_json::json!({
+                "targetId":self.config.target_id,
+                "targetRoot":self.config.target_root,
+                "targetTransport":self.config.target_transport,
+                "targetPlatform":self.config.target_platform,
+                "declaredRoots":self.config.declared_roots,
+                "protectedRoots":self.config.protected_roots,
+                "caseSensitive":self.config.case_sensitive,
+                "targetIdentityDigest":self.config.target_identity_digest,
+                "composedLoadoutDigest":self.config.composed_loadout_digest,
+                "policyDigest":self.config.policy_digest,
+                "relayClientRoot":self.config.relay_client_root,
+                "relayEndpoint":self.config.relay_endpoint,
+                "sourceRevision":self.config.provider_pipeline.as_ref().map(|pipeline| &pipeline.source.revision),
+                "providers":providers,
+            }),
+        )
+        .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn provider_input_digests(&self) -> Result<BTreeMap<PathBuf, Sha256Digest>, DomainFailure> {
+        let Some(pipeline) = &self.config.provider_pipeline else {
+            return Ok(BTreeMap::new());
+        };
+        let mut paths = Vec::new();
+        for provider in &pipeline.providers {
+            match provider {
+                ConfiguredProvider::Native { files, .. } => {
+                    paths.extend(files.iter().map(|file| file.source.to_string()));
+                }
+                ConfiguredProvider::Apm {
+                    manifest,
+                    lockfile,
+                    policy,
+                    ..
+                } => {
+                    paths.extend([
+                        path_text(manifest)?.to_owned(),
+                        path_text(lockfile)?.to_owned(),
+                        path_text(policy)?.to_owned(),
+                    ]);
+                }
+                ConfiguredProvider::Chezmoi { source, config, .. } => {
+                    paths.extend([path_text(source)?.to_owned(), path_text(config)?.to_owned()]);
+                }
+            }
+        }
+        let mut digests = BTreeMap::new();
+        for relative in paths {
+            let path = checked_repository_path(&pipeline.source.repository, &relative)?;
+            collect_local_input_digests(&pipeline.source.repository, &path, &mut digests)?;
+        }
+        Ok(digests)
+    }
+
     fn external_state_digests(&self) -> Result<BTreeMap<PathBuf, Sha256Digest>, DomainFailure> {
         self.config
             .materialized_states
@@ -1019,33 +1119,47 @@ impl ProductionSyncDomain {
             .collect()
     }
 
-    fn persist_execution_authority(
+    fn seal_execution_authority(
         &self,
         plan: &Plan,
         states: &[MaterializedState],
     ) -> Result<(), DomainFailure> {
         let record = ProviderAuthorityRecord {
+            plan: plan.clone(),
             states: states.to_vec(),
             relay_endpoint: self.config.relay_endpoint.clone(),
             executable_digests: self.executable_digests()?,
             external_state_digests: self.external_state_digests()?,
+            provider_input_digests: self.provider_input_digests()?,
+            provider_configuration_digest: self.provider_configuration_digest()?,
             source_revision: self
                 .config
                 .provider_pipeline
                 .as_ref()
                 .map(|pipeline| pipeline.source.revision.clone()),
         };
-        let bytes = serde_json::to_vec(&record).map_err(|_| DomainFailure::OperationFailed)?;
         let path = self.authority_path(plan);
-        let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
-        fs::create_dir_all(parent).map_err(|_| DomainFailure::OperationFailed)?;
         if path.exists() {
-            return if fs::read(path).map_err(|_| DomainFailure::OperationFailed)? == bytes {
+            return if self.load_execution_authority(plan)? == record {
                 Ok(())
             } else {
                 Err(DomainFailure::OperationFailed)
             };
         }
+        let key = self.load_or_create_authority_key()?;
+        let cipher = XChaCha20Cipher::new(key);
+        let plaintext = serde_json::to_vec(&record).map_err(|_| DomainFailure::OperationFailed)?;
+        let ciphertext = cipher
+            .seal(&plaintext, plan.id.as_str().as_bytes())
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let envelope = AuthenticatedProviderAuthority {
+            schema: "commonkit.provider-authority.v1".into(),
+            algorithm: cipher.algorithm().into(),
+            ciphertext,
+        };
+        let bytes = serde_json::to_vec(&envelope).map_err(|_| DomainFailure::OperationFailed)?;
+        let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
+        fs::create_dir_all(parent).map_err(|_| DomainFailure::OperationFailed)?;
         let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
         let mut file = OpenOptions::new()
             .write(true)
@@ -1055,16 +1169,61 @@ impl ProductionSyncDomain {
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|_| DomainFailure::OperationFailed)?;
-        fs::rename(&temporary, &path).map_err(|_| DomainFailure::OperationFailed)
+        fs::rename(&temporary, &path).map_err(|_| DomainFailure::OperationFailed)?;
+        sync_parent_directory(parent)
     }
 
     fn load_execution_authority(
         &self,
         plan: &Plan,
     ) -> Result<ProviderAuthorityRecord, DomainFailure> {
-        let bytes =
-            fs::read(self.authority_path(plan)).map_err(|_| DomainFailure::OperationFailed)?;
-        serde_json::from_slice(&bytes).map_err(|_| DomainFailure::OperationFailed)
+        let path = self.authority_path(plan);
+        let metadata = fs::symlink_metadata(&path).map_err(|_| DomainFailure::OperationFailed)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(DomainFailure::OperationFailed);
+        }
+        let bytes = fs::read(path).map_err(|_| DomainFailure::OperationFailed)?;
+        let envelope: AuthenticatedProviderAuthority =
+            serde_json::from_slice(&bytes).map_err(|_| DomainFailure::OperationFailed)?;
+        if envelope.schema != "commonkit.provider-authority.v1"
+            || envelope.algorithm != "XCHACHA20-POLY1305"
+        {
+            return Err(DomainFailure::OperationFailed);
+        }
+        let key = self.load_authority_key()?;
+        let plaintext = XChaCha20Cipher::new(key)
+            .open(&envelope.ciphertext, plan.id.as_str().as_bytes())
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let record: ProviderAuthorityRecord =
+            serde_json::from_slice(&plaintext).map_err(|_| DomainFailure::OperationFailed)?;
+        if record.plan.id != plan.id || record.plan.target_id != plan.target_id {
+            return Err(DomainFailure::OperationFailed);
+        }
+        Ok(record)
+    }
+
+    fn authority_key_path(&self) -> PathBuf {
+        self.config.adapter_state.join("provider-authority.key")
+    }
+
+    fn load_authority_key(&self) -> Result<[u8; 32], DomainFailure> {
+        let path = self.authority_key_path();
+        let metadata = fs::symlink_metadata(&path).map_err(|_| DomainFailure::OperationFailed)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(DomainFailure::OperationFailed);
+        }
+        let bytes = fs::read(path).map_err(|_| DomainFailure::OperationFailed)?;
+        bytes.try_into().map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn load_or_create_authority_key(&self) -> Result<[u8; 32], DomainFailure> {
+        if self.authority_key_path().exists() {
+            return self.load_authority_key();
+        }
+        let mut key = [0_u8; 32];
+        rand::rng().fill_bytes(&mut key);
+        write_private_atomic(&self.authority_key_path(), &key)?;
+        Ok(key)
     }
 
     fn states(&self) -> Result<Vec<MaterializedState>, DomainFailure> {
@@ -1355,7 +1514,7 @@ impl ProductionSyncDomain {
                 self.finish_plan(&states, &artifacts, &rules, observed, &mut files)?
             }
         };
-        self.persist_execution_authority(&plan, &states)?;
+        self.seal_execution_authority(&plan, &states)?;
         self.plan_store
             .persist(&plan)
             .map_err(|_| DomainFailure::OperationFailed)?;
@@ -1441,6 +1600,142 @@ fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, DomainFailure> {
     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(bytes)))
         .map_err(|_| DomainFailure::OperationFailed)
 }
+
+fn collect_local_input_digests(
+    repository: &Path,
+    path: &Path,
+    output: &mut BTreeMap<PathBuf, Sha256Digest>,
+) -> Result<(), DomainFailure> {
+    let repository = repository
+        .canonicalize()
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    let metadata = fs::symlink_metadata(path).map_err(|_| DomainFailure::OperationFailed)?;
+    if metadata.file_type().is_symlink() || !path.starts_with(&repository) {
+        return Err(DomainFailure::OperationFailed);
+    }
+    if metadata.is_file() {
+        output.insert(
+            path.strip_prefix(repository)
+                .map_err(|_| DomainFailure::OperationFailed)?
+                .to_path_buf(),
+            digest_bytes(&fs::read(path).map_err(|_| DomainFailure::OperationFailed)?)?,
+        );
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Err(DomainFailure::OperationFailed);
+    }
+    let mut children = fs::read_dir(path)
+        .map_err(|_| DomainFailure::OperationFailed)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    children.sort_by_key(|entry| entry.file_name());
+    for child in children {
+        collect_local_input_digests(&repository, &child.path(), output)?;
+    }
+    Ok(())
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), DomainFailure> {
+    let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
+    fs::create_dir_all(parent).map_err(|_| DomainFailure::OperationFailed)?;
+    let temporary = path.with_extension(format!("tmp-{:032x}", rand::random::<u128>()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    if file.write_all(bytes).and_then(|_| file.sync_all()).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return Err(DomainFailure::OperationFailed);
+    }
+    fs::rename(&temporary, path).map_err(|_| DomainFailure::OperationFailed)?;
+    sync_parent_directory(parent)
+}
+
+fn sync_parent_directory(parent: &Path) -> Result<(), DomainFailure> {
+    #[cfg(unix)]
+    {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| DomainFailure::OperationFailed)?;
+    }
+    Ok(())
+}
+
+fn relay_authority_from_states(
+    config: &SyncConfig,
+    states: Vec<MaterializedState>,
+) -> Result<RelayProviderAuthority, DomainFailure> {
+    let artifact_store = ArtifactStore::open(&config.provider_artifacts)
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    for state in &states {
+        state.verify().map_err(|_| DomainFailure::OperationFailed)?;
+        for resource in &state.resources {
+            if let FilesystemIntent::File { content, .. } = &resource.intent {
+                artifact_store
+                    .load(content)
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+            }
+        }
+    }
+    let mut provider_inputs = states
+        .iter()
+        .map(|state| state.inputs.input_set_digest.clone())
+        .collect::<Vec<_>>();
+    provider_inputs.sort();
+    let mut artifacts = states
+        .iter()
+        .map(|state| state.digest.clone())
+        .collect::<Vec<_>>();
+    artifacts.sort();
+    let mut ownership = states
+        .iter()
+        .flat_map(|state| state.capabilities.iter())
+        .map(|resource| {
+            let ProviderCapability::McpStreamableHttp { id, .. } = &resource.capability;
+            (
+                id.clone(),
+                resource.provenance.provider_id.clone(),
+                resource.provenance.source.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    ownership.sort();
+    if ownership.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(DomainFailure::OperationFailed);
+    }
+    Ok(RelayProviderAuthority {
+        materialized_states: states,
+        relay_is_target_local: matches!(
+            config
+                .target_transport
+                .as_ref()
+                .unwrap_or(&SyncTargetTransport::Local),
+            SyncTargetTransport::Local
+        ),
+        target_identity_digest: config.target_identity_digest.clone(),
+        composed_loadout_digest: config.composed_loadout_digest.clone(),
+        provider_inputs_digest: digest_domain_json(
+            "commonkit.relay-provider-inputs.v1",
+            &provider_inputs,
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?,
+        policy_digest: config.policy_digest.clone(),
+        ownership_map_digest: digest_domain_json(
+            "commonkit.relay-capability-ownership.v1",
+            &ownership,
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?,
+        artifact_set_digest: digest_domain_json("commonkit.relay-materialized-set.v1", &artifacts)
+            .map_err(|_| DomainFailure::OperationFailed)?,
+    })
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlanRequest {
@@ -1473,22 +1768,26 @@ struct RollbackRequest {
     idempotency_key: Option<String>,
 }
 impl SyncDomain for ProductionSyncDomain {
+    fn persist_plan_execution_authority(
+        &self,
+        plan: &Plan,
+        states: &[MaterializedState],
+    ) -> Result<(), DomainFailure> {
+        self.seal_execution_authority(plan, states)
+    }
+
     fn plan_execution_authority(
         &self,
         approved: &Plan,
     ) -> Result<crate::PlanExecutionAuthority, DomainFailure> {
         let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
             .map_err(|_| DomainFailure::OperationFailed)?;
-        let rules = OwnershipRules::new(
-            self.config.case_sensitive,
-            self.config.declared_roots.clone(),
-            self.config.protected_roots.clone(),
-        )
-        .map_err(|_| DomainFailure::OperationFailed)?;
         let record = self.load_execution_authority(approved)?;
         if record.relay_endpoint != self.config.relay_endpoint
             || record.executable_digests != self.executable_digests()?
             || record.external_state_digests != self.external_state_digests()?
+            || record.provider_input_digests != self.provider_input_digests()?
+            || record.provider_configuration_digest != self.provider_configuration_digest()?
         {
             return Err(DomainFailure::OperationFailed);
         }
@@ -1496,80 +1795,59 @@ impl SyncDomain for ProductionSyncDomain {
             if record.source_revision.as_deref() != Some(pipeline.source.revision.as_str()) {
                 return Err(DomainFailure::OperationFailed);
             }
-            let mut repository = GitRepository::new(
-                ProcessGitRunner::new(&pipeline.source.repository),
-                pipeline.source.trusted_remote_url.clone(),
-                "origin",
-            );
-            let status = repository
-                .inspect(true)
-                .map_err(|_| DomainFailure::OperationFailed)?;
-            if status.revision.as_str() != pipeline.source.revision
-                || !matches!(
-                    status.disposition,
-                    GitSyncDisposition::Clean | GitSyncDisposition::Ahead
-                )
-            {
-                return Err(DomainFailure::OperationFailed);
-            }
             for configured in &pipeline.providers {
                 let expected = match configured {
-                    ConfiguredProvider::Native { version, .. } => Some(("native", version)),
-                    ConfiguredProvider::Apm { version, .. } => Some(("apm", version)),
-                    ConfiguredProvider::Chezmoi { .. } => None,
+                    ConfiguredProvider::Native { version, .. } => ("native", version.to_string()),
+                    ConfiguredProvider::Apm { version, .. } => ("apm", version.to_string()),
+                    ConfiguredProvider::Chezmoi { .. } => (
+                        "chezmoi",
+                        commonkit_adapters::TESTED_CHEZMOI_VERSION.to_owned(),
+                    ),
                 };
-                if let Some((id, version)) = expected {
-                    if !record.states.iter().any(|state| {
-                        state.inputs.provider_id.as_str() == id
-                            && &state.inputs.provider_version == version
-                    }) {
-                        return Err(DomainFailure::OperationFailed);
-                    }
+                if !record.states.iter().any(|state| {
+                    state.inputs.provider_id.as_str() == expected.0
+                        && state.inputs.provider_version.to_string() == expected.1
+                }) {
+                    return Err(DomainFailure::OperationFailed);
                 }
             }
         }
-        let mut states = record.states;
-        states.retain(|state| state.inputs.provider_id.as_str() != "commonkit-relay-client");
-        if states.iter().any(|state| !state.capabilities.is_empty()) {
-            let managed_root = self
-                .config
-                .relay_client_root
-                .as_ref()
-                .ok_or(DomainFailure::OperationFailed)?;
-            if let Some(client_state) = materialize_mcp_client_state(
-                &states,
-                &artifacts,
-                managed_root,
-                self.config
-                    .relay_endpoint
-                    .as_deref()
-                    .unwrap_or("http://127.0.0.1:3764/mcp"),
-            )
-            .map_err(|_| DomainFailure::OperationFailed)?
-            {
-                states.push(client_state);
+        for state in &record.states {
+            state.verify().map_err(|_| DomainFailure::OperationFailed)?;
+            for resource in &state.resources {
+                if let FilesystemIntent::File { content, .. } = &resource.intent {
+                    artifacts
+                        .load(content)
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                }
             }
         }
-        let bindings = provider_plan_bindings(
-            ProviderPlanRequest {
-                target_id: self.config.target_id.clone(),
-                target_identity_digest: self.config.target_identity_digest.clone(),
-                composed_loadout_digest: self.config.composed_loadout_digest.clone(),
-                // Observed state is deliberately excluded from provider
-                // authority; adapters revalidate each operation preimage.
-                observed_digest: self.config.target_identity_digest.clone(),
-                policy_digest: self.config.policy_digest.clone(),
-                ownership_rules: &rules,
-                mapped_side_effects: BTreeSet::new(),
-            },
-            &states,
-            &artifacts,
-        )
-        .map_err(|_| DomainFailure::OperationFailed)?;
-        Ok(crate::PlanExecutionAuthority {
-            policy_digest: self.config.policy_digest.clone(),
-            bindings,
+        let reconstructed = build_plan(PlanDraft {
+            target_id: record.plan.target_id.clone(),
+            desired_digest: record.plan.desired_digest.clone(),
+            observed_digest: record.plan.observed_digest.clone(),
+            policy_digest: record.plan.policy_digest.clone(),
+            bindings: record.plan.bindings.clone(),
+            operations: record.plan.operations.clone(),
         })
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        if reconstructed != record.plan || reconstructed != *approved {
+            return Err(DomainFailure::OperationFailed);
+        }
+        Ok(crate::PlanExecutionAuthority {
+            policy_digest: reconstructed.policy_digest.clone(),
+            bindings: reconstructed.bindings.clone(),
+            plan_digest: reconstructed.id,
+        })
+    }
+
+    fn relay_execution_authority(
+        &self,
+        approved: &Plan,
+    ) -> Result<RelayProviderAuthority, DomainFailure> {
+        self.plan_execution_authority(approved)?;
+        let record = self.load_execution_authority(approved)?;
+        relay_authority_from_states(&self.config, record.states)
     }
 
     fn relay_provider_authority(&self) -> Result<RelayProviderAuthority, DomainFailure> {
