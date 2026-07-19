@@ -33,6 +33,7 @@ fn local_filesystem_is_confined_to_one_declared_capability_root() {
         b"{}\n"
     );
 
+    drop(target);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -62,6 +63,7 @@ fn local_filesystem_rejects_symlink_ancestors_and_leafs() {
     ));
     assert!(!outside.join("new").exists());
 
+    drop(target);
     fs::remove_dir_all(root).unwrap();
     fs::remove_dir_all(outside).unwrap();
 }
@@ -76,6 +78,7 @@ fn read_only_root_refuses_mutation() {
         target.write_file(&path, b"{}"),
         Err(TargetFilesystemError::ReadOnly)
     ));
+    drop(target);
     fs::remove_dir_all(root).unwrap();
 }
 
