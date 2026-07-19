@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[cfg(not(windows))]
+use std::process::Command;
+use std::process::Output;
 
 use super::provider::ProviderFailure;
 
@@ -62,6 +64,7 @@ impl<'a> ProviderSandbox<'a> {
     }
 }
 
+#[cfg(not(windows))]
 fn unavailable(platform: &str, remediation: &str) -> ProviderFailure {
     ProviderFailure::Materialize(format!(
         "provider sandbox capability is unavailable on {platform}; {remediation}; provider execution was denied before launch"
@@ -459,7 +462,7 @@ mod windows_appcontainer {
                     ))
                 })?;
                 let path = child.path();
-                let metadata = child.symlink_metadata().map_err(|error| {
+                let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
                     failure(format!(
                         "provider sandbox could not inspect {}: {error}",
                         path.display()
@@ -555,7 +558,7 @@ mod windows_appcontainer {
     struct OwnedHandle(HANDLE);
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
-            if self.0 != 0 && self.0 != INVALID_HANDLE_VALUE {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
                 unsafe { CloseHandle(self.0) };
             }
         }
@@ -777,7 +780,7 @@ mod windows_appcontainer {
     impl Job {
         fn kill_on_close() -> Result<Self, ProviderFailure> {
             let handle = unsafe { CreateJobObjectW(null(), null()) };
-            if handle == 0 {
+            if handle.is_null() {
                 return Err(last_error("could not create provider containment job"));
             }
             let handle = OwnedHandle(handle);
@@ -814,8 +817,8 @@ mod windows_appcontainer {
                 lpSecurityDescriptor: null_mut(),
                 bInheritHandle: 1,
             };
-            let mut read = 0;
-            let mut write = 0;
+            let mut read: HANDLE = null_mut();
+            let mut write: HANDLE = null_mut();
             if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
                 return Err(last_error("could not create provider input pipe"));
             }
@@ -837,8 +840,8 @@ mod windows_appcontainer {
                 lpSecurityDescriptor: null_mut(),
                 bInheritHandle: 1,
             };
-            let mut read = 0;
-            let mut write = 0;
+            let mut read: HANDLE = null_mut();
+            let mut write: HANDLE = null_mut();
             if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
                 return Err(last_error("could not create provider output pipe"));
             }

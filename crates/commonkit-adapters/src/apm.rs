@@ -3,7 +3,7 @@ use std::fs;
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 use std::process::Command;
 use std::process::Output;
 
@@ -390,7 +390,7 @@ fn validate_diagnostic_command(command: &str) -> Result<(), ProviderFailure> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 fn configure_provider_environment(
     command: &mut Command,
     staging: &Path,
