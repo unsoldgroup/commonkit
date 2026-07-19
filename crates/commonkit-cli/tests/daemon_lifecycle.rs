@@ -149,6 +149,14 @@ fn fallback_refuses_same_executable_with_a_reused_pid_birth_token() {
         .unwrap();
     let mut forged = original_value;
     forged["pid"] = serde_json::json!(unrelated.id());
+    // Linux reports process birth identity in clock ticks. Two processes
+    // spawned within the same tick can therefore have the same token, which
+    // does not model PID reuse and made this security regression test flaky
+    // on fast hosted runners. Preserve the original token as provenance while
+    // making the simulated stale identity unambiguously different from every
+    // supported Unix observer format.
+    forged["startToken"] =
+        serde_json::json!(format!("{}:stale", forged["startToken"].as_str().unwrap()));
     std::fs::write(&pid_path, serde_json::to_vec(&forged).unwrap()).unwrap();
 
     let status = service.status().unwrap();
