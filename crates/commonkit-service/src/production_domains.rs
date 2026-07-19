@@ -220,6 +220,7 @@ pub struct ProductionDomainRegistry {
     pub snapshots: Option<Arc<dyn SnapshotDomain>>,
     pub(crate) skill_canary: Option<Arc<SkillCanaryRuntime>>,
     pub targets: Option<Arc<crate::TargetInventory>>,
+    pub target_sync_domains: BTreeMap<StableId, Arc<dyn SyncDomain>>,
     ssh_execution: Option<(PathBuf, ProductionSshTarget)>,
 }
 
@@ -415,6 +416,7 @@ impl ProductionDomainRegistry {
                 snapshots: None,
                 skill_canary: None,
                 targets: None,
+                target_sync_domains: BTreeMap::new(),
                 ssh_execution: None,
             });
         }
@@ -528,6 +530,7 @@ impl ProductionDomainRegistry {
                 },
             )
             .transpose()?;
+        let legacy_sync_target_id = config.sync.as_ref().map(|sync| sync.target_id.clone());
         let sync = config
             .sync
             .map(
@@ -555,6 +558,10 @@ impl ProductionDomainRegistry {
                 },
             )
             .transpose()?;
+        let target_sync_domains = legacy_sync_target_id
+            .zip(sync.clone())
+            .into_iter()
+            .collect();
         let credentials = config
             .credentials
             .map(
@@ -629,6 +636,7 @@ impl ProductionDomainRegistry {
             snapshots,
             skill_canary,
             targets,
+            target_sync_domains,
             ssh_execution,
         })
     }

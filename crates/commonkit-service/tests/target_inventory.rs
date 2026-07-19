@@ -10,8 +10,9 @@ use std::sync::Arc;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use commonkit_service::{
-    ApplyStatus, ControlPlane, ControlToken, DomainFailure, EventHub, ExecutionResult,
-    PlanExecutor, ServiceStatus, SyncDomain, router_with_control,
+    ApplyStatus, ControlPlane, ControlToken, DomainFailure, DriftChecker, EventHub,
+    ExecutionResult, OverallState, PlanExecutor, SelectedTargetsDriftChecker, ServiceStatus,
+    SyncDomain, router_with_control,
 };
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -317,4 +318,53 @@ fn production_config_loads_local_and_multiple_ssh_targets_without_a_sync_domain(
             .collect::<Vec<_>>(),
         vec!["build", "staging"]
     );
+}
+
+#[test]
+fn scheduler_verifies_every_selected_target_read_only_and_reports_partial_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let inventory = Arc::new(
+        TargetInventory::open(
+            temporary.path().join("targets.json"),
+            vec![
+                target("healthy", TargetTransport::Local),
+                target("drifted", TargetTransport::Local),
+            ],
+            Some(vec![
+                StableId::parse("healthy").unwrap(),
+                StableId::parse("drifted").unwrap(),
+            ]),
+        )
+        .unwrap(),
+    );
+    struct ResultDomain(Result<serde_json::Value, DomainFailure>);
+    impl SyncDomain for ResultDomain {
+        fn plan(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+            panic!("scheduler must not plan")
+        }
+        fn verify(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+            self.0.clone()
+        }
+        fn rollback(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+            panic!("scheduler must not mutate")
+        }
+    }
+    let checker = SelectedTargetsDriftChecker::new(
+        inventory,
+        BTreeMap::from([
+            (
+                StableId::parse("healthy").unwrap(),
+                Arc::new(ResultDomain(Ok(serde_json::json!({"state":"healthy"}))))
+                    as Arc<dyn SyncDomain>,
+            ),
+            (
+                StableId::parse("drifted").unwrap(),
+                Arc::new(ResultDomain(Err(DomainFailure::VerificationFailed)))
+                    as Arc<dyn SyncDomain>,
+            ),
+        ]),
+    );
+    let result = checker.check();
+    assert_eq!(result.state, OverallState::Drifted);
+    assert_eq!(result.code.as_deref(), Some("selected_target_drifted"));
 }

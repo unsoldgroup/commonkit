@@ -1191,6 +1191,80 @@ pub struct SyncDomainDriftChecker {
     domain: Option<Arc<dyn SyncDomain>>,
 }
 
+/// Read-only drift checker over the durable selected-target set. It never
+/// plans, applies, or rolls back, and a missing configured domain fails closed.
+pub struct SelectedTargetsDriftChecker {
+    inventory: Arc<TargetInventory>,
+    domains: BTreeMap<StableId, Arc<dyn SyncDomain>>,
+}
+
+impl SelectedTargetsDriftChecker {
+    pub fn new(
+        inventory: Arc<TargetInventory>,
+        domains: BTreeMap<StableId, Arc<dyn SyncDomain>>,
+    ) -> Self {
+        Self { inventory, domains }
+    }
+}
+
+impl DriftChecker for SelectedTargetsDriftChecker {
+    fn check(&self) -> DriftResult {
+        let selected = self.inventory.selected();
+        if selected.is_empty() {
+            return DriftResult {
+                state: OverallState::Degraded,
+                code: Some("no_selected_targets".into()),
+            };
+        }
+        let mut drifted = false;
+        for target in selected {
+            let Some(domain) = self.domains.get(&target) else {
+                return DriftResult {
+                    state: OverallState::Degraded,
+                    code: Some("selected_target_unconfigured".into()),
+                };
+            };
+            match domain.verify(serde_json::json!({ "targetId": target })) {
+                Ok(_) => {}
+                Err(DomainFailure::VerificationFailed | DomainFailure::StalePlan) => {
+                    drifted = true;
+                }
+                Err(_) => {
+                    return DriftResult {
+                        state: OverallState::Degraded,
+                        code: Some("selected_target_check_failed".into()),
+                    };
+                }
+            }
+        }
+        if drifted {
+            DriftResult {
+                state: OverallState::Drifted,
+                code: Some("selected_target_drifted".into()),
+            }
+        } else {
+            DriftResult {
+                state: OverallState::Healthy,
+                code: None,
+            }
+        }
+    }
+}
+
+enum ProductionDriftChecker {
+    Single(SyncDomainDriftChecker),
+    Selected(SelectedTargetsDriftChecker),
+}
+
+impl DriftChecker for ProductionDriftChecker {
+    fn check(&self) -> DriftResult {
+        match self {
+            Self::Single(checker) => checker.check(),
+            Self::Selected(checker) => checker.check(),
+        }
+    }
+}
+
 impl SyncDomainDriftChecker {
     pub fn new(domain: Option<Arc<dyn SyncDomain>>) -> Self {
         Self { domain }
@@ -2768,7 +2842,7 @@ pub struct BoundServer {
     discovery: DaemonDiscovery,
     relay: Option<(tokio::net::TcpListener, Router)>,
     relay_address: Option<SocketAddr>,
-    scheduler: Arc<DriftScheduler<SyncDomainDriftChecker>>,
+    scheduler: Arc<DriftScheduler<ProductionDriftChecker>>,
 }
 
 impl BoundServer {
@@ -2859,12 +2933,25 @@ impl BoundServer {
             ssh_executor,
         ));
         let control = ControlPlane::with_plan_store(executor, plan_store);
-        let drift_checker = Arc::new(SyncDomainDriftChecker::new(production_domains.sync.clone()));
+        let drift_checker = Arc::new(match production_domains.targets.clone() {
+            Some(targets) if !production_domains.target_sync_domains.is_empty() => {
+                ProductionDriftChecker::Selected(SelectedTargetsDriftChecker::new(
+                    targets,
+                    production_domains.target_sync_domains.clone(),
+                ))
+            }
+            _ => ProductionDriftChecker::Single(SyncDomainDriftChecker::new(
+                production_domains.sync.clone(),
+            )),
+        });
         let skill_canary = production_domains.skill_canary.clone();
         let skills = skill_canary.as_ref().map(|runtime| runtime.engine());
         if let Some(targets) = production_domains.targets.clone() {
             control.set_target_inventory(targets);
         }
+        control
+            .set_target_sync_domains(production_domains.target_sync_domains.clone())
+            .map_err(|_| ServiceError::UnsafeDiscoveryPath)?;
         control.set_headless_domains(production_domains.into_headless());
         let scheduler_store = SchedulerStore::open(
             discovery_path
