@@ -153,6 +153,87 @@ fn accepts_the_official_pinned_version_output_and_rejects_other_versions() {
 }
 
 #[test]
+fn materialization_uses_immutable_executable_source_and_config_snapshots() {
+    let fixture = Fixture::new("immutable-snapshots");
+    fs::write(fixture.source.join("dot_value"), "original-source\n").unwrap();
+    let live_source = fixture.source.join("dot_value");
+    fs::write(
+        &fixture.executable,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  case "$HOME" in
+  *commonkit-chezmoi-immutable-snapshots*)
+    touch "$HOME/race-ready"
+    while [ ! -f "$HOME/race-go" ]; do sleep 0.01; done
+    ;;
+  esac
+  printf 'chezmoi version v2.70.4\n'
+  exit 0
+fi
+dest=''
+source=''
+config=''
+previous=''
+for arg in "$@"; do
+  if [ "$previous" = '--destination' ]; then dest="$arg"; fi
+  if [ "$previous" = '--source' ]; then source="$arg"; fi
+  if [ "$previous" = '--config' ]; then config="$arg"; fi
+  previous="$arg"
+done
+if grep -q malicious "$config"; then exit 92; fi
+mkdir -p "$dest"
+cp -R "$source"/. "$dest"/
+mv "$dest/dot_value" "$dest/.value"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&fixture.executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let provider = fixture.provider();
+    let approved = provider.inspect_inputs(&context()).unwrap();
+    let race_root = fixture.root.clone();
+    let race_config = fixture.config.clone();
+    let race_executable = fixture.executable.clone();
+    let racer = std::thread::spawn(move || {
+        let stage = race_root.join("stage");
+        for _ in 0..1_000 {
+            if stage.join("race-ready").exists() {
+                fs::write(live_source, "swapped-source\n").unwrap();
+                fs::write(
+                    race_config,
+                    "[hooks.read-source-state.pre]\ncommand = \"malicious\"\n",
+                )
+                .unwrap();
+                fs::write(&race_executable, "#!/bin/sh\nexit 91\n").unwrap();
+                fs::set_permissions(&race_executable, fs::Permissions::from_mode(0o700)).unwrap();
+                fs::write(stage.join("race-go"), b"").unwrap();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("provider did not reach race point");
+    });
+
+    let state = provider
+        .materialize(&context(), &fixture.workspace(), &fixture.artifacts())
+        .unwrap();
+    racer.join().unwrap();
+
+    assert_eq!(state.inputs, approved);
+    let artifacts = fixture.artifacts();
+    let content = state
+        .resources
+        .iter()
+        .find_map(|resource| match &resource.intent {
+            FilesystemIntent::File { path, content, .. } if path.as_str() == "home/.value" => {
+                Some(artifacts.load(content).unwrap())
+            }
+            _ => None,
+        })
+        .expect("snapshotted output");
+    assert_eq!(content, b"original-source\n");
+}
+
+#[test]
 fn provider_process_cannot_write_outside_its_isolated_workspace() {
     let fixture = Fixture::new("sandbox-write-escape");
     let marker = fixture.root.join("escaped");

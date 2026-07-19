@@ -189,6 +189,79 @@ fn invalid_inputs_fail_before_provider_execution() {
 }
 
 #[test]
+fn materialization_uses_immutable_executable_and_input_snapshots() {
+    let root = fixture("immutable-snapshots");
+    let executable = root.join("apm");
+    fs::create_dir_all(root.join(".apm/instructions")).unwrap();
+    fs::write(root.join(".apm/instructions/base.md"), "original-source\n").unwrap();
+    let manifest = root.join("apm.yml");
+    write_executable(
+        &executable,
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  if [ -f "$HOME/apm.yml" ]; then
+    touch "$HOME/race-ready"
+    while [ ! -f "$HOME/race-go" ]; do sleep 0.01; done
+  fi
+  printf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\n'
+  exit 0
+fi
+if [ "$1" = "compile" ]; then
+  mkdir -p .claude
+  cat apm.yml .apm/instructions/base.md > .claude/CLAUDE.md
+fi
+if [ "$1" = "audit" ]; then printf '{"ok":true}\n'; fi
+"#,
+    );
+    let provider = configured(&root, executable);
+    fs::write(&manifest, "packages: [original]\n").unwrap();
+    let approved = provider.inspect_inputs(&context()).unwrap();
+    let stage = root.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, &[]).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+    let race_root = root.clone();
+    let race_stage = stage.clone();
+    let racer = std::thread::spawn(move || {
+        for _ in 0..1_000 {
+            if race_stage.join("race-ready").exists() {
+                fs::write(race_root.join("apm.yml"), "packages: [swapped]\n").unwrap();
+                fs::write(
+                    race_root.join(".apm/instructions/base.md"),
+                    "swapped-source\n",
+                )
+                .unwrap();
+                write_executable(&race_root.join("apm"), "#!/bin/sh\nexit 91\n");
+                fs::write(race_stage.join("race-go"), b"").unwrap();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("provider did not reach race point");
+    });
+
+    let state = provider
+        .materialize(&context(), &workspace, &artifacts)
+        .unwrap();
+    racer.join().unwrap();
+
+    assert_eq!(state.inputs, approved);
+    let content = state
+        .resources
+        .iter()
+        .find_map(|resource| match &resource.intent {
+            FilesystemIntent::File { path, content, .. }
+                if path.as_str() == "home/.claude/CLAUDE.md" =>
+            {
+                Some(artifacts.load(content).unwrap())
+            }
+            _ => None,
+        })
+        .expect("snapshotted output");
+    assert_eq!(content, b"packages: [original]\noriginal-source\n");
+}
+
+#[test]
 fn executable_replacement_invalidates_provider_before_launch() {
     let root = fixture("executable-replacement");
     let marker = root.join("executed");

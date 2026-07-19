@@ -10,6 +10,10 @@ use super::provider::{
     ProviderFailure, ProviderInputs, ProviderWorkspace,
 };
 use super::provider_sandbox::ProviderSandbox;
+use super::provider_snapshot::{
+    PrivateSnapshotRoot, SymlinkPolicy, copy_regular_file as snapshot_file,
+    create_private_snapshot_root,
+};
 use super::resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, ResourceProvenance,
     SafeSymlinkTarget,
@@ -27,6 +31,13 @@ pub struct ChezmoiProvider {
     cache: PathBuf,
     persistent_state: PathBuf,
     working_tree: PathBuf,
+}
+
+struct ChezmoiInputSnapshot {
+    _root: PrivateSnapshotRoot,
+    executable: PathBuf,
+    source: PathBuf,
+    config: PathBuf,
 }
 
 impl ChezmoiProvider {
@@ -70,9 +81,13 @@ impl ChezmoiProvider {
         })
     }
 
-    fn preflight(&self) -> Result<(), ProviderFailure> {
-        let config = fs::read_to_string(&self.config).map_err(|error| {
-            ProviderFailure::Inspect(format!("chezmoi config {}: {error}", self.config.display()))
+    fn preflight_paths(
+        &self,
+        source_root: &Path,
+        config_path: &Path,
+    ) -> Result<(), ProviderFailure> {
+        let config = fs::read_to_string(config_path).map_err(|error| {
+            ProviderFailure::Inspect(format!("chezmoi config {}: {error}", config_path.display()))
         })?;
         if ["[hooks.", "command =", "interpreter ="]
             .iter()
@@ -80,11 +95,11 @@ impl ChezmoiProvider {
         {
             return Err(unsupported("config", "hook_or_command"));
         }
-        let mut entries = collect_paths(&self.source)
+        let mut entries = collect_paths(source_root)
             .map_err(|error| ProviderFailure::Inspect(error.to_string()))?;
         entries.sort();
         for path in entries {
-            let relative = path.strip_prefix(&self.source).unwrap_or(&path);
+            let relative = path.strip_prefix(source_root).unwrap_or(&path);
             let source = portable_path(relative);
             let name = relative
                 .file_name()
@@ -146,8 +161,16 @@ impl ChezmoiProvider {
         Ok(())
     }
 
-    fn validate_version(&self) -> Result<(), ProviderFailure> {
-        let executable = fs::read(&self.executable).map_err(|error| {
+    fn preflight(&self) -> Result<(), ProviderFailure> {
+        self.preflight_paths(&self.source, &self.config)
+    }
+
+    fn validate_version_at(
+        &self,
+        executable_path: &Path,
+        isolated_root: Option<&Path>,
+    ) -> Result<(), ProviderFailure> {
+        let executable = fs::read(executable_path).map_err(|error| {
             ProviderFailure::Inspect(format!("could not read chezmoi executable: {error}"))
         })?;
         let digest = digest_domain_json("commonkit.provider-executable.v1", &executable)
@@ -155,18 +178,26 @@ impl ChezmoiProvider {
         if digest != self.executable_digest {
             return Err(ProviderFailure::Inspect(format!(
                 "chezmoi executable {} changed after provider initialization; reconstruct the provider and approve a new plan",
-                self.executable.display()
+                executable_path.display()
             )));
         }
-        let isolated = tempfile::tempdir().map_err(|error| {
-            ProviderFailure::Inspect(format!("could not create chezmoi version sandbox: {error}"))
-        })?;
-        let mut command = ProviderSandbox::new(&self.executable, isolated.path());
+        let temporary;
+        let isolated = if let Some(root) = isolated_root {
+            root
+        } else {
+            temporary = tempfile::tempdir().map_err(|error| {
+                ProviderFailure::Inspect(format!(
+                    "could not create chezmoi version sandbox: {error}"
+                ))
+            })?;
+            temporary.path()
+        };
+        let mut command = ProviderSandbox::new(executable_path, isolated);
         command
             .arg("--version")
-            .writable_root(isolated.path())
-            .env("HOME", isolated.path())
-            .env("TMPDIR", isolated.path());
+            .writable_root(isolated)
+            .env("HOME", isolated)
+            .env("TMPDIR", isolated);
         let output = command.output().map_err(|error| {
             ProviderFailure::Inspect(format!(
                 "could not execute chezmoi in provider sandbox: {error}"
@@ -185,10 +216,23 @@ impl ChezmoiProvider {
         Ok(())
     }
 
+    fn validate_version(&self) -> Result<(), ProviderFailure> {
+        self.validate_version_at(&self.executable, None)
+    }
+
     fn inputs(&self, context: &ProviderContext) -> Result<ProviderInputs, ProviderFailure> {
-        let source_digest = digest_source_tree(&self.source)?;
-        let config = fs::read(&self.config).map_err(|error| {
-            ProviderFailure::Inspect(format!("{}: {error}", self.config.display()))
+        self.inputs_from(context, &self.source, &self.config)
+    }
+
+    fn inputs_from(
+        &self,
+        context: &ProviderContext,
+        source: &Path,
+        config_path: &Path,
+    ) -> Result<ProviderInputs, ProviderFailure> {
+        let source_digest = digest_source_tree(source)?;
+        let config = fs::read(config_path).map_err(|error| {
+            ProviderFailure::Inspect(format!("{}: {error}", config_path.display()))
         })?;
         let config_digest = digest_domain_json("commonkit.chezmoi-config.v1", &config)
             .map_err(|error| ProviderFailure::Inspect(error.to_string()))?;
@@ -205,6 +249,51 @@ impl ChezmoiProvider {
             vec!["filesystem".into(), "isolated_materialization".into()],
         )
         .map_err(Into::into)
+    }
+
+    fn snapshot_inputs(
+        &self,
+        scratch: &Path,
+        approved: &ProviderInputs,
+    ) -> Result<ChezmoiInputSnapshot, ProviderFailure> {
+        let root = create_private_snapshot_root(scratch)?;
+        let executable = root.join(
+            self.executable
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("chezmoi")),
+        );
+        let executable_bytes = snapshot_file(&self.executable, &executable, "chezmoi executable")?;
+        let executable_digest =
+            digest_domain_json("commonkit.provider-executable.v1", &executable_bytes)
+                .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
+        require_snapshot_digest(
+            "chezmoi executable",
+            &executable_digest,
+            &approved.input_digests["providerExecutable"],
+        )?;
+        let config = root.join("chezmoi.toml");
+        let config_bytes = snapshot_file(&self.config, &config, "chezmoi config")?;
+        let config_digest = digest_domain_json("commonkit.chezmoi-config.v1", &config_bytes)
+            .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
+        require_snapshot_digest(
+            "chezmoi config",
+            &config_digest,
+            &approved.input_digests["config"],
+        )?;
+        let source = root.join("source");
+        super::provider_snapshot::copy_tree(&self.source, &source, SymlinkPolicy::Preserve)?;
+        let source_digest = digest_source_tree(&source)?;
+        require_snapshot_digest(
+            "chezmoi source",
+            &source_digest,
+            &approved.input_digests["source"],
+        )?;
+        Ok(ChezmoiInputSnapshot {
+            _root: root,
+            executable,
+            source,
+            config,
+        })
     }
 
     /// v2.70.4 exposes `.chezmoi.os`/`.chezmoi.arch` from runtime.GOOS/GOARCH
@@ -228,6 +317,20 @@ impl ChezmoiProvider {
     }
 }
 
+fn require_snapshot_digest(
+    label: &str,
+    actual: &Sha256Digest,
+    approved: &Sha256Digest,
+) -> Result<(), ProviderFailure> {
+    if actual == approved {
+        Ok(())
+    } else {
+        Err(ProviderFailure::Materialize(format!(
+            "{label} changed while creating its immutable snapshot; retry inspection and approve a new plan"
+        )))
+    }
+}
+
 impl DesiredStateProvider for ChezmoiProvider {
     fn id(&self) -> &StableId {
         &self.id
@@ -247,8 +350,10 @@ impl DesiredStateProvider for ChezmoiProvider {
     ) -> Result<MaterializedState, ProviderFailure> {
         self.validate_execution_platform(context)?;
         self.preflight()?;
-        self.validate_version()?;
         let inputs = self.inputs(context)?;
+        let snapshot = self.snapshot_inputs(workspace.scratch_root(), &inputs)?;
+        self.preflight_paths(&snapshot.source, &snapshot.config)?;
+        self.validate_version_at(&snapshot.executable, Some(workspace.staging_root()))?;
         let root = context.declared_roots.first().ok_or_else(|| {
             ProviderFailure::Materialize("chezmoi requires one declared target root".into())
         })?;
@@ -291,12 +396,12 @@ impl DesiredStateProvider for ChezmoiProvider {
                 "could not create isolated persistent-state parent: {error}"
             ))
         })?;
-        let mut command = ProviderSandbox::new(&self.executable, workspace.staging_root());
+        let mut command = ProviderSandbox::new(&snapshot.executable, workspace.staging_root());
         command
             .arg("--source")
-            .arg(&self.source)
+            .arg(&snapshot.source)
             .arg("--config")
-            .arg(&self.config)
+            .arg(&snapshot.config)
             .arg("--destination")
             .arg(&destination)
             .arg("--cache")
@@ -313,8 +418,8 @@ impl DesiredStateProvider for ChezmoiProvider {
             .arg("apply")
             .arg("--force")
             .arg("--exclude=scripts")
-            .readable_path(&self.source)
-            .readable_path(&self.config)
+            .readable_path(&snapshot.source)
+            .readable_path(&snapshot.config)
             .writable_root(workspace.staging_root())
             .env("HOME", workspace.staging_root())
             .env("TMPDIR", workspace.staging_root());

@@ -18,6 +18,10 @@ use super::provider::{
     ProviderWorkspace,
 };
 use super::provider_sandbox::ProviderSandbox;
+use super::provider_snapshot::{
+    PrivateSnapshotRoot, SymlinkPolicy, copy_regular_file as snapshot_file,
+    create_private_snapshot_root,
+};
 use super::resources::{
     FilesystemIntent, NormalizedManagedPath, NormalizedResource, ResourceProvenance,
 };
@@ -49,6 +53,16 @@ pub struct ApmProvider {
     executable_digest: Sha256Digest,
     git_executable: PathBuf,
     git_digest: Sha256Digest,
+}
+
+struct ApmInputSnapshot {
+    _root: PrivateSnapshotRoot,
+    executable: PathBuf,
+    git_executable: PathBuf,
+    manifest: PathBuf,
+    lockfile: PathBuf,
+    policy: PathBuf,
+    project_sources: Option<PathBuf>,
 }
 
 impl ApmProvider {
@@ -172,20 +186,21 @@ impl ApmProvider {
 
     fn run(
         &self,
+        snapshot: &ApmInputSnapshot,
         staging: &Path,
         scratch: &Path,
         args: &[&str],
     ) -> Result<Output, ProviderFailure> {
         let staging = provider_cli_path(staging);
         let scratch = provider_cli_path(scratch);
-        let mut command = ProviderSandbox::new(&self.config.executable, &staging);
+        let mut command = ProviderSandbox::new(&snapshot.executable, &staging);
         command
             .args(args)
             .writable_root(&staging)
             .writable_root(&scratch)
-            .readable_path(&self.git_executable);
+            .readable_path(&snapshot.git_executable);
         #[cfg(windows)]
-        if let Some(git_installation) = self
+        if let Some(git_installation) = snapshot
             .git_executable
             .parent()
             .and_then(std::path::Path::parent)
@@ -199,13 +214,13 @@ impl ApmProvider {
             &mut command,
             &staging,
             &scratch,
-            &self.git_executable,
+            &snapshot.git_executable,
         );
         let output = command.output().map_err(|error| {
             ProviderFailure::Materialize(format!(
                 "could not execute pinned APM {} at {}: {error}",
                 self.config.version,
-                self.config.executable.display()
+                snapshot.executable.display()
             ))
         })?;
         persist_private_diagnostics(&scratch, args[0], &output)?;
@@ -219,7 +234,11 @@ impl ApmProvider {
         Ok(output)
     }
 
-    fn prepare_staging(&self, staging: &Path) -> Result<(), ProviderFailure> {
+    fn prepare_staging(
+        &self,
+        staging: &Path,
+        snapshot: &ApmInputSnapshot,
+    ) -> Result<(), ProviderFailure> {
         if let Some(entry) = fs::read_dir(staging).map_err(materialize_io)?.next() {
             let entry = entry.map_err(materialize_io)?;
             return Err(ProviderFailure::Materialize(format!(
@@ -227,20 +246,146 @@ impl ApmProvider {
                 entry.file_name().to_string_lossy()
             )));
         }
-        copy_input(&self.config.manifest, &staging.join("apm.yml"))?;
-        copy_input(&self.config.lockfile, &staging.join("apm.lock.yaml"))?;
-        copy_input(&self.config.policy, &staging.join("apm-policy.yml"))?;
-        let source = self
+        copy_input(&snapshot.manifest, &staging.join("apm.yml"))?;
+        copy_input(&snapshot.lockfile, &staging.join("apm.lock.yaml"))?;
+        copy_input(&snapshot.policy, &staging.join("apm-policy.yml"))?;
+        if let Some(source) = &snapshot.project_sources {
+            copy_tree(source, &staging.join(".apm"))?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_inputs(
+        &self,
+        scratch: &Path,
+        approved: &ProviderInputs,
+    ) -> Result<ApmInputSnapshot, ProviderFailure> {
+        let root = create_private_snapshot_root(scratch)?;
+        let executable = root.join(
+            self.config
+                .executable
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("apm")),
+        );
+        let executable_bytes =
+            snapshot_file(&self.config.executable, &executable, "APM executable")?;
+        require_snapshot_digest(
+            "APM executable",
+            &digest_bytes(&executable_bytes)?,
+            &approved.input_digests["providerExecutable"],
+        )?;
+
+        let git_executable = snapshot_git_runtime(&self.git_executable, &root)?;
+        let git_bytes = fs::read(&git_executable).map_err(materialize_io)?;
+        require_snapshot_digest(
+            "Git executable",
+            &digest_bytes(&git_bytes)?,
+            &approved.input_digests["gitExecutable"],
+        )?;
+
+        let manifest = root.join("apm.yml");
+        let lockfile = root.join("apm.lock.yaml");
+        let policy = root.join("apm-policy.yml");
+        for (source, destination, label, digest_name) in [
+            (&self.config.manifest, &manifest, "APM manifest", "manifest"),
+            (&self.config.lockfile, &lockfile, "APM lockfile", "lockfile"),
+            (
+                &self.config.policy,
+                &policy,
+                "APM package policy",
+                "packagePolicy",
+            ),
+        ] {
+            let bytes = snapshot_file(source, destination, label)?;
+            require_snapshot_digest(
+                label,
+                &digest_bytes(&bytes)?,
+                &approved.input_digests[digest_name],
+            )?;
+        }
+
+        let live_sources = self
             .config
             .manifest
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(".apm");
-        if source.exists() {
-            copy_tree(&source, &staging.join(".apm"))?;
+        let project_sources = if live_sources.exists() {
+            let destination = root.join("project-sources");
+            super::provider_snapshot::copy_tree(
+                &live_sources,
+                &destination,
+                SymlinkPolicy::Reject,
+            )?;
+            Some(destination)
+        } else {
+            None
+        };
+        let absent_project_sources = root.join("absent-project-sources");
+        let snapshotted_source_digest = digest_optional_tree(
+            project_sources
+                .as_deref()
+                .unwrap_or(&absent_project_sources),
+        )?;
+        require_snapshot_digest(
+            "APM project sources",
+            &snapshotted_source_digest,
+            &approved.input_digests["projectSources"],
+        )?;
+
+        if let Some(source) = &self.config.bound_source {
+            let bytes =
+                snapshot_file(source, &root.join("promoted-source"), "APM promoted source")?;
+            require_snapshot_digest(
+                "APM promoted source",
+                &digest_bytes(&bytes)?,
+                &approved.input_digests["promotedSource"],
+            )?;
         }
-        Ok(())
+        Ok(ApmInputSnapshot {
+            _root: root,
+            executable,
+            git_executable,
+            manifest,
+            lockfile,
+            policy,
+            project_sources,
+        })
     }
+}
+
+fn require_snapshot_digest(
+    label: &str,
+    actual: &Sha256Digest,
+    approved: &Sha256Digest,
+) -> Result<(), ProviderFailure> {
+    if actual == approved {
+        Ok(())
+    } else {
+        Err(ProviderFailure::Materialize(format!(
+            "{label} changed while creating its immutable snapshot; retry inspection and approve a new plan"
+        )))
+    }
+}
+
+#[cfg(not(windows))]
+fn snapshot_git_runtime(source: &Path, root: &Path) -> Result<PathBuf, ProviderFailure> {
+    let destination = root.join("git");
+    snapshot_file(source, &destination, "Git executable")?;
+    Ok(destination)
+}
+
+#[cfg(windows)]
+fn snapshot_git_runtime(source: &Path, root: &Path) -> Result<PathBuf, ProviderFailure> {
+    let installation = source.parent().and_then(Path::parent).ok_or_else(|| {
+        ProviderFailure::Materialize("Git executable has no installation root".into())
+    })?;
+    let destination = root.join("git-runtime");
+    super::provider_snapshot::copy_tree(installation, &destination, SymlinkPolicy::Preserve)?;
+    let relative = source
+        .strip_prefix(installation)
+        .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
+    Ok(destination.join(relative))
 }
 
 fn configure_provider_sandbox_environment(
@@ -535,9 +680,10 @@ impl DesiredStateProvider for ApmProvider {
         let inputs = self.preflight(context)?;
         let staging = workspace.staging_root();
         let scratch = workspace.scratch_root();
-        self.prepare_staging(staging)?;
+        let snapshot = self.snapshot_inputs(scratch, &inputs)?;
+        self.prepare_staging(staging, &snapshot)?;
 
-        let version = self.run(staging, scratch, &["--version"])?;
+        let version = self.run(&snapshot, staging, scratch, &["--version"])?;
         let found = parse_version(&String::from_utf8_lossy(&version.stdout));
         if found.as_deref() != Some(self.config.version.as_str()) {
             return Err(ProviderFailure::Materialize(format!(
@@ -549,11 +695,17 @@ impl DesiredStateProvider for ApmProvider {
 
         let targets = self.config.targets.join(",");
         self.run(
+            &snapshot,
             staging,
             scratch,
             &["install", "--frozen", "--target", &targets],
         )?;
-        self.run(staging, scratch, &["compile", "--target", &targets])?;
+        self.run(
+            &snapshot,
+            staging,
+            scratch,
+            &["compile", "--target", &targets],
+        )?;
         let policy = staging.join("apm-policy.yml");
         let policy = policy.to_str().ok_or_else(|| {
             ProviderFailure::Materialize(
@@ -561,6 +713,7 @@ impl DesiredStateProvider for ApmProvider {
             )
         })?;
         let audit = self.run(
+            &snapshot,
             staging,
             scratch,
             &[
