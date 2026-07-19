@@ -274,6 +274,7 @@ fn creates_verifies_and_removes_a_managed_file_on_rollback() {
     adapter.rollback(&operation).expect("rollback");
     assert!(!target.join("nested/config.json").exists());
 
+    drop(adapter);
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -303,6 +304,7 @@ fn windows_replaces_an_existing_file_atomically_and_restores_it() {
         fs::read(target.join("settings")).expect("restored"),
         b"before"
     );
+    drop(adapter);
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -327,6 +329,7 @@ fn windows_rejects_a_reparse_ancestor_without_outside_mutation() {
     fs::rename(target.join("config"), &displaced).expect("displace ancestor");
     if let Err(error) = symlink_dir(&outside, target.join("config")) {
         if error.kind() == std::io::ErrorKind::PermissionDenied {
+            drop(adapter);
             fs::remove_dir_all(root).expect("cleanup unsupported symlink environment");
             return;
         }
@@ -342,6 +345,7 @@ fn windows_rejects_a_reparse_ancestor_without_outside_mutation() {
         fs::read(outside.join("settings")).expect("outside sentinel"),
         b"outside sentinel"
     );
+    drop(adapter);
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -387,6 +391,7 @@ fn restores_the_exact_preimage_and_rejects_changes_after_planning() {
         adapter.prepare(&operation).expect_err("must reject").code,
         "preimage_changed"
     );
+    drop(adapter);
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -400,6 +405,7 @@ fn rejects_literal_secrets_in_portable_file_content() {
             .register(intent("config.txt", b"API_KEY=literal-secret", None))
             .is_err()
     );
+    drop(adapter);
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -482,6 +488,7 @@ fn a_fresh_process_recovers_an_applied_file_without_reconstructing_the_provider(
         store.load(run_id).expect("receipt").receipt().state,
         ReceiptState::RolledBack
     );
+    drop(adapters);
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -554,6 +561,7 @@ fn a_fresh_process_recovers_when_the_target_changed_before_applied_was_recorded(
         fs::read(target.join("config.txt")).expect("restored preimage"),
         b"before"
     );
+    drop(adapters);
     fs::remove_dir_all(root).expect("cleanup");
 }
 
@@ -586,5 +594,6 @@ fn a_fresh_adapter_rejects_a_mutation_descriptor_not_bound_to_the_operation() {
         "operation_payload_mismatch"
     );
     assert!(!target.join("config.txt").exists());
+    drop(fresh);
     fs::remove_dir_all(root).expect("cleanup");
 }

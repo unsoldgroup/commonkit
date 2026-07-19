@@ -1136,77 +1136,20 @@ fn replace_file_in(
         options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let mut file = parent.open_with(&temporary, &options)?;
     let result = (|| {
+        let mut file = parent.open_with(&temporary, &options)?;
         file.write_all(bytes)?;
         set_file_mode(&file, mode)?;
         file.sync_all()?;
-        atomic_replace_in(parent, &temporary, leaf, &file)
+        // Close the temporary handle before rename. Windows otherwise keeps the
+        // source name open while cap-std performs its capability-relative move.
+        drop(file);
+        parent.rename(&temporary, parent, leaf)
     })();
     if result.is_err() {
         let _ = parent.remove_file(&temporary);
     }
     result
-}
-
-#[cfg(not(windows))]
-fn atomic_replace_in(
-    parent: &Dir,
-    temporary: &Path,
-    leaf: &Path,
-    _temporary_file: &cap_std::fs::File,
-) -> Result<(), std::io::Error> {
-    parent.rename(temporary, parent, leaf)
-}
-
-#[cfg(windows)]
-fn atomic_replace_in(
-    parent: &Dir,
-    _temporary: &Path,
-    leaf: &Path,
-    temporary_file: &cap_std::fs::File,
-) -> Result<(), std::io::Error> {
-    use std::mem::{offset_of, size_of};
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_RENAME_INFO, FileRenameInfo, SetFileInformationByHandle,
-    };
-
-    let name = leaf.as_os_str().encode_wide().collect::<Vec<_>>();
-    let name_bytes = name
-        .len()
-        .checked_mul(size_of::<u16>())
-        .ok_or_else(|| std::io::Error::other("replacement filename is too long"))?;
-    let total_bytes = offset_of!(FILE_RENAME_INFO, FileName)
-        .checked_add(name_bytes)
-        .ok_or_else(|| std::io::Error::other("replacement filename is too long"))?;
-    let words = total_bytes.div_ceil(size_of::<usize>());
-    let mut storage = vec![0usize; words];
-    let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-    let parent_file = parent.try_clone()?.into_std_file();
-    unsafe {
-        (*info).Anonymous.ReplaceIfExists = 1;
-        (*info).RootDirectory = parent_file.as_raw_handle() as _;
-        (*info).FileNameLength = u32::try_from(name_bytes)
-            .map_err(|_| std::io::Error::other("replacement filename is too long"))?;
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
-            name.len(),
-        );
-        let result = SetFileInformationByHandle(
-            temporary_file.as_raw_handle() as _,
-            FileRenameInfo,
-            info.cast(),
-            u32::try_from(total_bytes)
-                .map_err(|_| std::io::Error::other("replacement metadata is too large"))?,
-        );
-        if result == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 #[cfg(windows)]
