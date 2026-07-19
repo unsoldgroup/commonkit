@@ -1,3 +1,5 @@
+import { escapeHtml } from "./html.ts";
+
 export type UpdateSummary = {
   currentVersion: string;
   version: string;
@@ -12,16 +14,6 @@ export type UpdateUiState =
   | { kind: "available"; update: UpdateSummary }
   | { kind: "installing"; update: UpdateSummary }
   | { kind: "error"; message: string };
-
-function escapeHtml(value: string): string {
-  return value.replace(/[&<>"']/g, (character) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#39;",
-  })[character]!);
-}
 
 export function updatePanel(state: UpdateUiState): string {
   let action = '<button id="check-update" type="button">Check for updates</button>';

@@ -1,11 +1,9 @@
 import type { Route } from "./navigation.ts";
+import { escapeHtml } from "./html.ts";
 
 export type ManagementState = Partial<Record<Route, unknown>>;
 type RecordValue = Record<string, unknown>;
 
-function escapeHtml(value: unknown): string {
-  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
-}
 function record(value: unknown): RecordValue { return value && typeof value === "object" && !Array.isArray(value) ? value as RecordValue : {}; }
 function list(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
 function label(value: unknown): string { return String(value ?? "unknown").replaceAll("_", " "); }

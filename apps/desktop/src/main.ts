@@ -150,6 +150,11 @@ async function showResult(route: Route, action: () => Promise<unknown>): Promise
   render();
 }
 
+function showError(route: Route, error: unknown): void {
+  if (management) (management as unknown as Record<string, unknown>)[route] = { error: errorMessage(error) };
+  render();
+}
+
 function bindManagementActions(route: Route): void {
   document.querySelector("#plan-sync")?.addEventListener("click", () => {
     try {
@@ -161,7 +166,7 @@ function bindManagementActions(route: Route): void {
         return plan;
       });
     } catch (error) {
-      void showResult(route, async () => { throw error; });
+      showError(route, error);
     }
   });
   document.querySelector("#verify-state")?.addEventListener("click", () => {
@@ -169,7 +174,7 @@ function bindManagementActions(route: Route): void {
       const targetId = convergenceTarget(targets);
       void showResult(route, () => desktopApi.verify(targetId));
     } catch (error) {
-      void showResult(route, async () => { throw error; });
+      showError(route, error);
     }
   });
   document.querySelector("#apply-plan")?.addEventListener("click", () => {
@@ -180,7 +185,7 @@ function bindManagementActions(route: Route): void {
       if (!window.confirm(`Apply reviewed plan ${planId} to ${targetId}?`)) return;
       void showResult(route, () => desktopApi.applyPlan(targetId, planId, confirmationId("apply-plan")));
     } catch (error) {
-      void showResult(route, async () => { throw error; });
+      showError(route, error);
     }
   });
   document.querySelector("#snapshot-create")?.addEventListener("click", () => {
@@ -239,7 +244,7 @@ function bindManagementActions(route: Route): void {
       link.download = "commonkit-diagnostics.json";
       link.click();
       URL.revokeObjectURL(url);
-    }).catch((error) => void showResult(route, async () => { throw error; }));
+    }).catch((error) => showError(route, error));
   });
 }
 

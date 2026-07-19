@@ -1,3 +1,5 @@
+import { escapeHtml } from "./html.ts";
+
 export type OnboardingProvider = "native" | "apm" | "chezmoi";
 
 export function onboardingPanel(provider: OnboardingProvider = "native", message = ""): string {
@@ -25,8 +27,4 @@ export function onboardingPanel(provider: OnboardingProvider = "native", message
       <label><input name="publishRegistration" type="checkbox" value="true" required> Commit and push this target registration</label>
       ${apm}${chezmoi}<button class="primary" type="submit">Materialize first plan</button>
     </form>${message ? `<p class="onboarding-result">${escapeHtml(message)}</p>` : ""}</section>`;
-}
-
-function escapeHtml(value: string): string {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
