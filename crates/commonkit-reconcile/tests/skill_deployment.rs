@@ -403,6 +403,16 @@ fn rollback_fails_closed_when_fresh_target_observation_is_not_exact() {
         error.code(),
         "skill_deployment_rollback_verification_failed"
     );
+    assert!(
+        temporary
+            .join("canary-run-observation/skill-deployment-rollback-failure.receipt")
+            .is_file()
+    );
+    assert!(
+        anchors
+            .join("canary-run-observation.rollback-failure.anchor")
+            .is_file()
+    );
     std::fs::remove_dir_all(temporary).expect("cleanup");
     std::fs::remove_dir_all(anchors).expect("cleanup anchors");
 }
@@ -450,6 +460,14 @@ fn rollback_failure_never_persists_a_restored_deployment_receipt() {
     let value: serde_json::Value =
         serde_json::from_slice(&std::fs::read(failure).expect("failure receipt")).expect("json");
     assert_eq!(value["state"], "rollback_failed");
+    let failure_id = Sha256Digest::parse(value["id"].as_str().expect("failure id")).expect("id");
+    assert_eq!(
+        workflow
+            .load_rollback_failure(&id("canary-run-rollback-failure"), &failure_id)
+            .expect("authenticated failure receipt")
+            .state,
+        SkillDeploymentState::RollbackFailed
+    );
     std::fs::remove_dir_all(temporary).expect("cleanup");
     std::fs::remove_dir_all(anchors).expect("cleanup anchors");
 }
@@ -506,6 +524,35 @@ fn recovery_authenticates_intent_and_deterministically_finalizes_or_records_roll
         matches!(recovered, SkillDeploymentRecovery::Recovered(value) if value.outcome == ReconcileOutcome::RolledBack && value.restored_digest == Some(digest('c')))
     );
     assert!(anchors.join("recover-rollback.recovery.anchor").is_file());
+
+    let mut compiler = Compiler {
+        source_digest: digest('b'),
+    };
+    let prepared = workflow
+        .prepare(request(), &mut compiler, &authority)
+        .expect("prepare");
+    let mut failing: Vec<Box<dyn Adapter>> = vec![Box::new(FailingVerifyAdapter)];
+    workflow
+        .apply(prepared, id("recover-unverified"), &mut failing)
+        .expect_err("verify failure rolls generic run back");
+    let error = workflow
+        .recover(
+            &id("recover-unverified"),
+            &mut failing,
+            &mut Observer(digest('e')),
+        )
+        .expect_err("unverified rollback recovery");
+    assert_eq!(
+        error.code(),
+        "skill_deployment_rollback_verification_failed"
+    );
+    let recovery: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(temporary.join("recover-unverified/skill-deployment-recovery.receipt"))
+            .expect("failure recovery receipt"),
+    )
+    .expect("recovery json");
+    assert_eq!(recovery["outcome"], "rollback_failed");
+    assert!(anchors.join("recover-unverified.recovery.anchor").is_file());
     std::fs::remove_dir_all(temporary).expect("cleanup");
     std::fs::remove_dir_all(anchors).expect("cleanup");
 }

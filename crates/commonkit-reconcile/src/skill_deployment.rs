@@ -440,10 +440,27 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         };
         let restored_digest = match outcome {
             ReconcileOutcome::RolledBack => {
-                let observed = observer
+                let observed = match observer
                     .observe_digest(&intent.plan.target_id, &intent.plan.operations)
-                    .map_err(SkillDeploymentError::Observe)?;
+                {
+                    Ok(observed) => observed,
+                    Err(error) => {
+                        self.persist_recovery_receipt(
+                            run_id,
+                            &intent.plan,
+                            ReconcileOutcome::RollbackFailed,
+                            None,
+                        )?;
+                        return Err(SkillDeploymentError::Observe(error));
+                    }
+                };
                 if observed != intent.plan.observed_digest {
+                    self.persist_recovery_receipt(
+                        run_id,
+                        &intent.plan,
+                        ReconcileOutcome::RollbackFailed,
+                        None,
+                    )?;
                     return Err(SkillDeploymentError::RollbackVerificationFailed);
                 }
                 Some(observed)
@@ -452,11 +469,23 @@ impl<'a> SkillDeploymentWorkflow<'a> {
             ReconcileOutcome::RollbackFailed => None,
             other => return Err(SkillDeploymentError::UnexpectedRollbackOutcome(other)),
         };
-        let draft = (run_id, &intent.plan.id, outcome, &restored_digest);
+        let receipt =
+            self.persist_recovery_receipt(run_id, &intent.plan, outcome, restored_digest)?;
+        Ok(SkillDeploymentRecovery::Recovered(receipt))
+    }
+
+    fn persist_recovery_receipt(
+        &self,
+        run_id: &StableId,
+        plan: &Plan,
+        outcome: ReconcileOutcome,
+        restored_digest: Option<Sha256Digest>,
+    ) -> Result<SkillDeploymentRecoveryReceipt, SkillDeploymentError> {
+        let draft = (run_id, &plan.id, outcome, &restored_digest);
         let receipt = SkillDeploymentRecoveryReceipt {
             id: digest_domain_json("commonkit.skill-deployment-recovery.v1", &draft)?,
             run_id: run_id.clone(),
-            plan_id: intent.plan.id,
+            plan_id: plan.id.clone(),
             outcome,
             restored_digest,
         };
@@ -470,7 +499,7 @@ impl<'a> SkillDeploymentWorkflow<'a> {
             &bytes,
         )?;
         self.trust.anchor(run_id, "recovery", &bytes)?;
-        Ok(SkillDeploymentRecovery::Recovered(receipt))
+        Ok(receipt)
     }
 
     pub fn load(
@@ -520,42 +549,34 @@ impl<'a> SkillDeploymentWorkflow<'a> {
         let state = match outcome {
             ReconcileOutcome::RolledBack => SkillDeploymentState::RolledBack,
             ReconcileOutcome::RollbackFailed => {
-                let operation_ids = deployment
-                    .plan
-                    .operations
-                    .iter()
-                    .rev()
-                    .map(|operation| operation.id.clone())
-                    .collect::<Vec<_>>();
-                let draft = (
-                    &deployment.id,
+                self.persist_rollback_failure(
                     run_id,
-                    SkillDeploymentState::RollbackFailed,
-                    &operation_ids,
+                    &deployment,
                     "skill_deployment_rollback_failed",
-                );
-                let failure = SkillDeploymentRollbackFailureReceipt {
-                    id: digest_domain_json(
-                        "commonkit.skill-deployment-rollback-failure.v1",
-                        &draft,
-                    )?,
-                    deployment_receipt_id: deployment.id,
-                    run_id: run_id.clone(),
-                    state: SkillDeploymentState::RollbackFailed,
-                    operation_ids,
-                    error_code: "skill_deployment_rollback_failed".into(),
-                };
-                let bytes = canonical_json(&failure)?;
-                persist_receipt(&rollback_failure_path(self.store, run_id), &bytes)?;
-                self.trust.anchor(run_id, "rollback-failure", &bytes)?;
+                )?;
                 return Err(SkillDeploymentError::CanaryRollbackFailed);
             }
             _ => return Err(SkillDeploymentError::UnexpectedRollbackOutcome(outcome)),
         };
-        let observed = observer
+        let observed = match observer
             .observe_digest(&deployment.canary_loadout, &deployment.plan.operations)
-            .map_err(SkillDeploymentError::Observe)?;
+        {
+            Ok(observed) => observed,
+            Err(error) => {
+                self.persist_rollback_failure(
+                    run_id,
+                    &deployment,
+                    "skill_deployment_observation_failed",
+                )?;
+                return Err(SkillDeploymentError::Observe(error));
+            }
+        };
         if observed != deployment.plan.observed_digest {
+            self.persist_rollback_failure(
+                run_id,
+                &deployment,
+                "skill_deployment_rollback_verification_failed",
+            )?;
             return Err(SkillDeploymentError::RollbackVerificationFailed);
         }
         let operation_ids = deployment
@@ -604,6 +625,64 @@ impl<'a> SkillDeploymentWorkflow<'a> {
             return Err(SkillDeploymentError::DeploymentReceiptMismatch);
         }
         Ok(receipt)
+    }
+
+    pub fn load_rollback_failure(
+        &self,
+        run_id: &StableId,
+        expected_id: &Sha256Digest,
+    ) -> Result<SkillDeploymentRollbackFailureReceipt, SkillDeploymentError> {
+        let bytes = read_receipt_bytes(&rollback_failure_path(self.store, run_id))?;
+        self.trust.verify(run_id, "rollback-failure", &bytes)?;
+        let receipt: SkillDeploymentRollbackFailureReceipt = serde_json::from_slice(&bytes)?;
+        let draft = (
+            &receipt.deployment_receipt_id,
+            &receipt.run_id,
+            receipt.state,
+            &receipt.operation_ids,
+            receipt.error_code.as_str(),
+        );
+        if &receipt.id != expected_id
+            || receipt.run_id != *run_id
+            || digest_domain_json("commonkit.skill-deployment-rollback-failure.v1", &draft)?
+                != receipt.id
+        {
+            return Err(SkillDeploymentError::DeploymentReceiptMismatch);
+        }
+        Ok(receipt)
+    }
+
+    fn persist_rollback_failure(
+        &self,
+        run_id: &StableId,
+        deployment: &SkillDeploymentReceipt,
+        error_code: &str,
+    ) -> Result<(), SkillDeploymentError> {
+        let operation_ids = deployment
+            .plan
+            .operations
+            .iter()
+            .rev()
+            .map(|operation| operation.id.clone())
+            .collect::<Vec<_>>();
+        let draft = (
+            &deployment.id,
+            run_id,
+            SkillDeploymentState::RollbackFailed,
+            &operation_ids,
+            error_code,
+        );
+        let failure = SkillDeploymentRollbackFailureReceipt {
+            id: digest_domain_json("commonkit.skill-deployment-rollback-failure.v1", &draft)?,
+            deployment_receipt_id: deployment.id.clone(),
+            run_id: run_id.clone(),
+            state: SkillDeploymentState::RollbackFailed,
+            operation_ids,
+            error_code: error_code.into(),
+        };
+        let bytes = canonical_json(&failure)?;
+        persist_receipt(&rollback_failure_path(self.store, run_id), &bytes)?;
+        self.trust.anchor(run_id, "rollback-failure", &bytes)
     }
 }
 

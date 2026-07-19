@@ -692,7 +692,15 @@ impl SkillOptSleepOptimizer {
         // identities in a separate root that was never provider-readable.
         let harness_private = PrivateStaging::new("commonkit-skill-harness")?;
         let harness_suite_path = harness_private.path().join("suite-manifest.json");
-        fs::write(&harness_suite_path, canonical_json(suite)?)?;
+        let harness_baseline_path = harness_private.path().join("baseline-SKILL.md");
+        let harness_candidate_path = harness_private.path().join("candidate-SKILL.md");
+        persist_private_copy(&harness_suite_path, &canonical_json(suite)?)?;
+        persist_private_copy(&harness_baseline_path, current_skill)?;
+        persist_private_copy(&harness_candidate_path, &candidate)?;
+        if digest_bytes(&read_ordinary_file(&harness_candidate_path)?)? != digest_bytes(&candidate)?
+        {
+            return Err(SkillError::HarnessIntegrityMismatch);
+        }
         let harness_stdout = harness_private.path().join("evaluation.json");
         let harness_stderr = harness_private.path().join("stderr.log");
         let mut harness = isolated_command(
@@ -705,9 +713,9 @@ impl SkillOptSleepOptimizer {
             .env("PATH", "/usr/bin:/bin")
             .arg("evaluate")
             .arg("--baseline")
-            .arg(&skill_path)
+            .arg(&harness_baseline_path)
             .arg("--candidate")
-            .arg(staging_dir.join("proposed_SKILL.md"))
+            .arg(&harness_candidate_path)
             .arg("--suite-manifest")
             .arg(&harness_suite_path)
             .arg("--corpus")
@@ -2284,6 +2292,14 @@ fn private_output_file(path: &Path) -> Result<fs::File, SkillError> {
         options.mode(0o600);
     }
     Ok(options.open(path)?)
+}
+
+fn persist_private_copy(path: &Path, bytes: &[u8]) -> Result<(), SkillError> {
+    let mut file = private_output_file(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    sync_parent(path)?;
+    Ok(())
 }
 
 fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, SkillError> {
