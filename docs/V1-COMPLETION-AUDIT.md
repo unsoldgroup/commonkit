@@ -1,6 +1,6 @@
 # CommonKit v1 completion audit
 
-Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `c80107e`. “Met locally” means the production Rust path and its focused contracts pass on the audit host; it does not stand in for production signing, notarization, published updater, or hosted multi-OS evidence.
+Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `efe9a9d` (`efe9a9d9f4359952a7b0b21ed3e9e1f50e33a270`). “Met locally” means the production Rust path and its focused contracts pass on the audit host; it does not stand in for production signing, notarization, published updater, or hosted multi-OS evidence. GitHub reported no workflow run for this exact commit at the time of the audit.
 
 ## Twelve-flow matrix
 
@@ -21,20 +21,22 @@ Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` thro
 
 ## Focused verification run
 
-- Fresh CLI onboarding, including imported APM/chezmoi inputs and secret/symlink rejection: 10 tests passed.
-- Fresh target inventory, consent, per-target execution, selected-target scheduling, and restart behavior: 10 tests passed.
+- Fresh CLI onboarding, including imported APM/chezmoi inputs and secret/symlink rejection: 13 tests passed.
+- Fresh target inventory, consent, per-target execution, selected-target scheduling, and restart behavior: 11 tests passed.
 - Fresh production typed-SSH reconciliation: 1 end-to-end test passed.
-- Fresh desktop management, onboarding, security, and update behavior: 15 tests passed.
+- Fresh provider-to-relay convergence, durable input binding, and ownership collision rejection: 3 tests passed.
+- Fresh desktop management, onboarding, security, and update behavior: 18 tests passed.
 - Fresh release-readiness contracts, including installed three-OS lifecycle wiring: 7 tests passed.
 - Earlier production service domains, credentials, scheduler, and typed-SSH focused verification: 10 tests passed.
 - Earlier provider pipeline, remote staging, and SSH filesystem recovery: 5 tests passed.
 - Earlier durable snapshot restore/promotion: 9 tests passed.
 - Shared relay compatibility: passed with both legacy Node and the current Rust daemon.
 - Skill deployment/canary recovery: 7 tests passed.
-- Release-readiness contracts: 7 tests passed.
-- SkillOpt: the first full crate run exposed an order-sensitive detached-forgery fixture; commit `32a8626` isolated the fixture path, and the complete crate then passed (14 tests plus doc tests).
+- Fresh SkillOpt crate verification: 14 tests plus doc tests passed, including provider isolation, stale Git/policy rejection, durable candidate promotion, evidence handling, scheduling, and upgrade isolation.
 
 ## Priority findings
+
+Finding count: **P0: 0; P1: 2**.
 
 ### P0
 
