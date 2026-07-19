@@ -11,7 +11,8 @@ port=40222
 user=commonkit_smoke
 # GitHub's RUNNER_TEMP ancestors are intentionally not traversable by another
 # account. Keep keys and logs there, but place the simulated remote target under
-# a unique traverse-only root that the privilege-dropped sshd child can reach.
+# a unique private root owned by the privilege-dropped account. The helper's
+# capability-safe artifact store must be able to read every state-path component.
 runtime_root=$(mktemp -d /tmp/commonkit-ssh-smoke.XXXXXX)
 home="$runtime_root/home"
 target="$runtime_root/target"
@@ -38,10 +39,11 @@ unset password_hash
 sudo chage --expiredate -1 "$user"
 sudo awk -F: -v user="$user" '$1 == user && $2 ~ /^\$6\$/ && $8 == "" { found = 1 } END { exit !found }' /etc/shadow
 sudo chown -R "$user:$user" "$home" "$target" "$state"
-sudo chown root:root "$runtime_root"
-sudo chmod 0711 "$runtime_root"
+sudo chown "$user:$user" "$runtime_root"
+sudo chmod 0700 "$runtime_root"
 # These assertions reproduce the hosted failure before sshd obscures it as a
 # generic public-key rejection, and ensure no broader access is required.
+sudo -u "$user" test -r "$runtime_root" -a -x "$runtime_root"
 sudo -u "$user" test -r "$home/.ssh/authorized_keys"
 sudo -u "$user" test -x "$home/commonkit-target-helper"
 sudo -u "$user" test -w "$target" -a -w "$state"
@@ -78,11 +80,32 @@ sudo /usr/sbin/sshd -E "$sshd_log" -f "$scratch/sshd/config"
 known_hosts="$scratch/known_hosts"
 ssh-keyscan -p "$port" 127.0.0.1 > "$known_hosts" 2>/dev/null
 request='{"operation":"write_file","root_id":"home","path":"ssh-proof.txt","content":[115,115,104,10]}'
+redact_diagnostics() {
+  sed -E \
+    -e 's#(/tmp/commonkit-ssh-smoke\.)[^ /]+#\1[redacted]#g' \
+    -e 's#SHA256:[A-Za-z0-9+/=]+#SHA256:[redacted]#g'
+}
+# Prove the installed helper, config, root, and request agree before adding the
+# SSH transport boundary. This catches capability/path regressions directly.
+direct_response="$scratch/direct-response.json"
+direct_stderr="$scratch/direct-helper-stderr.log"
+if ! {
+  printf '%s' "$request" | sudo -u "$user" env -i HOME="$home" PATH=/usr/bin:/bin \
+    "$home/commonkit-target-helper" --stdio-v1
+} > "$direct_response" 2> "$direct_stderr"; then
+  sed -n '1,40p' "$direct_stderr" | redact_diagnostics >&2
+  exit 1
+fi
+node -e 'const r=require(process.argv[1]);if(r.result!=="applied")process.exit(1)' "$direct_response"
+test "$(cat "$target/ssh-proof.txt")" = ssh
+sudo -u "$user" rm "$target/ssh-proof.txt"
+helper_stderr="$scratch/helper-stderr.log"
 if ! printf '%s' "$request" | ssh -T -i "$key" -p "$port" \
   -o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
   -o "UserKnownHostsFile=$known_hosts" -- "$user@127.0.0.1" \
-  "$home/commonkit-target-helper" --stdio-v1 > "$scratch/response.json"; then
-  sudo sed -n '1,120p' "$sshd_log" >&2
+  "$home/commonkit-target-helper" --stdio-v1 > "$scratch/response.json" 2> "$helper_stderr"; then
+  sed -n '1,40p' "$helper_stderr" | redact_diagnostics >&2
+  sudo sed -n '1,120p' "$sshd_log" | redact_diagnostics >&2
   exit 1
 fi
 node -e 'const r=require(process.argv[1]);if(r.result!=="applied")process.exit(1)' "$scratch/response.json"
