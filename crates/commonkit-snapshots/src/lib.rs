@@ -263,6 +263,21 @@ pub struct PublishedPortableAuthority {
     pub repository_revision: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PortablePublication {
+    pub database: DatabaseId,
+    pub generation: u64,
+    pub authority_revision: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveredPortablePublication {
+    pub database: DatabaseId,
+    pub generation: u64,
+    pub authority_revision: String,
+    pub repository_revision: String,
+}
+
 /// Atomically publishes a staged portable tree only if `expected_parent` is still the trusted
 /// remote branch head. Implementations must use a non-force, fast-forward-only remote update.
 pub trait PortableAuthorityPublisher {
@@ -270,7 +285,27 @@ pub trait PortableAuthorityPublisher {
         &mut self,
         expected_parent: &str,
         staged_portable_root: &Path,
+        publication: &PortablePublication,
     ) -> Result<String, SnapshotError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublisherFailpoint {
+    None,
+    AfterPushBeforeLocalRef,
+    AfterLocalRefBeforePortableInstall,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PendingGitPublication {
+    schema: String,
+    expected_parent: String,
+    repository_revision: String,
+    database: DatabaseId,
+    generation: u64,
+    authority_revision: String,
+    clone: PathBuf,
 }
 
 /// Git-backed authority publisher. It never commits from the user's working tree: the exact
@@ -284,6 +319,7 @@ pub struct ProcessGitAuthorityPublisher {
     branch: String,
     portable_relative: PathBuf,
     staging_root: PathBuf,
+    failpoint: PublisherFailpoint,
 }
 
 impl ProcessGitAuthorityPublisher {
@@ -302,6 +338,7 @@ impl ProcessGitAuthorityPublisher {
             branch: branch.into(),
             portable_relative: portable_relative.into(),
             staging_root: staging_root.into(),
+            failpoint: PublisherFailpoint::None,
         };
         if !value.executable.is_absolute()
             || !value.repository.is_absolute()
@@ -313,6 +350,204 @@ impl ProcessGitAuthorityPublisher {
             return Err(SnapshotError::InvalidObjectStore);
         }
         Ok(value)
+    }
+
+    pub fn set_failpoint(&mut self, failpoint: PublisherFailpoint) {
+        self.failpoint = failpoint;
+    }
+
+    fn pending_path(&self) -> PathBuf {
+        self.staging_root.join("pending-git-publication.json")
+    }
+
+    fn anchor_ref(publication: &PortablePublication) -> String {
+        format!(
+            "refs/tags/commonkit-authority/{}/{}-{}",
+            publication.database,
+            publication.generation,
+            publication
+                .authority_revision
+                .strip_prefix("sha256:")
+                .unwrap_or("invalid")
+        )
+    }
+
+    fn remote_refs(&self, pattern: &str) -> Result<Vec<(String, String)>, SnapshotError> {
+        let output = Command::new(&self.executable)
+            .args(["ls-remote", self.trusted_remote_url.as_str(), pattern])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !output.status.success() {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
+        std::str::from_utf8(&output.stdout)
+            .map_err(|_| SnapshotError::TransactionIntegrity)?
+            .lines()
+            .map(|line| {
+                let mut fields = line.split_whitespace();
+                let revision = fields.next().filter(|value| valid_git_revision(value));
+                let reference = fields.next();
+                match (revision, reference, fields.next()) {
+                    (Some(revision), Some(reference), None) => {
+                        Ok((revision.into(), reference.into()))
+                    }
+                    _ => Err(SnapshotError::TransactionIntegrity),
+                }
+            })
+            .collect()
+    }
+
+    pub fn verify_remote_trust_anchor(
+        &self,
+        database: &DatabaseId,
+        generation: u64,
+        authority_revision: &str,
+    ) -> Result<(), SnapshotError> {
+        validate_digest(authority_revision)?;
+        let pattern = format!("refs/tags/commonkit-authority/{database}/*");
+        let refs = self.remote_refs(&pattern)?;
+        if refs.is_empty() {
+            // A kit that has never published through CommonKit has no remote anchor yet. The
+            // first atomic publication establishes it; after that, the tag is independently
+            // monotonic even if an administrator force-rolls the kit branch back.
+            return Ok(());
+        }
+        let mut parsed = refs
+            .into_iter()
+            .map(|(commit, reference)| {
+                let leaf = reference
+                    .rsplit('/')
+                    .next()
+                    .ok_or(SnapshotError::TransactionIntegrity)?;
+                let (generation, revision) = leaf
+                    .split_once('-')
+                    .ok_or(SnapshotError::TransactionIntegrity)?;
+                let generation = generation
+                    .parse::<u64>()
+                    .map_err(|_| SnapshotError::TransactionIntegrity)?;
+                Ok((generation, format!("sha256:{revision}"), commit))
+            })
+            .collect::<Result<Vec<_>, SnapshotError>>()?;
+        parsed.sort_by_key(|item| item.0);
+        let latest = parsed
+            .last()
+            .ok_or(SnapshotError::PortableAuthorityRollback)?;
+        if parsed
+            .iter()
+            .rev()
+            .take_while(|item| item.0 == latest.0)
+            .count()
+            != 1
+            || latest.0 != generation
+            || latest.1 != authority_revision
+            || latest.2 != self.trusted_remote_revision()?
+        {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        Ok(())
+    }
+
+    pub fn recover_pending_publication(
+        &mut self,
+    ) -> Result<Option<RecoveredPortablePublication>, SnapshotError> {
+        let path = self.pending_path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let pending: PendingGitPublication = serde_json::from_slice(
+            &std::fs::read(&path).map_err(|_| SnapshotError::ObjectStoreFailed)?,
+        )
+        .map_err(|_| SnapshotError::TransactionIntegrity)?;
+        if pending.schema != "commonkit.git-publication.v1"
+            || !valid_git_revision(&pending.expected_parent)
+            || !valid_git_revision(&pending.repository_revision)
+            || !pending.clone.is_absolute()
+        {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        let expected_clone_parent = pending
+            .clone
+            .parent()
+            .and_then(|parent| parent.canonicalize().ok());
+        if expected_clone_parent.as_deref() != self.staging_root.canonicalize().ok().as_deref()
+            || !pending
+                .clone
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("git-authority-"))
+        {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        let publication = PortablePublication {
+            database: pending.database.clone(),
+            generation: pending.generation,
+            authority_revision: pending.authority_revision.clone(),
+        };
+        self.verify_remote_trust_anchor(
+            &pending.database,
+            pending.generation,
+            &pending.authority_revision,
+        )?;
+        if self.trusted_remote_revision()? != pending.repository_revision {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        let remote_ref = format!("refs/heads/{}", self.branch);
+        self.git_status(
+            &pending.clone,
+            &[
+                "fetch",
+                "--no-tags",
+                self.trusted_remote_url.as_str(),
+                &remote_ref,
+            ],
+        )?;
+        self.git_status(
+            &pending.clone,
+            &[
+                "checkout",
+                "--force",
+                "--detach",
+                &pending.repository_revision,
+            ],
+        )?;
+        self.git_status(
+            &self.repository,
+            &[
+                "fetch",
+                "--no-tags",
+                self.trusted_remote_url.as_str(),
+                &remote_ref,
+            ],
+        )?;
+        let local_ref = format!("refs/heads/{}", self.branch);
+        let current = self.git_output(&self.repository, &["rev-parse", &local_ref])?;
+        if current != pending.repository_revision {
+            self.git_status(
+                &self.repository,
+                &[
+                    "update-ref",
+                    &local_ref,
+                    &pending.repository_revision,
+                    &pending.expected_parent,
+                ],
+            )?;
+        }
+        let source = pending.clone.join(&self.portable_relative);
+        let destination = self.repository.join(&self.portable_relative);
+        if destination.exists() {
+            std::fs::remove_dir_all(&destination).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        }
+        copy_portable_tree(&source, &destination)?;
+        std::fs::remove_file(&path).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        let _ = std::fs::remove_dir_all(&pending.clone);
+        let _ = publication;
+        Ok(Some(RecoveredPortablePublication {
+            database: pending.database,
+            generation: pending.generation,
+            authority_revision: pending.authority_revision,
+            repository_revision: pending.repository_revision,
+        }))
     }
 
     pub fn checked_out_revision(&self) -> Result<String, SnapshotError> {
@@ -389,8 +624,10 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
         &mut self,
         expected_parent: &str,
         staged_portable_root: &Path,
+        publication: &PortablePublication,
     ) -> Result<String, SnapshotError> {
         if !valid_git_revision(expected_parent)
+            || validate_digest(&publication.authority_revision).is_err()
             || self.checked_out_revision()? != expected_parent
             || self.trusted_remote_revision()? != expected_parent
         {
@@ -429,7 +666,7 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
                 .to_str()
                 .ok_or(SnapshotError::InvalidObjectStore)?;
             self.git_status(&clone, &["add", "--", portable])?;
-            self.git_status(
+            if let Err(error) = self.git_status(
                 &clone,
                 &[
                     "-c",
@@ -440,15 +677,43 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
                     "-m",
                     "commonkit: publish portable authority",
                 ],
-            )?;
+            ) {
+                let _ = std::fs::remove_file(self.pending_path());
+                return Err(error);
+            }
             let revision = self.git_output(&clone, &["rev-parse", "HEAD"])?;
+            std::fs::create_dir_all(&self.staging_root)
+                .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+            let pending = PendingGitPublication {
+                schema: "commonkit.git-publication.v1".into(),
+                expected_parent: expected_parent.into(),
+                repository_revision: revision.clone(),
+                database: publication.database.clone(),
+                generation: publication.generation,
+                authority_revision: publication.authority_revision.clone(),
+                clone: clone.clone(),
+            };
+            atomic_write(
+                &self.pending_path(),
+                &serde_json::to_vec(&pending).map_err(|_| SnapshotError::TransactionIntegrity)?,
+            )?;
             let destination_ref = format!("HEAD:refs/heads/{}", self.branch);
+            let anchor_ref = format!("HEAD:{}", Self::anchor_ref(publication));
             self.git_status(
                 &clone,
-                &["push", self.trusted_remote_url.as_str(), &destination_ref],
+                &[
+                    "push",
+                    "--atomic",
+                    self.trusted_remote_url.as_str(),
+                    &destination_ref,
+                    &anchor_ref,
+                ],
             )?;
             if self.trusted_remote_revision()? != revision {
                 return Err(SnapshotError::StalePortableAuthority);
+            }
+            if self.failpoint == PublisherFailpoint::AfterPushBeforeLocalRef {
+                return Err(SnapshotError::Interrupted);
             }
             let remote_ref = format!("refs/heads/{}", self.branch);
             self.git_status(
@@ -465,9 +730,22 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
                 &self.repository,
                 &["update-ref", &local_ref, &revision, expected_parent],
             )?;
+            if self.failpoint == PublisherFailpoint::AfterLocalRefBeforePortableInstall {
+                return Err(SnapshotError::Interrupted);
+            }
+            let destination = self.repository.join(&self.portable_relative);
+            if destination.exists() {
+                std::fs::remove_dir_all(&destination)
+                    .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+            }
+            copy_portable_tree(&clone.join(&self.portable_relative), &destination)?;
+            std::fs::remove_file(self.pending_path())
+                .map_err(|_| SnapshotError::ObjectStoreFailed)?;
             Ok(revision)
         })();
-        let _ = std::fs::remove_dir_all(&clone);
+        if !self.pending_path().exists() {
+            let _ = std::fs::remove_dir_all(&clone);
+        }
         result
     }
 }
@@ -1001,6 +1279,57 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
         expected_repository_parent: &str,
         publisher: &mut impl PortableAuthorityPublisher,
     ) -> Result<PublishedPortableAuthority, SnapshotError> {
+        self.compare_and_swap_published(
+            database,
+            expected_revision,
+            expected_repository_parent,
+            publisher,
+            |record| {
+                if record.current_writer != expected_writer || candidate_writer.is_empty() {
+                    return Err(SnapshotError::StalePortableAuthority);
+                }
+                record.current_writer = candidate_writer.into();
+                Ok(())
+            },
+        )
+    }
+
+    pub fn compare_and_swap_head_published(
+        &self,
+        database: &DatabaseId,
+        expected_revision: &str,
+        writer: &str,
+        accepted_head: &str,
+        accepted_descriptor: &str,
+        expected_repository_parent: &str,
+        publisher: &mut impl PortableAuthorityPublisher,
+    ) -> Result<PublishedPortableAuthority, SnapshotError> {
+        validate_digest(accepted_head)?;
+        validate_digest(accepted_descriptor)?;
+        self.compare_and_swap_published(
+            database,
+            expected_revision,
+            expected_repository_parent,
+            publisher,
+            |record| {
+                if record.current_writer != writer {
+                    return Err(SnapshotError::StalePortableAuthority);
+                }
+                record.accepted_head = Some(accepted_head.into());
+                record.accepted_descriptor = Some(accepted_descriptor.into());
+                Ok(())
+            },
+        )
+    }
+
+    fn compare_and_swap_published(
+        &self,
+        database: &DatabaseId,
+        expected_revision: &str,
+        expected_repository_parent: &str,
+        publisher: &mut impl PortableAuthorityPublisher,
+        update: impl FnOnce(&mut PortableAuthorityRecord) -> Result<(), SnapshotError>,
+    ) -> Result<PublishedPortableAuthority, SnapshotError> {
         if expected_repository_parent.trim().is_empty() {
             return Err(SnapshotError::StalePortableAuthority);
         }
@@ -1014,11 +1343,11 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
             return Err(error);
         }
         let staged_store = PortableAuthorityStore::open(&stage, self.cipher)?;
-        let staged = match staged_store.compare_and_swap_writer(
+        let staged = match staged_store.compare_and_swap_with_failpoint(
             database,
             expected_revision,
-            expected_writer,
-            candidate_writer,
+            PortableAuthorityFailpoint::None,
+            update,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -1026,7 +1355,15 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
                 return Err(error);
             }
         };
-        let repository_revision = match publisher.publish(expected_repository_parent, &stage) {
+        let repository_revision = match publisher.publish(
+            expected_repository_parent,
+            &stage,
+            &PortablePublication {
+                database: database.clone(),
+                generation: staged.record.generation,
+                authority_revision: staged.revision.clone(),
+            },
+        ) {
             Ok(revision) if !revision.trim().is_empty() => revision,
             Ok(_) => {
                 let _ = std::fs::remove_dir_all(&stage);

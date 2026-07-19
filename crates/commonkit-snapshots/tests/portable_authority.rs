@@ -6,7 +6,7 @@ use std::{
 
 use commonkit_snapshots::{
     DatabaseId, DeterministicTestCipher, PortableAuthorityFailpoint, PortableAuthorityPublisher,
-    PortableAuthorityStore, ProcessGitAuthorityPublisher, SnapshotError,
+    PortableAuthorityStore, ProcessGitAuthorityPublisher, PublisherFailpoint, SnapshotError,
 };
 use sha2::{Digest, Sha256};
 
@@ -273,6 +273,7 @@ impl PortableAuthorityPublisher for TestRemote<'_> {
         &mut self,
         expected_parent: &str,
         _staged_portable_root: &std::path::Path,
+        _publication: &commonkit_snapshots::PortablePublication,
     ) -> Result<String, SnapshotError> {
         let mut parent = self.parent.lock().unwrap();
         if parent.as_str() != expected_parent {
@@ -474,6 +475,197 @@ fn concrete_git_publisher_allows_only_one_clone_to_advance_the_remote_parent() {
             .unwrap_err(),
         SnapshotError::StalePortableAuthority
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn concrete_git_publisher_recovers_both_post_push_interruption_windows() {
+    for failpoint in [
+        PublisherFailpoint::AfterPushBeforeLocalRef,
+        PublisherFailpoint::AfterLocalRefBeforePortableInstall,
+    ] {
+        let fixture = GitFixture::new();
+        let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+            .unwrap()
+            .read(&fixture.database)
+            .unwrap();
+        let mut publisher = fixture.publisher();
+        publisher.set_failpoint(failpoint);
+        assert_eq!(
+            PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+                .unwrap()
+                .compare_and_swap_writer_published(
+                    &fixture.database,
+                    &initial.revision,
+                    "machine-a",
+                    "machine-b",
+                    &fixture.parent,
+                    &mut publisher,
+                ),
+            Err(SnapshotError::Interrupted)
+        );
+
+        let recovered = fixture
+            .publisher()
+            .recover_pending_publication()
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.database, fixture.database);
+        assert_eq!(
+            PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+                .unwrap()
+                .read(&fixture.database)
+                .unwrap()
+                .record
+                .current_writer,
+            "machine-b"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_clone_rejects_a_force_rolled_back_branch_using_remote_generation_anchor() {
+    let fixture = GitFixture::new();
+    let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .compare_and_swap_writer_published(
+            &fixture.database,
+            &initial.revision,
+            "machine-a",
+            "machine-b",
+            &fixture.parent,
+            &mut fixture.publisher(),
+        )
+        .unwrap();
+
+    GitFixture::git(
+        &fixture.clone,
+        &[
+            "push",
+            "--force",
+            "origin",
+            &format!("{}:main", fixture.parent),
+        ],
+    );
+    let fresh = fixture.root.path().join("fresh");
+    let status = std::process::Command::new("/usr/bin/git")
+        .args([
+            "clone",
+            "--branch",
+            "main",
+            fixture.remote.to_str().unwrap(),
+            fresh.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let publisher = ProcessGitAuthorityPublisher::new(
+        "/usr/bin/git",
+        &fresh,
+        fixture.remote.to_str().unwrap(),
+        "main",
+        "kit",
+        fixture.root.path().join("fresh-staging"),
+    )
+    .unwrap();
+    assert_eq!(
+        publisher.verify_remote_trust_anchor(&fixture.database, 0, &initial.revision),
+        Err(SnapshotError::PortableAuthorityRollback)
+    );
+}
+
+#[cfg(unix)]
+struct GitFixture {
+    root: tempfile::TempDir,
+    remote: std::path::PathBuf,
+    clone: std::path::PathBuf,
+    parent: String,
+    cipher: DeterministicTestCipher,
+    database: DatabaseId,
+}
+
+#[cfg(unix)]
+impl GitFixture {
+    fn git(directory: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let remote = root.path().join("remote.git");
+        let seed = root.path().join("seed");
+        fs::create_dir(&remote).unwrap();
+        Self::git(&remote, &["init", "--bare", "--initial-branch=main"]);
+        fs::create_dir(&seed).unwrap();
+        Self::git(&seed, &["init", "--initial-branch=main"]);
+        Self::git(&seed, &["config", "user.name", "CommonKit Test"]);
+        Self::git(&seed, &["config", "user.email", "commonkit-test@localhost"]);
+        let cipher = DeterministicTestCipher::new([81; 32]);
+        let database = DatabaseId::new("context-mode").unwrap();
+        PortableAuthorityStore::open(seed.join("kit"), &cipher)
+            .unwrap()
+            .initialize(&database, "machine-a")
+            .unwrap();
+        Self::git(&seed, &["add", "kit"]);
+        Self::git(&seed, &["commit", "-m", "seed authority"]);
+        Self::git(
+            &seed,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        Self::git(&seed, &["push", "-u", "origin", "main"]);
+        let clone = root.path().join("clone");
+        assert!(
+            std::process::Command::new("/usr/bin/git")
+                .args([
+                    "clone",
+                    "--branch",
+                    "main",
+                    remote.to_str().unwrap(),
+                    clone.to_str().unwrap()
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let parent = Self::git(&clone, &["rev-parse", "HEAD"]);
+        Self {
+            root,
+            remote,
+            clone,
+            parent,
+            cipher,
+            database,
+        }
+    }
+
+    fn publisher(&self) -> ProcessGitAuthorityPublisher {
+        ProcessGitAuthorityPublisher::new(
+            "/usr/bin/git",
+            &self.clone,
+            self.remote.to_str().unwrap(),
+            "main",
+            "kit",
+            self.root.path().join("publisher-staging"),
+        )
+        .unwrap()
+    }
 }
 
 fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {

@@ -2811,13 +2811,38 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         let authority_store = self
             .portable_authority(&cipher)
             .map_err(|_| DomainFailure::OperationFailed)?;
-        let updated_authority = match authority_store.compare_and_swap_head(
-            &database.id,
-            &portable_authority.revision,
-            &source_target,
-            &stored.manifest.content_digest,
-            &descriptor_digest,
-        ) {
+        let authority_result = if self.git_authority.is_some() {
+            let mut git_publisher = self.git_authority_publisher()?;
+            let checked_out_revision = git_publisher
+                .checked_out_revision()
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+            let trusted_remote_revision = git_publisher
+                .trusted_remote_revision()
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+            if checked_out_revision != trusted_remote_revision {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            authority_store
+                .compare_and_swap_head_published(
+                    &database.id,
+                    &portable_authority.revision,
+                    &source_target,
+                    &stored.manifest.content_digest,
+                    &descriptor_digest,
+                    &trusted_remote_revision,
+                    &mut git_publisher,
+                )
+                .map(|published| published.authority)
+        } else {
+            authority_store.compare_and_swap_head(
+                &database.id,
+                &portable_authority.revision,
+                &source_target,
+                &stored.manifest.content_digest,
+                &descriptor_digest,
+            )
+        };
+        let updated_authority = match authority_result {
             Ok(authority) => authority,
             Err(_) => {
                 // A descriptor is discoverable only when the authority CAS references it. Remove a

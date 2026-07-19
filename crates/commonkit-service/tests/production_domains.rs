@@ -10,6 +10,10 @@ use commonkit_reconcile::{Adapter, ReceiptStore, ReconcileOutcome, Reconciler};
 use commonkit_service::{
     ControlError, ControlPlane, ExecutionResult, PlanExecutor, ProductionDomainRegistry, SyncDomain,
 };
+use commonkit_snapshots::{
+    AuthorityStore, DatabaseId, PortableAuthorityStore, ProcessGitAuthorityPublisher,
+    PromotionPlan, PublisherFailpoint, SnapshotError, XChaCha20Cipher,
+};
 
 struct UnexpectedExecutor;
 
@@ -752,6 +756,231 @@ fn promoted_writer_is_the_only_source_allowed_to_advance_snapshot_history() {
             .len(),
         2
     );
+}
+
+#[test]
+fn fresh_clone_rejects_force_rolled_back_snapshot_authority_branch() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let database = root.join("writer.db");
+    std::fs::write(&database, b"state-v1").unwrap();
+    let key_path = root.join("snapshot-key");
+    std::fs::write(&key_path, b"snapshot-test-key").unwrap();
+    let git_authority = snapshot_git_authority(root);
+    let remote = root.join(".snapshot-authority-remote.git");
+    let config = root.join("headless.json");
+    write_json(
+        &config,
+        &serde_json::json!({
+            "sync": null,
+            "credentials": null,
+            "snapshots": {
+                "root": root.join("snapshots"),
+                "portableState": root.join("kit"),
+                "keyReference": format!("file://{}", key_path.display()),
+                "objectStore": {"type":"local"},
+                "gitAuthority": git_authority,
+                "databases": [{
+                    "id":"context-mode", "path":database, "targetId":"writer",
+                    "observedPaths":{}, "format":"file", "lifecycle":lifecycle_config()
+                }]
+            }
+        }),
+    );
+    let snapshots = ProductionDomainRegistry::load(
+        &config,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap()
+    .snapshots
+    .unwrap();
+    snapshots
+        .create(serde_json::json!({"databaseId":"context-mode"}))
+        .unwrap();
+
+    let initial = {
+        let output = std::process::Command::new(git_executable())
+            .arg("-C")
+            .arg(root)
+            .args(["rev-list", "--max-parents=0", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let status = std::process::Command::new(git_executable())
+        .arg("-C")
+        .arg(root)
+        .args([
+            "push",
+            "--force",
+            remote.to_str().unwrap(),
+            &format!("{initial}:refs/heads/main"),
+        ])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let fresh = root.join("fresh-clone");
+    assert!(
+        std::process::Command::new(git_executable())
+            .args([
+                "clone",
+                "--branch",
+                "main",
+                remote.to_str().unwrap(),
+                fresh.to_str().unwrap()
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let fresh_config = root.join("fresh-headless.json");
+    write_json(
+        &fresh_config,
+        &serde_json::json!({
+            "sync": null,
+            "credentials": null,
+            "snapshots": {
+                "root": root.join("fresh-state"),
+                "portableState": fresh.join("kit"),
+                "keyReference": format!("file://{}", key_path.display()),
+                "objectStore": {"type":"local"},
+                "gitAuthority": {
+                    "executable":git_executable(), "repository":fresh,
+                    "trustedRemoteUrl":remote, "branch":"main",
+                    "stagingRoot":root.join("fresh-staging")
+                },
+                "databases": [{
+                    "id":"context-mode", "path":database, "targetId":"writer",
+                    "observedPaths":{}, "format":"file", "lifecycle":lifecycle_config()
+                }]
+            }
+        }),
+    );
+    assert!(
+        ProductionDomainRegistry::load(
+            &fresh_config,
+            std::sync::Arc::new(PlanStore::open(root.join("fresh-plans")).unwrap()),
+            root.join("fresh-receipts"),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn production_startup_completes_promotion_after_each_post_push_interruption_window() {
+    use sha2::{Digest, Sha256};
+
+    for (index, failpoint) in [
+        PublisherFailpoint::AfterPushBeforeLocalRef,
+        PublisherFailpoint::AfterLocalRefBeforePortableInstall,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let database_path = root.join("writer.db");
+        let candidate_path = root.join("candidate.db");
+        std::fs::write(&database_path, b"state-v1").unwrap();
+        std::fs::write(&candidate_path, b"state-v1").unwrap();
+        let secret = b"snapshot-test-key";
+        let key_path = root.join("snapshot-key");
+        std::fs::write(&key_path, secret).unwrap();
+        let git_authority = snapshot_git_authority(root);
+        let remote = root.join(".snapshot-authority-remote.git");
+        let config = root.join("headless.json");
+        write_json(
+            &config,
+            &serde_json::json!({
+                "sync": null, "credentials": null,
+                "snapshots": {
+                    "root":root.join("snapshots"), "portableState":root.join("kit"),
+                    "keyReference":format!("file://{}", key_path.display()),
+                    "objectStore":{"type":"local"}, "gitAuthority":git_authority,
+                    "databases":[{
+                        "id":"context-mode", "path":database_path, "targetId":"writer",
+                        "observedPaths":{"candidate":candidate_path}, "format":"file",
+                        "lifecycle":lifecycle_config()
+                    }]
+                }
+            }),
+        );
+        let registry = ProductionDomainRegistry::load(
+            &config,
+            std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+            root.join("receipts"),
+        )
+        .unwrap();
+        registry
+            .snapshots
+            .as_ref()
+            .unwrap()
+            .create(serde_json::json!({"databaseId":"context-mode"}))
+            .unwrap();
+
+        let key: [u8; 32] = Sha256::digest(secret).into();
+        let cipher = XChaCha20Cipher::new(key);
+        let database = DatabaseId::new("context-mode").unwrap();
+        let portable = PortableAuthorityStore::open_with_trusted_anchor(
+            root.join("kit"),
+            root.join("snapshots/portable-authority-anchors"),
+            &cipher,
+        )
+        .unwrap();
+        let current = portable.read(&database).unwrap();
+        let content_digest = format!("sha256:{:x}", Sha256::digest(b"state-v1"));
+        let run_id = format!("interrupted-promotion-{index}");
+        let local = AuthorityStore::open(root.join("snapshots/authority")).unwrap();
+        local
+            .prepare_promotion(PromotionPlan {
+                schema: "commonkit.promotion-plan.v1".into(),
+                run_id: run_id.clone(),
+                database: database.clone(),
+                previous_writer: "writer".into(),
+                candidate_writer: "candidate".into(),
+                latest_snapshot_digest: content_digest.clone(),
+                current_writer_digest: content_digest.clone(),
+                candidate_digest: content_digest,
+            })
+            .unwrap();
+        let mut publisher = ProcessGitAuthorityPublisher::new(
+            git_executable(),
+            root,
+            remote.to_str().unwrap(),
+            "main",
+            "kit",
+            root.join("snapshot-git-staging"),
+        )
+        .unwrap();
+        let parent = publisher.trusted_remote_revision().unwrap();
+        publisher.set_failpoint(failpoint);
+        assert_eq!(
+            portable.compare_and_swap_writer_published(
+                &database,
+                &current.revision,
+                "writer",
+                "candidate",
+                &parent,
+                &mut publisher,
+            ),
+            Err(SnapshotError::Interrupted)
+        );
+
+        drop(registry);
+        let restarted = ProductionDomainRegistry::load(
+            &config,
+            std::sync::Arc::new(PlanStore::open(root.join("plans-restarted")).unwrap()),
+            root.join("receipts-restarted"),
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.snapshots.unwrap().list().unwrap()["writers"]["context-mode"],
+            "candidate"
+        );
+        assert!(local.unfinished_promotions().unwrap().is_empty());
+    }
 }
 
 #[test]
