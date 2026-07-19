@@ -2,9 +2,9 @@ use std::fs;
 
 use commonkit_snapshots::{
     Authority, AuthorityStore, DatabaseId, DatabaseLifecycle, DeterministicTestCipher,
-    DurableRestore, InMemoryObjectStore, PromotionFailpoint, PromotionPlan, RestoreFailpoint,
-    RestorePlan, RestoreState, SnapshotError, SnapshotService, SqliteBackup, StaticBackup,
-    manifest_digest,
+    DurableRestore, InMemoryObjectStore, PromotionFailpoint, PromotionPlan, PromotionRecovery,
+    RestoreFailpoint, RestorePlan, RestoreState, SnapshotError, SnapshotService, SqliteBackup,
+    StaticBackup, manifest_digest,
 };
 
 #[derive(Default)]
@@ -349,6 +349,45 @@ fn fresh_process_finishes_a_promotion_prepared_before_portable_authority_changes
 
     assert_eq!(receipt.previous_writer, "writer-a");
     assert_eq!(receipt.authoritative_writer, "writer-b");
+}
+
+#[test]
+fn fresh_process_aborts_a_prepared_promotion_when_portable_cas_never_happened() {
+    let root = tempfile::tempdir().unwrap();
+    let database = DatabaseId::new("context-mode").unwrap();
+    let store = AuthorityStore::open(root.path()).unwrap();
+    store.initialize(&database, "writer-a").unwrap();
+    store
+        .prepare_promotion(PromotionPlan {
+            schema: "commonkit.promotion-plan.v1".into(),
+            run_id: "promotion-pre-cas-failure".into(),
+            database: database.clone(),
+            previous_writer: "writer-a".into(),
+            candidate_writer: "writer-b".into(),
+            latest_snapshot_digest: "sha256:snapshot".into(),
+            current_writer_digest: "sha256:snapshot".into(),
+            candidate_digest: "sha256:snapshot".into(),
+        })
+        .unwrap();
+
+    let restarted = AuthorityStore::open(root.path()).unwrap();
+    assert_eq!(
+        restarted
+            .recover_promotion_against_portable(
+                "promotion-pre-cas-failure",
+                "writer-a",
+                "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+        PromotionRecovery::Aborted
+    );
+    assert!(restarted.unfinished_promotions().unwrap().is_empty());
+    assert_eq!(
+        restarted.authority(&database).unwrap(),
+        Authority::Writer {
+            target: "writer-a".into()
+        }
+    );
 }
 
 #[test]

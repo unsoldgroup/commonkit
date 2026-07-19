@@ -5,7 +5,8 @@ use std::{
 };
 
 use commonkit_snapshots::{
-    DatabaseId, DeterministicTestCipher, PortableAuthorityStore, SnapshotError,
+    DatabaseId, DeterministicTestCipher, PortableAuthorityFailpoint, PortableAuthorityPublisher,
+    PortableAuthorityStore, SnapshotError,
 };
 use sha2::{Digest, Sha256};
 
@@ -192,6 +193,168 @@ fn replaying_an_older_authenticated_authority_is_rejected_when_history_remains()
 
     assert_eq!(
         store.read(&database),
+        Err(SnapshotError::PortableAuthorityRollback)
+    );
+}
+
+#[test]
+fn replaying_an_entire_old_portable_tree_is_rejected_by_the_independent_anchor() {
+    let portable = tempfile::tempdir().unwrap();
+    let anchor = tempfile::tempdir().unwrap();
+    let old_tree = tempfile::tempdir().unwrap();
+    let cipher = DeterministicTestCipher::new([76; 32]);
+    let database = DatabaseId::new("context-mode").unwrap();
+    let store =
+        PortableAuthorityStore::open_with_trusted_anchor(portable.path(), anchor.path(), &cipher)
+            .unwrap();
+    let initial = store.initialize(&database, "machine-a").unwrap();
+    copy_tree(portable.path(), old_tree.path());
+    store
+        .compare_and_swap_writer(&database, &initial.revision, "machine-a", "machine-b")
+        .unwrap();
+
+    fs::remove_dir_all(portable.path()).unwrap();
+    fs::create_dir_all(portable.path()).unwrap();
+    copy_tree(old_tree.path(), portable.path());
+
+    let restarted =
+        PortableAuthorityStore::open_with_trusted_anchor(portable.path(), anchor.path(), &cipher)
+            .unwrap();
+    assert_eq!(
+        restarted.read(&database),
+        Err(SnapshotError::PortableAuthorityRollback)
+    );
+}
+
+#[test]
+fn restart_repairs_a_torn_history_before_pointer_publication() {
+    let portable = tempfile::tempdir().unwrap();
+    let anchor = tempfile::tempdir().unwrap();
+    let cipher = DeterministicTestCipher::new([77; 32]);
+    let database = DatabaseId::new("context-mode").unwrap();
+    let store =
+        PortableAuthorityStore::open_with_trusted_anchor(portable.path(), anchor.path(), &cipher)
+            .unwrap();
+    let initial = store.initialize(&database, "machine-a").unwrap();
+    assert_eq!(
+        store
+            .compare_and_swap_writer_with_failpoint(
+                &database,
+                &initial.revision,
+                "machine-a",
+                "machine-b",
+                PortableAuthorityFailpoint::AfterHistoryWrite,
+            )
+            .unwrap_err(),
+        SnapshotError::Interrupted
+    );
+
+    let repaired =
+        PortableAuthorityStore::open_with_trusted_anchor(portable.path(), anchor.path(), &cipher)
+            .unwrap()
+            .read(&database)
+            .unwrap();
+    assert_eq!(repaired.record.current_writer, "machine-b");
+    assert_eq!(repaired.record.generation, 1);
+    assert!(
+        !portable
+            .path()
+            .join("authority-publish/context-mode.json")
+            .exists()
+    );
+}
+
+struct TestRemote<'a> {
+    parent: &'a std::sync::Mutex<String>,
+}
+
+impl PortableAuthorityPublisher for TestRemote<'_> {
+    fn publish(
+        &mut self,
+        expected_parent: &str,
+        _staged_portable_root: &std::path::Path,
+    ) -> Result<String, SnapshotError> {
+        let mut parent = self.parent.lock().unwrap();
+        if parent.as_str() != expected_parent {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
+        *parent = format!("{expected_parent}-next");
+        Ok(parent.clone())
+    }
+}
+
+#[test]
+fn two_independent_clones_cannot_both_publish_a_promotion_from_one_remote_parent() {
+    let seed = tempfile::tempdir().unwrap();
+    let clone_a = tempfile::tempdir().unwrap();
+    let clone_b = tempfile::tempdir().unwrap();
+    let cipher = DeterministicTestCipher::new([78; 32]);
+    let database = DatabaseId::new("context-mode").unwrap();
+    let initial = PortableAuthorityStore::open(seed.path(), &cipher)
+        .unwrap()
+        .initialize(&database, "machine-a")
+        .unwrap();
+    copy_tree(seed.path(), clone_a.path());
+    copy_tree(seed.path(), clone_b.path());
+    let remote_parent = std::sync::Mutex::new("git-parent-1".to_owned());
+
+    let first = PortableAuthorityStore::open(clone_a.path(), &cipher)
+        .unwrap()
+        .compare_and_swap_writer_published(
+            &database,
+            &initial.revision,
+            "machine-a",
+            "machine-b",
+            "git-parent-1",
+            &mut TestRemote {
+                parent: &remote_parent,
+            },
+        )
+        .unwrap();
+    assert_eq!(first.authority.record.current_writer, "machine-b");
+    assert_eq!(first.repository_revision, "git-parent-1-next");
+
+    assert_eq!(
+        PortableAuthorityStore::open(clone_b.path(), &cipher)
+            .unwrap()
+            .compare_and_swap_writer_published(
+                &database,
+                &initial.revision,
+                "machine-a",
+                "machine-c",
+                "git-parent-1",
+                &mut TestRemote {
+                    parent: &remote_parent,
+                },
+            )
+            .unwrap_err(),
+        SnapshotError::StalePortableAuthority
+    );
+    assert_eq!(
+        PortableAuthorityStore::open(clone_b.path(), &cipher)
+            .unwrap()
+            .read(&database)
+            .unwrap()
+            .record
+            .current_writer,
+        "machine-a"
+    );
+}
+
+#[test]
+fn fresh_clone_rejects_a_lagging_checkout_against_the_trusted_remote_head() {
+    let portable = tempfile::tempdir().unwrap();
+    let anchor = tempfile::tempdir().unwrap();
+    let cipher = DeterministicTestCipher::new([79; 32]);
+    let database = DatabaseId::new("context-mode").unwrap();
+    let store =
+        PortableAuthorityStore::open_with_trusted_anchor(portable.path(), anchor.path(), &cipher)
+            .unwrap();
+    store.initialize(&database, "machine-a").unwrap();
+
+    assert_eq!(
+        store
+            .read_at_repository_revision(&database, "git-old-checkout", "git-current-remote-head",),
         Err(SnapshotError::PortableAuthorityRollback)
     );
 }
