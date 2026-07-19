@@ -13,8 +13,15 @@ use tokio::sync::RwLock;
 struct Args {
     #[arg(long, default_value_t = 0)]
     port: u16,
-    #[arg(long, default_value_t = commonkit_relay::DEFAULT_PORT)]
+    #[arg(long, default_value_t = default_relay_port())]
     relay_port: u16,
+}
+
+fn default_relay_port() -> u16 {
+    std::env::var("COMMONKIT_RELAY_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(commonkit_relay::DEFAULT_PORT)
 }
 
 #[tokio::main]

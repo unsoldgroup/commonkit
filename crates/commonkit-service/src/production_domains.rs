@@ -768,6 +768,13 @@ impl ProductionDomainRegistry {
                         return Err(ProductionDomainError::EmptyCapability);
                     }
                     validate_object_store(&config.object_store)?;
+                    let defer_authority_bootstrap = sync_configs.values().any(|sync| {
+                        sync.provider_pipeline.as_ref().is_some_and(|pipeline| {
+                            config
+                                .portable_state
+                                .starts_with(&pipeline.source.repository)
+                        })
+                    });
                     fs::create_dir_all(config.root.join("objects"))?;
                     fs::create_dir_all(config.root.join("manifests"))?;
                     fs::create_dir_all(config.portable_state.join("snapshots"))?;
@@ -794,9 +801,6 @@ impl ProductionDomainRegistry {
                         databases,
                         lock: Mutex::new(()),
                     };
-                    let cipher = domain
-                        .cipher()
-                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     if domain.git_authority.is_some() {
                         let mut publisher = domain
                             .git_authority_publisher()
@@ -817,57 +821,20 @@ impl ProductionDomainRegistry {
                             return Err(ProductionDomainError::UnsafeConfig);
                         }
                     }
-                    let portable = PortableAuthorityStore::open_with_trusted_anchor(
-                        &domain.portable_state,
-                        domain.root.join("portable-authority-anchors"),
-                        &cipher,
-                    )
-                    .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-                    let local = AuthorityStore::open(domain.root.join("authority"))
+                    let cipher = domain
+                        .cipher()
                         .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     for database in domain.databases.values() {
-                        let authority_preexisted = domain
+                        let authority_exists = domain
                             .portable_state
                             .join("authority")
                             .join(format!("{}.json", database.id))
                             .exists();
-                        let authority = portable
-                            .initialize(&database.id, &database.target_id)
-                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-                        if domain.git_authority.is_some() {
-                            let mut publisher = domain
-                                .git_authority_publisher()
-                                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-                            if !authority_preexisted
-                                && domain
-                                    .git_authority
-                                    .as_ref()
-                                    .is_some_and(|config| config.bootstrap)
-                            {
-                                publisher
-                                    .bootstrap_remote_trust_anchor(
-                                        &domain.portable_state,
-                                        &commonkit_snapshots::PortablePublication {
-                                            database: database.id.clone(),
-                                            generation: authority.record.generation,
-                                            authority_revision: authority.revision.clone(),
-                                        },
-                                    )
-                                    .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-                            }
-                            publisher
-                                .verify_remote_trust_anchor(
-                                    &database.id,
-                                    authority.record.generation,
-                                    &authority.revision,
-                                )
-                                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        if defer_authority_bootstrap && !authority_exists {
+                            continue;
                         }
-                        local
-                            .synchronize_from_portable(
-                                &database.id,
-                                &authority.record.current_writer,
-                            )
+                        domain
+                            .initialize_authority(database, &cipher)
                             .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     }
                     domain.recover_unfinished()?;
@@ -2274,6 +2241,57 @@ impl ProductionSnapshotDomain {
         )
     }
 
+    fn initialize_authority(
+        &self,
+        database: &SnapshotDatabase,
+        cipher: &XChaCha20Cipher,
+    ) -> Result<commonkit_snapshots::VersionedPortableAuthority, DomainFailure> {
+        let authority_preexisted = self
+            .portable_state
+            .join("authority")
+            .join(format!("{}.json", database.id))
+            .exists();
+        let portable = self
+            .portable_authority(cipher)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let authority = portable
+            .initialize(&database.id, &database.target_id)
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        if self.git_authority.is_some() {
+            let mut publisher = self.git_authority_publisher()?;
+            if !authority_preexisted
+                && self
+                    .git_authority
+                    .as_ref()
+                    .is_some_and(|config| config.bootstrap)
+            {
+                publisher
+                    .bootstrap_remote_trust_anchor(
+                        &self.portable_state,
+                        &commonkit_snapshots::PortablePublication {
+                            database: database.id.clone(),
+                            generation: authority.record.generation,
+                            authority_revision: authority.revision.clone(),
+                        },
+                    )
+                    .map_err(|_| DomainFailure::VerificationFailed)?;
+            }
+            publisher
+                .verify_remote_trust_anchor(
+                    &database.id,
+                    authority.record.generation,
+                    &authority.revision,
+                )
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+        }
+        AuthorityStore::open(self.root.join("authority"))
+            .and_then(|local| {
+                local.synchronize_from_portable(&database.id, &authority.record.current_writer)
+            })
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(authority)
+    }
+
     fn git_authority_publisher(&self) -> Result<ProcessGitAuthorityPublisher, DomainFailure> {
         let config = self
             .git_authority
@@ -2418,13 +2436,16 @@ impl ProductionSnapshotDomain {
         }
         let authority = AuthorityStore::open(self.root.join("authority"))
             .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        let unfinished_promotions = authority
+            .unfinished_promotions()
+            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        if unfinished_promotions.is_empty() {
+            return Ok(());
+        }
         let portable = self
             .portable_authority(&cipher)
             .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-        for run_id in authority
-            .unfinished_promotions()
-            .map_err(|_| ProductionDomainError::UnsafeConfig)?
-        {
+        for run_id in unfinished_promotions {
             let plan = authority
                 .prepared_promotion(&run_id)
                 .map_err(|_| ProductionDomainError::UnsafeConfig)?;
@@ -2769,11 +2790,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .get(&id)
             .ok_or(DomainFailure::InvalidRequest)?;
         let cipher = self.cipher()?;
-        let portable_authority = self
-            .portable_authority(&cipher)
-            .map_err(|_| DomainFailure::OperationFailed)?
-            .read(&database.id)
-            .map_err(|_| DomainFailure::VerificationFailed)?;
+        let portable_authority = self.initialize_authority(database, &cipher)?;
         let source_target = portable_authority.record.current_writer.clone();
         let source_path = Self::database_path_for_target(database, &source_target)?;
         let service = SnapshotService::new(&cipher);
