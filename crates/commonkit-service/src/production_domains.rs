@@ -93,6 +93,10 @@ struct SyncConfig {
     target_identity_digest: Sha256Digest,
     composed_loadout_digest: Sha256Digest,
     policy_digest: Sha256Digest,
+    /// Runtime-derived, target-local endpoint. It is deliberately absent from
+    /// portable configuration so clients cannot drift from daemon discovery.
+    #[serde(skip)]
+    relay_endpoint: Option<String>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -524,6 +528,26 @@ impl ProductionDomainRegistry {
         }
         Self::load(config_path, plan_store, receipt_root)
     }
+    pub fn load_optional_with_relay_endpoint(
+        config_path: &Path,
+        plan_store: Arc<PlanStore>,
+        receipt_root: PathBuf,
+        relay_address: std::net::SocketAddr,
+    ) -> Result<Self, ProductionDomainError> {
+        if !relay_address.ip().is_loopback() {
+            return Err(ProductionDomainError::UnsafeConfig);
+        }
+        if !config_path.exists() {
+            return Self::load_optional(config_path, plan_store, receipt_root);
+        }
+        Self::load_with_ssh_factory_and_relay_endpoint(
+            config_path,
+            plan_store,
+            receipt_root,
+            Arc::new(ProcessSshTransportFactory),
+            Some(format!("http://127.0.0.1:{}/mcp", relay_address.port())),
+        )
+    }
     pub fn load(
         config_path: &Path,
         plan_store: Arc<PlanStore>,
@@ -543,11 +567,35 @@ impl ProductionDomainRegistry {
         receipt_root: PathBuf,
         ssh_factory: Arc<dyn ProductionSshTransportFactory>,
     ) -> Result<Self, ProductionDomainError> {
+        Self::load_with_ssh_factory_and_relay_endpoint(
+            config_path,
+            plan_store,
+            receipt_root,
+            ssh_factory,
+            None,
+        )
+    }
+
+    fn load_with_ssh_factory_and_relay_endpoint(
+        config_path: &Path,
+        plan_store: Arc<PlanStore>,
+        receipt_root: PathBuf,
+        ssh_factory: Arc<dyn ProductionSshTransportFactory>,
+        relay_endpoint: Option<String>,
+    ) -> Result<Self, ProductionDomainError> {
         let metadata = fs::symlink_metadata(config_path)?;
         if !metadata.is_file() || metadata.file_type().is_symlink() {
             return Err(ProductionDomainError::UnsafeConfig);
         }
-        let config: ProductionConfig = serde_json::from_slice(&fs::read(config_path)?)?;
+        let mut config: ProductionConfig = serde_json::from_slice(&fs::read(config_path)?)?;
+        if let Some(endpoint) = relay_endpoint {
+            if let Some(sync) = config.sync.as_mut() {
+                sync.relay_endpoint = Some(endpoint.clone());
+            }
+            for sync in &mut config.sync_targets {
+                sync.relay_endpoint = Some(endpoint.clone());
+            }
+        }
         let mut sync_configs = BTreeMap::new();
         for sync in config
             .sync
@@ -1131,7 +1179,10 @@ impl ProductionSyncDomain {
                 &states,
                 &artifacts,
                 managed_root,
-                "http://127.0.0.1:3764/mcp",
+                self.config
+                    .relay_endpoint
+                    .as_deref()
+                    .unwrap_or("http://127.0.0.1:3764/mcp"),
             )
             .map_err(|_| DomainFailure::OperationFailed)?
             {
