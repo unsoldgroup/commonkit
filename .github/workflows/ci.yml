@@ -46,6 +46,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux provider sandbox
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace --all-features --locked
       - if: runner.os == 'Windows'
@@ -141,6 +144,21 @@ jobs:
       CHEZMOI_VERSION: 2.70.4
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux provider sandbox
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
+      - name: Preflight provider sandbox capability
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            test -x /usr/bin/bwrap
+            /usr/bin/bwrap --version
+            /usr/bin/bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --ro-bind /bin /bin --proc /proc --dev /dev -- /usr/bin/true
+          else
+            test -x /usr/bin/sandbox-exec
+            /usr/bin/sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/true
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - name: Download checksum-pinned providers
         shell: bash
@@ -192,6 +210,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Preflight Windows AppContainer provider sandbox
+        run: cargo test --locked -p commonkit-adapters --lib provider_sandbox::windows_sandbox_tests
       - name: Download checksum-pinned providers
         shell: pwsh
         run: |

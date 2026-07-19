@@ -45,7 +45,6 @@ fn materializes_only_into_isolated_destination_with_fixed_flags() {
     )));
 
     let calls = fs::read_to_string(&fixture.calls).unwrap();
-    assert!(calls.lines().next().unwrap().contains("--version"));
     let apply = calls.lines().find(|line| line.contains(" apply")).unwrap();
     for required in [
         "--source",
@@ -137,24 +136,47 @@ fn target_platform_facts_change_provider_inputs_not_controller_constants() {
 #[test]
 fn accepts_the_official_pinned_version_output_and_rejects_other_versions() {
     let fixture = Fixture::new("official-version");
-    fs::write(
-        &fixture.version_output,
-        "chezmoi version v2.70.4, commit 64583685c5eb36e10670bad076d5406a08baf751, built at 2026-05-19T22:47:23Z, built by goreleaser\n",
-    )
-    .unwrap();
     fixture.provider().inspect_inputs(&context()).unwrap();
 
     fs::write(
-        &fixture.version_output,
-        "chezmoi version v2.70.40, commit malicious\n",
+        &fixture.executable,
+        "#!/bin/sh\nprintf 'chezmoi version v2.70.40, commit malicious\\n'\n",
     )
     .unwrap();
+    fs::set_permissions(&fixture.executable, fs::Permissions::from_mode(0o700)).unwrap();
     let error = fixture
         .provider()
         .inspect_inputs(&context())
         .unwrap_err()
         .to_string();
     assert!(error.contains("2.70.4 is required"), "{error}");
+}
+
+#[test]
+fn provider_process_cannot_write_outside_its_isolated_workspace() {
+    let fixture = Fixture::new("sandbox-write-escape");
+    let marker = fixture.root.join("escaped");
+    fs::write(
+        &fixture.executable,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'chezmoi version v2.70.4\\n'; exit 0; fi\nprintf escaped > '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fixture.executable, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let error = fixture
+        .provider()
+        .materialize(&context(), &fixture.workspace(), &fixture.artifacts())
+        .unwrap_err()
+        .to_string();
+
+    assert!(!marker.exists(), "provider escaped its writable workspace");
+    assert!(
+        error.contains("chezmoi failed"),
+        "unexpected diagnostic: {error}"
+    );
 }
 
 #[test]
@@ -353,7 +375,6 @@ struct Fixture {
     config: PathBuf,
     executable: PathBuf,
     calls: PathBuf,
-    version_output: PathBuf,
     live: PathBuf,
 }
 
@@ -363,24 +384,20 @@ impl Fixture {
         let source = root.join("source");
         let config = root.join("chezmoi.toml");
         let executable = root.join("fake-chezmoi");
-        let calls = root.join("calls");
-        let version_output = root.join("version-output");
+        let calls = root.join("stage/calls");
         let live = root.join("live");
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(root.join("stage")).unwrap();
         fs::create_dir_all(&live).unwrap();
         fs::write(&config, "[data]\n").unwrap();
-        fs::write(&version_output, "chezmoi version v2.70.4\n").unwrap();
         fs::write(
             &executable,
-            format!(
-                r#"#!/bin/sh
+            r#"#!/bin/sh
 if [ "$1" = "--version" ]; then
-  printf '%s\n' "$*" >> '{}'
-  cat '{}'
+  printf 'chezmoi version v2.70.4\n'
   exit 0
 fi
-printf '%s\n' "$*" >> '{}'
+printf '%s\n' "$*" >> "$PWD/calls"
 dest=''
 source=''
 previous=''
@@ -394,13 +411,9 @@ cp -R "$source"/. "$dest"/
 find "$dest" -name 'dot_*' | while read path; do
   parent=$(dirname "$path")
   base=$(basename "$path")
-  mv "$path" "$parent/.${{base#dot_}}"
+  mv "$path" "$parent/.${base#dot_}"
 done
 "#,
-                calls.display(),
-                version_output.display(),
-                calls.display()
-            ),
         )
         .unwrap();
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
@@ -410,7 +423,6 @@ done
             config,
             executable,
             calls,
-            version_output,
             live,
         }
     }

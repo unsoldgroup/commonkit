@@ -11,6 +11,7 @@ mod native;
 mod pipeline;
 mod planning;
 mod provider;
+mod provider_sandbox;
 mod remote_helper;
 mod remote_provider;
 mod resources;

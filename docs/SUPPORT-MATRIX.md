@@ -18,6 +18,15 @@ This matrix is a release gate, not a claim that unchecked rows are production-re
 
 Windows remote management is out of v1; local Windows is required. Linux v1 packaging targets AppImage and Debian-family `.deb`. GitHub CLI is the initial GitHub authentication path. Snapshot storage remains S3-compatible and provider-neutral; Cloudflare R2 is the recommended deployment profile. BWS is the initial external secret-manager adapter. SkillOpt is optional in v1 and is enabled only where its isolation contract has been proven; unsupported platforms reject it rather than weakening isolation.
 
+Pinned APM and chezmoi commands execute inside an operating-system boundary:
+macOS Seatbelt, Linux bubblewrap, or a no-network Windows AppContainer. The
+provider receives read access only to operating-system runtime files, its
+executable, and declared inputs, and write access only to its disposable
+CommonKit workspace. Missing sandbox
+capability, an undeclared path, or a network attempt fails closed before target
+mutation. Hosted provider jobs preflight the platform boundary before exercising
+the checksum-pinned releases.
+
 No row is release-ready until its installer, reconciliation, recovery, update, and uninstall tests pass on the named platform.
 
 Release packaging and lifecycle workflows are executable and fail closed without production signing identities. They have not been demonstrated with production notarization/signing and a published two-version updater path. A green ordinary CI run does not imply installer or updater support.

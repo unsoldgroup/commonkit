@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use commonkit_contracts::{Sha256Digest, StableId, digest_domain_json};
 
@@ -10,6 +9,7 @@ use super::provider::{
     DesiredStateProvider, ExactProviderVersion, MaterializedState, ProviderContext,
     ProviderFailure, ProviderInputs, ProviderWorkspace,
 };
+use super::provider_sandbox::ProviderSandbox;
 use super::resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, ResourceProvenance,
     SafeSymlinkTarget,
@@ -21,6 +21,7 @@ pub const TESTED_CHEZMOI_VERSION: &str = "2.70.4";
 pub struct ChezmoiProvider {
     id: StableId,
     executable: PathBuf,
+    executable_digest: Sha256Digest,
     source: PathBuf,
     config: PathBuf,
     cache: PathBuf,
@@ -45,10 +46,22 @@ impl ChezmoiProvider {
                 "chezmoi requires an existing executable, source directory, and config file".into(),
             ));
         }
+        let executable = executable.canonicalize().map_err(|error| {
+            ProviderFailure::Inspect(format!(
+                "could not canonicalize chezmoi executable: {error}"
+            ))
+        })?;
+        let executable_bytes = fs::read(&executable).map_err(|error| {
+            ProviderFailure::Inspect(format!("could not read chezmoi executable: {error}"))
+        })?;
+        let executable_digest =
+            digest_domain_json("commonkit.provider-executable.v1", &executable_bytes)
+                .map_err(|error| ProviderFailure::Inspect(error.to_string()))?;
         Ok(Self {
             id: StableId::parse("chezmoi")
                 .map_err(|error| ProviderFailure::Inspect(error.to_string()))?,
             executable,
+            executable_digest,
             source,
             config,
             cache: cache.as_ref().to_path_buf(),
@@ -134,12 +147,31 @@ impl ChezmoiProvider {
     }
 
     fn validate_version(&self) -> Result<(), ProviderFailure> {
-        let output = Command::new(&self.executable)
+        let executable = fs::read(&self.executable).map_err(|error| {
+            ProviderFailure::Inspect(format!("could not read chezmoi executable: {error}"))
+        })?;
+        let digest = digest_domain_json("commonkit.provider-executable.v1", &executable)
+            .map_err(|error| ProviderFailure::Inspect(error.to_string()))?;
+        if digest != self.executable_digest {
+            return Err(ProviderFailure::Inspect(format!(
+                "chezmoi executable {} changed after provider initialization; reconstruct the provider and approve a new plan",
+                self.executable.display()
+            )));
+        }
+        let isolated = tempfile::tempdir().map_err(|error| {
+            ProviderFailure::Inspect(format!("could not create chezmoi version sandbox: {error}"))
+        })?;
+        let mut command = ProviderSandbox::new(&self.executable, isolated.path());
+        command
             .arg("--version")
-            .output()
-            .map_err(|error| {
-                ProviderFailure::Inspect(format!("could not execute chezmoi: {error}"))
-            })?;
+            .writable_root(isolated.path())
+            .env("HOME", isolated.path())
+            .env("TMPDIR", isolated.path());
+        let output = command.output().map_err(|error| {
+            ProviderFailure::Inspect(format!(
+                "could not execute chezmoi in provider sandbox: {error}"
+            ))
+        })?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let reported_version = stdout
             .strip_prefix("chezmoi version ")
@@ -166,6 +198,7 @@ impl ChezmoiProvider {
             "commonkit.chezmoi-provider.v1".into(),
             BTreeMap::from([
                 ("config".into(), config_digest),
+                ("providerExecutable".into(), self.executable_digest.clone()),
                 ("source".into(), source_digest),
                 ("targetPlatform".into(), context.platform_facts_digest()?),
             ]),
@@ -258,7 +291,8 @@ impl DesiredStateProvider for ChezmoiProvider {
                 "could not create isolated persistent-state parent: {error}"
             ))
         })?;
-        let status = Command::new(&self.executable)
+        let mut command = ProviderSandbox::new(&self.executable, workspace.staging_root());
+        command
             .arg("--source")
             .arg(&self.source)
             .arg("--config")
@@ -279,14 +313,15 @@ impl DesiredStateProvider for ChezmoiProvider {
             .arg("apply")
             .arg("--force")
             .arg("--exclude=scripts")
-            .env_clear()
+            .readable_path(&self.source)
+            .readable_path(&self.config)
+            .writable_root(workspace.staging_root())
             .env("HOME", workspace.staging_root())
-            .env("TMPDIR", workspace.staging_root())
-            .status()
-            .map_err(|error| {
-                ProviderFailure::Materialize(format!("chezmoi execution failed: {error}"))
-            })?;
-        if !status.success() {
+            .env("TMPDIR", workspace.staging_root());
+        let output = command.output().map_err(|error| {
+            ProviderFailure::Materialize(format!("chezmoi execution failed: {error}"))
+        })?;
+        if !output.status.success() {
             return Err(ProviderFailure::Materialize(
                 "chezmoi failed while materializing the isolated destination".into(),
             ));

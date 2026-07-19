@@ -3,7 +3,9 @@ use std::fs;
 use std::fs::OpenOptions as StdOpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+#[cfg(windows)]
+use std::process::Command;
+use std::process::Output;
 
 use commonkit_contracts::{Sha256Digest, StableId};
 use serde::Deserialize;
@@ -15,6 +17,7 @@ use super::provider::{
     ProviderCapabilityResource, ProviderContext, ProviderFailure, ProviderInputs,
     ProviderWorkspace,
 };
+use super::provider_sandbox::ProviderSandbox;
 use super::resources::{
     FilesystemIntent, NormalizedManagedPath, NormalizedResource, ResourceProvenance,
 };
@@ -43,6 +46,7 @@ pub struct ApmProviderConfig {
 pub struct ApmProvider {
     id: StableId,
     config: ApmProviderConfig,
+    executable_digest: Sha256Digest,
     git_executable: PathBuf,
     git_digest: Sha256Digest,
 }
@@ -62,6 +66,14 @@ impl ApmProvider {
                 "APM spike supports exactly the claude and codex targets".into(),
             ));
         }
+        let executable = ordinary_file(&config.executable, "APM executable")?;
+        let executable_digest = digest_bytes(&fs::read(&executable).map_err(|error| {
+            ProviderFailure::Inspect(format!(
+                "could not read APM executable {}: {error}",
+                executable.display()
+            ))
+        })?)?;
+        config.executable = executable;
         let git_executable = resolve_git_executable(config.git_executable.as_deref())?;
         let git_digest = digest_bytes(&fs::read(&git_executable).map_err(|error| {
             ProviderFailure::Inspect(format!(
@@ -73,6 +85,7 @@ impl ApmProvider {
             id: StableId::parse(APM_PROVIDER_ID)
                 .map_err(|error| ProviderFailure::Inspect(error.to_string()))?,
             config,
+            executable_digest,
             git_executable,
             git_digest,
         })
@@ -80,6 +93,18 @@ impl ApmProvider {
 
     fn preflight(&self, context: &ProviderContext) -> Result<ProviderInputs, ProviderFailure> {
         let executable = ordinary_file(&self.config.executable, "APM executable")?;
+        let current_executable_digest = digest_bytes(&fs::read(&executable).map_err(|error| {
+            ProviderFailure::Inspect(format!(
+                "could not read APM executable {}: {error}",
+                executable.display()
+            ))
+        })?)?;
+        if current_executable_digest != self.executable_digest {
+            return Err(ProviderFailure::Inspect(format!(
+                "APM executable {} changed after provider initialization; reconstruct the provider and approve a new plan",
+                executable.display()
+            )));
+        }
         let git = ordinary_absolute_file(&self.git_executable, "Git executable")?;
         let current_git_digest = digest_bytes(&fs::read(&git).map_err(|error| {
             ProviderFailure::Inspect(format!(
@@ -129,6 +154,7 @@ impl ApmProvider {
             ),
             ("targetPolicy".into(), context.policy_digest.clone()),
             ("targetPlatform".into(), context.platform_facts_digest()?),
+            ("providerExecutable".into(), current_executable_digest),
             ("gitExecutable".into(), current_git_digest),
         ]);
         if let Some(bytes) = bound_source {
@@ -152,9 +178,29 @@ impl ApmProvider {
     ) -> Result<Output, ProviderFailure> {
         let staging = provider_cli_path(staging);
         let scratch = provider_cli_path(scratch);
-        let mut command = Command::new(&self.config.executable);
-        command.args(args).current_dir(&staging);
-        configure_provider_environment(&mut command, &staging, &scratch, &self.git_executable);
+        let mut command = ProviderSandbox::new(&self.config.executable, &staging);
+        command
+            .args(args)
+            .writable_root(&staging)
+            .writable_root(&scratch)
+            .readable_path(&self.git_executable);
+        #[cfg(windows)]
+        if let Some(git_installation) = self
+            .git_executable
+            .parent()
+            .and_then(std::path::Path::parent)
+        {
+            // Git for Windows dispatches helpers from sibling directories under
+            // its installation root. Grant that pinned runtime tree read/execute
+            // access without granting any repository or user-profile path.
+            command.readable_path(git_installation);
+        }
+        configure_provider_sandbox_environment(
+            &mut command,
+            &staging,
+            &scratch,
+            &self.git_executable,
+        );
         let output = command.output().map_err(|error| {
             ProviderFailure::Materialize(format!(
                 "could not execute pinned APM {} at {}: {error}",
@@ -194,6 +240,41 @@ impl ApmProvider {
             copy_tree(&source, &staging.join(".apm"))?;
         }
         Ok(())
+    }
+}
+
+fn configure_provider_sandbox_environment(
+    command: &mut ProviderSandbox<'_>,
+    staging: &Path,
+    scratch: &Path,
+    git: &Path,
+) {
+    command
+        .env("HOME", staging)
+        .env("TMPDIR", scratch)
+        .env("APM_TEMP_DIR", scratch)
+        .env("APM_CACHE_DIR", scratch.join("apm-cache"))
+        .env("APM_NON_INTERACTIVE", "1")
+        .env("GIT_PYTHON_GIT_EXECUTABLE", git);
+    #[cfg(windows)]
+    {
+        command
+            .env("USERPROFILE", staging)
+            .env("APPDATA", staging.join("AppData/Roaming"))
+            .env("LOCALAPPDATA", staging.join("AppData/Local"))
+            .env("TEMP", scratch)
+            .env("TMP", scratch);
+        if let Some(system_root) =
+            std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"))
+        {
+            command
+                .env("SystemRoot", &system_root)
+                .env("WINDIR", &system_root)
+                .env("COMSPEC", Path::new(&system_root).join("System32/cmd.exe"));
+        }
+        command
+            .env("OS", "Windows_NT")
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
     }
 }
 
@@ -309,6 +390,7 @@ fn validate_diagnostic_command(command: &str) -> Result<(), ProviderFailure> {
     }
 }
 
+#[cfg(windows)]
 fn configure_provider_environment(
     command: &mut Command,
     staging: &Path,

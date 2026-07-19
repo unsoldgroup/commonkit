@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -188,6 +189,38 @@ fn invalid_inputs_fail_before_provider_execution() {
 }
 
 #[test]
+fn executable_replacement_invalidates_provider_before_launch() {
+    let root = fixture("executable-replacement");
+    let marker = root.join("executed");
+    let executable = root.join("apm");
+    write_executable(
+        &executable,
+        "#!/bin/sh\nprintf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\\n'\n",
+    );
+    let provider = configured(&root, executable.clone());
+    write_executable(
+        &executable,
+        &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    );
+    let stage = root.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, &[]).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+
+    let error = provider
+        .materialize(&context(), &workspace, &artifacts)
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        error.contains("changed after provider initialization"),
+        "{error}"
+    );
+    assert!(!marker.exists(), "replacement provider executable ran");
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn failed_provider_output_stays_private_and_exported_diagnostics_are_bounded_and_redacted() {
     let root = fixture("private-diagnostics");
     let executable = root.join("apm");
@@ -232,13 +265,12 @@ if [ "$1" = "install" ]; then printf 'ordinary failure detail\ntoken=super-secre
 #[test]
 fn pinned_apm_materializes_claude_and_codex_outside_the_live_target() {
     let root = fixture("materialize");
-    let log = root.join("argv.log");
+    let log = root.join("stage/argv.log");
     let executable = root.join("apm");
     write_executable(
         &executable,
-        &format!(
-            r##"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
+        r##"#!/bin/sh
+printf '%s\n' "$*" >> "$PWD/argv.log"
 if [ "$1" = "--version" ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\n'; exit 0; fi
 if [ "$1" = "compile" ]; then
   mkdir -p .claude .codex
@@ -246,10 +278,8 @@ if [ "$1" = "compile" ]; then
   printf 'codex context\n' > .codex/AGENTS.md
   printf 'root codex context\n' > AGENTS.md
 fi
-if [ "$1" = "audit" ]; then printf '{{"ok":true}}\n'; fi
+if [ "$1" = "audit" ]; then printf '{"ok":true}\n'; fi
 "##,
-            log.display()
-        ),
     );
     let provider = configured(&root, executable);
     let stage = root.join("stage");
@@ -314,17 +344,85 @@ if [ "$1" = "audit" ]; then printf '{{"ok":true}}\n'; fi
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
-fn version_mismatch_is_actionable_and_stops_before_compilation() {
-    let root = fixture("version");
-    let log = root.join("argv.log");
-    let executable = root.join("apm");
+fn provider_process_cannot_write_outside_its_isolated_workspace() {
+    let root = fixture("sandbox-write-escape");
+    let outside = root.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let marker = outside.join("escaped");
+    let executable = root.join("malicious-apm");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\\n'; exit 0; fi\nprintf escaped > '{}'\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let provider = configured(&root, executable);
+    let stage = root.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, &[]).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+
+    let error = provider
+        .materialize(&context(), &workspace, &artifacts)
+        .unwrap_err()
+        .to_string();
+
+    assert!(!marker.exists(), "provider escaped its writable workspace");
+    assert!(
+        error.contains("provider sandbox") || error.contains("APM command"),
+        "unexpected diagnostic: {error}"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_process_cannot_open_network_connections() {
+    if !Path::new("/usr/bin/curl").is_file() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let root = fixture("sandbox-network-escape");
+    let executable = root.join("malicious-apm");
     write_executable(
         &executable,
         &format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'Agent Package Manager (APM) CLI version 0.26.0 (fixture)\\n'\n",
-            log.display()
+            "#!/bin/sh\nif [ \"$1\" = --version ]; then printf 'Agent Package Manager (APM) CLI version 0.25.0 (fixture)\\n'; exit 0; fi\n/usr/bin/curl --max-time 1 --silent http://127.0.0.1:{port}/ > \"$PWD/network-response\"\nexit 1\n"
         ),
+    );
+    let provider = configured(&root, executable);
+    let stage = root.join("stage");
+    fs::create_dir_all(&stage).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, &[]).unwrap();
+    let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
+
+    let _ = provider.materialize(&context(), &workspace, &artifacts);
+
+    assert!(
+        listener.accept().is_err(),
+        "provider opened a network connection outside its sandbox"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn version_mismatch_is_actionable_and_stops_before_compilation() {
+    let root = fixture("version");
+    let log = root.join("stage/argv.log");
+    let executable = root.join("apm");
+    write_executable(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$PWD/argv.log\"\nprintf 'Agent Package Manager (APM) CLI version 0.26.0 (fixture)\\n'\n",
     );
     let provider = configured(&root, executable);
     let stage = root.join("stage");
