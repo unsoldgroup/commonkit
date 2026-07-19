@@ -890,6 +890,20 @@ impl PlanExecutor for TargetIdentityPlanExecutor {
             .operations
             .iter()
             .all(|operation| matches!(operation.adapter_id.as_str(), "files" | "ssh-files"));
+        let mixed_filesystem = plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() == "files")
+            && plan
+                .operations
+                .iter()
+                .any(|operation| operation.adapter_id.as_str() == "ssh-files");
+        if mixed_filesystem {
+            return ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("mixed_target_plan")),
+            };
+        }
         if filesystem && !plan.operations.is_empty() {
             return self.targets.get(&plan.target_id).map_or(
                 ExecutionResult {
@@ -948,6 +962,16 @@ impl PlanExecutor for TargetDispatchPlanExecutor {
             .operations
             .iter()
             .any(|operation| operation.adapter_id.as_str() == "ssh-files");
+        let has_local = plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() != "ssh-files");
+        if has_ssh && has_local {
+            return ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("mixed_target_plan")),
+            };
+        }
         if has_ssh {
             return self.ssh.as_ref().map_or(
                 ExecutionResult {
@@ -1114,7 +1138,6 @@ impl PlanExecutor for LocalPlanExecutor {
         execution_result(result)
     }
 
-
     fn execute_bound(
         &self,
         plan: &Plan,
@@ -1125,16 +1148,12 @@ impl PlanExecutor for LocalPlanExecutor {
             .execution_lock
             .lock()
             .map_err(|_| LocalExecutionError::Lock)
-            .and_then(|_guard| {
-                self.execute_durable(plan, confirmation_id, Some(idempotency_key))
-            });
+            .and_then(|_guard| self.execute_durable(plan, confirmation_id, Some(idempotency_key)));
         execution_result(result)
     }
 }
 
-fn execution_result(
-    result: Result<ReconcileOutcome, LocalExecutionError>,
-) -> ExecutionResult {
+fn execution_result(result: Result<ReconcileOutcome, LocalExecutionError>) -> ExecutionResult {
     match result {
         Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
             status: ApplyStatus::Succeeded,
@@ -1791,10 +1810,8 @@ impl ControlPlane {
         }
         let resolved = resolved_mcp_from_materialized(&authority.materialized_states)
             .map_err(|_| ControlError::RelayAuthorityChanged)?;
-        let declaration_digest = digest_domain_json(
-            "commonkit.resolved-mcp-declarations.v1",
-            &resolved,
-        )?;
+        let declaration_digest =
+            digest_domain_json("commonkit.resolved-mcp-declarations.v1", &resolved)?;
         if plan.policy_digest != authority.policy_digest
             || plan.bindings.target_identity_digest != authority.target_identity_digest
             || plan.bindings.composed_loadout_digest != authority.composed_loadout_digest
@@ -1821,12 +1838,8 @@ impl ControlPlane {
             .expect("relay execution path lock")
             .clone()
             .ok_or(ControlError::RelayAuthorityChanged)?;
-        let adapter = RelayAdapter::open(
-            stable_code("relay"),
-            live,
-            state,
-        )
-        .map_err(|_| ControlError::RelayAuthorityChanged)?;
+        let adapter = RelayAdapter::open(stable_code("relay"), live, state)
+            .map_err(|_| ControlError::RelayAuthorityChanged)?;
         for operation in relay_operations {
             adapter
                 .validate_mutation_inputs(operation, &expected)
@@ -2147,9 +2160,7 @@ impl From<ControlError> for ApiError {
             ControlError::IdempotencyConflict | ControlError::PlanConflict => {
                 Self::conflict("conflict")
             }
-            ControlError::RelayAuthorityChanged => {
-                Self::conflict("relay_authority_changed")
-            }
+            ControlError::RelayAuthorityChanged => Self::conflict("relay_authority_changed"),
             ControlError::InvalidIdempotencyKey => Self::bad_request("invalid_idempotency_key"),
             ControlError::InvalidPlan | ControlError::Contract(_) => {
                 Self::bad_request("invalid_plan")
@@ -3029,9 +3040,7 @@ async fn plan_relay_reconcile(
         .relay_provider_authority()
         .map_err(|_| ApiError::conflict("relay_provider_authority_invalid"))?;
     if !authority.relay_is_target_local {
-        return Err(ApiError::conflict(
-            "relay_requires_target_resident_daemon",
-        ));
+        return Err(ApiError::conflict("relay_requires_target_resident_daemon"));
     }
     let resolved = resolved_mcp_from_materialized(&authority.materialized_states)
         .map_err(|_| ApiError::conflict("relay_provider_output_invalid"))?;
@@ -3331,10 +3340,8 @@ impl BoundServer {
         let fallback = Arc::new(TargetDispatchPlanExecutor::new(local_executor, None));
         let executor = Arc::new(TargetIdentityPlanExecutor::new(fallback, target_executors));
         let control = ControlPlane::with_plan_store(executor, plan_store);
-        control.set_relay_execution_paths(
-            paths.config.join("relay.json"),
-            paths.state.join("relay"),
-        );
+        control
+            .set_relay_execution_paths(paths.config.join("relay.json"), paths.state.join("relay"));
         let drift_checker = Arc::new(match production_domains.targets.clone() {
             Some(targets) if !production_domains.target_sync_domains.is_empty() => {
                 ProductionDriftChecker::Selected(SelectedTargetsDriftChecker::new(

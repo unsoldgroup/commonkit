@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::{
     fs,
     path::PathBuf,
@@ -9,20 +9,20 @@ use std::{
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use commonkit_contracts::{OperationKind, PlanBindings, ResourceRef, Risk, Sha256Digest, StableId};
-use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_adapters::{
     ExactProviderVersion, MaterializedState, ProviderCapability, ProviderCapabilityResource,
     ProviderInputs, ResourceProvenance,
 };
+use commonkit_contracts::{OperationKind, PlanBindings, ResourceRef, Risk, Sha256Digest, StableId};
+use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_reconcile::PlanStore;
 use commonkit_relay::{
     RelayAdapter, RelayConfig, RelayMutationInputs, RelayPlanRequest, plan_relay_operation,
 };
 use commonkit_service::{
     ApplyStatus, ControlPlane, ControlToken, DomainFailure, EventHub, ExecutionResult,
-    PlanExecutor, RelayProviderAuthority, ServiceStatus, SyncDomain, resolved_mcp_from_materialized,
-    router_with_control,
+    PlanExecutor, RelayProviderAuthority, ServiceStatus, SyncDomain,
+    resolved_mcp_from_materialized, router_with_control,
 };
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -219,7 +219,11 @@ fn relay_apply_recomputes_authority_and_rejects_change_after_review() {
     let plan = control.register_plan(plan).unwrap();
 
     domain.0.lock().unwrap().policy_digest = digest('9');
-    assert!(control.apply(&plan.id, &confirmation, "relay-apply").is_err());
+    assert!(
+        control
+            .apply(&plan.id, &confirmation, "relay-apply")
+            .is_err()
+    );
     assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
     fs::remove_dir_all(root).unwrap();
 }

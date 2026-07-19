@@ -224,14 +224,10 @@ fn ssh_target_with_provider_mcp_requires_a_target_resident_daemon() {
     let remote = Memory::default();
     let (registry, _, _) = setup_with_capabilities(temporary.path(), remote, true);
     assert_eq!(
-        registry
-            .sync
-            .as_ref()
-            .unwrap()
-            .plan(serde_json::json!({
-                "confirmed": true,
-                "confirmationId": "relay-plan"
-            })),
+        registry.sync.as_ref().unwrap().plan(serde_json::json!({
+            "confirmed": true,
+            "confirmationId": "relay-plan"
+        })),
         Err(DomainFailure::RelayRequiresTargetResidentDaemon)
     );
 }
