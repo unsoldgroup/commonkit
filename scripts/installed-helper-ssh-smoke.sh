@@ -24,7 +24,10 @@ chmod 0700 "$home" "$home/.ssh"
 chmod 0600 "$home/.ssh/authorized_keys" "$home/.config/commonkit/target-helper.json"
 chmod 0755 "$home/commonkit-target-helper"
 sudo useradd --home-dir "$home" --no-create-home --shell /bin/sh "$user"
-sudo usermod --password '*' "$user"
+# OpenSSH rejects a locked shadow entry before it considers authorized_keys.
+# Keep the disposable account unlocked with an unusable hash; password auth is
+# disabled in the isolated sshd configuration below.
+sudo usermod --password x "$user"
 sudo chown -R "$user:$user" "$home" "$target" "$state"
 host_key="$scratch/sshd/host_key"
 ssh-keygen -q -t ed25519 -N '' -f "$host_key"
