@@ -527,6 +527,7 @@ fn write_runtime_state(
             let version = ExactProviderVersion::parse("0.25.0")?;
             let provider = ApmProvider::new(ApmProviderConfig {
                 executable: executable.clone(),
+                git_executable: None,
                 version: version.clone(),
                 manifest: manifest_path,
                 lockfile: lockfile_path,

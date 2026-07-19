@@ -153,6 +153,7 @@ fn configured_with_bound_source(
     fs::write(&policy, "allowedSources: [local]\n").unwrap();
     ApmProvider::new(ApmProviderConfig {
         executable,
+        git_executable: None,
         version: ExactProviderVersion::parse("0.25.0").unwrap(),
         manifest,
         lockfile,
@@ -385,6 +386,7 @@ fn real_apm_025_release_materializes_only_in_disposable_staging_when_enabled() {
     fs::create_dir_all(&stage).unwrap();
     let provider = ApmProvider::new(ApmProviderConfig {
         executable,
+        git_executable: None,
         version: ExactProviderVersion::parse("0.25.0").unwrap(),
         manifest: root.join("apm.yml"),
         lockfile: root.join("apm.lock.yaml"),

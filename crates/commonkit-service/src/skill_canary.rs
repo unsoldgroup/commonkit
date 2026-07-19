@@ -190,6 +190,7 @@ impl ProductionApmCompiler {
     ) -> Result<ApmCompilation, AdapterFailure> {
         let provider = ApmProvider::new(ApmProviderConfig {
             executable: self.config.apm_executable.clone(),
+            git_executable: None,
             version: ExactProviderVersion::parse(self.config.apm_version.clone()).map_err(fail)?,
             manifest: self.config.manifest.clone(),
             lockfile: self.config.lockfile.clone(),

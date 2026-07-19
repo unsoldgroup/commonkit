@@ -24,6 +24,9 @@ const CONTRACT_VERSION: &str = "commonkit.apm-provider.v1";
 #[derive(Debug, Clone)]
 pub struct ApmProviderConfig {
     pub executable: PathBuf,
+    /// Explicit controller Git executable. When omitted, it is resolved once from the
+    /// controller PATH and then pinned by path and digest.
+    pub git_executable: Option<PathBuf>,
     pub version: ExactProviderVersion,
     pub manifest: PathBuf,
     pub lockfile: PathBuf,
@@ -38,6 +41,8 @@ pub struct ApmProviderConfig {
 pub struct ApmProvider {
     id: StableId,
     config: ApmProviderConfig,
+    git_executable: PathBuf,
+    git_digest: Sha256Digest,
 }
 
 impl ApmProvider {
@@ -55,15 +60,37 @@ impl ApmProvider {
                 "APM spike supports exactly the claude and codex targets".into(),
             ));
         }
+        let git_executable = resolve_git_executable(config.git_executable.as_deref())?;
+        let git_digest = digest_bytes(&fs::read(&git_executable).map_err(|error| {
+            ProviderFailure::Inspect(format!(
+                "could not read Git executable {}: {error}",
+                git_executable.display()
+            ))
+        })?)?;
         Ok(Self {
             id: StableId::parse(APM_PROVIDER_ID)
                 .map_err(|error| ProviderFailure::Inspect(error.to_string()))?,
             config,
+            git_executable,
+            git_digest,
         })
     }
 
     fn preflight(&self, context: &ProviderContext) -> Result<ProviderInputs, ProviderFailure> {
         let executable = ordinary_file(&self.config.executable, "APM executable")?;
+        let git = ordinary_absolute_file(&self.git_executable, "Git executable")?;
+        let current_git_digest = digest_bytes(&fs::read(&git).map_err(|error| {
+            ProviderFailure::Inspect(format!(
+                "could not read Git executable {}: {error}",
+                git.display()
+            ))
+        })?)?;
+        if current_git_digest != self.git_digest {
+            return Err(ProviderFailure::Inspect(format!(
+                "Git executable {} changed after provider initialization; reconstruct the provider and approve a new plan",
+                git.display()
+            )));
+        }
         let manifest = read_input(&self.config.manifest, "manifest")?;
         let lockfile = read_input(&self.config.lockfile, "lockfile")?;
         let policy = read_input(&self.config.policy, "package policy")?;
@@ -100,6 +127,7 @@ impl ApmProvider {
             ),
             ("targetPolicy".into(), context.policy_digest.clone()),
             ("targetPlatform".into(), context.platform_facts_digest()?),
+            ("gitExecutable".into(), current_git_digest),
         ]);
         if let Some(bytes) = bound_source {
             input_digests.insert("promotedSource".into(), digest_bytes(&bytes)?);
@@ -122,7 +150,7 @@ impl ApmProvider {
     ) -> Result<Output, ProviderFailure> {
         let mut command = Command::new(&self.config.executable);
         command.args(args).current_dir(staging);
-        configure_provider_environment(&mut command, staging, scratch);
+        configure_provider_environment(&mut command, staging, scratch, &self.git_executable);
         let output = command.output().map_err(|error| {
             ProviderFailure::Materialize(format!(
                 "could not execute pinned APM {} at {}: {error}",
@@ -164,14 +192,20 @@ impl ApmProvider {
     }
 }
 
-fn configure_provider_environment(command: &mut Command, staging: &Path, scratch: &Path) {
+fn configure_provider_environment(
+    command: &mut Command,
+    staging: &Path,
+    scratch: &Path,
+    git: &Path,
+) {
     command
         .env_clear()
         .env("HOME", staging)
         .env("TMPDIR", scratch)
         .env("APM_TEMP_DIR", scratch)
         .env("APM_CACHE_DIR", scratch.join("apm-cache"))
-        .env("APM_NON_INTERACTIVE", "1");
+        .env("APM_NON_INTERACTIVE", "1")
+        .env("GIT_PYTHON_GIT_EXECUTABLE", git);
     #[cfg(windows)]
     {
         use std::path::Component;
@@ -218,8 +252,9 @@ mod windows_environment_tests {
     fn pinned_bundle_receives_only_isolated_windows_profile_and_temp_paths() {
         let staging = Path::new(r"C:\isolated\stage");
         let scratch = Path::new(r"C:\isolated\scratch");
+        let git = Path::new(r"C:\Program Files\Git\cmd\git.exe");
         let mut command = Command::new("apm.exe");
-        configure_provider_environment(&mut command, staging, scratch);
+        configure_provider_environment(&mut command, staging, scratch, git);
         let explicit = command
             .get_envs()
             .filter_map(|(key, value)| value.map(|value| (key.to_owned(), value.to_owned())))
@@ -256,6 +291,10 @@ mod windows_environment_tests {
         );
         assert!(!explicit.contains_key(OsStr::new("PATH")));
         assert!(!explicit.contains_key(OsStr::new("GITHUB_TOKEN")));
+        assert_eq!(
+            explicit.get(OsStr::new("GIT_PYTHON_GIT_EXECUTABLE")),
+            Some(&git.as_os_str().to_owned())
+        );
     }
 }
 
@@ -741,6 +780,37 @@ fn ordinary_file(path: &Path, label: &str) -> Result<PathBuf, ProviderFailure> {
     Ok(path.to_path_buf())
 }
 
+fn ordinary_absolute_file(path: &Path, label: &str) -> Result<PathBuf, ProviderFailure> {
+    if !path.is_absolute() {
+        return Err(ProviderFailure::Inspect(format!(
+            "{label} {} must be an absolute path",
+            path.display()
+        )));
+    }
+    ordinary_file(path, label)
+}
+
+fn resolve_git_executable(explicit: Option<&Path>) -> Result<PathBuf, ProviderFailure> {
+    if let Some(path) = explicit {
+        return ordinary_absolute_file(path, "Git executable");
+    }
+    let path = std::env::var_os("PATH").ok_or_else(|| {
+        ProviderFailure::Inspect(
+            "APM requires Git; configure an absolute ordinary Git executable or add Git to the controller PATH".into(),
+        )
+    })?;
+    let filename = if cfg!(windows) { "git.exe" } else { "git" };
+    for directory in std::env::split_paths(&path).filter(|path| path.is_absolute()) {
+        let candidate = directory.join(filename);
+        if ordinary_absolute_file(&candidate, "Git executable").is_ok() {
+            return Ok(candidate);
+        }
+    }
+    Err(ProviderFailure::Inspect(
+        "APM requires Git; configure an absolute ordinary Git executable or install Git on the controller PATH".into(),
+    ))
+}
+
 fn read_input(path: &Path, label: &str) -> Result<Vec<u8>, ProviderFailure> {
     ordinary_file(path, &format!("APM {label}"))?;
     fs::read(path).map_err(|error| {
@@ -763,4 +833,29 @@ fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, ProviderFailure> {
 
 fn materialize_io(error: std::io::Error) -> ProviderFailure {
     ProviderFailure::Materialize(error.to_string())
+}
+
+#[cfg(all(test, unix))]
+mod git_dependency_tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn explicit_git_must_exist_and_must_not_be_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing-git");
+        assert!(resolve_git_executable(Some(&missing)).is_err());
+
+        let target = root.path().join("git-target");
+        fs::write(&target, b"git").unwrap();
+        let link = root.path().join("git-link");
+        symlink(&target, &link).unwrap();
+        assert!(resolve_git_executable(Some(&link)).is_err());
+    }
+
+    #[test]
+    fn explicit_git_must_be_absolute() {
+        assert!(resolve_git_executable(Some(Path::new("git"))).is_err());
+    }
 }

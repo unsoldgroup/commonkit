@@ -1419,6 +1419,7 @@ impl ProductionSyncDomain {
                 managed_root,
             } => ApmProvider::new(ApmProviderConfig {
                 executable: executable.clone(),
+                git_executable: None,
                 version: version.clone(),
                 manifest: checked_repository_path(
                     &pipeline.source.repository,

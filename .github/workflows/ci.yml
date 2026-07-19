@@ -214,6 +214,9 @@ jobs:
         run: |
           $stage = Join-Path $env:RUNNER_TEMP "commonkit-apm-preflight-stage"
           $scratch = Join-Path $env:RUNNER_TEMP "commonkit-apm-preflight-scratch"
+          $gitBin = (Get-Command git -CommandType Application -ErrorAction Stop).Source
+          if (-not [System.IO.Path]::IsPathFullyQualified($gitBin)) { throw "Git executable path must be absolute" }
+          if ((Get-Item -LiteralPath $gitBin).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { throw "Git executable must not be a reparse point" }
           New-Item -ItemType Directory -Force -Path $stage, $scratch | Out-Null
           $psi = [System.Diagnostics.ProcessStartInfo]::new()
           $psi.FileName = $env:COMMONKIT_APM_025_BIN
@@ -235,6 +238,7 @@ jobs:
           $psi.Environment["APM_TEMP_DIR"] = $scratch
           $psi.Environment["APM_CACHE_DIR"] = Join-Path $scratch "apm-cache"
           $psi.Environment["APM_NON_INTERACTIVE"] = "1"
+          $psi.Environment["GIT_PYTHON_GIT_EXECUTABLE"] = $gitBin
           $psi.Environment["SystemRoot"] = $env:SystemRoot
           $psi.Environment["WINDIR"] = $env:SystemRoot
           $psi.Environment["COMSPEC"] = Join-Path $env:SystemRoot "System32\cmd.exe"

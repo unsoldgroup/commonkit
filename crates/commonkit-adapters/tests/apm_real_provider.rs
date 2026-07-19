@@ -39,6 +39,7 @@ fn checksum_pinned_apm_release_materializes_without_touching_live_target() {
     fs::create_dir_all(&live).unwrap();
     let provider = ApmProvider::new(ApmProviderConfig {
         executable,
+        git_executable: None,
         version: ExactProviderVersion::parse("0.25.0").unwrap(),
         manifest: root.join("apm.yml"),
         lockfile: root.join("apm.lock.yaml"),
