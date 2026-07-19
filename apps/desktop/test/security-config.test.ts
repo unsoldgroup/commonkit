@@ -8,6 +8,7 @@ test("desktop capabilities expose no shell, process, filesystem, or arbitrary HT
   const capability = JSON.parse(await readFile(new URL("capabilities/main.json", root), "utf8"));
   const permissions = JSON.stringify(capability.permissions);
   for (const denied of ["shell", "process", "fs:", "http:"]) assert.ok(!permissions.includes(denied), denied);
+  assert.ok(capability.permissions.includes("dialog:allow-open"));
   assert.deepEqual(capability.windows, ["main"]);
 });
 
