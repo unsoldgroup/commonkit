@@ -751,6 +751,7 @@ dependencies = [
  "cap-std",
  "commonkit-contracts",
  "commonkit-core",
+ "commonkit-platform",
  "commonkit-reconcile",
  "libc",
  "serde",
@@ -770,6 +771,7 @@ dependencies = [
  "commonkit-adapters",
  "commonkit-config",
  "commonkit-contracts",
+ "commonkit-core",
  "commonkit-platform",
  "commonkit-reconcile",
  "commonkit-service",
@@ -841,6 +843,7 @@ version = "0.1.0"
 dependencies = [
  "directories",
  "thiserror 2.0.18",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
