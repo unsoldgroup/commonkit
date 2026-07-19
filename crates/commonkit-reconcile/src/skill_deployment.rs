@@ -231,7 +231,7 @@ pub struct SkillDeploymentRecoveryReceipt {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkillDeploymentRecovery {
-    Finalized(SkillDeploymentReceipt),
+    Finalized(Box<SkillDeploymentReceipt>),
     Recovered(SkillDeploymentRecoveryReceipt),
 }
 
@@ -426,7 +426,7 @@ impl<'a> SkillDeploymentWorkflow<'a> {
             let bytes = canonical_json(&receipt)?;
             persist_receipt(&deployment_path(self.store, run_id), &bytes)?;
             self.trust.anchor(run_id, "receipt", &bytes)?;
-            return Ok(SkillDeploymentRecovery::Finalized(receipt));
+            return Ok(SkillDeploymentRecovery::Finalized(Box::new(receipt)));
         }
         let outcome = match journal.receipt().state {
             ReceiptState::RolledBack => ReconcileOutcome::RolledBack,

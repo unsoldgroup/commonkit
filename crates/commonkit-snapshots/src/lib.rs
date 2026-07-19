@@ -263,6 +263,13 @@ pub struct PublishedPortableAuthority {
     pub repository_revision: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PortableHeadUpdate<'a> {
+    pub writer: &'a str,
+    pub accepted_head: &'a str,
+    pub accepted_descriptor: &'a str,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PortablePublication {
     pub database: DatabaseId,
@@ -1536,25 +1543,23 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
         &self,
         database: &DatabaseId,
         expected_revision: &str,
-        writer: &str,
-        accepted_head: &str,
-        accepted_descriptor: &str,
+        update: PortableHeadUpdate<'_>,
         expected_repository_parent: &str,
         publisher: &mut impl PortableAuthorityPublisher,
     ) -> Result<PublishedPortableAuthority, SnapshotError> {
-        validate_digest(accepted_head)?;
-        validate_digest(accepted_descriptor)?;
+        validate_digest(update.accepted_head)?;
+        validate_digest(update.accepted_descriptor)?;
         self.compare_and_swap_published(
             database,
             expected_revision,
             expected_repository_parent,
             publisher,
             |record| {
-                if record.current_writer != writer {
+                if record.current_writer != update.writer {
                     return Err(SnapshotError::StalePortableAuthority);
                 }
-                record.accepted_head = Some(accepted_head.into());
-                record.accepted_descriptor = Some(accepted_descriptor.into());
+                record.accepted_head = Some(update.accepted_head.into());
+                record.accepted_descriptor = Some(update.accepted_descriptor.into());
                 Ok(())
             },
         )

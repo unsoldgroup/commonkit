@@ -73,7 +73,7 @@ fn lifecycle_adapter_applies_verifies_and_rolls_back_typed_state() {
     adapter.prepare(&operation).unwrap();
     adapter.apply(&operation).unwrap();
     adapter.verify(&operation).unwrap();
-    assert_eq!(backend.inspect("commonkit-relay").unwrap().running, true);
+    assert!(backend.inspect("commonkit-relay").unwrap().running);
 
     adapter.rollback(&operation).unwrap();
     assert_eq!(

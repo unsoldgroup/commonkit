@@ -59,7 +59,7 @@ fn checksum_pinned_apm_release_materializes_without_touching_live_target() {
     let state = provider
         .materialize(
             &context,
-            &ProviderWorkspace::open(&stage, &[live.clone()]).unwrap(),
+            &ProviderWorkspace::open(&stage, std::slice::from_ref(&live)).unwrap(),
             &ArtifactStore::open(root.join("artifacts")).unwrap(),
         )
         .unwrap();

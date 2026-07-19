@@ -280,6 +280,23 @@ fn create_clones_an_empty_repository_before_importing_provider_files() {
                         status: output.status.code(),
                     });
                 }
+                for (key, value) in [
+                    ("user.name", "CommonKit Test"),
+                    ("user.email", "commonkit-test@invalid.example"),
+                ] {
+                    let status = Command::new("git")
+                        .arg("-C")
+                        .arg(&args[3])
+                        .args(["config", "--local", key, value])
+                        .status()
+                        .unwrap();
+                    if !status.success() {
+                        return Err(OnboardingError::ToolFailed {
+                            tool: "git".into(),
+                            status: status.code(),
+                        });
+                    }
+                }
                 return Ok(String::new());
             }
             let output = Command::new(program).args(arguments).output().unwrap();

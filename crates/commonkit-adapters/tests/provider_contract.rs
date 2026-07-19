@@ -84,9 +84,9 @@ fn provider_workspace_cannot_overlap_a_live_or_protected_root() {
     fs::create_dir_all(&staging).unwrap();
     fs::create_dir_all(&live).unwrap();
 
-    let workspace = ProviderWorkspace::open(&staging, &[live.clone()]).unwrap();
+    let workspace = ProviderWorkspace::open(&staging, std::slice::from_ref(&live)).unwrap();
     assert_eq!(workspace.staging_root(), staging.canonicalize().unwrap());
-    assert!(ProviderWorkspace::open(&live, &[live.clone()]).is_err());
+    assert!(ProviderWorkspace::open(&live, std::slice::from_ref(&live)).is_err());
 
     fs::remove_dir_all(root).unwrap();
 }

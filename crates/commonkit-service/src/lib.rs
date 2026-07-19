@@ -583,10 +583,12 @@ pub fn router_with_control(
         status,
         authority,
         events,
-        control,
-        relay_runtime,
-        None,
-        None,
+        RouterRuntime {
+            control,
+            relay_runtime,
+            skills: None,
+            skill_canary: None,
+        },
     )
 }
 
@@ -603,11 +605,20 @@ pub fn router_with_skills(
         status,
         authority,
         events,
-        ControlPlane::new(Arc::new(UnavailableExecutor)),
-        relay_runtime,
-        Some(skills),
-        None,
+        RouterRuntime {
+            control: ControlPlane::new(Arc::new(UnavailableExecutor)),
+            relay_runtime,
+            skills: Some(skills),
+            skill_canary: None,
+        },
     )
+}
+
+struct RouterRuntime {
+    control: ControlPlane,
+    relay_runtime: Arc<ManagedRelayRuntime>,
+    skills: Option<Arc<SkillEngine>>,
+    skill_canary: Option<Arc<skill_canary::SkillCanaryRuntime>>,
 }
 
 fn router_with_control_and_relay(
@@ -615,20 +626,17 @@ fn router_with_control_and_relay(
     status: Arc<RwLock<ServiceStatus>>,
     authority: impl Into<String>,
     events: EventHub,
-    control: ControlPlane,
-    relay_runtime: Arc<ManagedRelayRuntime>,
-    skills: Option<Arc<SkillEngine>>,
-    skill_canary: Option<Arc<skill_canary::SkillCanaryRuntime>>,
+    runtime: RouterRuntime,
 ) -> Router {
     let state = ApiState {
         token,
         status,
         authority: authority.into(),
         events,
-        control,
-        relay_runtime,
-        skills,
-        skill_canary,
+        control: runtime.control,
+        relay_runtime: runtime.relay_runtime,
+        skills: runtime.skills,
+        skill_canary: runtime.skill_canary,
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
@@ -3701,10 +3709,12 @@ impl BoundServer {
             status,
             local.to_string(),
             events,
-            control,
-            relay_runtime.clone(),
-            skills,
-            skill_canary,
+            RouterRuntime {
+                control,
+                relay_runtime: relay_runtime.clone(),
+                skills,
+                skill_canary,
+            },
         );
         // The listener is bound before provider domains are loaded so its
         // actual address can be included in discovery and desired state.

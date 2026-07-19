@@ -28,10 +28,10 @@ use commonkit_reconcile::{
 };
 use commonkit_snapshots::{
     AuthenticatedCipher, AuthorityStore, ConsistentBackup, DatabaseId, DatabaseLifecycle,
-    DurableRestore, ObjectStore, PortableAuthorityStore, ProcessGitAuthorityPublisher,
-    ProcessObjectCommandRunner, PromotionPlan, RestoreFailpoint, RestorePlan,
-    S3CompatibleObjectStore, SnapshotError, SnapshotManifest, SnapshotService, SqliteBackup,
-    StaticBackup, XChaCha20Cipher, manifest_digest,
+    DurableRestore, ObjectStore, PortableAuthorityStore, PortableHeadUpdate,
+    ProcessGitAuthorityPublisher, ProcessObjectCommandRunner, PromotionPlan, RestoreFailpoint,
+    RestorePlan, S3CompatibleObjectStore, SnapshotError, SnapshotManifest, SnapshotService,
+    SqliteBackup, StaticBackup, XChaCha20Cipher, manifest_digest,
 };
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -1477,7 +1477,7 @@ impl ProductionSyncDomain {
                 .ok_or(DomainFailure::OperationFailed)?;
             if let Some(client_state) = materialize_mcp_client_state(
                 &states,
-                &artifacts,
+                artifacts,
                 managed_root,
                 self.config
                     .relay_endpoint
@@ -1575,7 +1575,7 @@ impl ProductionSyncDomain {
                 composed_loadout_digest: self.config.composed_loadout_digest.clone(),
                 observed_digest,
                 policy_digest: self.config.policy_digest.clone(),
-                ownership_rules: &rules,
+                ownership_rules: rules,
                 mapped_side_effects: BTreeSet::new(),
             },
             states,
@@ -2917,9 +2917,11 @@ impl SnapshotDomain for ProductionSnapshotDomain {
                 .compare_and_swap_head_published(
                     &database.id,
                     &portable_authority.revision,
-                    &source_target,
-                    &stored.manifest.content_digest,
-                    &descriptor_digest,
+                    PortableHeadUpdate {
+                        writer: &source_target,
+                        accepted_head: &stored.manifest.content_digest,
+                        accepted_descriptor: &descriptor_digest,
+                    },
                     &trusted_remote_revision,
                     &mut git_publisher,
                 )

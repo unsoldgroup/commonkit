@@ -62,8 +62,10 @@ fn s3_compatible_store_uses_binary_stdio_and_fixed_argv_without_credentials() {
     use commonkit_snapshots::{ObjectCommandRunner, ObjectStore, S3CompatibleObjectStore};
     use std::sync::{Arc, Mutex};
 
+    type RecordedObjectCalls = Arc<Mutex<Vec<(Vec<String>, Vec<u8>)>>>;
+
     #[derive(Clone)]
-    struct Runner(Arc<Mutex<Vec<(Vec<String>, Vec<u8>)>>>);
+    struct Runner(RecordedObjectCalls);
     impl ObjectCommandRunner for Runner {
         fn run(&mut self, arguments: &[String], stdin: &[u8]) -> Result<Vec<u8>, SnapshotError> {
             self.0

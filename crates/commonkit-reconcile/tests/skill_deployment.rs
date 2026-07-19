@@ -248,8 +248,6 @@ fn compiles_apm_applies_named_canary_and_links_receipts() {
     assert_eq!(receipt.candidate_id, id("candidate-1"));
     assert_eq!(receipt.canary_loadout, id("codex-canary"));
     let deployment_id = receipt.id.clone();
-    drop(workflow);
-    drop(store);
 
     let restarted_store = ReceiptStore::open(&temporary).expect("restart store");
     let restarted_trust = DeploymentTrustStore::open(&anchors, [7; 32]).expect("restart trust");

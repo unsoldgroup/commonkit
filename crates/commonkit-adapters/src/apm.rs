@@ -145,7 +145,7 @@ impl ApmProvider {
     }
 
     fn prepare_staging(&self, staging: &Path) -> Result<(), ProviderFailure> {
-        for entry in fs::read_dir(staging).map_err(materialize_io)? {
+        if let Some(entry) = fs::read_dir(staging).map_err(materialize_io)?.next() {
             let entry = entry.map_err(materialize_io)?;
             return Err(ProviderFailure::Materialize(format!(
                 "APM staging directory must be empty; found {}",

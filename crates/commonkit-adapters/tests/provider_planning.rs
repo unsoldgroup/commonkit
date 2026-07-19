@@ -182,7 +182,7 @@ fn provider_policy_failures_stop_before_operation_registration() {
     };
     let error = build_provider_plan(
         request(),
-        &[base.clone()],
+        std::slice::from_ref(&base),
         &artifacts,
         &mut FileAdapter::open(&target, &root.join("outside-state")).unwrap(),
     )

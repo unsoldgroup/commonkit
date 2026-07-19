@@ -214,7 +214,7 @@ if [ "$1" = "audit" ]; then printf '{{"ok":true}}\n'; fi
     let artifacts = root.join("artifacts");
     fs::create_dir_all(&stage).unwrap();
     fs::create_dir_all(&live).unwrap();
-    let workspace = ProviderWorkspace::open(&stage, &[live.clone()]).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, std::slice::from_ref(&live)).unwrap();
     let artifacts = ArtifactStore::open(&artifacts).unwrap();
 
     let inputs = provider.inspect_inputs(&context()).unwrap();
@@ -245,7 +245,8 @@ if [ "$1" = "audit" ]; then printf '{{"ok":true}}\n'; fi
 
     let second_stage = root.join("second-stage");
     fs::create_dir_all(&second_stage).unwrap();
-    let second_workspace = ProviderWorkspace::open(&second_stage, &[live.clone()]).unwrap();
+    let second_workspace =
+        ProviderWorkspace::open(&second_stage, std::slice::from_ref(&live)).unwrap();
     let repeated = provider
         .materialize(&context(), &second_workspace, &artifacts)
         .unwrap();
@@ -393,7 +394,7 @@ fn real_apm_025_release_materializes_only_in_disposable_staging_when_enabled() {
         bound_source: None,
     })
     .unwrap();
-    let workspace = ProviderWorkspace::open(&stage, &[live.clone()]).unwrap();
+    let workspace = ProviderWorkspace::open(&stage, std::slice::from_ref(&live)).unwrap();
     let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
     let state = provider
         .materialize(&context(), &workspace, &artifacts)

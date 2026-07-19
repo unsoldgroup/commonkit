@@ -71,7 +71,7 @@ fn provider_mcp_becomes_content_addressed_claude_and_codex_relay_configs() {
             };
             (
                 path.as_str().to_owned(),
-                String::from_utf8(artifacts.load(&content).unwrap()).unwrap(),
+                String::from_utf8(artifacts.load(content).unwrap()).unwrap(),
             )
         })
         .collect::<BTreeMap<_, _>>();
