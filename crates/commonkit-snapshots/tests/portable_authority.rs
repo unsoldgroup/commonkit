@@ -1035,6 +1035,22 @@ impl GitFixture {
         Self::new_with_protection(true)
     }
 
+    fn configure_identity(directory: &std::path::Path) {
+        Self::git(
+            directory,
+            &["config", "--local", "user.name", "CommonKit Test"],
+        );
+        Self::git(
+            directory,
+            &[
+                "config",
+                "--local",
+                "user.email",
+                "commonkit-test@localhost",
+            ],
+        );
+    }
+
     fn new_with_protection(protect_authority_ref: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let remote = root.path().join("remote.git");
@@ -1043,8 +1059,7 @@ impl GitFixture {
         Self::git(&remote, &["init", "--bare", "--initial-branch=main"]);
         fs::create_dir(&seed).unwrap();
         Self::git(&seed, &["init", "--initial-branch=main"]);
-        Self::git(&seed, &["config", "user.name", "CommonKit Test"]);
-        Self::git(&seed, &["config", "user.email", "commonkit-test@localhost"]);
+        Self::configure_identity(&seed);
         let cipher = DeterministicTestCipher::new([81; 32]);
         let database = DatabaseId::new("context-mode").unwrap();
         PortableAuthorityStore::open(seed.join("kit"), &cipher)
@@ -1072,6 +1087,7 @@ impl GitFixture {
                 .unwrap()
                 .success()
         );
+        Self::configure_identity(&clone);
         let parent = Self::git(&clone, &["rev-parse", "HEAD"]);
         let mut fixture = Self {
             root,
