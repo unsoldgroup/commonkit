@@ -150,9 +150,11 @@ impl ApmProvider {
         scratch: &Path,
         args: &[&str],
     ) -> Result<Output, ProviderFailure> {
+        let staging = provider_cli_path(staging);
+        let scratch = provider_cli_path(scratch);
         let mut command = Command::new(&self.config.executable);
-        command.args(args).current_dir(staging);
-        configure_provider_environment(&mut command, staging, scratch, &self.git_executable);
+        command.args(args).current_dir(&staging);
+        configure_provider_environment(&mut command, &staging, &scratch, &self.git_executable);
         let output = command.output().map_err(|error| {
             ProviderFailure::Materialize(format!(
                 "could not execute pinned APM {} at {}: {error}",
@@ -160,7 +162,7 @@ impl ApmProvider {
                 self.config.executable.display()
             ))
         })?;
-        persist_private_diagnostics(scratch, args[0], &output)?;
+        persist_private_diagnostics(&scratch, args[0], &output)?;
         if !output.status.success() {
             return Err(ProviderFailure::Materialize(format!(
                 "APM command `{}` failed with status {}; inspect the provider's private diagnostics, fix the inputs, and retry",
@@ -193,6 +195,24 @@ impl ApmProvider {
         }
         Ok(())
     }
+}
+
+fn provider_cli_path(path: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        // APM 0.25.0 appends POSIX-style path fragments internally. Python's
+        // Windows path handling rejects those fragments when the working
+        // directory uses Rust's verbatim (`\\?\`) representation, so hand the
+        // external CLI the equivalent ordinary DOS/UNC spelling.
+        let rendered = path.as_os_str().to_string_lossy();
+        if let Some(rest) = rendered.strip_prefix(r"\\?\UNC\") {
+            return std::path::PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = rendered.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
 }
 
 fn persist_private_diagnostics(
@@ -342,6 +362,18 @@ fn configure_provider_environment(
 mod windows_environment_tests {
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
+
+    #[test]
+    fn provider_cli_paths_remove_verbatim_prefixes() {
+        assert_eq!(
+            super::provider_cli_path(Path::new(r"\\?\C:\isolated\stage")),
+            PathBuf::from(r"C:\isolated\stage")
+        );
+        assert_eq!(
+            super::provider_cli_path(Path::new(r"\\?\UNC\server\share\stage")),
+            PathBuf::from(r"\\server\share\stage")
+        );
+    }
 
     use super::*;
 
