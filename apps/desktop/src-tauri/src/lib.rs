@@ -1094,12 +1094,31 @@ fn authorize_update_install(
 
 fn write_update_report(path: &Path, payload: &serde_json::Value) -> std::io::Result<()> {
     let temporary = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(payload).unwrap_or_default();
+    let bytes = serde_json::to_vec_pretty(payload).map_err(std::io::Error::other)?;
     let mut file = std::fs::File::create(&temporary)?;
     use std::io::Write as _;
     file.write_all(&bytes)?;
     file.sync_all()?;
-    std::fs::rename(temporary, path)
+    std::fs::rename(temporary, path)?;
+    std::fs::File::open(path)?.sync_all()?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        std::fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+fn install_after_durable_handoff<T, Handoff, Install>(
+    verified_bytes: T,
+    persist_handoff: Handoff,
+    install: Install,
+) -> Result<(), String>
+where
+    Handoff: FnOnce() -> Result<(), String>,
+    Install: FnOnce(T) -> Result<(), String>,
+{
+    persist_handoff()?;
+    install(verified_bytes)
 }
 
 #[tauri::command]
@@ -1129,17 +1148,8 @@ async fn run_automated_update_lifecycle(app: tauri::AppHandle, report: PathBuf, 
         #[cfg(target_os = "windows")]
         let updater = {
             let marker_app = app.clone();
-            let marker_report = report.clone();
-            let marker_expected = expected.clone();
             app.updater_builder()
                 .on_before_exit(move || {
-                    let marker = serde_json::json!({
-                        "schemaVersion": 1,
-                        "previousVersion": env!("CARGO_PKG_VERSION"),
-                        "expectedVersion": marker_expected,
-                        "updaterExitPrepared": true,
-                    });
-                    let _ = write_update_report(&marker_report, &marker);
                     marker_app.cleanup_before_exit();
                 })
                 .build()
@@ -1153,6 +1163,25 @@ async fn run_automated_update_lifecycle(app: tauri::AppHandle, report: PathBuf, 
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "the expected published update is unavailable".to_owned())?;
         authorize_update_install(true, &expected, &update.version)?;
+        #[cfg(target_os = "windows")]
+        {
+            let bytes = update
+                .download(|_, _| {}, || {})
+                .await
+                .map_err(|error| error.to_string())?;
+            let marker = serde_json::json!({
+                "schemaVersion": 1,
+                "previousVersion": env!("CARGO_PKG_VERSION"),
+                "expectedVersion": expected,
+                "updaterExitPrepared": true,
+            });
+            install_after_durable_handoff(
+                bytes,
+                || write_update_report(&report, &marker).map_err(|error| error.to_string()),
+                |bytes| update.install(bytes).map_err(|error| error.to_string()),
+            )?;
+        }
+        #[cfg(not(target_os = "windows"))]
         update
             .download_and_install(|_, _| {}, || {})
             .await
@@ -1176,7 +1205,10 @@ async fn run_automated_update_lifecycle(app: tauri::AppHandle, report: PathBuf, 
             }),
         ),
     };
-    let _ = write_update_report(&report, &payload);
+    if write_update_report(&report, &payload).is_err() {
+        app.exit(71);
+        return;
+    }
     app.exit(exit_code);
 }
 
@@ -1563,6 +1595,21 @@ mod tests {
         assert!(authorize_update_install(false, "0.2.0", "0.2.0").is_err());
         assert!(authorize_update_install(true, "0.2.0", "0.3.0").is_err());
         assert!(authorize_update_install(true, "0.2.0", "0.2.0").is_ok());
+    }
+    #[test]
+    fn updater_install_is_not_started_when_durable_handoff_fails() {
+        let mut install_started = false;
+        let result = install_after_durable_handoff(
+            vec![1, 2, 3],
+            || Err("marker fsync failed".to_owned()),
+            |_| {
+                install_started = true;
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), "marker fsync failed");
+        assert!(!install_started);
     }
     #[test]
     fn onboarding_binds_pinned_provider_to_fixed_cli_arguments() {

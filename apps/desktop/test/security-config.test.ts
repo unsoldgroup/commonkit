@@ -77,5 +77,11 @@ test("updater commands separate inspection from explicitly confirmed installatio
   assert.match(source, /on_before_exit/);
   assert.match(source, /"updaterExitPrepared"\s*:\s*true/);
   assert.match(source, /cleanup_before_exit/);
+  const lifecycle = source.slice(source.indexOf("async fn run_automated_update_lifecycle"), source.indexOf("fn show_main_window"));
+  const download = lifecycle.indexOf(".download(");
+  const marker = lifecycle.indexOf("write_update_report");
+  const install = lifecycle.indexOf(".install(");
+  assert.ok(download >= 0 && marker > download && install > marker, "verified download must precede durable handoff and installer launch");
+  assert.doesNotMatch(lifecycle, /let _ = write_update_report/);
   assert.match(source, /expected\s*==\s*env!\("CARGO_PKG_VERSION"\)/);
 });
