@@ -41,6 +41,61 @@ fn content_addressed_artifacts_are_immutable_and_verified_on_every_load() {
     fs::remove_dir_all(root).expect("cleanup");
 }
 
+#[test]
+fn opening_an_existing_store_never_creates_a_missing_root() {
+    let root = temporary_directory("missing-existing-artifacts");
+
+    assert!(matches!(
+        ArtifactStore::open_existing(&root),
+        Err(ArtifactError::InvalidRoot)
+    ));
+    assert!(!root.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_an_existing_store_rejects_unsafe_metadata_without_repairing_it() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = temporary_directory("unsafe-existing-artifacts");
+    fs::create_dir_all(&root).expect("root");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).expect("unsafe mode");
+    let before = fs::symlink_metadata(&root)
+        .expect("before")
+        .permissions()
+        .mode()
+        & 0o777;
+
+    assert!(matches!(
+        ArtifactStore::open_existing(&root),
+        Err(ArtifactError::InvalidRoot)
+    ));
+    assert_eq!(
+        fs::symlink_metadata(&root)
+            .expect("after")
+            .permissions()
+            .mode()
+            & 0o777,
+        before
+    );
+
+    let link = temporary_directory("existing-artifact-link");
+    symlink(&root, &link).expect("link");
+    assert!(matches!(
+        ArtifactStore::open_existing(&link),
+        Err(ArtifactError::InvalidRoot)
+    ));
+    assert!(
+        fs::symlink_metadata(&link)
+            .expect("link remains")
+            .file_type()
+            .is_symlink()
+    );
+
+    fs::remove_file(link).expect("cleanup link");
+    fs::remove_dir_all(root).expect("cleanup root");
+}
+
 #[cfg(unix)]
 #[test]
 fn artifact_load_rejects_a_symlink_substitution() {

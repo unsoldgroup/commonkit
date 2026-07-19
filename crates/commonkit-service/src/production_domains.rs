@@ -796,8 +796,14 @@ impl ProductionDomainRegistry {
                         .cipher()
                         .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     if domain.git_authority.is_some() {
-                        let publisher = domain
+                        let mut publisher = domain
                             .git_authority_publisher()
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        // A remote branch and its immutable authority anchor may have advanced
+                        // atomically before this process was interrupted. Recover that authenticated
+                        // publication intent before comparing the stale checkout to the remote.
+                        publisher
+                            .recover_pending_publication()
                             .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                         let checked_out = publisher
                             .checked_out_revision()
@@ -821,6 +827,17 @@ impl ProductionDomainRegistry {
                         let authority = portable
                             .initialize(&database.id, &database.target_id)
                             .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        if domain.git_authority.is_some() {
+                            domain
+                                .git_authority_publisher()
+                                .map_err(|_| ProductionDomainError::UnsafeConfig)?
+                                .verify_remote_trust_anchor(
+                                    &database.id,
+                                    authority.record.generation,
+                                    &authority.revision,
+                                )
+                                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        }
                         local
                             .synchronize_from_portable(
                                 &database.id,
@@ -1702,7 +1719,7 @@ fn relay_authority_from_states(
     config: &SyncConfig,
     states: Vec<MaterializedState>,
 ) -> Result<RelayProviderAuthority, DomainFailure> {
-    let artifact_store = ArtifactStore::open(&config.provider_artifacts)
+    let artifact_store = ArtifactStore::open_existing(&config.provider_artifacts)
         .map_err(|_| DomainFailure::OperationFailed)?;
     for state in &states {
         state.verify().map_err(|_| DomainFailure::OperationFailed)?;
@@ -1810,7 +1827,7 @@ impl SyncDomain for ProductionSyncDomain {
         &self,
         approved: &Plan,
     ) -> Result<crate::PlanExecutionAuthority, DomainFailure> {
-        let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
+        let artifacts = ArtifactStore::open_existing(&self.config.provider_artifacts)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let record = self.load_execution_authority(approved)?;
         if record.relay_endpoint != self.config.relay_endpoint

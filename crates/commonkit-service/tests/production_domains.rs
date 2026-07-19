@@ -7,7 +7,79 @@ use commonkit_adapters::{
 use commonkit_contracts::{StableId, digest_domain_json};
 use commonkit_reconcile::PlanStore;
 use commonkit_reconcile::{Adapter, ReceiptStore, ReconcileOutcome, Reconciler};
-use commonkit_service::ProductionDomainRegistry;
+use commonkit_service::{
+    ControlError, ControlPlane, ExecutionResult, PlanExecutor, ProductionDomainRegistry, SyncDomain,
+};
+
+struct UnexpectedExecutor;
+
+impl PlanExecutor for UnexpectedExecutor {
+    fn execute(
+        &self,
+        _plan: &commonkit_contracts::Plan,
+        _confirmation_id: &StableId,
+    ) -> ExecutionResult {
+        panic!("rejected apply must not reach the executor")
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TreeEntry {
+    path: std::path::PathBuf,
+    kind: &'static str,
+    bytes: Vec<u8>,
+    mode: u32,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn filesystem_snapshot(root: &std::path::Path) -> Vec<TreeEntry> {
+    fn visit(base: &std::path::Path, path: &std::path::Path, entries: &mut Vec<TreeEntry>) {
+        let mut children = std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        children.sort();
+        for child in children {
+            let metadata = std::fs::symlink_metadata(&child).unwrap();
+            let file_type = metadata.file_type();
+            let (kind, bytes) = if file_type.is_dir() {
+                ("directory", Vec::new())
+            } else if file_type.is_symlink() {
+                (
+                    "symlink",
+                    std::fs::read_link(&child)
+                        .unwrap()
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .to_vec(),
+                )
+            } else {
+                ("file", std::fs::read(&child).unwrap())
+            };
+            #[cfg(unix)]
+            let mode = {
+                use std::os::unix::fs::PermissionsExt;
+                metadata.permissions().mode()
+            };
+            #[cfg(not(unix))]
+            let mode = u32::from(metadata.permissions().readonly());
+            entries.push(TreeEntry {
+                path: child.strip_prefix(base).unwrap().to_owned(),
+                kind,
+                bytes,
+                mode,
+                modified: metadata.modified().ok(),
+            });
+            if file_type.is_dir() {
+                visit(base, &child, entries);
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    visit(root, root, &mut entries);
+    entries
+}
 
 #[cfg(unix)]
 #[test]
@@ -312,6 +384,65 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         Err(commonkit_service::DomainFailure::OperationFailed),
         "an authenticated envelope cannot be replayed under another plan"
     );
+
+    let unavailable_artifacts = root.join("provider-artifacts-unavailable");
+    std::fs::rename(root.join("provider-artifacts"), &unavailable_artifacts).unwrap();
+    let before_rejected_apply = filesystem_snapshot(root);
+    let control = ControlPlane::new(std::sync::Arc::new(UnexpectedExecutor));
+    control
+        .set_target_sync_domains(BTreeMap::from([(
+            plan_contract.target_id.clone(),
+            sync.clone() as std::sync::Arc<dyn SyncDomain>,
+        )]))
+        .unwrap();
+    let registered = control.register_plan(plan_contract.clone()).unwrap();
+    assert!(matches!(
+        control.apply(
+            &registered.id,
+            &StableId::parse("read-only-authority-check").unwrap(),
+            "missing-artifact-root",
+        ),
+        Err(ControlError::PlanAuthorityChanged)
+    ));
+    assert!(!root.join("provider-artifacts").exists());
+    assert_eq!(
+        filesystem_snapshot(root),
+        before_rejected_apply,
+        "rejected apply must not create, chmod, repair, or otherwise mutate durable state"
+    );
+    std::fs::rename(unavailable_artifacts, root.join("provider-artifacts")).unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let artifact_root = root.join("provider-artifacts");
+        std::fs::set_permissions(&artifact_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let before_rejected_apply = filesystem_snapshot(root);
+        assert!(matches!(
+            control.apply(
+                &registered.id,
+                &StableId::parse("read-only-permission-check").unwrap(),
+                "unsafe-artifact-root-mode",
+            ),
+            Err(ControlError::PlanAuthorityChanged)
+        ));
+        assert_eq!(
+            filesystem_snapshot(root),
+            before_rejected_apply,
+            "rejected apply must not repair unsafe artifact-store permissions"
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&artifact_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        std::fs::set_permissions(&artifact_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
     let receipts = ReceiptStore::open(root.join("receipts")).unwrap();
     let run_id = StableId::parse("production-run").unwrap();
     let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(

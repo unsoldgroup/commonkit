@@ -38,6 +38,30 @@ impl ArtifactStore {
         Ok(Self { root })
     }
 
+    /// Opens a store for integrity validation without changing the filesystem.
+    ///
+    /// Unlike [`Self::open`], this never creates the root or repairs its
+    /// permissions. Execution-time authority checks use this path so rejecting
+    /// a stale or malformed plan is a strictly read-only operation.
+    pub fn open_existing(root: impl AsRef<Path>) -> Result<Self, ArtifactError> {
+        let root = root.as_ref();
+        let metadata = fs::symlink_metadata(root).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ArtifactError::InvalidRoot
+            } else {
+                error.into()
+            }
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(ArtifactError::InvalidRoot);
+        }
+        if !has_private_directory_permissions(&metadata) {
+            return Err(ArtifactError::InvalidRoot);
+        }
+        let root = root.canonicalize()?;
+        Ok(Self { root })
+    }
+
     pub fn put(
         &self,
         bytes: &[u8],
@@ -110,6 +134,18 @@ impl ArtifactStore {
             digest.as_str().trim_start_matches("sha256:")
         ))
     }
+}
+
+#[cfg(unix)]
+fn has_private_directory_permissions(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o777 == 0o700
+}
+
+#[cfg(not(unix))]
+fn has_private_directory_permissions(_metadata: &fs::Metadata) -> bool {
+    true
 }
 
 fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, ArtifactError> {
