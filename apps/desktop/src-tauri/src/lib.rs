@@ -337,14 +337,15 @@ impl ServiceClient {
 
     async fn apply(
         &self,
+        target_id: &str,
         plan_id: &str,
         confirmation_id: &str,
     ) -> Result<serde_json::Value, DesktopError> {
-        validate_digest(plan_id)?;
         validate_id(confirmation_id)?;
+        let route = target_apply_route(target_id, plan_id)?;
         let key = format!("desktop-{}", &plan_id[7..23]);
         Ok(self
-            .request(reqwest::Method::POST, &format!("/plans/{plan_id}/apply"))
+            .request(reqwest::Method::POST, &route)
             .await?
             .header("idempotency-key", key)
             .json(&serde_json::json!({"confirmed": true, "confirmationId": confirmation_id}))
@@ -354,6 +355,22 @@ impl ServiceClient {
             .json()
             .await?)
     }
+}
+
+fn target_convergence_route(target_id: &str, action: &str) -> Result<String, DesktopError> {
+    validate_id(target_id)?;
+    if !matches!(action, "sync/plan" | "verify") {
+        return Err(DesktopError::InvalidInput);
+    }
+    Ok(format!("/targets/{target_id}/{action}"))
+}
+
+fn target_apply_route(target_id: &str, plan_id: &str) -> Result<String, DesktopError> {
+    validate_digest(plan_id)?;
+    Ok(format!(
+        "{}/plans/{plan_id}/apply",
+        target_convergence_route(target_id, "verify")?.trim_end_matches("/verify")
+    ))
 }
 
 fn management_routes() -> [(&'static str, &'static str); 6] {
@@ -367,9 +384,11 @@ fn management_routes() -> [(&'static str, &'static str); 6] {
     ]
 }
 
-fn operator_routes() -> [(&'static str, &'static str); 10] {
+fn operator_routes() -> [(&'static str, &'static str); 12] {
     [
-        ("verify", "/verify"),
+        ("plan", "/targets/{target}/sync/plan"),
+        ("verify", "/targets/{target}/verify"),
+        ("apply", "/targets/{target}/plans/{plan}/apply"),
         ("snapshot_create", "/snapshots"),
         ("snapshot_restore", "/snapshots/restore"),
         ("snapshot_promote", "/snapshots/promote"),
@@ -536,10 +555,21 @@ async fn desktop_management_snapshot(
 #[tauri::command]
 async fn apply_plan(
     client: tauri::State<'_, ServiceClient>,
+    target_id: String,
     plan_id: String,
     confirmation_id: String,
 ) -> Result<serde_json::Value, DesktopError> {
-    client.apply(&plan_id, &confirmation_id).await
+    client.apply(&target_id, &plan_id, &confirmation_id).await
+}
+
+#[tauri::command]
+async fn plan_sync(
+    client: tauri::State<'_, ServiceClient>,
+    target_id: String,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    let path = target_convergence_route(&target_id, "sync/plan")?;
+    post_confirmed(&client, &path, serde_json::json!({}), &confirmation_id).await
 }
 
 fn confirmed_body(
@@ -571,12 +601,14 @@ async fn post_confirmed(
 #[tauri::command]
 async fn desktop_verify(
     client: tauri::State<'_, ServiceClient>,
+    target_id: String,
 ) -> Result<serde_json::Value, DesktopError> {
+    let path = target_convergence_route(&target_id, "verify")?;
     client
         .json(
             reqwest::Method::POST,
-            "/verify",
-            Some(serde_json::json!({"targetId": null, "pointer": null})),
+            &path,
+            Some(serde_json::json!({"targetId": target_id, "pointer": null})),
         )
         .await
 }
@@ -859,6 +891,7 @@ pub fn run() {
             onboarding_initialize,
             desktop_management_snapshot,
             apply_plan,
+            plan_sync,
             desktop_verify,
             targets_list,
             targets_select,
@@ -926,7 +959,9 @@ mod tests {
         assert_eq!(
             operator_routes(),
             [
-                ("verify", "/verify"),
+                ("plan", "/targets/{target}/sync/plan"),
+                ("verify", "/targets/{target}/verify"),
+                ("apply", "/targets/{target}/plans/{plan}/apply"),
                 ("snapshot_create", "/snapshots"),
                 ("snapshot_restore", "/snapshots/restore"),
                 ("snapshot_promote", "/snapshots/promote"),
@@ -945,6 +980,26 @@ mod tests {
         assert!(validate_digest("../../control.token").is_err());
         assert!(validate_id("desktop-confirmation-1").is_ok());
         assert!(validate_id("bad/value").is_err());
+    }
+    #[test]
+    fn convergence_routes_are_scoped_to_the_selected_target() {
+        assert_eq!(
+            target_convergence_route("workstation-a", "sync/plan").unwrap(),
+            "/targets/workstation-a/sync/plan"
+        );
+        assert_eq!(
+            target_convergence_route("workstation-a", "verify").unwrap(),
+            "/targets/workstation-a/verify"
+        );
+        assert_eq!(
+            target_apply_route("workstation-a", &format!("sha256:{}", "a".repeat(64))).unwrap(),
+            format!(
+                "/targets/workstation-a/plans/sha256:{}/apply",
+                "a".repeat(64)
+            )
+        );
+        assert!(target_convergence_route("../other", "verify").is_err());
+        assert!(target_apply_route("workstation-a", "stale-plan").is_err());
     }
     #[test]
     fn update_install_requires_consent_bound_to_the_observed_version() {

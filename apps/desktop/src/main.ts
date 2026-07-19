@@ -7,6 +7,7 @@ import { updatePanel, type UpdateUiState } from "./updater-view.ts";
 import { managementPanel } from "./management-view.ts";
 import { onboardingPanel, type OnboardingProvider } from "./onboarding-view.ts";
 import { open } from "@tauri-apps/plugin-dialog";
+import { assertPlanTarget, convergenceTarget } from "./target-selection.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
@@ -144,7 +145,38 @@ async function showResult(route: Route, action: () => Promise<unknown>): Promise
 }
 
 function bindManagementActions(route: Route): void {
-  document.querySelector("#verify-state")?.addEventListener("click", () => void showResult(route, desktopApi.verify));
+  document.querySelector("#plan-sync")?.addEventListener("click", () => {
+    try {
+      const targetId = convergenceTarget(targets);
+      if (!window.confirm(`Stage providers and create a plan for ${targetId}?`)) return;
+      void showResult(route, async () => {
+        const plan = await desktopApi.planSync(targetId, confirmationId("plan-sync"));
+        assertPlanTarget(plan, targetId);
+        return plan;
+      });
+    } catch (error) {
+      void showResult(route, async () => { throw error; });
+    }
+  });
+  document.querySelector("#verify-state")?.addEventListener("click", () => {
+    try {
+      const targetId = convergenceTarget(targets);
+      void showResult(route, () => desktopApi.verify(targetId));
+    } catch (error) {
+      void showResult(route, async () => { throw error; });
+    }
+  });
+  document.querySelector("#apply-plan")?.addEventListener("click", () => {
+    const planId = required("Reviewed plan digest");
+    if (!planId) return;
+    try {
+      const targetId = convergenceTarget(targets);
+      if (!window.confirm(`Apply reviewed plan ${planId} to ${targetId}?`)) return;
+      void showResult(route, () => desktopApi.applyPlan(targetId, planId, confirmationId("apply-plan")));
+    } catch (error) {
+      void showResult(route, async () => { throw error; });
+    }
+  });
   document.querySelector("#snapshot-create")?.addEventListener("click", () => {
     const databaseId = required("Database ID to snapshot");
     if (!databaseId || !window.confirm(`Create an encrypted snapshot of ${databaseId}?`)) return;

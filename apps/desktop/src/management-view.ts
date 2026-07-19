@@ -15,7 +15,7 @@ export function managementPanel(route: Route, state: ManagementState): string {
 function operatorActions(route: Route): string {
   switch (route) {
     case "plans":
-      return '<div class="actions"><button id="verify-state">Verify managed state</button></div>';
+      return '<div class="actions"><button id="plan-sync">Plan selected target</button><button id="verify-state">Verify selected target</button><button id="apply-plan">Apply reviewed plan</button></div>';
     case "snapshots":
       return '<div class="actions"><button id="snapshot-create">Create snapshot</button><button id="snapshot-restore">Restore snapshot</button><button id="snapshot-promote">Promote writer</button></div>';
     case "relay":
