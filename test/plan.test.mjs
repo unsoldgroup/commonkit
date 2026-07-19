@@ -39,3 +39,11 @@ test('never plans credentials or live runtime databases', () => {
     assert.equal(isForbiddenPath(operation.target), false, operation.target)
   }
 })
+
+test('recognizes forbidden Windows paths', () => {
+  for (const candidate of [
+    String.raw`C:\Users\al\.codex\auth.json`,
+    String.raw`C:\Users\al\skill\secrets\token.txt`,
+    String.raw`D:\runtime\context-mode\sessions\active.db`,
+  ]) assert.equal(isForbiddenPath(candidate), true, candidate)
+})

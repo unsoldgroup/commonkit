@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import test from "node:test";
 
@@ -91,7 +92,7 @@ test("updater manifest uses Tauri platform keys and signed payloads", async () =
     const notes = join(root, "release-notes.md");
     await writeFile(notes, "Security and reliability improvements.");
     await execFileAsync(process.execPath, [
-      new URL("../scripts/assemble-updater-manifest.mjs", import.meta.url).pathname,
+      fileURLToPath(new URL("../scripts/assemble-updater-manifest.mjs", import.meta.url)),
       root,
       "v1.2.3",
       notes,

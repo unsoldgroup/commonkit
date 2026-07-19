@@ -21,7 +21,8 @@ const FORBIDDEN = [
 ]
 
 export function isForbiddenPath(candidate) {
-  return FORBIDDEN.some((pattern) => pattern.test(candidate))
+  const portableCandidate = candidate.replaceAll('\\', '/')
+  return FORBIDDEN.some((pattern) => pattern.test(portableCandidate))
 }
 
 export function buildPlan({ home, remoteHome }) {

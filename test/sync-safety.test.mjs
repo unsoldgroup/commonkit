@@ -11,7 +11,7 @@ test('detects forbidden paths recursively before rsync', () => {
   try {
     fs.mkdirSync(path.join(root, 'skill', 'secrets'), { recursive: true })
     fs.writeFileSync(path.join(root, 'skill', 'secrets', 'token.txt'), 'not-a-real-secret')
-    assert.match(findForbiddenDescendant(root), /\/secrets$/)
+    assert.equal(path.basename(findForbiddenDescendant(root)), 'secrets')
     assert.ok(RSYNC_EXCLUDES.includes('secrets/'))
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
