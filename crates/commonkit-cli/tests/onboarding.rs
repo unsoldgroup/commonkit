@@ -301,6 +301,28 @@ mkdir -p "$dest"; cp -R "$src"/. "$dest"/; [ -f "$dest/dot_editor" ] && mv "$des
 }
 
 #[test]
+fn create_rejects_secret_plaintext_in_provider_imports() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let source = temporary.path().join("source");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::write(source.join("dot_config"), "api_token: plaintext-value\n").unwrap();
+    let config = temporary.path().join("chezmoi.toml");
+    std::fs::write(&config, "[data]\n").unwrap();
+    test_support::write_logging_tools(&bin, &temporary.path().join("commands"));
+    test_support::write_tool(&bin, "chezmoi", "exit 0");
+    let mut request = request(temporary.path(), InitMode::Create, "owner/secret-kit");
+    request.provider = ProviderSelection::Chezmoi {
+        executable: bin.join("chezmoi"),
+        source,
+        config,
+    };
+    let error = initialize(&request, &ProcessRunner::new(&bin)).unwrap_err();
+    assert!(error.to_string().contains("secret-like"));
+}
+
+#[test]
 fn connect_rejects_native_sources_that_escape_the_git_checkout() {
     let temporary = tempfile::tempdir().unwrap();
     let bin = temporary.path().join("bin");

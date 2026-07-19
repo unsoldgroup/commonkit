@@ -742,23 +742,35 @@ fn read_safe_import_file(path: &Path) -> Result<Vec<u8>, OnboardingError> {
         return Err(OnboardingError::EmptyProviderInput(path.into()));
     }
     if let Ok(text) = std::str::from_utf8(&bytes) {
+        commonkit_contracts::assert_no_embedded_secrets(&serde_json::Value::String(
+            text.to_owned(),
+        ))
+        .map_err(|_| OnboardingError::SecretLikeImport(path.into()))?;
         for line in text.lines() {
-            let lower = line.trim().to_ascii_lowercase();
-            if [
-                "token:",
-                "password:",
-                "api_key:",
-                "apikey:",
-                "client_secret:",
-            ]
-            .iter()
-            .any(|key| lower.starts_with(key))
-            {
-                let value = line
-                    .split_once(':')
-                    .map(|(_, value)| value.trim())
-                    .unwrap_or("");
-                if !value.is_empty() && !value.starts_with("${") && !value.contains("://") {
+            if let Some((key, value)) = line.trim().split_once(':') {
+                let key = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>();
+                let sensitive = [
+                    "apikey",
+                    "token",
+                    "secret",
+                    "password",
+                    "passwd",
+                    "authorization",
+                    "credential",
+                    "privatekey",
+                ]
+                .iter()
+                .any(|marker| key == *marker || key.ends_with(marker));
+                let value = value.trim().trim_matches(['"', '\'']);
+                let reference = value.starts_with('$')
+                    || ["env:", "secret:", "bws:", "keychain:", "vault:"]
+                        .iter()
+                        .any(|prefix| value.to_ascii_lowercase().starts_with(prefix));
+                if sensitive && !value.is_empty() && value != "false" && !reference {
                     return Err(OnboardingError::SecretLikeImport(path.into()));
                 }
             }
