@@ -20,7 +20,9 @@ use commonkit_contracts::{
     LayerDocument, Plan, ReceiptState, Sha256Digest, StableId, assert_no_embedded_secrets,
     digest_domain_json,
 };
-use commonkit_reconcile::{Adapter, PlanStore, ReceiptStore, ReconcileOutcome, Reconciler};
+use commonkit_reconcile::{
+    Adapter, PlanStore, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
+};
 use commonkit_snapshots::{
     AuthenticatedCipher, Authority, AuthorityStore, DatabaseId, DatabaseLifecycle, DurableRestore,
     ObjectStore, ProcessObjectCommandRunner, PromotionPlan, RestoreFailpoint, RestorePlan,
@@ -318,9 +320,15 @@ impl ProductionSshPlanExecutor {
             Ok(_) => Reconciler::with_store(&self.receipts)
                 .recover_run(run_id, &durable, &mut adapters)
                 .map_err(|_| DomainFailure::OperationFailed),
-            Err(_) => Reconciler::with_store(&self.receipts)
+            Err(ReceiptError::NotFound(_)) => Reconciler::with_store(&self.receipts)
                 .execute(&durable, run_id, &mut adapters)
                 .map_err(|_| DomainFailure::OperationFailed),
+            Err(ReceiptError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                Reconciler::with_store(&self.receipts)
+                    .execute(&durable, run_id, &mut adapters)
+                    .map_err(|_| DomainFailure::OperationFailed)
+            }
+            Err(_) => Err(DomainFailure::OperationFailed),
         }
     }
 }
