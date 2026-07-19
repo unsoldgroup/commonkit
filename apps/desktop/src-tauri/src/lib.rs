@@ -472,13 +472,12 @@ async fn schedule_configure(
     if interval_seconds == 0 {
         return Err(DesktopError::InvalidInput);
     }
-    post_confirmed(
-        &client,
-        "/schedule",
-        serde_json::json!({"enabled": enabled, "intervalSeconds": interval_seconds}),
-        &confirmation_id,
-    )
-    .await
+    let body = if enabled {
+        serde_json::json!({"enabled": true, "intervalSeconds": interval_seconds})
+    } else {
+        serde_json::json!({"enabled": false})
+    };
+    post_confirmed(&client, "/schedule", body, &confirmation_id).await
 }
 
 fn validate_ids(values: &[String]) -> Result<(), DesktopError> {

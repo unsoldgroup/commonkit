@@ -966,7 +966,6 @@ fn run_schedule(command: ScheduleCommand) -> Result<(), Box<dyn Error>> {
                 "/control/v1/schedule",
                 Some(json!({
                     "enabled": false,
-                    "intervalSeconds": 1,
                     "confirmed": true,
                     "confirmationId": nonce("schedule-disable")
                 })),
