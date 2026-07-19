@@ -3965,6 +3965,7 @@ mod runtime_reload_tests {
             .clone()
             .oneshot(
                 Request::get("/control/v1/domains/reload")
+                    .header(header::HOST, "127.0.0.1:12345")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -3979,6 +3980,7 @@ mod runtime_reload_tests {
                     Request::builder()
                         .method(method)
                         .uri("/control/v1/domains/reload")
+                        .header(header::HOST, "127.0.0.1:12345")
                         .header(
                             header::AUTHORIZATION,
                             format!("Bearer {}", token.expose_for_client()),
@@ -3995,6 +3997,7 @@ mod runtime_reload_tests {
         let adopted = app
             .oneshot(
                 Request::post("/control/v1/sync/plan")
+                    .header(header::HOST, "127.0.0.1:12345")
                     .header(
                         header::AUTHORIZATION,
                         format!("Bearer {}", token.expose_for_client()),
