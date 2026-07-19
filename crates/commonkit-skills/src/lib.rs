@@ -2173,6 +2173,7 @@ mod provider_requirement_tests {
 mod provider_sandbox_tests {
     use super::{create_private_staging, isolated_command};
     use std::path::Path;
+    use std::process::Command;
 
     #[test]
     fn narrow_profile_can_start_the_system_shell_from_staging() {
@@ -2186,6 +2187,71 @@ mod provider_sandbox_tests {
             .expect("execute sandboxed shell");
         let _ = std::fs::remove_dir_all(staging);
         assert!(status.success());
+    }
+
+    #[test]
+    fn sandbox_denies_network_outside_writes_and_undeclared_processes() {
+        let staging = create_private_staging().expect("staging");
+        let root = staging.parent().expect("staging parent").join(format!(
+            "commonkit-skillopt-adversary-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("provider root");
+        let source = root.join("adversary.c");
+        let executable = root.join("adversary");
+        std::fs::write(
+            &source,
+            r#"#include <arpa/inet.h>
+#include <fcntl.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char **environ;
+int main(int argc, char **argv) {
+  if (argc != 3) return 2;
+  if (open(argv[2], O_CREAT | O_WRONLY, 0600) >= 0) return 10;
+  int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (socket_fd >= 0) {
+    struct sockaddr_in address = {0};
+    address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) == 0) return 11;
+    close(socket_fd);
+  }
+  pid_t pid = 0; char *args[] = { "/usr/bin/true", NULL };
+  if (posix_spawn(&pid, args[0], NULL, NULL, args, environ) == 0) {
+    waitpid(pid, NULL, 0); return 12;
+  }
+  FILE *proof = fopen(argv[1], "w");
+  if (!proof) return 13;
+  fputs("isolated\n", proof); fclose(proof); return 0;
+}"#,
+        )
+        .expect("adversary source");
+        let compiled = Command::new("/usr/bin/clang")
+            .args(["-Os", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .status()
+            .expect("compile adversary");
+        assert!(compiled.success());
+        let proof = staging.join("proof.txt");
+        let outside = root.join("outside.txt");
+        let status = isolated_command(&executable, &staging, &[])
+            .expect("sandbox command")
+            .arg(&proof)
+            .arg(&outside)
+            .status()
+            .expect("run adversary");
+        assert!(
+            status.success(),
+            "sandbox adversary escaped or could not write its proof: {status}"
+        );
+        assert_eq!(std::fs::read_to_string(&proof).unwrap(), "isolated\n");
+        assert!(!outside.exists());
+        std::fs::remove_dir_all(&root).expect("remove provider root");
+        std::fs::remove_dir_all(staging).expect("remove staging");
     }
 }
 
@@ -2425,8 +2491,30 @@ fn isolated_command(
         )
         .collect::<Result<Vec<_>, _>>()?
         .join(" ");
+    let mut exec_rules = std::iter::once(
+        executable
+            .parent()
+            .ok_or(SkillError::ProviderIsolationUnavailable)?,
+    )
+    .chain(extra_read_roots.iter().copied())
+    .map(|path| quoted(path).map(|path| format!("(subpath {path})")))
+    .collect::<Result<Vec<_>, _>>()?;
+    // Console scripts may use the system shell as their pinned interpreter;
+    // every other executable must reside in a measured provider root.
+    for interpreter_or_utility in [
+        "/bin/sh",
+        "/bin/bash",
+        "/bin/mkdir",
+        "/bin/sleep",
+        "/usr/bin/dirname",
+        "/usr/bin/grep",
+    ] {
+        exec_rules.push(format!("(literal \"{interpreter_or_utility}\")"));
+    }
+    let exec_rules = exec_rules.join(" ");
     let profile = format!(
-        "(version 1) (deny default) (allow process*) (allow sysctl-read) \
+        "(version 1) (deny default) (allow process-fork) \
+         (allow process-exec {exec_rules}) (allow sysctl-read) \
          (allow file-read* {read_rules}) (allow file-write* (subpath {})) \
          (deny network*)",
         quoted(staging)?

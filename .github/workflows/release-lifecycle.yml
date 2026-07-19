@@ -100,19 +100,17 @@ jobs:
           hdiutil detach "$RUNNER_TEMP/commonkit-mount"
           codesign --verify --deep --strict /Applications/CommonKit.app
           spctl --assess --type execute --verbose /Applications/CommonKit.app
-      - name: Update macOS by installing current signed release
+      - name: Update macOS through the signed Tauri updater
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
-          dmg=$(find current -maxdepth 1 -name '*.dmg' -print -quit)
-          test -n "$dmg"
-          mkdir "$RUNNER_TEMP/commonkit-update-mount"
-          hdiutil attach -nobrowse -readonly -mountpoint "$RUNNER_TEMP/commonkit-update-mount" "$dmg"
-          app=$(find "$RUNNER_TEMP/commonkit-update-mount" -maxdepth 1 -name '*.app' -print -quit)
-          test -n "$app"
-          sudo ditto "$app" /Applications/CommonKit.app
-          hdiutil detach "$RUNNER_TEMP/commonkit-update-mount"
+          report="$RUNNER_TEMP/commonkit-tauri-update.json"
+          expected="${{ inputs.current_tag }}"; expected="${expected#v}"
+          COMMONKIT_DESKTOP_UPDATE_REPORT="$report" \
+            COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION="$expected" \
+            /Applications/CommonKit.app/Contents/MacOS/commonkit-desktop
+          node -e 'const r=require(process.argv[1]);if(!r.updatedByTauri||r.installedVersion!==process.argv[2])process.exit(1)' "$report" "$expected"
           codesign --verify --deep --strict /Applications/CommonKit.app
           spctl --assess --type execute --verbose /Applications/CommonKit.app
       - name: Launch installed macOS desktop and verify its managed daemon
@@ -142,16 +140,21 @@ jobs:
           echo "COMMONKIT_DEB_PACKAGE=$package" >> "$GITHUB_ENV"
           sudo dpkg -i "$deb"
           dpkg-query --show "$package"
-      - name: Update Linux by installing current signed Debian release
+      - name: Update Linux AppImage through the signed Tauri updater
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          deb=$(find current -maxdepth 1 -name '*.deb' -print -quit)
-          test -n "$deb"
-          test "$(dpkg-deb --field "$deb" Package)" = "$COMMONKIT_DEB_PACKAGE"
-          sudo dpkg -i "$deb"
-          dpkg-query --show "$COMMONKIT_DEB_PACKAGE"
+          appimage=$(find previous -maxdepth 1 -name '*.AppImage' -print -quit)
+          test -n "$appimage"
+          cp "$appimage" "$RUNNER_TEMP/CommonKit.AppImage"
+          chmod +x "$RUNNER_TEMP/CommonKit.AppImage"
+          report="$RUNNER_TEMP/commonkit-tauri-update.json"
+          expected="${{ inputs.current_tag }}"; expected="${expected#v}"
+          COMMONKIT_DESKTOP_UPDATE_REPORT="$report" \
+            COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION="$expected" \
+            xvfb-run -a "$RUNNER_TEMP/CommonKit.AppImage"
+          node -e 'const r=require(process.argv[1]);if(!r.updatedByTauri||r.installedVersion!==process.argv[2])process.exit(1)' "$report" "$expected"
       - name: Launch installed Linux desktop and verify its managed daemon
         if: runner.os == 'Linux'
         shell: bash
@@ -175,15 +178,22 @@ jobs:
           if ((Get-AuthenticodeSignature $installer.FullName).Status -ne 'Valid') { throw 'Previous NSIS signature is not valid' }
           $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Previous NSIS install failed: $($process.ExitCode)" }
-      - name: Update Windows by installing current signed NSIS release
+      - name: Update Windows through the signed Tauri updater
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $installer = Get-ChildItem current -Filter '*-setup.exe' | Select-Object -First 1
-          if (-not $installer) { throw 'Current NSIS installer not found' }
-          if ((Get-AuthenticodeSignature $installer.FullName).Status -ne 'Valid') { throw 'Current NSIS signature is not valid' }
-          $process = Start-Process -FilePath $installer.FullName -ArgumentList '/S' -Wait -PassThru
-          if ($process.ExitCode -ne 0) { throw "Current NSIS update failed: $($process.ExitCode)" }
+          $entry = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -eq 'CommonKit' } | Select-Object -First 1
+          $desktop = ($entry.DisplayIcon -split ',')[0].Trim('"')
+          if (-not (Test-Path $desktop)) { throw 'Installed CommonKit desktop path is unavailable' }
+          $report = Join-Path $env:RUNNER_TEMP 'commonkit-tauri-update.json'
+          $expected = '${{ inputs.current_tag }}'.TrimStart('v')
+          $env:COMMONKIT_DESKTOP_UPDATE_REPORT = $report
+          $env:COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION = $expected
+          $process = Start-Process -FilePath $desktop -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Tauri updater failed: $($process.ExitCode)" }
+          $result = Get-Content $report -Raw | ConvertFrom-Json
+          if (-not $result.updatedByTauri -or $result.installedVersion -ne $expected) { throw 'Tauri updater did not install the expected signed release' }
       - name: Launch installed Windows desktop and verify its managed daemon
         if: runner.os == 'Windows'
         shell: pwsh

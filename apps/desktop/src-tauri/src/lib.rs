@@ -1186,6 +1186,7 @@ async fn refresh_tray(app: tauri::AppHandle) {
         let runtime = RuntimeBinaryLayout::discover();
         let payload = serde_json::json!({
             "schemaVersion": 1,
+            "desktopVersion": env!("CARGO_PKG_VERSION"),
             "desktopExecutable": std::env::current_exe().ok(),
             "serviceState": status.state,
             "runtimeVersion": status.runtime_version,

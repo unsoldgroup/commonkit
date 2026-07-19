@@ -116,6 +116,12 @@ start_daemon() {
 trap stop_daemon EXIT
 start_daemon
 "$commonkit" daemon status | node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>{const s=JSON.parse(b);if(!s.installed||!s.running)process.exit(1)})'
+"$commonkit" daemon restart >/dev/null
+for _ in $(seq 1 150); do
+  if "$commonkit" relay status >/dev/null 2>&1; then restarted=1; break; fi
+  sleep 0.1
+done
+test "${restarted:-}" = 1
 
 init_json="$scratch/init.json"
 "$commonkit" init connect \

@@ -133,6 +133,12 @@ test("release lifecycle matrix exercises install update and uninstall", async ()
   assert.match(workflow, /commonkitd-linux-x86_64/);
   assert.match(workflow, /commonkitd-windows-x86_64\.exe/);
   assert.match(workflow, /installed-lifecycle\.sh/);
+  assert.match(workflow, /COMMONKIT_DESKTOP_UPDATE_REPORT/);
+  assert.match(workflow, /COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION/);
+  assert.match(workflow, /updatedByTauri/);
+  assert.doesNotMatch(workflow, /Update macOS by installing current signed release/);
+  assert.doesNotMatch(workflow, /Update Linux by installing current signed Debian release/);
+  assert.doesNotMatch(workflow, /Update Windows by installing current signed NSIS release/);
 });
 
 test("CI exercises an unsigned installed CLI and daemon lifecycle on every OS", async () => {
