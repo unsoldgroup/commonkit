@@ -97,7 +97,7 @@ if ! {
   exit 1
 fi
 node -e 'const r=require(process.argv[1]);if(r.result!=="applied")process.exit(1)' "$direct_response"
-test "$(cat "$target/ssh-proof.txt")" = ssh
+test "$(sudo -u "$user" cat "$target/ssh-proof.txt")" = ssh
 sudo -u "$user" rm "$target/ssh-proof.txt"
 helper_stderr="$scratch/helper-stderr.log"
 if ! printf '%s' "$request" | ssh -T -i "$key" -p "$port" \
@@ -109,4 +109,4 @@ if ! printf '%s' "$request" | ssh -T -i "$key" -p "$port" \
   exit 1
 fi
 node -e 'const r=require(process.argv[1]);if(r.result!=="applied")process.exit(1)' "$scratch/response.json"
-test "$(cat "$target/ssh-proof.txt")" = ssh
+test "$(sudo -u "$user" cat "$target/ssh-proof.txt")" = ssh
