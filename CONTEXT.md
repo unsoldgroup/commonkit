@@ -58,12 +58,31 @@ _Avoid_: Provider, package manager
 The process of planning, applying, and verifying a target against its selected loadout.
 _Avoid_: File copy, deployment
 
+**Job**:
+An immutable, content-addressed request for durable execution that outlives its submitting client.
+_Avoid_: Task process, remote command
+
+**Attempt**:
+A revisioned execution of a **Job** with its own lease, fencing token, and terminal receipt.
+_Avoid_: Job retry
+
+**Execution Profile**:
+Execution-only resource, capability, isolation, and comparability requirements for a **Job**.
+_Avoid_: Loadout
+
+**Execution Target**:
+A managed **Target** advertising durable-execution readiness, capacity, and an exact Loadout digest.
+_Avoid_: Worker box
+
 ## Relationships
 
 - A **CommonKit** defines one or more **Loadouts**.
 - A **CommonKit** composes configuration in this precedence order: public base, organization policy, personal kit, project loadout, then target overrides.
 - Organization security policy is a non-overridable floor. Later layers may tighten it but cannot weaken it.
 - A **Loadout** is materialized on one or more **Targets**.
+- A **Job** has one or more ordered **Attempts**, but at most one active leased **Attempt**.
+- An **Execution Target** references a managed **Target** and exact Loadout and **Execution Profile** digests.
+- MCP exposes context and durable execution controls; `commonkit-execd` owns lifecycle persistence independently of MCP sessions.
 - An **Adapter** participates in **Reconciliation** for one agent or service.
 - A **Loadout** selects a version-pinned **Agent-context provider** for portable agent content.
 - A **Desired-state provider** computes resources in isolated staging; it never mutates a managed live target.

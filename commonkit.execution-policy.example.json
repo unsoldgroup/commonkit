@@ -1,0 +1,8 @@
+{
+  "allowedRepositories": ["https://github.com/example/project.git"],
+  "maxCpuMillis": 4000,
+  "maxMemoryMib": 8192,
+  "maxDiskMib": 20480,
+  "allowNetwork": false,
+  "allowRepositoryWrite": false
+}

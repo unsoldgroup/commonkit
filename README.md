@@ -11,12 +11,26 @@ providers compute normalized desired resources in isolation. CommonKit alone
 owns target policy, mutation, receipts, verification, recovery, services,
 credentials, the persistent MCP relay, and mutable-state snapshots.
 
+Durable remote jobs and browser benchmark shards are handled by the Rust
+`commonkit-execd` service. Remote Claude/Codex sessions receive repository-declared
+tasks, issue context, plans, and skills through CommonKit MCP; execution continues
+when the submitting session disconnects. See
+[`docs/scopes/durable-execution-v1.md`](docs/scopes/durable-execution-v1.md).
+
+This repository is a pnpm workspace. It also owns the independently
+publishable [`mcp-local-relay`](packages/mcp-local-relay) package, which keeps
+MCP upstreams warm and exposes them through one persistent local endpoint.
+CommonKit remains the desired-state control plane; the relay is its MCP data
+plane.
+
 ## V1 architecture
 
 - Microsoft APM is the preferred agent-context provider.
 - Chezmoi is the preferred home-configuration provider for the supported,
   side-effect-free subset.
 - Native providers remain available for migration and fallback.
+- On macOS, external providers fail closed unless their isolation contract is
+  available; the supported native fallback remains available.
 - Provider output is staged in a content-addressed artifact store; providers
   never apply directly to a managed live target.
 - Filesystem, service, credential, relay, and snapshot adapters perform the

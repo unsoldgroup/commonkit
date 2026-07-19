@@ -26,3 +26,11 @@ fn rejects_embedded_secrets_and_accepts_references() {
         assert_no_embedded_secrets(&safe_value).expect("safe reference");
     }
 }
+
+#[test]
+fn permits_numeric_fencing_tokens_but_not_string_credentials() {
+    assert!(assert_no_embedded_secrets(&serde_json::json!({"fencingToken": 42})).is_ok());
+    assert!(
+        assert_no_embedded_secrets(&serde_json::json!({"fencingToken": "raw-secret"})).is_err()
+    );
+}

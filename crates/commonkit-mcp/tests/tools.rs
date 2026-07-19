@@ -1,10 +1,13 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use commonkit_contracts::*;
 use commonkit_mcp::{
-    ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend,
-    ProposeSkillCanaryApplyInput, ProposeSkillCanaryRollbackInput, ProposeSkillPromotionInput,
-    ReadInput, RelayReconcileInput, RelayReviewInput, ShowSkillCandidateInput,
-    SkillEvidencePreviewInput, SkillOpportunitiesInput, TargetConsentInput,
+    ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend, ExecutionBackend,
+    ExecutionContext, ProposeSkillCanaryApplyInput, ProposeSkillCanaryRollbackInput,
+    ProposeSkillPromotionInput, ReadInput, RelayReconcileInput, RelayReviewInput,
+    ShowSkillCandidateInput, SkillEvidencePreviewInput, SkillOpportunitiesInput, SubmitTaskInput,
+    TargetConsentInput,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
@@ -33,6 +36,58 @@ impl ControlBackend for FakeBackend {
         Box::pin(async move { Ok(json!({"path": path})) })
     }
 }
+#[derive(Default)]
+struct FakeExecution {
+    paths: Mutex<Vec<String>>,
+}
+impl ExecutionBackend for FakeExecution {
+    fn request(
+        &self,
+        _: &'static str,
+        path: String,
+        _: Option<serde_json::Value>,
+    ) -> BackendFuture<'_> {
+        self.paths.lock().unwrap().push(path);
+        Box::pin(async { Ok(json!({"jobId":"job_1"})) })
+    }
+}
+fn digest(seed: char) -> Sha256Digest {
+    Sha256Digest::parse(format!("sha256:{}", seed.to_string().repeat(64))).unwrap()
+}
+fn manifest() -> ExecutionManifest {
+    ExecutionManifest {
+        schema_version: SchemaVersion(1),
+        repository: "https://example.invalid/repo.git".into(),
+        repository_revision: GitRevision::parse("a".repeat(40)).unwrap(),
+        workspace_bundle_digest: None,
+        argv: vec!["cargo".into(), "test".into()],
+        workdir: PortableSourcePath::parse("repo").unwrap(),
+        secret_refs: vec![],
+        timeout_seconds: 60,
+        cancel_grace_seconds: 1,
+        resources: ResourceRequirements {
+            cpu_millis: 100,
+            memory_mib: 64,
+            disk_mib: 10,
+        },
+        required_capabilities: BTreeSet::new(),
+        loadout_digest: digest('b'),
+        execution_profile_digest: digest('c'),
+        retry: RetryPolicy {
+            max_attempts: 1,
+            retryable_exit_codes: BTreeSet::new(),
+        },
+        checkpoint_enabled: false,
+        artifacts: ArtifactPolicy {
+            globs: vec![],
+            retention_seconds: 60,
+            max_bytes: 1024,
+        },
+        network_policy: NetworkPolicy::Deny,
+        repository_write: false,
+        browser: None,
+    }
+}
 
 #[test]
 fn publishes_stable_initial_tool_names() {
@@ -41,11 +96,18 @@ fn publishes_stable_initial_tool_names() {
         names,
         [
             "commonkit_apply_plan",
+            "commonkit_cancel_job",
             "commonkit_compose",
             "commonkit_credentials_readiness",
             "commonkit_explain",
             "commonkit_export_diagnostics",
+            "commonkit_get_artifact_access",
+            "commonkit_get_execution_context",
+            "commonkit_get_execution_targets",
+            "commonkit_get_job",
+            "commonkit_get_job_events",
             "commonkit_get_status",
+            "commonkit_list_job_artifacts",
             "commonkit_list_skill_candidates",
             "commonkit_list_skills",
             "commonkit_plan_sync",
@@ -55,6 +117,8 @@ fn publishes_stable_initial_tool_names() {
             "commonkit_propose_skill_promotion",
             "commonkit_relay_reconcile",
             "commonkit_relay_status",
+            "commonkit_resume_job",
+            "commonkit_retry_job",
             "commonkit_rollback",
             "commonkit_schedule_status",
             "commonkit_schedule_update",
@@ -62,6 +126,7 @@ fn publishes_stable_initial_tool_names() {
             "commonkit_skill_opportunities",
             "commonkit_snapshot_create",
             "commonkit_snapshot_restore",
+            "commonkit_submit_task",
             "commonkit_verify",
         ]
     );
@@ -337,4 +402,37 @@ async fn read_tools_forward_only_bounded_structured_inputs() {
         result.structured_content.expect("structured")["path"],
         "/control/v1/compose"
     );
+}
+
+#[tokio::test]
+async fn remote_mcp_submits_only_repository_declared_tasks() {
+    let execution = Arc::new(FakeExecution::default());
+    let server = CommonKitMcp::new(Arc::new(FakeBackend::default())).with_execution(
+        execution.clone(),
+        ExecutionContext {
+            issue_id: "USG-46".into(),
+            plan: "Run contracts".into(),
+            skills: vec!["durable-objects".into()],
+            tasks: BTreeMap::from([("verify".into(), manifest())]),
+        },
+    );
+    let context = server.get_execution_context().await.unwrap();
+    assert_eq!(context.structured_content.unwrap()["issueId"], "USG-46");
+    let denied = server
+        .submit_task(Parameters(SubmitTaskInput {
+            task_id: "arbitrary-shell".into(),
+            idempotency_key: "1".into(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(denied.is_error, Some(true));
+    assert!(execution.paths.lock().unwrap().is_empty());
+    let accepted = server
+        .submit_task(Parameters(SubmitTaskInput {
+            task_id: "verify".into(),
+            idempotency_key: "2".into(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(accepted.structured_content.unwrap()["jobId"], "job_1");
 }
