@@ -1644,18 +1644,26 @@ impl SnapshotRequest {
     }
 }
 impl ProductionSnapshotDomain {
-    fn observed_database_digest(
-        database: &SnapshotDatabase,
+    fn database_path_for_target<'a>(
+        database: &'a SnapshotDatabase,
         target: &str,
-    ) -> Result<String, DomainFailure> {
-        let path = if target == database.target_id {
-            &database.path
+    ) -> Result<&'a Path, DomainFailure> {
+        if target == database.target_id {
+            Ok(&database.path)
         } else {
             database
                 .observed_paths
                 .get(target)
-                .ok_or(DomainFailure::InvalidRequest)?
-        };
+                .map(PathBuf::as_path)
+                .ok_or(DomainFailure::InvalidRequest)
+        }
+    }
+
+    fn observed_database_digest(
+        database: &SnapshotDatabase,
+        target: &str,
+    ) -> Result<String, DomainFailure> {
+        let path = Self::database_path_for_target(database, target)?;
         let bytes = match database.format {
             SnapshotSourceFormat::Sqlite => SqliteBackup::new(path)
                 .export()
@@ -1665,6 +1673,78 @@ impl ProductionSnapshotDomain {
             }
         };
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+
+    /// Finds the sole authenticated history head by following content-digest parent links. The
+    /// encrypted descriptors are content-addressed, but their snapshot IDs are deliberately not a
+    /// clock and therefore must never be used to infer chronology.
+    fn validated_chain_head(
+        manifests: Vec<StoredSnapshot>,
+        database_id: &str,
+    ) -> Result<Option<StoredSnapshot>, DomainFailure> {
+        let mut nodes = BTreeMap::<String, StoredSnapshot>::new();
+        for stored in manifests
+            .into_iter()
+            .filter(|stored| stored.manifest.database.to_string() == database_id)
+        {
+            if stored.manifest.schema != "commonkit.snapshot.v1"
+                || stored.manifest.source_digest != stored.manifest.content_digest
+                || nodes
+                    .insert(stored.manifest.content_digest.clone(), stored)
+                    .is_some()
+            {
+                return Err(DomainFailure::VerificationFailed);
+            }
+        }
+        if nodes.is_empty() {
+            return Ok(None);
+        }
+
+        let mut parents_with_children = BTreeSet::new();
+        let mut roots = 0usize;
+        for (digest, stored) in &nodes {
+            match &stored.manifest.parent_digest {
+                None => roots += 1,
+                Some(parent) => {
+                    if parent == digest
+                        || !nodes.contains_key(parent)
+                        || !parents_with_children.insert(parent.clone())
+                    {
+                        return Err(DomainFailure::VerificationFailed);
+                    }
+                }
+            }
+        }
+        let heads = nodes
+            .keys()
+            .filter(|digest| !parents_with_children.contains(*digest))
+            .cloned()
+            .collect::<Vec<_>>();
+        if roots != 1 || heads.len() != 1 {
+            return Err(DomainFailure::VerificationFailed);
+        }
+
+        let mut visited = BTreeSet::new();
+        let mut cursor = heads[0].clone();
+        loop {
+            if !visited.insert(cursor.clone()) {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            match nodes
+                .get(&cursor)
+                .ok_or(DomainFailure::VerificationFailed)?
+                .manifest
+                .parent_digest
+                .clone()
+            {
+                Some(parent) => cursor = parent,
+                None => break,
+            }
+        }
+        if visited.len() != nodes.len() {
+            return Err(DomainFailure::VerificationFailed);
+        }
+        Ok(nodes.remove(&heads[0]))
     }
 
     fn recover_unfinished(&self) -> Result<(), ProductionDomainError> {
@@ -1865,6 +1945,73 @@ impl ProductionSnapshotDomain {
     }
 }
 
+#[cfg(test)]
+mod snapshot_chain_tests {
+    use super::*;
+
+    fn stored(id: &str, content: &str, parent: Option<&str>) -> StoredSnapshot {
+        StoredSnapshot {
+            snapshot_id: StableId::parse(id).unwrap(),
+            manifest: SnapshotManifest {
+                schema: "commonkit.snapshot.v1".into(),
+                database: DatabaseId::new("context-mode").unwrap(),
+                source_target: "writer".into(),
+                source_format: "file".into(),
+                source_digest: content.into(),
+                parent_digest: parent.map(str::to_owned),
+                content_digest: content.into(),
+                object_digest: format!("object-{id}"),
+                cipher: "test".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_head_follows_parent_chain_not_lexicographic_snapshot_id() {
+        let older = stored("snapshot-z", "sha256:older", None);
+        let newer = stored("snapshot-a", "sha256:newer", Some("sha256:older"));
+
+        let head =
+            ProductionSnapshotDomain::validated_chain_head(vec![newer, older], "context-mode")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(head.snapshot_id.as_str(), "snapshot-a");
+    }
+
+    #[test]
+    fn snapshot_head_rejects_forks_cycles_and_missing_parents() {
+        let fork = vec![
+            stored("snapshot-root", "sha256:root", None),
+            stored("snapshot-left", "sha256:left", Some("sha256:root")),
+            stored("snapshot-right", "sha256:right", Some("sha256:root")),
+        ];
+        assert!(matches!(
+            ProductionSnapshotDomain::validated_chain_head(fork, "context-mode"),
+            Err(DomainFailure::VerificationFailed)
+        ));
+
+        let cycle = vec![
+            stored("snapshot-one", "sha256:one", Some("sha256:two")),
+            stored("snapshot-two", "sha256:two", Some("sha256:one")),
+        ];
+        assert!(matches!(
+            ProductionSnapshotDomain::validated_chain_head(cycle, "context-mode"),
+            Err(DomainFailure::VerificationFailed)
+        ));
+
+        let missing = vec![stored(
+            "snapshot-orphan",
+            "sha256:orphan",
+            Some("sha256:missing"),
+        )];
+        assert!(matches!(
+            ProductionSnapshotDomain::validated_chain_head(missing, "context-mode"),
+            Err(DomainFailure::VerificationFailed)
+        ));
+    }
+}
+
 struct ProcessDatabaseLifecycle<'a>(&'a DatabaseLifecycleConfig);
 impl ProcessDatabaseLifecycle<'_> {
     fn run(command: &LifecycleCommand) -> Result<(), SnapshotError> {
@@ -1909,35 +2056,49 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .databases
             .get(&id)
             .ok_or(DomainFailure::InvalidRequest)?;
+        let authority = AuthorityStore::open(self.root.join("authority"))
+            .map_err(|_| DomainFailure::OperationFailed)?
+            .authority(&database.id)
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        let source_target = match authority {
+            Authority::Writer { target } => target,
+            Authority::Unassigned => return Err(DomainFailure::VerificationFailed),
+        };
+        let source_path = Self::database_path_for_target(database, &source_target)?;
         let cipher = self.cipher()?;
         let service = SnapshotService::new(&cipher);
-        let prior = self
-            .manifests()?
-            .into_iter()
-            .filter(|item| item.manifest.database.to_string() == id)
-            .last()
-            .map(|item| item.manifest.content_digest);
-        let mut objects = self.objects()?;
-        let manifest = match database.format {
-            SnapshotSourceFormat::Sqlite => service.snapshot(
-                &database.id,
-                &database.target_id,
-                prior,
-                &SqliteBackup::new(&database.path),
-                &mut objects,
+        let head = Self::validated_chain_head(self.manifests()?, &id)?;
+        let prior = head
+            .as_ref()
+            .map(|item| item.manifest.content_digest.clone());
+        let (source_format, bytes) = match database.format {
+            SnapshotSourceFormat::Sqlite => (
+                "sqlite3-online-backup",
+                SqliteBackup::new(source_path)
+                    .export()
+                    .map_err(|_| DomainFailure::OperationFailed)?,
             ),
-            SnapshotSourceFormat::File => {
-                let bytes = fs::read(&database.path).map_err(|_| DomainFailure::OperationFailed)?;
-                service.snapshot(
-                    &database.id,
-                    &database.target_id,
-                    prior,
-                    &StaticBackup::new("file", bytes),
-                    &mut objects,
-                )
+            SnapshotSourceFormat::File => (
+                "file",
+                fs::read(source_path).map_err(|_| DomainFailure::OperationFailed)?,
+            ),
+        };
+        let source_digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+        if let Some(head) = head {
+            if head.manifest.content_digest == source_digest {
+                return Ok(serde_json::json!({"snapshotId":head.snapshot_id,"databaseId":id}));
             }
         }
-        .map_err(|_| DomainFailure::OperationFailed)?;
+        let mut objects = self.objects()?;
+        let manifest = service
+            .snapshot(
+                &database.id,
+                &source_target,
+                prior,
+                &StaticBackup::new(source_format, bytes),
+                &mut objects,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?;
         let snapshot_id = StableId::parse(format!("snapshot-{}", &manifest.object_digest[7..31]))
             .map_err(|_| DomainFailure::OperationFailed)?;
         let stored = StoredSnapshot {
@@ -2049,11 +2210,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             return Err(DomainFailure::InvalidRequest);
         }
         let target = request.target_id.ok_or(DomainFailure::InvalidRequest)?;
-        let latest = self
-            .manifests()?
-            .into_iter()
-            .filter(|item| item.manifest.database.to_string() == id)
-            .last()
+        let latest = Self::validated_chain_head(self.manifests()?, &id)?
             .ok_or(DomainFailure::InvalidRequest)?;
         let current_writer = self
             .writers()?

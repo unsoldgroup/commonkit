@@ -437,6 +437,93 @@ fn snapshot_promotion_rejects_unsnapshotted_authoritative_changes_and_missing_ob
 }
 
 #[test]
+fn promoted_writer_is_the_only_source_allowed_to_advance_snapshot_history() {
+    use sha2::{Digest, Sha256};
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let writer_a = root.join("writer-a.db");
+    let writer_b = root.join("writer-b.db");
+    std::fs::write(&writer_a, b"state-v1").unwrap();
+    std::fs::write(&writer_b, b"state-v1").unwrap();
+    let key_path = root.join("snapshot-key");
+    std::fs::write(&key_path, b"snapshot-test-key").unwrap();
+    let config = root.join("headless.json");
+    write_json(
+        &config,
+        &serde_json::json!({
+            "sync": null,
+            "credentials": null,
+            "snapshots": {
+                "root": root.join("snapshots"),
+                "portableState": root.join("kit"),
+                "keyReference": format!("file://{}", key_path.display()),
+                "objectStore": {"type":"local"},
+                "databases": [{
+                    "id":"context-mode",
+                    "path":writer_a,
+                    "targetId":"machine-a",
+                    "observedPaths":{"machine-b":writer_b},
+                    "format":"file",
+                    "lifecycle":lifecycle_config()
+                }]
+            }
+        }),
+    );
+    let snapshots = ProductionDomainRegistry::load(
+        &config,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap()
+    .snapshots
+    .unwrap();
+
+    let first = snapshots
+        .create(serde_json::json!({"databaseId":"context-mode"}))
+        .unwrap();
+    snapshots
+        .promote(serde_json::json!({
+            "databaseId":"context-mode",
+            "targetId":"machine-b",
+            "confirmationId":"promote-to-b"
+        }))
+        .unwrap();
+    std::fs::write(&writer_b, b"state-v2-from-b").unwrap();
+    let second = snapshots
+        .create(serde_json::json!({"databaseId":"context-mode"}))
+        .unwrap();
+
+    let listing = snapshots.list().unwrap();
+    let manifests = listing["snapshots"].as_array().unwrap();
+    let second_manifest = manifests
+        .iter()
+        .find(|item| item["snapshotId"] == second["snapshotId"])
+        .unwrap();
+    assert_eq!(second_manifest["manifest"]["sourceTarget"], "machine-b");
+    assert_eq!(
+        second_manifest["manifest"]["parentDigest"],
+        format!("sha256:{:x}", Sha256::digest(b"state-v1"))
+    );
+
+    // A stale former writer cannot create a new branch or become authoritative again merely by
+    // changing its local bytes. With B unchanged, create is a no-op at the true chain head.
+    std::fs::write(&writer_a, b"state-v3-from-old-a").unwrap();
+    let after_old_writer_change = snapshots
+        .create(serde_json::json!({"databaseId":"context-mode"}))
+        .unwrap();
+    assert_eq!(after_old_writer_change["snapshotId"], second["snapshotId"]);
+    assert_ne!(first["snapshotId"], second["snapshotId"]);
+    assert_eq!(
+        snapshots.list().unwrap()["snapshots"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn portable_descriptor_discovers_and_restores_snapshot_on_another_machine() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
