@@ -6,7 +6,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use commonkit_contracts::{ProviderLock, ProviderSource, Sha256Digest, StableId};
-use commonkit_skills::{SkillOptProviderManager, UpgradeApproval};
+#[cfg(not(target_os = "macos"))]
+use commonkit_skills::SkillError;
+use commonkit_skills::SkillOptProviderManager;
+#[cfg(target_os = "macos")]
+use commonkit_skills::UpgradeApproval;
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
 fn id(value: &str) -> StableId {
@@ -14,7 +18,7 @@ fn id(value: &str) -> StableId {
 }
 
 #[test]
-fn upgrade_uses_disposable_hashed_environment_and_requires_separate_activation() {
+fn upgrade_uses_disposable_hashed_environment_and_requires_supported_platform_isolation() {
     let root = std::env::temp_dir().join(format!(
         "commonkit-upgrade-{}-{}",
         std::process::id(),
@@ -129,25 +133,40 @@ printf '{"schemaVersion":1,"suiteDigest":"%s","skillId":"%s","baselineDigest":"%
         )
         .expect("declared executables");
     let plan = manager.plan_upgrade(lock.clone(), &fixtures).expect("plan");
+    #[cfg(not(target_os = "macos"))]
+    {
+        let error = manager
+            .execute_upgrade(&plan)
+            .expect_err("upgrade evaluation must fail closed without OS isolation");
+        assert!(matches!(error, SkillError::ProviderIsolationUnavailable));
+        assert!(!root.join("active-provider.json").exists());
+        fs::remove_dir_all(root).expect("cleanup");
+        return;
+    }
+    #[cfg(target_os = "macos")]
     let report = manager.execute_upgrade(&plan).expect("upgrade report");
-    assert!(report.compatible);
-    assert_eq!(report.baseline_basis_points, 0);
-    assert_eq!(report.candidate_basis_points, 10_000);
-    let active_lock = root.join("active-provider.json");
-    assert!(!active_lock.exists());
-    manager
-        .activate_upgrade(
-            &report,
-            UpgradeApproval {
-                approver: id("al"),
-                approved_at_unix_ms: 1,
-                reason: "contract and behavior reviewed".into(),
-            },
-            &active_lock,
-        )
-        .expect("activate");
-    let activated: ProviderLock =
-        serde_json::from_slice(&fs::read(active_lock).expect("active lock")).expect("lock json");
-    assert_eq!(activated, lock);
-    fs::remove_dir_all(root).expect("cleanup");
+    #[cfg(target_os = "macos")]
+    {
+        assert!(report.compatible);
+        assert_eq!(report.baseline_basis_points, 0);
+        assert_eq!(report.candidate_basis_points, 10_000);
+        let active_lock = root.join("active-provider.json");
+        assert!(!active_lock.exists());
+        manager
+            .activate_upgrade(
+                &report,
+                UpgradeApproval {
+                    approver: id("al"),
+                    approved_at_unix_ms: 1,
+                    reason: "contract and behavior reviewed".into(),
+                },
+                &active_lock,
+            )
+            .expect("activate");
+        let activated: ProviderLock =
+            serde_json::from_slice(&fs::read(active_lock).expect("active lock"))
+                .expect("lock json");
+        assert_eq!(activated, lock);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
 }

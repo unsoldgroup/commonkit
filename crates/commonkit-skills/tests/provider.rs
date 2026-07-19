@@ -8,15 +8,19 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(target_os = "macos")]
 use commonkit_contracts::{
     EvaluationCaseManifest, EvaluationMetric, HarnessLock, OptimizationLimits, PortableSourcePath,
-    ProviderLock, ProviderSource, SchemaVersion, Sha256Digest, SkillDescriptor,
-    SkillEvaluationSuite, SkillLifecycle, SkillOptimizationManifest, StableId,
+    SchemaVersion, SkillDescriptor, SkillEvaluationSuite, SkillLifecycle,
+    SkillOptimizationManifest,
 };
+use commonkit_contracts::{ProviderLock, ProviderSource, Sha256Digest, StableId};
 use commonkit_skills::{
-    ProviderCheck, SkillOptBackend, SkillOptProviderConfig, SkillOptSleepOptimizer, SkillOptimizer,
-    measure_harness_lock, measure_provider_installation,
+    ProviderCheck, SkillOptBackend, SkillOptProviderConfig, SkillOptSleepOptimizer,
+    measure_provider_installation,
 };
+#[cfg(target_os = "macos")]
+use commonkit_skills::{SkillOptimizer, measure_harness_lock};
 
 static NONCE: AtomicU64 = AtomicU64::new(0);
 fn id(value: &str) -> StableId {
