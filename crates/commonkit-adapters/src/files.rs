@@ -44,10 +44,6 @@ impl ManagedRelativePath {
         }
     }
 
-    pub fn as_path(&self) -> &Path {
-        &self.0
-    }
-
     fn portable(&self) -> String {
         self.0
             .components()
@@ -202,7 +198,7 @@ impl FileAdapter {
         if let Ok(text) = std::str::from_utf8(&intent.content) {
             assert_no_embedded_secrets(&Value::String(text.into()))?;
         }
-        let observed = read_optional(&self.target, intent.path.as_path())?;
+        let observed = self.inspect_legacy_file(&intent.path)?;
         let before_digest = observed.as_deref().map(digest_bytes).transpose()?;
         if intent.expected_before != before_digest {
             return Err(FileAdapterError::PreimageMismatch);
@@ -440,6 +436,19 @@ impl FileAdapter {
             "filesystem-file" | "directory" | "symlink" | "removal"
         )
     }
+
+    fn inspect_legacy_file(
+        &self,
+        path: &ManagedRelativePath,
+    ) -> Result<Option<Vec<u8>>, FileAdapterError> {
+        self.validate_target_binding()?;
+        let (parent, leaf) = match open_parent_nofollow(&self.target, &path.portable(), false) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        read_optional_in(&parent, &leaf).map_err(FileAdapterError::Io)
+    }
 }
 
 impl FileAdapter {
@@ -634,8 +643,9 @@ impl Adapter for FileAdapter {
             return self.prepare_semantic(operation);
         }
         let managed = self.managed(operation)?;
-        let observed = read_optional(&self.target, managed.path.as_path())
-            .map_err(|_| failure("inspect_failed", "could not inspect managed file"))?;
+        let observed = self
+            .inspect_legacy_file(&managed.path)
+            .map_err(|_| failure("unsafe_path", "managed file path is unsafe"))?;
         let observed_digest = observed
             .as_deref()
             .map(digest_bytes)

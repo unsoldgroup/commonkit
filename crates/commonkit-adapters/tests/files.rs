@@ -41,6 +41,130 @@ fn intent(path: &str, content: &[u8], expected_before: Option<Sha256Digest>) -> 
 }
 
 #[cfg(unix)]
+fn assert_state_excludes_bytes(state: &std::path::Path, forbidden: &[u8]) {
+    fn visit(path: &std::path::Path, forbidden: &[u8]) {
+        for entry in fs::read_dir(path).expect("read adapter state") {
+            let entry = entry.expect("state entry");
+            let kind = entry.file_type().expect("state entry type");
+            if kind.is_dir() {
+                visit(&entry.path(), forbidden);
+            } else if kind.is_file() {
+                assert_ne!(
+                    fs::read(entry.path()).expect("state file"),
+                    forbidden,
+                    "outside bytes entered durable adapter state"
+                );
+            }
+        }
+    }
+    visit(state, forbidden);
+}
+
+#[cfg(unix)]
+fn substitute_legacy_path(
+    target: &std::path::Path,
+    outside: &std::path::Path,
+    displaced: &std::path::Path,
+    substitution: &str,
+) {
+    use std::os::unix::fs::symlink;
+
+    match substitution {
+        "root" => {
+            fs::rename(target, displaced).expect("displace root");
+            symlink(outside, target).expect("substitute root");
+        }
+        "ancestor" => {
+            fs::rename(target.join("config"), displaced).expect("displace ancestor");
+            symlink(outside, target.join("config")).expect("substitute ancestor");
+        }
+        "leaf" => {
+            fs::remove_file(target.join("config/settings")).expect("remove leaf");
+            symlink(outside.join("settings"), target.join("config/settings"))
+                .expect("substitute leaf");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_register_rejects_root_ancestor_and_leaf_substitution_without_importing_outside_bytes() {
+    const OUTSIDE: &[u8] = b"outside registration sentinel";
+    for substitution in ["root", "ancestor", "leaf"] {
+        let root = temporary_directory(&format!("legacy-register-{substitution}"));
+        let target = root.join("target");
+        let state = root.join("state");
+        let outside = root.join("outside");
+        let displaced = root.join("displaced");
+        fs::create_dir_all(target.join("config")).expect("target");
+        fs::create_dir_all(outside.join("config")).expect("outside");
+        fs::write(target.join("config/settings"), b"inside before").expect("inside");
+        fs::write(outside.join("settings"), OUTSIDE).expect("outside");
+        fs::write(outside.join("config/settings"), OUTSIDE).expect("outside root");
+        let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+
+        substitute_legacy_path(&target, &outside, &displaced, substitution);
+        adapter
+            .register(intent("config/settings", b"managed", Some(digest(OUTSIDE))))
+            .expect_err("substituted path must fail registration closed");
+
+        assert_eq!(
+            fs::read(outside.join("settings")).expect("outside"),
+            OUTSIDE
+        );
+        assert_state_excludes_bytes(&state, OUTSIDE);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_prepare_rejects_root_ancestor_and_leaf_substitution_without_backing_up_outside_bytes() {
+    const OUTSIDE: &[u8] = b"outside prepare sentinel";
+    for substitution in ["root", "ancestor", "leaf"] {
+        let root = temporary_directory(&format!("legacy-prepare-{substitution}"));
+        let target = root.join("target");
+        let state = root.join("state");
+        let outside = root.join("outside");
+        let displaced = root.join("displaced");
+        fs::create_dir_all(target.join("config")).expect("target");
+        fs::create_dir_all(outside.join("config")).expect("outside");
+        fs::write(target.join("config/settings"), b"inside before").expect("inside");
+        fs::write(outside.join("settings"), OUTSIDE).expect("outside");
+        fs::write(outside.join("config/settings"), OUTSIDE).expect("outside root");
+        let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+        let operation = adapter
+            .register(intent(
+                "config/settings",
+                b"managed",
+                Some(digest(b"inside before")),
+            ))
+            .expect("operation");
+
+        substitute_legacy_path(&target, &outside, &displaced, substitution);
+        adapter
+            .prepare(&operation)
+            .expect_err("substituted path must fail prepare closed");
+
+        assert_eq!(
+            fs::read(outside.join("settings")).expect("outside"),
+            OUTSIDE
+        );
+        assert_state_excludes_bytes(&state, OUTSIDE);
+        assert!(
+            !state
+                .join("backups")
+                .read_dir()
+                .expect("backups")
+                .any(|entry| entry.is_ok()),
+            "failed prepare must not persist a backup"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
+#[cfg(unix)]
 fn assert_legacy_substitution_fails_closed(phase: &str, substitution: &str) {
     use std::os::unix::fs::symlink;
 
