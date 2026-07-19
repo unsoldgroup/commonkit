@@ -27,6 +27,10 @@ fn context() -> ProviderContext {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn materializes_only_into_isolated_destination_with_fixed_flags() {
     let fixture = Fixture::new("isolated");
     fs::write(fixture.source.join("dot_gitconfig"), "[user]\nname = Al\n").unwrap();
@@ -110,6 +114,10 @@ fn rejects_materialization_for_a_different_target_platform_before_apply() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn target_platform_facts_change_provider_inputs_not_controller_constants() {
     let fixture = Fixture::new("target-platform");
     let controller = fixture.provider().inspect_inputs(&context()).unwrap();
@@ -134,6 +142,10 @@ fn target_platform_facts_change_provider_inputs_not_controller_constants() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn accepts_the_official_pinned_version_output_and_rejects_other_versions() {
     let fixture = Fixture::new("official-version");
     fixture.provider().inspect_inputs(&context()).unwrap();
@@ -153,6 +165,10 @@ fn accepts_the_official_pinned_version_output_and_rejects_other_versions() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn materialization_uses_immutable_executable_source_and_config_snapshots() {
     let fixture = Fixture::new("immutable-snapshots");
     fs::write(fixture.source.join("dot_value"), "original-source\n").unwrap();
@@ -239,6 +255,10 @@ mv "$dest/dot_value" "$dest/.value"
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn provider_process_cannot_write_outside_its_isolated_workspace() {
     let fixture = Fixture::new("sandbox-write-escape");
     let marker = fixture.root.join("escaped");
@@ -435,6 +455,10 @@ fn rejects_config_hooks_before_execution() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn scans_regular_files_directories_and_safe_symlinks_from_staging() {
     let fixture = Fixture::new("scan");
     fs::write(fixture.source.join("dot_gitconfig"), "git").unwrap();

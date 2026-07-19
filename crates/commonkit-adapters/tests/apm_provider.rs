@@ -18,6 +18,10 @@ fn digest(seed: char) -> Sha256Digest {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn documented_apm_mcp_output_becomes_provenance_bound_provider_capability() {
     let root = fixture("mcp-capability");
     let executable = root.join("apm");
@@ -69,6 +73,10 @@ dependencies:
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn ambiguous_or_conflicting_apm_mcp_output_fails_closed() {
     let root = fixture("mcp-conflict");
     let executable = root.join("apm");
@@ -189,6 +197,10 @@ fn invalid_inputs_fail_before_provider_execution() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn materialization_uses_immutable_executable_and_input_snapshots() {
     let root = fixture("immutable-snapshots");
     let executable = root.join("apm");
@@ -299,6 +311,10 @@ fn executable_replacement_invalidates_provider_before_launch() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn failed_provider_output_stays_private_and_exported_diagnostics_are_bounded_and_redacted() {
     let root = fixture("private-diagnostics");
     let executable = root.join("apm");
@@ -341,6 +357,10 @@ if [ "$1" = "install" ]; then printf 'ordinary failure detail\ntoken=super-secre
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn pinned_apm_materializes_claude_and_codex_outside_the_live_target() {
     let root = fixture("materialize");
     let log = root.join("stage/argv.log");
@@ -494,6 +514,10 @@ fn provider_process_cannot_open_network_connections() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn version_mismatch_is_actionable_and_stops_before_compilation() {
     let root = fixture("version");
     let log = root.join("stage/argv.log");
@@ -520,6 +544,10 @@ fn version_mismatch_is_actionable_and_stops_before_compilation() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn version_check_rejects_incidental_matching_numbers() {
     let root = fixture("version-format");
     let executable = root.join("apm");

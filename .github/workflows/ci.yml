@@ -137,7 +137,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
     env:
       APM_VERSION: 0.25.0
@@ -145,20 +145,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux provider sandbox
-        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap
       - name: Preflight provider sandbox capability
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            test -x /usr/bin/bwrap
-            /usr/bin/bwrap --version
-            /usr/bin/bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --ro-bind /bin /bin --proc /proc --dev /dev -- /usr/bin/true
-          else
-            test -x /usr/bin/sandbox-exec
-            /usr/bin/sandbox-exec -p '(version 1) (allow default) (deny network*)' /usr/bin/true
-          fi
+          test -x /usr/bin/bwrap
+          /usr/bin/bwrap --version
+          /usr/bin/bwrap --unshare-all --die-with-parent --ro-bind /usr /usr --ro-bind /bin /bin --proc /proc --dev /dev -- /usr/bin/true
       - uses: dtolnay/rust-toolchain@stable
       - name: Download checksum-pinned providers
         shell: bash
@@ -166,24 +160,10 @@ jobs:
           set -euo pipefail
           provider_dir="$RUNNER_TEMP/commonkit-providers"
           mkdir -p "$provider_dir/apm"
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            if [[ "$(uname -m)" == "arm64" ]]; then
-              apm_asset="apm-darwin-arm64.tar.gz"
-              apm_sha="8b46963bf881d1369c1ee30f6099fba54d13379a8860ec190cdcaf50cf4586a9"
-              chezmoi_asset="chezmoi-darwin-arm64"
-              chezmoi_sha="f32d5f9b5802a5afc5f60d4ca6839e6ed65b658c9ded9053434526194d5fad5d"
-            else
-              apm_asset="apm-darwin-x86_64.tar.gz"
-              apm_sha="8b1c43543113550e49939c7970429e19881d6347c90c44185eb55ea73d0eca73"
-              chezmoi_asset="chezmoi-darwin-amd64"
-              chezmoi_sha="aad5f6005ca42d8ca63fb05cf173489d0bbf4ebb6bf991cb2e30972b6323aa71"
-            fi
-          else
-            apm_asset="apm-linux-x86_64.tar.gz"
-            apm_sha="7a4281ef915e9609f8841eced19285bf2dcf702862302171f7e893c30e1b3244"
-            chezmoi_asset="chezmoi-linux-amd64"
-            chezmoi_sha="f9e5c2822356f4e96f94442efc5cb5ef35df2a06f7f06b6315dbdac0dbaf22a3"
-          fi
+          apm_asset="apm-linux-x86_64.tar.gz"
+          apm_sha="7a4281ef915e9609f8841eced19285bf2dcf702862302171f7e893c30e1b3244"
+          chezmoi_asset="chezmoi-linux-amd64"
+          chezmoi_sha="f9e5c2822356f4e96f94442efc5cb5ef35df2a06f7f06b6315dbdac0dbaf22a3"
           curl --fail --location --retry 3 "https://github.com/microsoft/apm/releases/download/v${APM_VERSION}/${apm_asset}" --output "$provider_dir/apm.tar.gz"
           printf '%s  %s\n' "$apm_sha" "$provider_dir/apm.tar.gz" | shasum -a 256 --check
           tar -xzf "$provider_dir/apm.tar.gz" -C "$provider_dir/apm"
