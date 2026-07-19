@@ -5,8 +5,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
-    ArtifactStore, CredentialReference, FileAdapter, LocalSensitiveFileStore, MaterializedState,
-    NormalizedManagedPath, OwnershipRules, ProviderPlanRequest, SecretValue, build_provider_plan,
+    ArtifactStore, BwsCredentialResolver, CredentialReference, CredentialResolver, FileAdapter,
+    LocalSensitiveFileStore, MaterializedState, NormalizedManagedPath, OwnershipRules,
+    PlatformKeychain, PlatformKeychainCredentialResolver, ProcessBwsRunner,
+    ProcessPlatformSecretCommandRunner, ProviderPlanRequest, SecretValue, build_provider_plan,
     validate_ownership,
 };
 use commonkit_config::{LayerSet, MergeRules, compose_layers};
@@ -65,6 +67,7 @@ struct SyncConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CredentialConfig {
     root: PathBuf,
+    bws_executable: Option<PathBuf>,
     destinations: Vec<CredentialDestination>,
 }
 #[derive(Clone, Deserialize)]
@@ -203,9 +206,20 @@ impl ProductionDomainRegistry {
                     if config.destinations.is_empty() || !config.root.is_absolute() {
                         return Err(ProductionDomainError::EmptyCapability);
                     }
+                    if let Some(executable) = &config.bws_executable {
+                        let metadata = fs::symlink_metadata(executable)
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        if !executable.is_absolute()
+                            || !metadata.is_file()
+                            || metadata.file_type().is_symlink()
+                        {
+                            return Err(ProductionDomainError::UnsafeConfig);
+                        }
+                    }
                     fs::create_dir_all(&config.root)?;
                     Ok(Arc::new(ProductionCredentialDomain {
                         root: config.root,
+                        bws_executable: config.bws_executable,
                         destinations: unique_destinations(config.destinations)?,
                     }))
                 },
@@ -531,6 +545,7 @@ impl SyncDomain for ProductionSyncDomain {
 
 struct ProductionCredentialDomain {
     root: PathBuf,
+    bws_executable: Option<PathBuf>,
     destinations: BTreeMap<StableId, CredentialDestination>,
 }
 #[derive(Deserialize)]
@@ -547,7 +562,10 @@ impl CredentialRequest {
         let _ = (self.confirmed, &self.confirmation_id, &self.idempotency_key);
     }
 }
-fn resolve(reference: &CredentialReference) -> Result<SecretValue, DomainFailure> {
+fn resolve(
+    reference: &CredentialReference,
+    bws_executable: Option<&Path>,
+) -> Result<SecretValue, DomainFailure> {
     let bytes = match reference.scheme() {
         "env" => std::env::var_os(reference.opaque())
             .map(|v| v.to_string_lossy().into_owned().into_bytes())
@@ -559,6 +577,22 @@ fn resolve(reference: &CredentialReference) -> Result<SecretValue, DomainFailure
                 return Err(DomainFailure::OperationFailed);
             }
             fs::read(reference.opaque()).map_err(|_| DomainFailure::OperationFailed)?
+        }
+        "bws" => {
+            let executable = bws_executable.ok_or(DomainFailure::OperationFailed)?;
+            return BwsCredentialResolver::new(ProcessBwsRunner::new(executable))
+                .resolve(reference)
+                .map_err(|_| DomainFailure::OperationFailed);
+        }
+        "keychain" => {
+            let platform =
+                PlatformKeychain::current().map_err(|_| DomainFailure::OperationFailed)?;
+            return PlatformKeychainCredentialResolver::new(
+                platform,
+                ProcessPlatformSecretCommandRunner,
+            )
+            .resolve(reference)
+            .map_err(|_| DomainFailure::OperationFailed);
         }
         _ => return Err(DomainFailure::OperationFailed),
     };
@@ -578,7 +612,10 @@ impl CredentialDomain for ProductionCredentialDomain {
                 .get(&id)
                 .ok_or(DomainFailure::InvalidRequest)?;
             store
-                .write(&destination.path, &resolve(&destination.reference)?)
+                .write(
+                    &destination.path,
+                    &resolve(&destination.reference, self.bws_executable.as_deref())?,
+                )
                 .map_err(|_| DomainFailure::OperationFailed)?;
             applied.push(id);
         }
@@ -594,7 +631,7 @@ impl CredentialDomain for ProductionCredentialDomain {
                 .destinations
                 .get(&id)
                 .ok_or(DomainFailure::InvalidRequest)?;
-            let expected = resolve(&destination.reference)?;
+            let expected = resolve(&destination.reference, self.bws_executable.as_deref())?;
             let path = self.root.join(destination.path.as_str());
             let metadata =
                 fs::symlink_metadata(&path).map_err(|_| DomainFailure::VerificationFailed)?;
@@ -731,7 +768,7 @@ impl ProductionSnapshotDomain {
         }
     }
     fn cipher(&self) -> Result<XChaCha20Cipher, DomainFailure> {
-        let secret = resolve(&self.key_reference)?;
+        let secret = resolve(&self.key_reference, None)?;
         let mut key = [0u8; 32];
         key.copy_from_slice(&Sha256::digest(secret.expose_for_apply()));
         Ok(XChaCha20Cipher::new(key))

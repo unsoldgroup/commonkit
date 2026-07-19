@@ -61,7 +61,10 @@ enum Command {
         confirmed: bool,
     },
     /// Configure scheduled drift checks.
-    Schedule,
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
     /// Export redacted diagnostics from the local daemon.
     Diagnostics,
     /// Inspect or provision credential references through the local daemon.
@@ -74,10 +77,51 @@ enum Command {
         #[command(subcommand)]
         command: RelayCommand,
     },
+    /// Create, inspect, restore, and promote mutable-state snapshots.
+    Snapshots {
+        #[command(subcommand)]
+        command: SnapshotCommand,
+    },
     /// Inspect canonical skills and durable optimization candidates.
     Skills {
         #[command(subcommand)]
         command: SkillsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ScheduleCommand {
+    Status,
+    Enable {
+        #[arg(long)]
+        interval_seconds: u64,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    Disable {
+        #[arg(long)]
+        confirmed: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommand {
+    Create {
+        database_id: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    List,
+    Restore {
+        snapshot_id: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    Promote {
+        database_id: String,
+        target_id: String,
+        #[arg(long)]
+        confirmed: bool,
     },
 }
 
@@ -485,9 +529,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             Some(json!({"targetId":null,"pointer":null})),
             None,
         )?)?,
-        Command::Schedule => {
-            print_daemon(daemon_control("GET", "/control/v1/schedule", None, None)?)?
-        }
+        Command::Schedule { command } => run_schedule(command)?,
         Command::Diagnostics => print_daemon(daemon_control(
             "GET",
             "/control/v1/diagnostics",
@@ -502,6 +544,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         )?)?,
         Command::Credentials { command } => run_credentials(command)?,
         Command::Relay { command } => run_relay(command)?,
+        Command::Snapshots { command } => run_snapshots(command)?,
         Command::Skills { command } => run_skills(command)?,
     }
     Ok(())
@@ -884,6 +927,109 @@ fn run_credentials(command: CredentialCommand) -> Result<(), Box<dyn Error>> {
             Some(json!({"destinationIds": destination_ids})),
             None,
         )?,
+    };
+    print_daemon(value)
+}
+
+fn require_confirmation(confirmed: bool) -> Result<(), Box<dyn Error>> {
+    if confirmed {
+        Ok(())
+    } else {
+        Err("confirmation_required: pass --confirmed after reviewing the operation".into())
+    }
+}
+
+fn run_schedule(command: ScheduleCommand) -> Result<(), Box<dyn Error>> {
+    let value = match command {
+        ScheduleCommand::Status => daemon_control("GET", "/control/v1/schedule", None, None)?,
+        ScheduleCommand::Enable {
+            interval_seconds,
+            confirmed,
+        } => {
+            require_confirmation(confirmed)?;
+            daemon_control(
+                "POST",
+                "/control/v1/schedule",
+                Some(json!({
+                    "enabled": true,
+                    "intervalSeconds": interval_seconds,
+                    "confirmed": true,
+                    "confirmationId": nonce("schedule-enable")
+                })),
+                None,
+            )?
+        }
+        ScheduleCommand::Disable { confirmed } => {
+            require_confirmation(confirmed)?;
+            daemon_control(
+                "POST",
+                "/control/v1/schedule",
+                Some(json!({
+                    "enabled": false,
+                    "intervalSeconds": 1,
+                    "confirmed": true,
+                    "confirmationId": nonce("schedule-disable")
+                })),
+                None,
+            )?
+        }
+    };
+    print_daemon(value)
+}
+
+fn run_snapshots(command: SnapshotCommand) -> Result<(), Box<dyn Error>> {
+    let value = match command {
+        SnapshotCommand::List => daemon_control("GET", "/control/v1/snapshots", None, None)?,
+        SnapshotCommand::Create {
+            database_id,
+            confirmed,
+        } => {
+            require_confirmation(confirmed)?;
+            daemon_control(
+                "POST",
+                "/control/v1/snapshots",
+                Some(json!({
+                    "databaseId": database_id,
+                    "confirmed": true,
+                    "confirmationId": nonce("snapshot-create")
+                })),
+                None,
+            )?
+        }
+        SnapshotCommand::Restore {
+            snapshot_id,
+            confirmed,
+        } => {
+            require_confirmation(confirmed)?;
+            daemon_control(
+                "POST",
+                "/control/v1/snapshots/restore",
+                Some(json!({
+                    "snapshotId": snapshot_id,
+                    "confirmed": true,
+                    "confirmationId": nonce("snapshot-restore")
+                })),
+                None,
+            )?
+        }
+        SnapshotCommand::Promote {
+            database_id,
+            target_id,
+            confirmed,
+        } => {
+            require_confirmation(confirmed)?;
+            daemon_control(
+                "POST",
+                "/control/v1/snapshots/promote",
+                Some(json!({
+                    "databaseId": database_id,
+                    "targetId": target_id,
+                    "confirmed": true,
+                    "confirmationId": nonce("snapshot-promote")
+                })),
+                None,
+            )?
+        }
     };
     print_daemon(value)
 }

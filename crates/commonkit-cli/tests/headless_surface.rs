@@ -38,3 +38,38 @@ fn credential_apply_requires_consent_before_contacting_daemon() {
         assert!(String::from_utf8_lossy(&output.stderr).contains("daemon_unavailable"));
     }
 }
+
+#[test]
+fn snapshot_and_drift_schedule_mutations_require_explicit_consent() {
+    for arguments in [
+        vec!["snapshots", "create", "context-mode"],
+        vec!["snapshots", "restore", "snapshot-1"],
+        vec!["snapshots", "promote", "context-mode", "workstation-b"],
+        vec!["schedule", "enable", "--interval-seconds", "60"],
+        vec!["schedule", "disable"],
+    ] {
+        let output = command(&arguments);
+        assert!(!output.status.success(), "{arguments:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("confirmation_required"),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    for arguments in [
+        vec!["snapshots", "list"],
+        vec!["snapshots", "create", "context-mode", "--confirmed"],
+        vec![
+            "schedule",
+            "enable",
+            "--interval-seconds",
+            "60",
+            "--confirmed",
+        ],
+    ] {
+        let output = command(&arguments);
+        assert!(!output.status.success(), "daemon is intentionally absent");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("daemon_unavailable"));
+    }
+}
