@@ -1615,15 +1615,18 @@ mod tests {
     }
     #[test]
     fn onboarding_binds_pinned_provider_to_fixed_cli_arguments() {
+        let fixture_root = std::env::temp_dir().join("commonkit-desktop-onboarding");
         let request = OnboardingRequest {
             mode: "connect".into(),
             repository: "owner/kit".into(),
-            kit_directory: PathBuf::from("/tmp/kit"),
+            kit_directory: fixture_root.join("kit"),
             loadout: "personal".into(),
             target: "workstation".into(),
-            target_root: PathBuf::from("/tmp/home"),
+            target_root: fixture_root.join("home"),
             provider: "apm".into(),
-            provider_executable: Some(PathBuf::from("/opt/apm")),
+            provider_executable: Some(
+                fixture_root.join(format!("apm{}", std::env::consts::EXE_SUFFIX)),
+            ),
             provider_version: Some("0.25.0".into()),
             apm_manifest: Some("apm.yml".into()),
             apm_lockfile: Some("apm.lock.yaml".into()),
@@ -1647,15 +1650,18 @@ mod tests {
 
     #[test]
     fn onboarding_rejects_unpinned_or_traversing_provider_inputs() {
+        let fixture_root = std::env::temp_dir().join("commonkit-desktop-onboarding-invalid");
         let request = OnboardingRequest {
             mode: "connect".into(),
             repository: "owner/kit".into(),
-            kit_directory: PathBuf::from("/tmp/kit"),
+            kit_directory: fixture_root.join("kit"),
             loadout: "personal".into(),
             target: "workstation".into(),
-            target_root: PathBuf::from("/tmp/home"),
+            target_root: fixture_root.join("home"),
             provider: "chezmoi".into(),
-            provider_executable: Some(PathBuf::from("/opt/chezmoi")),
+            provider_executable: Some(
+                fixture_root.join(format!("chezmoi{}", std::env::consts::EXE_SUFFIX)),
+            ),
             provider_version: Some("latest".into()),
             apm_manifest: None,
             apm_lockfile: None,
