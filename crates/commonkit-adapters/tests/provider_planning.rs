@@ -153,6 +153,8 @@ fn verified_provider_states_build_a_durable_mutation_free_bound_plan() {
         plan.bindings.provider_inputs_digest
     );
 
+    drop(adapter);
+    drop(artifacts);
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -230,6 +232,7 @@ fn provider_policy_failures_stop_before_operation_registration() {
     .unwrap_err();
     assert!(matches!(error, ProviderPlanError::UnmappedSideEffect(_)));
     assert!(fs::read_dir(&target).unwrap().next().is_none());
+    drop(artifacts);
     fs::remove_dir_all(root).unwrap();
 }
 
