@@ -1,7 +1,22 @@
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn command(arguments: &[&str]) -> std::process::Output {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "commonkit-headless-no-daemon-{}-{nonce}",
+        std::process::id()
+    ));
     Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .env("HOME", &root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("APPDATA", root.join("appdata"))
+        .env("LOCALAPPDATA", root.join("local-appdata"))
         .args(arguments)
         .output()
         .expect("commonkit command")
