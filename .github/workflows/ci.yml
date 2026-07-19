@@ -209,6 +209,47 @@ jobs:
           if ((Get-FileHash $chezmoiBin -Algorithm SHA256).Hash.ToLowerInvariant() -ne "531e4b3d1f0814c4e962cd1a380bd4ea85f97aee5cc81ee27eea551339380ff7") { throw "chezmoi checksum mismatch" }
           "COMMONKIT_APM_025_BIN=$apmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
           "COMMONKIT_CHEZMOI_2_70_4=$chezmoiBin" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Verify pinned APM under the sanitized provider environment
+        shell: pwsh
+        run: |
+          $stage = Join-Path $env:RUNNER_TEMP "commonkit-apm-preflight-stage"
+          $scratch = Join-Path $env:RUNNER_TEMP "commonkit-apm-preflight-scratch"
+          New-Item -ItemType Directory -Force -Path $stage, $scratch | Out-Null
+          $psi = [System.Diagnostics.ProcessStartInfo]::new()
+          $psi.FileName = $env:COMMONKIT_APM_025_BIN
+          $psi.ArgumentList.Add("--version")
+          $psi.WorkingDirectory = $stage
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.Environment.Clear()
+          $psi.Environment["HOME"] = $stage
+          $psi.Environment["USERPROFILE"] = $stage
+          $psi.Environment["HOMEDRIVE"] = [System.IO.Path]::GetPathRoot($stage).TrimEnd('\')
+          $psi.Environment["HOMEPATH"] = $stage.Substring([System.IO.Path]::GetPathRoot($stage).Length - 1)
+          $psi.Environment["APPDATA"] = Join-Path $stage "AppData\Roaming"
+          $psi.Environment["LOCALAPPDATA"] = Join-Path $stage "AppData\Local"
+          $psi.Environment["TEMP"] = $scratch
+          $psi.Environment["TMP"] = $scratch
+          $psi.Environment["TMPDIR"] = $scratch
+          $psi.Environment["APM_TEMP_DIR"] = $scratch
+          $psi.Environment["APM_CACHE_DIR"] = Join-Path $scratch "apm-cache"
+          $psi.Environment["APM_NON_INTERACTIVE"] = "1"
+          $psi.Environment["SystemRoot"] = $env:SystemRoot
+          $psi.Environment["WINDIR"] = $env:SystemRoot
+          $psi.Environment["COMSPEC"] = Join-Path $env:SystemRoot "System32\cmd.exe"
+          $psi.Environment["OS"] = "Windows_NT"
+          $psi.Environment["PATHEXT"] = ".COM;.EXE;.BAT;.CMD"
+          $process = [System.Diagnostics.Process]::new()
+          $process.StartInfo = $psi
+          [void]$process.Start()
+          $stdout = $process.StandardOutput.ReadToEnd()
+          $stderr = $process.StandardError.ReadToEnd()
+          $process.WaitForExit()
+          if ($process.ExitCode -ne 0) {
+            Write-Error "Pinned APM failed in its no-secret sanitized environment (exit $($process.ExitCode)): $stderr"
+          }
+          if ($stdout -notmatch "0\.25\.0") { throw "unexpected pinned APM version output" }
       - run: cargo test --locked -p commonkit-adapters --test apm_real_provider checksum_pinned_apm_release_materializes_without_touching_live_target -- --ignored --exact
       - name: Verify pinned chezmoi executable
         shell: pwsh

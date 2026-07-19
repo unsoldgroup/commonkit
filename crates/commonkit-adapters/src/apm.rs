@@ -174,6 +174,8 @@ fn configure_provider_environment(command: &mut Command, staging: &Path, scratch
         .env("APM_NON_INTERACTIVE", "1");
     #[cfg(windows)]
     {
+        use std::path::Component;
+
         // Python's Windows home lookup does not use HOME. Keep every writable
         // provider location inside staging while restoring only OS runtime
         // paths required by the official PyInstaller bundle.
@@ -188,7 +190,19 @@ fn configure_provider_environment(command: &mut Command, staging: &Path, scratch
         {
             command
                 .env("SystemRoot", &system_root)
-                .env("WINDIR", system_root);
+                .env("WINDIR", &system_root)
+                .env("COMSPEC", Path::new(&system_root).join("System32/cmd.exe"));
+        }
+        command
+            .env("OS", "Windows_NT")
+            .env("PATHEXT", ".COM;.EXE;.BAT;.CMD");
+        if let Some(Component::Prefix(prefix)) = staging.components().next() {
+            let drive = prefix.as_os_str();
+            if let Ok(home_path) = staging.strip_prefix(Path::new(drive)) {
+                command
+                    .env("HOMEDRIVE", drive)
+                    .env("HOMEPATH", home_path.as_os_str());
+            }
         }
     }
 }
@@ -196,7 +210,7 @@ fn configure_provider_environment(command: &mut Command, staging: &Path, scratch
 #[cfg(all(test, windows))]
 mod windows_environment_tests {
     use std::collections::BTreeMap;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
 
     use super::*;
 
@@ -218,21 +232,30 @@ mod windows_environment_tests {
             ("TMP", scratch.as_os_str()),
             ("TMPDIR", scratch.as_os_str()),
         ] {
-            assert_eq!(explicit.get(key), Some(&expected.to_owned()), "{key}");
+            assert_eq!(
+                explicit.get(OsStr::new(key)),
+                Some(&expected.to_owned()),
+                "{key}"
+            );
         }
         assert_eq!(
-            explicit.get("APPDATA"),
+            explicit.get(OsStr::new("APPDATA")),
             Some(&staging.join("AppData/Roaming").into_os_string())
         );
         assert_eq!(
-            explicit.get("LOCALAPPDATA"),
+            explicit.get(OsStr::new("LOCALAPPDATA")),
             Some(&staging.join("AppData/Local").into_os_string())
         );
         let system_root = std::env::var_os("SystemRoot").or_else(|| std::env::var_os("WINDIR"));
-        assert_eq!(explicit.get("SystemRoot"), system_root.as_ref());
-        assert_eq!(explicit.get("WINDIR"), system_root.as_ref());
-        assert!(!explicit.contains_key("PATH"));
-        assert!(!explicit.contains_key("GITHUB_TOKEN"));
+        assert_eq!(explicit.get(OsStr::new("SystemRoot")), system_root.as_ref());
+        assert_eq!(explicit.get(OsStr::new("WINDIR")), system_root.as_ref());
+        assert!(explicit.contains_key(OsStr::new("COMSPEC")));
+        assert_eq!(
+            explicit.get(OsStr::new("PATHEXT")),
+            Some(&OsString::from(".COM;.EXE;.BAT;.CMD"))
+        );
+        assert!(!explicit.contains_key(OsStr::new("PATH")));
+        assert!(!explicit.contains_key(OsStr::new("GITHUB_TOKEN")));
     }
 }
 
