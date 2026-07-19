@@ -1,11 +1,21 @@
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-#[cfg(not(windows))]
-use std::process::Command;
 use std::process::Output;
+#[cfg(not(windows))]
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use super::provider::ProviderFailure;
+
+const PROVIDER_RUNTIME_LIMIT: Duration = Duration::from_secs(300);
+const PROVIDER_OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ProviderLimits {
+    runtime: Duration,
+    output_bytes: usize,
+}
 
 pub(crate) struct ProviderSandbox<'a> {
     executable: &'a Path,
@@ -14,6 +24,7 @@ pub(crate) struct ProviderSandbox<'a> {
     current_dir: &'a Path,
     writable_roots: Vec<PathBuf>,
     readable_paths: Vec<PathBuf>,
+    limits: ProviderLimits,
 }
 
 impl<'a> ProviderSandbox<'a> {
@@ -25,6 +36,10 @@ impl<'a> ProviderSandbox<'a> {
             current_dir,
             writable_roots: Vec::new(),
             readable_paths: vec![executable.to_path_buf()],
+            limits: ProviderLimits {
+                runtime: PROVIDER_RUNTIME_LIMIT,
+                output_bytes: PROVIDER_OUTPUT_LIMIT,
+            },
         }
     }
 
@@ -61,6 +76,15 @@ impl<'a> ProviderSandbox<'a> {
 
     pub(crate) fn output(&self) -> Result<Output, ProviderFailure> {
         platform_output(self)
+    }
+
+    #[cfg(test)]
+    fn test_limits(&mut self, runtime: Duration, output_bytes: usize) -> &mut Self {
+        self.limits = ProviderLimits {
+            runtime,
+            output_bytes,
+        };
+        self
     }
 }
 
@@ -146,9 +170,7 @@ fn platform_output(spec: &ProviderSandbox<'_>) -> Result<Output, ProviderFailure
         .current_dir(current_dir)
         .env_clear()
         .envs(&spec.environment);
-    command.output().map_err(|error| {
-        ProviderFailure::Materialize(format!("could not launch macOS provider sandbox: {error}"))
-    })
+    bounded_unix_output(command, spec.limits, "macOS")
 }
 
 #[cfg(target_os = "linux")]
@@ -196,9 +218,138 @@ fn platform_output(spec: &ProviderSandbox<'_>) -> Result<Output, ProviderFailure
         command.arg("--setenv").arg(key).arg(value);
     }
     command.arg("--").arg(spec.executable).args(&spec.args);
-    command.output().map_err(|error| {
-        ProviderFailure::Materialize(format!("could not launch Linux provider sandbox: {error}"))
+    bounded_unix_output(command, spec.limits, "Linux")
+}
+
+#[cfg(unix)]
+fn bounded_unix_output(
+    mut command: Command,
+    limits: ProviderLimits,
+    platform: &str,
+) -> Result<Output, ProviderFailure> {
+    use std::os::unix::process::CommandExt as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().map_err(|error| {
+        ProviderFailure::Materialize(format!(
+            "could not launch {platform} provider sandbox: {error}"
+        ))
+    })?;
+    let process_group = child.id() as i32;
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout_reader = bounded_reader(
+        child.stdout.take().expect("piped provider stdout"),
+        limits.output_bytes,
+        Arc::clone(&overflow),
+    );
+    let stderr_reader = bounded_reader(
+        child.stderr.take().expect("piped provider stderr"),
+        limits.output_bytes,
+        Arc::clone(&overflow),
+    );
+    let started = Instant::now();
+    let mut limit_failure = None;
+    let status = loop {
+        if overflow.load(Ordering::Acquire) {
+            limit_failure = Some(format!(
+                "provider output limit of {} bytes per stream was exceeded",
+                limits.output_bytes
+            ));
+            terminate_unix_group(process_group, &mut child);
+            break child.wait();
+        }
+        if started.elapsed() >= limits.runtime {
+            limit_failure = Some(format!(
+                "provider runtime limit of {} seconds was exceeded",
+                limits.runtime.as_secs_f64()
+            ));
+            terminate_unix_group(process_group, &mut child);
+            break child.wait();
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Provider completion never licenses detached descendants.
+                terminate_unix_process_group(process_group);
+                break Ok(status);
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(error) => break Err(error),
+        }
+    }
+    .map_err(|error| {
+        ProviderFailure::Materialize(format!(
+            "could not wait for {platform} provider sandbox: {error}"
+        ))
+    })?;
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| ProviderFailure::Materialize("provider stdout reader panicked".into()))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| ProviderFailure::Materialize("provider stderr reader panicked".into()))??;
+    if overflow.load(Ordering::Acquire) && limit_failure.is_none() {
+        limit_failure = Some(format!(
+            "provider output limit of {} bytes per stream was exceeded",
+            limits.output_bytes
+        ));
+    }
+    if let Some(reason) = limit_failure {
+        return Err(ProviderFailure::Materialize(reason));
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
     })
+}
+
+#[cfg(unix)]
+fn bounded_reader<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+    limit: usize,
+    overflow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<Result<Vec<u8>, ProviderFailure>> {
+    use std::sync::atomic::Ordering;
+
+    std::thread::spawn(move || {
+        let mut bytes = Vec::with_capacity(limit.min(8192));
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut buffer).map_err(|error| {
+                ProviderFailure::Materialize(format!("could not capture provider output: {error}"))
+            })?;
+            if read == 0 {
+                return Ok(bytes);
+            }
+            if bytes.len().saturating_add(read) > limit {
+                let remaining = limit.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&buffer[..remaining]);
+                overflow.store(true, Ordering::Release);
+                return Ok(bytes);
+            }
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+    })
+}
+
+#[cfg(unix)]
+fn terminate_unix_group(process_group: i32, child: &mut std::process::Child) {
+    terminate_unix_process_group(process_group);
+    let _ = child.kill();
+}
+
+#[cfg(unix)]
+fn terminate_unix_process_group(process_group: i32) {
+    unsafe {
+        libc::kill(-process_group, libc::SIGKILL);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -217,6 +368,76 @@ fn ensure_sandbox_parents(command: &mut Command, paths: &[PathBuf]) {
     }
     for parent in parents {
         command.arg("--dir").arg(parent);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_limit_tests {
+    use super::ProviderSandbox;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    fn fixture(script: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempfile::tempdir().expect("root");
+        let executable = root.path().join("provider");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("workspace");
+        std::fs::write(&executable, script).expect("script");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("permissions");
+        (root, executable, workspace)
+    }
+
+    #[test]
+    fn provider_runtime_limit_terminates_the_process() {
+        let (_root, executable, workspace) = fixture("#!/bin/sh\nsleep 30\n");
+        let mut command = ProviderSandbox::new(&executable, &workspace);
+        command
+            .writable_root(&workspace)
+            .test_limits(Duration::from_millis(100), 1024);
+
+        let error = command
+            .output()
+            .expect_err("provider must time out")
+            .to_string();
+
+        assert!(error.contains("runtime limit"), "{error}");
+    }
+
+    #[test]
+    fn provider_output_limit_terminates_unbounded_output() {
+        let (_root, executable, workspace) =
+            fixture("#!/bin/sh\nwhile :; do printf '0123456789abcdef'; done\n");
+        let mut command = ProviderSandbox::new(&executable, &workspace);
+        command
+            .writable_root(&workspace)
+            .test_limits(Duration::from_secs(2), 1024);
+
+        let error = command
+            .output()
+            .expect_err("provider output must be bounded")
+            .to_string();
+
+        assert!(error.contains("output limit"), "{error}");
+    }
+
+    #[test]
+    fn successful_provider_cannot_leave_a_descendant_running() {
+        let (_root, executable, workspace) = fixture(
+            "#!/bin/sh\n(sleep 1; printf survived > \"$PWD/descendant-marker\") &\nexit 0\n",
+        );
+        let mut command = ProviderSandbox::new(&executable, &workspace);
+        command
+            .writable_root(&workspace)
+            .test_limits(Duration::from_secs(2), 1024);
+
+        let output = command.output().expect("provider launch");
+        assert!(output.status.success(), "{output:?}");
+        std::thread::sleep(Duration::from_millis(1_200));
+        assert!(
+            !workspace.join("descendant-marker").exists(),
+            "provider descendant survived sandbox completion"
+        );
     }
 }
 
@@ -239,9 +460,12 @@ mod windows_appcontainer {
     use std::path::{Path, PathBuf};
     use std::process::{ExitStatus, Output};
     use std::ptr::{null, null_mut};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
     use windows_sys::Win32::Foundation::{
         CloseHandle, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
-        SetHandleInformation, WAIT_FAILED,
+        SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Security::Authorization::{
         BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
@@ -253,7 +477,8 @@ mod windows_appcontainer {
         SECURITY_CAPABILITIES,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ALL_ACCESS, FILE_ATTRIBUTE_REPARSE_POINT, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE,
+        FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     };
     use windows_sys::Win32::System::JobObjects::{
         AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
@@ -307,7 +532,11 @@ mod windows_appcontainer {
                 )));
             }
             for entry in existing_tree(&path)? {
-                add_permission(&mut permissions, entry, FILE_ALL_ACCESS);
+                add_permission(
+                    &mut permissions,
+                    entry.clone(),
+                    writable_permissions(&entry),
+                );
             }
         }
         // Non-inheriting grants are intentional. Existing trees are enumerated exactly;
@@ -325,7 +554,7 @@ mod windows_appcontainer {
             sid.0,
             &[stdin_pipe.read.0, stdout_pipe.write.0, stderr_pipe.write.0],
         )?;
-        let job = Job::kill_on_close()?;
+        let mut job = Some(Job::kill_on_close()?);
 
         let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -362,7 +591,10 @@ mod windows_appcontainer {
         drop(stdin_pipe);
         let process_handle = OwnedHandle(process.hProcess);
         let thread_handle = OwnedHandle(process.hThread);
-        if unsafe { AssignProcessToJobObject(job.0.0, process_handle.0) } == 0 {
+        if unsafe {
+            AssignProcessToJobObject(job.as_ref().expect("provider job").0.0, process_handle.0)
+        } == 0
+        {
             unsafe { TerminateProcess(process_handle.0, 1) };
             return Err(last_error(
                 "could not attach provider process to containment job",
@@ -372,15 +604,60 @@ mod windows_appcontainer {
         // The parent must release its writer copies before readers can observe EOF.
         drop(stdout_pipe.write);
         drop(stderr_pipe.write);
-        let stdout_reader = reader(stdout_pipe.read);
-        let stderr_reader = reader(stderr_pipe.read);
+        let overflow = Arc::new(AtomicBool::new(false));
+        let stdout_reader = reader(
+            stdout_pipe.read,
+            spec.limits.output_bytes,
+            Arc::clone(&overflow),
+        );
+        let stderr_reader = reader(
+            stderr_pipe.read,
+            spec.limits.output_bytes,
+            Arc::clone(&overflow),
+        );
         if unsafe { ResumeThread(thread_handle.0) } == u32::MAX {
             unsafe { TerminateProcess(process_handle.0, 1) };
             return Err(last_error("could not resume contained provider process"));
         }
         drop(thread_handle);
-        if unsafe { WaitForSingleObject(process_handle.0, INFINITE) } == WAIT_FAILED {
-            return Err(last_error("could not wait for contained provider process"));
+        let started = Instant::now();
+        let mut limit_failure = None;
+        loop {
+            match unsafe { WaitForSingleObject(process_handle.0, 10) } {
+                WAIT_OBJECT_0 => break,
+                WAIT_TIMEOUT => {
+                    if overflow.load(Ordering::Acquire) {
+                        limit_failure = Some(format!(
+                            "provider output limit of {} bytes per stream was exceeded",
+                            spec.limits.output_bytes
+                        ));
+                    } else if started.elapsed() >= spec.limits.runtime {
+                        limit_failure = Some(format!(
+                            "provider runtime limit of {} seconds was exceeded",
+                            spec.limits.runtime.as_secs_f64()
+                        ));
+                    }
+                    if limit_failure.is_some() {
+                        // Job close terminates the provider and every descendant.
+                        drop(job.take());
+                        if unsafe { WaitForSingleObject(process_handle.0, INFINITE) } == WAIT_FAILED
+                        {
+                            return Err(last_error(
+                                "could not wait for terminated provider process",
+                            ));
+                        }
+                        break;
+                    }
+                }
+                WAIT_FAILED => {
+                    return Err(last_error("could not wait for contained provider process"));
+                }
+                unexpected => {
+                    return Err(failure(format!(
+                        "unexpected Windows provider wait result {unexpected}"
+                    )));
+                }
+            }
         }
         let mut exit_code = 0;
         if unsafe { GetExitCodeProcess(process_handle.0, &mut exit_code) } == 0 {
@@ -388,13 +665,13 @@ mod windows_appcontainer {
         }
         // Close the job before joining pipe readers. A malicious provider may leave a
         // descendant holding inherited writer handles; kill-on-close guarantees EOF.
-        drop(job);
+        drop(job.take());
         let stdout = stdout_reader
             .join()
-            .map_err(|_| failure("provider stdout reader panicked"))??;
+            .map_err(|_| failure("provider stdout reader panicked"))?;
         let stderr = stderr_reader
             .join()
-            .map_err(|_| failure("provider stderr reader panicked"))??;
+            .map_err(|_| failure("provider stderr reader panicked"))?;
 
         // Explicit drops make the security cleanup order auditable: terminate descendants,
         // release process handles, restore every DACL, then release the derived SID.
@@ -404,6 +681,17 @@ mod windows_appcontainer {
         }
         drop(grants);
         drop(sid);
+        let stdout = stdout?;
+        let stderr = stderr?;
+        if overflow.load(Ordering::Acquire) && limit_failure.is_none() {
+            limit_failure = Some(format!(
+                "provider output limit of {} bytes per stream was exceeded",
+                spec.limits.output_bytes
+            ));
+        }
+        if let Some(reason) = limit_failure {
+            return Err(failure(reason));
+        }
         use std::os::windows::process::ExitStatusExt;
         Ok(Output {
             status: ExitStatus::from_raw(exit_code),
@@ -439,6 +727,15 @@ mod windows_appcontainer {
             .entry(path)
             .and_modify(|existing| *existing |= permission)
             .or_insert(permission);
+    }
+
+    pub(super) fn writable_permissions(path: &Path) -> u32 {
+        let mut permissions =
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE | DELETE;
+        if path.is_dir() {
+            permissions |= FILE_DELETE_CHILD;
+        }
+        permissions
     }
 
     fn existing_tree(root: &Path) -> Result<Vec<PathBuf>, ProviderFailure> {
@@ -854,15 +1151,32 @@ mod windows_appcontainer {
         }
     }
 
-    fn reader(handle: OwnedHandle) -> std::thread::JoinHandle<Result<Vec<u8>, ProviderFailure>> {
+    fn reader(
+        handle: OwnedHandle,
+        limit: usize,
+        overflow: Arc<AtomicBool>,
+    ) -> std::thread::JoinHandle<Result<Vec<u8>, ProviderFailure>> {
         let raw = handle.0 as usize;
         std::mem::forget(handle);
         std::thread::spawn(move || {
             let mut file = unsafe { File::from_raw_handle(raw as *mut c_void) };
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|error| failure(format!("could not capture provider output: {error}")))?;
-            Ok(bytes)
+            let mut bytes = Vec::with_capacity(limit.min(8192));
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = file.read(&mut buffer).map_err(|error| {
+                    failure(format!("could not capture provider output: {error}"))
+                })?;
+                if read == 0 {
+                    return Ok(bytes);
+                }
+                if bytes.len().saturating_add(read) > limit {
+                    let remaining = limit.saturating_sub(bytes.len());
+                    bytes.extend_from_slice(&buffer[..remaining]);
+                    overflow.store(true, Ordering::Release);
+                    return Ok(bytes);
+                }
+                bytes.extend_from_slice(&buffer[..read]);
+            }
         })
     }
 }
@@ -870,8 +1184,16 @@ mod windows_appcontainer {
 #[cfg(all(test, windows))]
 mod windows_sandbox_tests {
     use super::ProviderSandbox;
+    use std::ffi::c_void;
     use std::net::TcpListener;
+    use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
+    use std::ptr::null_mut;
+    use std::time::Duration;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+    use windows_sys::Win32::Storage::FileSystem::{WRITE_DAC, WRITE_OWNER};
 
     fn system_executable(name: &str) -> PathBuf {
         PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
@@ -889,6 +1211,33 @@ mod windows_sandbox_tests {
             .env("TMP", workspace);
     }
 
+    fn dacl_bytes(path: &Path) -> Vec<u8> {
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut dacl = null_mut();
+        let mut descriptor: *mut c_void = null_mut();
+        let result = unsafe {
+            GetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(result, 0, "read DACL failed with Windows error {result}");
+        let bytes = if dacl.is_null() {
+            Vec::new()
+        } else {
+            let length = unsafe { (*dacl).AclSize as usize };
+            unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), length).to_vec() }
+        };
+        unsafe { LocalFree(descriptor) };
+        bytes
+    }
+
     #[test]
     fn appcontainer_preflight_can_write_only_its_declared_workspace() {
         let root = tempfile::tempdir().expect("root");
@@ -897,6 +1246,8 @@ mod windows_sandbox_tests {
         std::fs::create_dir_all(&workspace).expect("workspace");
         std::fs::create_dir_all(&outside).expect("outside");
         let executable = system_executable("cmd.exe");
+        let workspace_dacl = dacl_bytes(&workspace);
+        let outside_dacl = dacl_bytes(&outside);
 
         let mut allowed = ProviderSandbox::new(&executable, &workspace);
         allowed.args(["/D", "/C", "> inside.txt echo contained"]);
@@ -911,6 +1262,12 @@ mod windows_sandbox_tests {
             std::fs::read_to_string(workspace.join("inside.txt")).expect("inside output"),
             "contained\r\n"
         );
+        assert_eq!(
+            dacl_bytes(&workspace),
+            workspace_dacl,
+            "workspace DACL changed"
+        );
+        assert_eq!(dacl_bytes(&outside), outside_dacl, "outside DACL changed");
 
         let marker = outside.join("escaped.txt");
         let escape = format!("> \"{}\" echo escaped", marker.display());
@@ -922,6 +1279,51 @@ mod windows_sandbox_tests {
             !marker.exists(),
             "AppContainer wrote outside its granted root"
         );
+        assert_eq!(
+            dacl_bytes(&workspace),
+            workspace_dacl,
+            "workspace DACL changed"
+        );
+        assert_eq!(dacl_bytes(&outside), outside_dacl, "outside DACL changed");
+    }
+
+    #[test]
+    fn writable_acl_excludes_acl_and_owner_control_rights() {
+        let root = tempfile::tempdir().expect("root");
+        let permissions = super::windows_appcontainer::writable_permissions(root.path());
+        assert_eq!(permissions & WRITE_DAC, 0, "sandbox may rewrite DACLs");
+        assert_eq!(permissions & WRITE_OWNER, 0, "sandbox may take ownership");
+    }
+
+    #[test]
+    fn appcontainer_runtime_and_output_are_bounded() {
+        let executable = system_executable("cmd.exe");
+
+        let runtime_root = tempfile::tempdir().expect("runtime workspace");
+        let mut runtime = ProviderSandbox::new(&executable, runtime_root.path());
+        runtime.args(["/D", "/C", "for /L %i in (1,0,2) do @rem"]);
+        runtime.test_limits(Duration::from_millis(100), 1024);
+        configure_runtime(&mut runtime, runtime_root.path());
+        let runtime_error = runtime
+            .output()
+            .expect_err("runtime must be bounded")
+            .to_string();
+        assert!(runtime_error.contains("runtime limit"), "{runtime_error}");
+
+        let output_root = tempfile::tempdir().expect("output workspace");
+        let mut output = ProviderSandbox::new(&executable, output_root.path());
+        output.args([
+            "/D",
+            "/C",
+            "for /L %i in (1,1,1000000) do @echo 0123456789abcdef",
+        ]);
+        output.test_limits(Duration::from_secs(5), 1024);
+        configure_runtime(&mut output, output_root.path());
+        let output_error = output
+            .output()
+            .expect_err("output must be bounded")
+            .to_string();
+        assert!(output_error.contains("output limit"), "{output_error}");
     }
 
     #[test]
