@@ -15,9 +15,9 @@ async fn unavailable_v1_capabilities_return_stable_actionable_errors() {
         Arc::new(RwLock::new(ServiceStatus::default())),
         "127.0.0.1:3764",
     );
-    for (method, path) in [
-        ("GET", "/control/v1/compose"),
-        ("POST", "/control/v1/explain"),
+    for (method, path, body) in [
+        ("GET", "/control/v1/compose", "{}"),
+        ("POST", "/control/v1/explain", r#"{"pointer":"/"}"#),
     ] {
         let response = application
             .clone()
@@ -31,21 +31,15 @@ async fn unavailable_v1_capabilities_return_stable_actionable_errors() {
                         format!("Bearer {}", token.expose_for_client()),
                     )
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(body))
                     .expect("request"),
             )
             .await
             .expect("response");
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED, "{path}");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
         let body = to_bytes(response.into_body(), 8192).await.expect("body");
         let value: Value = serde_json::from_slice(&body).expect("JSON");
-        assert_eq!(value["error"]["code"], "capability_unavailable");
-        assert!(
-            value["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("not implemented")
-        );
+        assert_eq!(value["error"]["code"], "composition_domain_unconfigured");
         assert_eq!(value["error"]["retryable"], false);
     }
 }
