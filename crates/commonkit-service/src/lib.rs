@@ -378,6 +378,12 @@ impl ControlToken {
             Ok(mut file) => {
                 file.write_all(&token.0)?;
                 file.sync_all()?;
+                #[cfg(windows)]
+                commonkit_platform::ensure_private_path(
+                    path,
+                    commonkit_platform::PrivatePathKind::File,
+                )
+                .map_err(|_| ServiceError::InsecureControlToken)?;
                 Ok(token)
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -3895,6 +3901,9 @@ fn validate_token_file(path: &Path) -> Result<(), ServiceError> {
             return Err(ServiceError::InsecureControlToken);
         }
     }
+    #[cfg(windows)]
+    commonkit_platform::verify_private_path(path, commonkit_platform::PrivatePathKind::File)
+        .map_err(|_| ServiceError::InsecureControlToken)?;
     Ok(())
 }
 

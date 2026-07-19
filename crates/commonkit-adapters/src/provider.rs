@@ -382,15 +382,8 @@ pub trait DesiredStateProvider {
     ) -> Result<MaterializedState, ProviderFailure>;
 }
 
-#[cfg(unix)]
-fn set_private_directory(path: &Path) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn set_private_directory(_path: &Path) -> Result<(), std::io::Error> {
-    Ok(())
+fn set_private_directory(path: &Path) -> Result<(), commonkit_platform::PlatformError> {
+    commonkit_platform::ensure_private_path(path, commonkit_platform::PrivatePathKind::Directory)
 }
 
 #[derive(Debug, Error)]
@@ -411,6 +404,8 @@ pub enum ProviderContractError {
     StagingOverlapsLiveRoot,
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Platform(#[from] commonkit_platform::PlatformError),
     #[error(transparent)]
     Contract(#[from] ContractError),
 }

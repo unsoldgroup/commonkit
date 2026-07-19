@@ -10,6 +10,7 @@ rust-version.workspace = true
 cap-std.workspace = true
 commonkit-contracts = { path = "../commonkit-contracts" }
 commonkit-core = { path = "../commonkit-core" }
+commonkit-platform = { path = "../commonkit-platform" }
 commonkit-reconcile = { path = "../commonkit-reconcile" }
 libc.workspace = true
 serde.workspace = true

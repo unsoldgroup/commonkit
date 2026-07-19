@@ -65,3 +65,21 @@ fn rejects_overbroad_token_permissions_and_symlinks() {
     assert!(ControlToken::load_or_create(&link).is_err());
     fs::remove_dir_all(directory).expect("cleanup");
 }
+
+#[cfg(windows)]
+#[test]
+fn rejects_token_with_broad_explicit_windows_ace() {
+    let directory = temporary_directory();
+    let path = directory.join("control.token");
+    ControlToken::load_or_create(&path).expect("create private token");
+
+    let status = std::process::Command::new("icacls.exe")
+        .arg(&path)
+        .args(["/grant", "*S-1-1-0:(R)"])
+        .status()
+        .expect("run icacls");
+    assert!(status.success(), "fixture must add a broad explicit ACE");
+
+    assert!(ControlToken::load(&path).is_err());
+    fs::remove_dir_all(directory).expect("cleanup");
+}

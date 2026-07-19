@@ -91,6 +91,22 @@ fn provider_workspace_cannot_overlap_a_live_or_protected_root() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn provider_workspace_enforces_private_windows_acls() {
+    use commonkit_platform::{PrivatePathKind, verify_private_path};
+
+    let root = unique_temp_dir("provider-workspace-acl");
+    let staging = root.join("staging");
+    fs::create_dir(&staging).unwrap();
+
+    let workspace = ProviderWorkspace::open(&staging, &[]).unwrap();
+
+    verify_private_path(workspace.staging_root(), PrivatePathKind::Directory).unwrap();
+    verify_private_path(workspace.scratch_root(), PrivatePathKind::Directory).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn unique_temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "commonkit-{label}-{}-{:?}",
