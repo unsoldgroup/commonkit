@@ -243,17 +243,16 @@ mod windows_acl {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::ptr::{null, null_mut};
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        BuildTrusteeWithSidW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
-        SET_ACCESS, SE_FILE_OBJECT,
+        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+        SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        AclSizeInformation, EqualSid, GetAce, GetAclInformation, GetLengthSid,
-        GetSecurityDescriptorControl, GetTokenInformation, TokenUser, ACCESS_ALLOWED_ACE,
-        ACCESS_ALLOWED_ACE_TYPE, ACL, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION,
-        INHERITED_ACE, NO_INHERITANCE, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
-        TOKEN_QUERY, TOKEN_USER,
+        ACCESS_ALLOWED_ACE, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, GetLengthSid,
+        GetSecurityDescriptorControl, GetTokenInformation, INHERITED_ACE, NO_INHERITANCE,
+        PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -337,7 +336,7 @@ mod windows_acl {
     pub(super) fn verify_current_user_only(path: &Path) -> Result<(), PlatformError> {
         use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
 
-        let sid = current_user_sid()?;
+        let mut sid = current_user_sid()?;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
         let mut dacl: *mut ACL = null_mut();
         let mut descriptor: *mut c_void = null_mut();
@@ -380,12 +379,12 @@ mod windows_acl {
         let valid = valid
             && unsafe {
                 let allowed = &*ace.cast::<ACCESS_ALLOWED_ACE>();
-                allowed.Header.AceType == ACCESS_ALLOWED_ACE_TYPE
-                    && allowed.Header.AceFlags & INHERITED_ACE == 0
+                allowed.Header.AceType == 0
+                    && u32::from(allowed.Header.AceFlags) & INHERITED_ACE == 0
                     && allowed.Mask == FILE_ALL_ACCESS
                     && EqualSid(
-                        (&allowed.SidStart as *const u32).cast_mut().cast(),
-                        sid.as_ptr().cast(),
+                        std::ptr::addr_of!(allowed.SidStart).cast_mut().cast(),
+                        sid.as_mut_ptr().cast(),
                     ) != 0
             };
         unsafe { LocalFree(descriptor) };
