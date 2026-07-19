@@ -12,6 +12,16 @@ test("desktop capabilities expose no shell, process, filesystem, or arbitrary HT
   assert.deepEqual(capability.windows, ["main"]);
 });
 
+test("first-run defaults stay native and require no webview path capability", async () => {
+  const capability = JSON.parse(await readFile(new URL("capabilities/main.json", root), "utf8"));
+  const frontend = await readFile(new URL("../src/main.ts", root), "utf8");
+  const backend = await readFile(new URL("src/lib.rs", root), "utf8");
+  assert.doesNotMatch(frontend, /@tauri-apps\/api\/path|homeDir\(/);
+  assert.doesNotMatch(JSON.stringify(capability.permissions), /core:path/);
+  assert.match(backend, /fn onboarding_defaults\(/);
+  assert.match(backend, /onboarding_defaults,/);
+});
+
 test("desktop is single-window, CSP-bound, and emits updater artifacts", async () => {
   const config = JSON.parse(await readFile(new URL("tauri.conf.json", root), "utf8"));
   const source = await readFile(new URL("src/lib.rs", root), "utf8");

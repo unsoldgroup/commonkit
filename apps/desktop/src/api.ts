@@ -5,11 +5,13 @@ import type { UpdateSummary } from "./updater-view.ts";
 export type GithubAuthStatus =
   | { state: "authenticated"; login: string; method: "githubCli" }
   | { state: "signedOut" };
+export interface OnboardingDefaults { kitDirectory: string; targetRoot: string; computerName: string; }
 
 export const desktopApi = {
   onboardingInitialize: (request: Record<string, unknown>) => invoke<unknown>("onboarding_initialize", { request }),
   githubAuthStatus: () => invoke<GithubAuthStatus>("github_auth_status"),
   githubAuthLogin: () => invoke<GithubAuthStatus>("github_auth_login"),
+  onboardingDefaults: () => invoke<OnboardingDefaults>("onboarding_defaults"),
   snapshot: () => invoke<DesktopSnapshot>("desktop_snapshot"),
   managementSnapshot: () => invoke<ManagementSnapshot>("desktop_management_snapshot"),
   targets: () => invoke<TargetInventorySnapshot>("targets_list"),

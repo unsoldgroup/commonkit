@@ -497,6 +497,47 @@ struct OnboardingRequest {
     publish_registration: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OnboardingDefaults {
+    kit_directory: PathBuf,
+    target_root: PathBuf,
+    computer_name: String,
+}
+
+fn onboarding_defaults_from(
+    paths: &AppPaths,
+    home: Option<&Path>,
+    computer_name: &str,
+) -> Result<OnboardingDefaults, DesktopError> {
+    let home = home.filter(|path| path.is_absolute());
+    let target_root = home
+        .map(|path| path.join("CommonKitManaged"))
+        .unwrap_or_else(|| paths.config.join("managed-test"));
+    let computer_name = if validate_id(computer_name).is_ok() {
+        computer_name.to_owned()
+    } else {
+        "workstation".to_owned()
+    };
+    Ok(OnboardingDefaults {
+        kit_directory: paths.config.join("setup"),
+        target_root,
+        computer_name,
+    })
+}
+
+#[tauri::command]
+fn onboarding_defaults() -> Result<OnboardingDefaults, DesktopError> {
+    let paths = AppPaths::discover().map_err(|_| DesktopError::OnboardingFailed)?;
+    let home =
+        std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
+    let computer_name = std::env::var("COMPUTERNAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| "workstation".to_owned())
+        .to_ascii_lowercase();
+    onboarding_defaults_from(&paths, home.as_deref(), &computer_name)
+}
+
 fn authorize_github_repository(
     mode: &str,
     repository: &str,
@@ -1648,6 +1689,7 @@ pub fn run() {
             desktop_snapshot,
             github_auth_status,
             github_auth_login,
+            onboarding_defaults,
             onboarding_initialize,
             desktop_management_snapshot,
             apply_plan,
@@ -1954,6 +1996,24 @@ mod tests {
         assert_eq!(candidates[1], PathBuf::from("/second").join(executable));
         #[cfg(target_os = "macos")]
         assert!(candidates.contains(&PathBuf::from("/opt/homebrew/bin/gh")));
+    }
+
+    #[test]
+    fn onboarding_defaults_are_computed_natively_without_webview_path_permissions() {
+        let paths = AppPaths::from_roots("/private/config", "/private/data", "/private/cache")
+            .expect("fixture roots");
+        let defaults = onboarding_defaults_from(&paths, Some(Path::new("/Users/al")), "al-macbook")
+            .expect("defaults");
+
+        assert_eq!(
+            defaults.kit_directory,
+            PathBuf::from("/private/config/setup")
+        );
+        assert_eq!(
+            defaults.target_root,
+            PathBuf::from("/Users/al/CommonKitManaged")
+        );
+        assert_eq!(defaults.computer_name, "al-macbook");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import "./style.css";
 import { desktopApi } from "./api.ts";
-import { navigation, routeFromHash, type Route } from "./navigation.ts";
+import { navigationForSetup, routeForSetup, routeFromHash, type Route } from "./navigation.ts";
 import { statusView } from "./view-model.ts";
 import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } from "./contracts.ts";
 import { updatePanel, type UpdateUiState } from "./updater-view.ts";
@@ -8,9 +8,9 @@ import { managementPanel } from "./management-view.ts";
 import { defaultOnboardingDraft, onboardingPanel, type OnboardingViewState } from "./onboarding-view.ts";
 import { applyOnboardingValues, onboardingRequest } from "./onboarding-controller.ts";
 import { open } from "@tauri-apps/plugin-dialog";
-import { homeDir } from "@tauri-apps/api/path";
 import { assertPlanTarget, convergenceTarget } from "./target-selection.ts";
 import { refreshDesktopState } from "./live-refresh.ts";
+import { setupCompletion } from "./setup-gate.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
@@ -24,6 +24,8 @@ let onboardingState: OnboardingViewState = {
   message: "",
   submitting: false,
 };
+let setupUnlocked = false;
+let setupCheckFailed = false;
 
 function placeholder(route: Route): string {
   const copy: Record<Route, [string, string]> = {
@@ -42,13 +44,16 @@ function placeholder(route: Route): string {
 }
 
 function render(): void {
-  const route = routeFromHash(location.hash);
-  const body = route === "onboarding" ? onboardingPanel(onboardingState) : route === "settings" ? updatePanel(updateState) : route === "status" && snapshot ? (() => {
+  const completion = setupUnlocked ? "complete" : setupCheckFailed ? "required" : setupCompletion(snapshot?.status ?? null, targets);
+  const setupComplete = completion === "complete";
+  const route = routeForSetup(routeFromHash(location.hash), setupComplete);
+  const visibleNavigation = navigationForSetup(setupComplete);
+  const body = completion === "checking" ? `<section class="panel setup-check"><p class="eyebrow">First run</p><h1>Checking this computer…</h1><p>CommonKit is checking whether setup is already complete.</p></section>` : route === "onboarding" ? onboardingPanel(onboardingState) : route === "settings" ? updatePanel(updateState) : route === "status" && snapshot ? (() => {
     const view = statusView(snapshot.status);
     const inventory = targets ? `<fieldset><legend>Managed targets</legend>${targets.targets.map((target) => `<label><input type="checkbox" name="managed-target" value="${target.id}" ${targets?.selected.includes(target.id) ? "checked" : ""}> ${target.id} · ${target.transport.type}</label>`).join("")}<button id="save-target-selection" type="button">Save target selection</button></fieldset>` : "";
     return `<section class="panel"><p class="eyebrow">Selected targets</p><h1>${view.heading}</h1><p>${view.detail}</p><dl><dt>Active target</dt><dd>${snapshot.status.activeTarget ?? "Multiple or not selected"}</dd><dt>Loadout</dt><dd>${snapshot.status.activeLoadout ?? "Not selected"}</dd><dt>Runtime</dt><dd>${snapshot.status.runtimeVersion}</dd></dl>${inventory}${view.primaryRoute !== "status" ? `<a class="primary" href="#${view.primaryRoute}">Continue</a>` : ""}</section>`;
   })() : management && route in management ? managementPanel(route, management) : placeholder(route);
-  app.innerHTML = `<aside><div class="brand">CommonKit</div><nav>${navigation.map(({ route: id, label }) => `<a class="${route === id ? "active" : ""}" href="#${id}">${label}</a>`).join("")}</nav></aside><main>${body}</main>`;
+  app.innerHTML = `<aside><div class="brand">CommonKit</div><nav>${visibleNavigation.map(({ route: id, label }) => `<a class="${route === id ? "active" : ""}" href="#${id}">${label}</a>`).join("")}</nav></aside><main>${body}</main>`;
   if (route === "onboarding") bindOnboardingActions();
   else if (route === "settings") bindUpdateActions();
   else if (route === "status") bindTargetActions();
@@ -136,6 +141,7 @@ function bindOnboardingActions(): void {
       const result = await desktopApi.onboardingInitialize(onboardingRequest(onboardingState.draft, onboardingState.auth.login));
       const plan = (result as { firstPlanId?: string }).firstPlanId ?? "ready";
       onboardingState.message = `Your setup preview ${plan} is ready. Review it before applying any changes.`;
+      setupUnlocked = true;
       location.hash = "#plans";
     } catch (error) {
       onboardingState.message = errorMessage(error);
@@ -309,21 +315,33 @@ function bindManagementActions(route: Route): void {
   });
 }
 
-addEventListener("hashchange", render);
+addEventListener("hashchange", () => {
+  window.scrollTo(0, 0);
+  render();
+});
 render();
 async function initializeOnboarding(): Promise<void> {
-  try {
-    const [auth, home] = await Promise.all([desktopApi.githubAuthStatus(), homeDir()]);
-    onboardingState.auth = auth;
-    const cleanHome = home.replace(/[\\/]$/, "");
-    if (!onboardingState.draft.kitDirectory) onboardingState.draft.kitDirectory = `${cleanHome}/.config/commonkit/setup`;
-    if (!onboardingState.draft.targetRoot) onboardingState.draft.targetRoot = `${cleanHome}/CommonKitManaged`;
-  } catch (error) {
-    onboardingState.auth = { state: "error", message: errorMessage(error) };
+  const [auth, defaults] = await Promise.allSettled([desktopApi.githubAuthStatus(), desktopApi.onboardingDefaults()]);
+  onboardingState.auth = auth.status === "fulfilled" ? auth.value : { state: "error", message: errorMessage(auth.reason) };
+  if (defaults.status === "fulfilled") {
+    onboardingState.draft.kitDirectory ||= defaults.value.kitDirectory;
+    onboardingState.draft.targetRoot ||= defaults.value.targetRoot;
+    if (onboardingState.draft.computerName === "workstation") onboardingState.draft.computerName = defaults.value.computerName;
+  } else {
+    onboardingState.message = "CommonKit could not determine safe local folders. Choose them manually to continue.";
   }
   render();
 }
 void initializeOnboarding();
+async function initializeSetupGate(): Promise<void> {
+  const [observed, inventory] = await Promise.allSettled([desktopApi.snapshot(), desktopApi.targets()]);
+  if (observed.status === "fulfilled") snapshot = observed.value;
+  if (inventory.status === "fulfilled") targets = inventory.value;
+  setupCheckFailed = observed.status === "rejected" || inventory.status === "rejected";
+  if (setupCheckFailed) onboardingState.message = "The CommonKit background service is unavailable. Restart CommonKit, then retry setup.";
+  render();
+}
+void initializeSetupGate();
 let refreshRunning = false;
 async function refreshLiveState(): Promise<void> {
   if (refreshRunning) return;
