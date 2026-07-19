@@ -20,3 +20,12 @@ test("management panels report unavailable domains as unavailable", () => {
 
   assert.match(html, /snapshot_domain_unconfigured/);
 });
+
+test("operator panels expose explicit fixed actions without rendering secret inputs", () => {
+  assert.match(managementPanel("snapshots", { snapshots: { snapshots: [] } }), /id="snapshot-create"/);
+  assert.match(managementPanel("relay", { relay: { state: "healthy" } }), /id="relay-restart"/);
+  assert.match(managementPanel("schedule", { schedule: { enabled: false } }), /id="schedule-enable"/);
+  assert.match(managementPanel("credentials", { credentials: { credentials: [] } }), /id="credential-apply"/);
+  assert.match(managementPanel("diagnostics", { diagnostics: { status: "healthy" } }), /id="diagnostics-export"/);
+  assert.doesNotMatch(managementPanel("credentials", { credentials: {} }), /type="password"/);
+});

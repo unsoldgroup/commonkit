@@ -35,6 +35,7 @@ function render(): void {
   })() : management && route in management ? managementPanel(route, management) : placeholder(route);
   app.innerHTML = `<aside><div class="brand">CommonKit</div><nav>${navigation.map(({ route: id, label }) => `<a class="${route === id ? "active" : ""}" href="#${id}">${label}</a>`).join("")}</nav></aside><main>${body}</main>`;
   if (route === "settings") bindUpdateActions();
+  else if (management && route in management) bindManagementActions(route);
 }
 
 function errorMessage(error: unknown): string {
@@ -65,6 +66,94 @@ function bindUpdateActions(): void {
       updateState = { kind: "error", message: errorMessage(error) };
       render();
     }
+  });
+}
+
+function confirmationId(action: string): string {
+  return `desktop-${action}-${Date.now()}`;
+}
+
+function required(promptText: string): string | null {
+  const value = window.prompt(promptText)?.trim();
+  return value || null;
+}
+
+async function showResult(route: Route, action: () => Promise<unknown>): Promise<void> {
+  try {
+    const value = await action();
+    if (management) (management as unknown as Record<string, unknown>)[route] = value;
+  } catch (error) {
+    if (management) (management as unknown as Record<string, unknown>)[route] = { error: errorMessage(error) };
+  }
+  render();
+}
+
+function bindManagementActions(route: Route): void {
+  document.querySelector("#verify-state")?.addEventListener("click", () => void showResult(route, desktopApi.verify));
+  document.querySelector("#snapshot-create")?.addEventListener("click", () => {
+    const databaseId = required("Database ID to snapshot");
+    if (!databaseId || !window.confirm(`Create an encrypted snapshot of ${databaseId}?`)) return;
+    void showResult(route, () => desktopApi.snapshotCreate(databaseId, confirmationId("snapshot-create")));
+  });
+  document.querySelector("#snapshot-restore")?.addEventListener("click", () => {
+    const snapshotId = required("Snapshot ID to restore");
+    if (!snapshotId || !window.confirm(`Restore ${snapshotId}? The current database will be backed up first.`)) return;
+    void showResult(route, () => desktopApi.snapshotRestore(snapshotId, confirmationId("snapshot-restore")));
+  });
+  document.querySelector("#snapshot-promote")?.addEventListener("click", () => {
+    const databaseId = required("Database ID");
+    const targetId = databaseId ? required("Target ID to promote as authoritative writer") : null;
+    if (!databaseId || !targetId || !window.confirm(`Promote ${targetId} as writer for ${databaseId}?`)) return;
+    void showResult(route, () => desktopApi.snapshotPromote(databaseId, targetId, confirmationId("snapshot-promote")));
+  });
+  document.querySelector("#relay-restart")?.addEventListener("click", () => {
+    if (!window.confirm("Restart the managed relay runtime?")) return;
+    void showResult(route, () => desktopApi.relayRestart(confirmationId("relay-restart")));
+  });
+  document.querySelector("#relay-reconcile")?.addEventListener("click", () => {
+    const source = required("Paste the reviewed relay reconciliation request JSON");
+    if (!source) return;
+    try {
+      const request: unknown = JSON.parse(source);
+      if (!window.confirm("Apply this reviewed relay desired state?")) return;
+      void showResult(route, () => desktopApi.relayReconcile(request, confirmationId("relay-reconcile")));
+    } catch {
+      if (management) (management as unknown as Record<string, unknown>)[route] = { error: "invalid_relay_request" };
+      render();
+    }
+  });
+  document.querySelector("#schedule-enable")?.addEventListener("click", () => {
+    const raw = required("Drift-check interval in seconds");
+    const interval = raw ? Number(raw) : 0;
+    if (!Number.isSafeInteger(interval) || interval < 1 || !window.confirm(`Enable read-only drift checks every ${interval} seconds?`)) return;
+    void showResult(route, () => desktopApi.scheduleConfigure(true, interval, confirmationId("schedule-enable")));
+  });
+  document.querySelector("#schedule-disable")?.addEventListener("click", () => {
+    if (!window.confirm("Disable scheduled drift checks?")) return;
+    void showResult(route, () => desktopApi.scheduleConfigure(false, 1, confirmationId("schedule-disable")));
+  });
+  document.querySelector("#credential-readiness")?.addEventListener("click", () => {
+    const reference = required("Credential reference (for example bws://secret-id)");
+    if (reference) void showResult(route, () => desktopApi.credentialReadiness([reference]));
+  });
+  document.querySelector("#credential-apply")?.addEventListener("click", () => {
+    const id = required("Configured credential destination ID");
+    if (!id || !window.confirm(`Provision credential destination ${id}? Secret values remain hidden.`)) return;
+    void showResult(route, () => desktopApi.credentialApply([id], confirmationId("credential-apply")));
+  });
+  document.querySelector("#credential-verify")?.addEventListener("click", () => {
+    const id = required("Configured credential destination ID to verify");
+    if (id) void showResult(route, () => desktopApi.credentialVerify([id]));
+  });
+  document.querySelector("#diagnostics-export")?.addEventListener("click", () => {
+    void desktopApi.diagnosticsExport().then((value) => {
+      const url = URL.createObjectURL(new Blob([JSON.stringify(value, null, 2)], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "commonkit-diagnostics.json";
+      link.click();
+      URL.revokeObjectURL(url);
+    }).catch((error) => void showResult(route, async () => { throw error; }));
   });
 }
 

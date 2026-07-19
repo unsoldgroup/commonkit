@@ -179,6 +179,21 @@ fn management_routes() -> [(&'static str, &'static str); 6] {
     ]
 }
 
+fn operator_routes() -> [(&'static str, &'static str); 10] {
+    [
+        ("verify", "/verify"),
+        ("snapshot_create", "/snapshots"),
+        ("snapshot_restore", "/snapshots/restore"),
+        ("snapshot_promote", "/snapshots/promote"),
+        ("relay_reconcile", "/relay/reconcile"),
+        ("relay_restart", "/relay/restart"),
+        ("schedule", "/schedule"),
+        ("credential_apply", "/credentials/apply"),
+        ("credential_verify", "/credentials/verify"),
+        ("diagnostics", "/diagnostics"),
+    ]
+}
+
 fn unavailable(error: DesktopError) -> serde_json::Value {
     serde_json::json!({ "error": error.to_string() })
 }
@@ -335,6 +350,198 @@ async fn apply_plan(
     client.apply(&plan_id, &confirmation_id).await
 }
 
+fn confirmed_body(
+    mut body: serde_json::Value,
+    confirmation_id: &str,
+) -> Result<serde_json::Value, DesktopError> {
+    validate_id(confirmation_id)?;
+    let object = body.as_object_mut().ok_or(DesktopError::InvalidInput)?;
+    object.insert("confirmed".into(), true.into());
+    object.insert("confirmationId".into(), confirmation_id.into());
+    Ok(body)
+}
+
+async fn post_confirmed(
+    client: &ServiceClient,
+    path: &str,
+    body: serde_json::Value,
+    confirmation_id: &str,
+) -> Result<serde_json::Value, DesktopError> {
+    client
+        .json(
+            reqwest::Method::POST,
+            path,
+            Some(confirmed_body(body, confirmation_id)?),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn desktop_verify(
+    client: tauri::State<'_, ServiceClient>,
+) -> Result<serde_json::Value, DesktopError> {
+    client
+        .json(
+            reqwest::Method::POST,
+            "/verify",
+            Some(serde_json::json!({"targetId": null, "pointer": null})),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn snapshot_create(
+    client: tauri::State<'_, ServiceClient>,
+    database_id: String,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    validate_id(&database_id)?;
+    post_confirmed(
+        &client,
+        "/snapshots",
+        serde_json::json!({"databaseId": database_id}),
+        &confirmation_id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn snapshot_restore(
+    client: tauri::State<'_, ServiceClient>,
+    snapshot_id: String,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    validate_id(&snapshot_id)?;
+    post_confirmed(
+        &client,
+        "/snapshots/restore",
+        serde_json::json!({"snapshotId": snapshot_id}),
+        &confirmation_id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn snapshot_promote(
+    client: tauri::State<'_, ServiceClient>,
+    database_id: String,
+    target_id: String,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    validate_id(&database_id)?;
+    validate_id(&target_id)?;
+    post_confirmed(
+        &client,
+        "/snapshots/promote",
+        serde_json::json!({"databaseId": database_id, "targetId": target_id}),
+        &confirmation_id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn relay_reconcile(
+    client: tauri::State<'_, ServiceClient>,
+    request: serde_json::Value,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    post_confirmed(&client, "/relay/reconcile", request, &confirmation_id).await
+}
+
+#[tauri::command]
+async fn relay_restart(
+    client: tauri::State<'_, ServiceClient>,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    post_confirmed(
+        &client,
+        "/relay/restart",
+        serde_json::json!({}),
+        &confirmation_id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn schedule_configure(
+    client: tauri::State<'_, ServiceClient>,
+    enabled: bool,
+    interval_seconds: u64,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    if interval_seconds == 0 {
+        return Err(DesktopError::InvalidInput);
+    }
+    post_confirmed(
+        &client,
+        "/schedule",
+        serde_json::json!({"enabled": enabled, "intervalSeconds": interval_seconds}),
+        &confirmation_id,
+    )
+    .await
+}
+
+fn validate_ids(values: &[String]) -> Result<(), DesktopError> {
+    if values.is_empty() {
+        return Err(DesktopError::InvalidInput);
+    }
+    values.iter().try_for_each(|value| validate_id(value))
+}
+
+#[tauri::command]
+async fn credential_readiness(
+    client: tauri::State<'_, ServiceClient>,
+    references: Vec<String>,
+) -> Result<serde_json::Value, DesktopError> {
+    client
+        .json(
+            reqwest::Method::POST,
+            "/credentials/readiness",
+            Some(serde_json::json!({"references": references})),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn credential_apply(
+    client: tauri::State<'_, ServiceClient>,
+    destination_ids: Vec<String>,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    validate_ids(&destination_ids)?;
+    post_confirmed(
+        &client,
+        "/credentials/apply",
+        serde_json::json!({"destinationIds": destination_ids}),
+        &confirmation_id,
+    )
+    .await
+}
+
+#[tauri::command]
+async fn credential_verify(
+    client: tauri::State<'_, ServiceClient>,
+    destination_ids: Vec<String>,
+) -> Result<serde_json::Value, DesktopError> {
+    validate_ids(&destination_ids)?;
+    client
+        .json(
+            reqwest::Method::POST,
+            "/credentials/verify",
+            Some(serde_json::json!({"destinationIds": destination_ids})),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn diagnostics_export(
+    client: tauri::State<'_, ServiceClient>,
+) -> Result<serde_json::Value, DesktopError> {
+    client
+        .json(reqwest::Method::GET, "/diagnostics", None)
+        .await
+}
+
 #[tauri::command]
 fn set_autostart(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
     let manager = app.autolaunch();
@@ -433,6 +640,17 @@ pub fn run() {
             desktop_snapshot,
             desktop_management_snapshot,
             apply_plan,
+            desktop_verify,
+            snapshot_create,
+            snapshot_restore,
+            snapshot_promote,
+            relay_reconcile,
+            relay_restart,
+            schedule_configure,
+            credential_readiness,
+            credential_apply,
+            credential_verify,
+            diagnostics_export,
             set_autostart,
             check_for_update,
             install_update,
@@ -478,6 +696,24 @@ mod tests {
                 ("snapshots", "/snapshots"),
                 ("relay", "/relay"),
                 ("schedule", "/schedule"),
+                ("diagnostics", "/diagnostics"),
+            ]
+        );
+    }
+    #[test]
+    fn operator_actions_are_bound_to_fixed_service_routes_and_methods() {
+        assert_eq!(
+            operator_routes(),
+            [
+                ("verify", "/verify"),
+                ("snapshot_create", "/snapshots"),
+                ("snapshot_restore", "/snapshots/restore"),
+                ("snapshot_promote", "/snapshots/promote"),
+                ("relay_reconcile", "/relay/reconcile"),
+                ("relay_restart", "/relay/restart"),
+                ("schedule", "/schedule"),
+                ("credential_apply", "/credentials/apply"),
+                ("credential_verify", "/credentials/verify"),
                 ("diagnostics", "/diagnostics"),
             ]
         );
