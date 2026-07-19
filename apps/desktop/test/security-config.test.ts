@@ -40,7 +40,8 @@ test("published installer lifecycle launches the installed desktop and waits for
 });
 
 test("installed lifecycle atomically reloads an already-running daemon after onboarding", async () => {
-  const lifecycle = await readFile(new URL("../../../scripts/installed-lifecycle.sh", import.meta.url), "utf8");
+  const lifecycle = (await readFile(new URL("../../../scripts/installed-lifecycle.sh", import.meta.url), "utf8"))
+    .replaceAll("\r\n", "\n");
   const firstStart = lifecycle.indexOf("trap stop_daemon EXIT\nstart_daemon");
   const initialized = lifecycle.indexOf('"$commonkit" init connect');
   const reload = lifecycle.indexOf('daemon reload-domains --confirmed');

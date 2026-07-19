@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 test("updater manifest carries generated release notes for the consent UI", async () => {
@@ -13,8 +14,8 @@ test("updater manifest carries generated release notes for the consent UI", asyn
   }
   const notes = join(root, "release-notes.md");
   await writeFile(notes, "Security fixes and recovery improvements.\n");
-  const result = spawnSync(process.execPath, [resolve("../../scripts/assemble-updater-manifest.mjs"), root, "v0.2.0", notes], {
-    cwd: new URL(".", import.meta.url).pathname,
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL("../../../scripts/assemble-updater-manifest.mjs", import.meta.url)), root, "v0.2.0", notes], {
+    cwd: fileURLToPath(new URL(".", import.meta.url)),
     env: { ...process.env, COMMONKIT_RELEASE_DOWNLOAD_BASE: "https://releases.example.test/v0.2.0" },
     encoding: "utf8",
   });
