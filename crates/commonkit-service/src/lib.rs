@@ -641,6 +641,10 @@ fn router_with_control_and_relay(
         .route("/control/v1/targets/select", post(select_targets))
         .route("/control/v1/targets/{id}/sync/plan", post(target_sync_plan))
         .route("/control/v1/targets/{id}/verify", post(target_verify))
+        .route(
+            "/control/v1/targets/{target}/plans/{plan}/apply",
+            post(target_apply_plan),
+        )
         .route("/control/v1/verify", post(verify_target))
         .route(
             "/control/v1/credentials/readiness",
@@ -1713,6 +1717,42 @@ async fn target_verify(
         .target_sync_domain(&target)
         .map_err(ApiError::from)?;
     safe_domain_result(domain.verify(request))
+}
+
+async fn target_apply_plan(
+    State(state): State<ApiState>,
+    AxumPath((target, plan)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    Json(request): Json<ApplyRequest>,
+) -> Result<(StatusCode, Json<ApplyOperation>), ApiError> {
+    if !request.confirmed {
+        return Err(ApiError::conflict("confirmation_required"));
+    }
+    let target = StableId::parse(target).map_err(|_| ApiError::bad_request("invalid_target_id"))?;
+    let plan = Sha256Digest::parse(plan).map_err(|_| ApiError::bad_request("invalid_plan_id"))?;
+    let bound = state
+        .control
+        .plan(&plan)
+        .ok_or_else(|| ApiError::not_found("plan_not_found"))?;
+    if bound.target_id != target {
+        return Err(ApiError::conflict("target_plan_mismatch"));
+    }
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| ApiError::bad_request("idempotency_key_required"))?;
+    let (operation, created) = state
+        .control
+        .apply(&plan, &request.confirmation_id, key)
+        .map_err(ApiError::from)?;
+    Ok((
+        if created {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        },
+        Json(operation),
+    ))
 }
 
 async fn register_plan(

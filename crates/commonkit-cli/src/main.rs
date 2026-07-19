@@ -107,6 +107,12 @@ enum TargetCommand {
         #[arg(long)]
         confirmed: bool,
     },
+    Apply {
+        target: String,
+        plan_id: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
     Verify {
         targets: Vec<String>,
     },
@@ -615,6 +621,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     }
                     print_daemon(Value::Array(results))?;
                 }
+                TargetCommand::Apply {
+                    confirmed: false, ..
+                } => {
+                    return Err("confirmation_required: target apply requires --confirmed".into());
+                }
+                TargetCommand::Apply {
+                    target,
+                    plan_id,
+                    confirmed: true,
+                } => print_daemon(daemon_control(
+                    "POST",
+                    &format!("/control/v1/targets/{target}/plans/{plan_id}/apply"),
+                    Some(json!({"confirmed":true,"confirmationId":format!("cli-apply-{target}")})),
+                    Some(nonce("target-apply")),
+                )?)?,
             }
         }
         Command::Compose { layers } => {
