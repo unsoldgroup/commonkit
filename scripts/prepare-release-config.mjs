@@ -16,10 +16,14 @@ if (missing.length) {
   if (!rawTag?.startsWith("v") || rawTag.slice(1) !== config.version) {
     throw new Error(`release tag ${rawTag ?? "<missing>"} must match desktop version v${config.version}`);
   }
+  const updateEndpoint = process.env.COMMONKIT_UPDATE_ENDPOINT.trim();
+  if (!updateEndpoint.startsWith("https://")) {
+    throw new Error("COMMONKIT_UPDATE_ENDPOINT must use HTTPS");
+  }
   config.plugins ??= {};
   config.plugins.updater = {
     pubkey: process.env.TAURI_UPDATER_PUBLIC_KEY.trim(),
-    endpoints: [process.env.COMMONKIT_UPDATE_ENDPOINT.trim()],
+    endpoints: [updateEndpoint],
   };
   if (process.env.RUNNER_OS === "Windows") {
     const timestampUrl = process.env.WINDOWS_TIMESTAMP_URL.trim();

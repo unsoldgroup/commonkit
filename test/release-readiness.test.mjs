@@ -58,6 +58,17 @@ test("release inputs are validated before packaging", async () => {
   assert.match(validator, /TAURI_UPDATER_PUBLIC_KEY/);
   assert.match(validator, /COMMONKIT_UPDATE_ENDPOINT/);
   assert.match(validator, /process\.exitCode = 1/);
+  assert.match(validator, /COMMONKIT_UPDATE_ENDPOINT must use HTTPS/);
+});
+
+test("release download URLs are bound to the repository and exact release tag", async () => {
+  const workflow = await read(".github/workflows/release.yml");
+
+  assert.match(
+    workflow,
+    /COMMONKIT_RELEASE_DOWNLOAD_BASE: https:\/\/github\.com\/\$\{\{ github\.repository \}\}\/releases\/download\/\$\{\{ inputs\.tag \|\| github\.ref_name \}\}/,
+  );
+  assert.doesNotMatch(workflow, /vars\.COMMONKIT_RELEASE_DOWNLOAD_BASE/);
 });
 
 test("release automation performs real assembly and fails closed", async () => {
