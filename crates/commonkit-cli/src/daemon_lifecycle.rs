@@ -366,8 +366,10 @@ fn wait_for_started_identity(
                 return Ok(identity);
             }
         }
-        if child.try_wait()?.is_some() {
-            return Err(DaemonLifecycleError::ProcessIdentityUnavailable);
+        if let Some(status) = child.try_wait()? {
+            return Err(DaemonLifecycleError::ProcessExitedBeforeIdentity(
+                status.to_string(),
+            ));
         }
         if Instant::now() >= deadline {
             return Err(DaemonLifecycleError::ProcessExecTimeout);
@@ -650,6 +652,8 @@ pub enum DaemonLifecycleError {
     StaleProcessIdentity,
     #[error("the daemon process identity could not be observed")]
     ProcessIdentityUnavailable,
+    #[error("the daemon exited before its process identity could be bound: {0}")]
+    ProcessExitedBeforeIdentity(String),
     #[error("the started daemon executable does not match the configured executable")]
     ProcessIdentityMismatch,
     #[error(

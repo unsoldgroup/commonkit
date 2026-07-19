@@ -1,5 +1,6 @@
 //! Cross-platform local paths and operating-system boundaries.
 
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
@@ -72,6 +73,9 @@ pub enum PrivatePathKind {
 
 impl AppPaths {
     pub fn discover() -> Result<Self, PlatformError> {
+        if let Some(paths) = configured_app_paths(|name| std::env::var_os(name))? {
+            return Ok(paths);
+        }
         let project = ProjectDirs::from("com", "unsoldgroup", "CommonKit")
             .ok_or(PlatformError::HomeUnavailable)?;
         Self::from_roots(
@@ -116,6 +120,24 @@ impl AppPaths {
             ensure_private_path(directory, PrivatePathKind::Directory)?;
         }
         Ok(())
+    }
+}
+
+fn configured_app_paths(
+    get: impl Fn(&OsStr) -> Option<OsString>,
+) -> Result<Option<AppPaths>, PlatformError> {
+    let config = get(OsStr::new("XDG_CONFIG_HOME"));
+    let data = get(OsStr::new("XDG_DATA_HOME"));
+    let cache = get(OsStr::new("XDG_CACHE_HOME"));
+    match (config, data, cache) {
+        (None, None, None) => Ok(None),
+        (Some(config), Some(data), Some(cache)) => AppPaths::from_roots(
+            PathBuf::from(config),
+            PathBuf::from(data),
+            PathBuf::from(cache),
+        )
+        .map(Some),
+        _ => Err(PlatformError::IncompleteRootOverride),
     }
 }
 
@@ -277,6 +299,10 @@ pub enum PlatformError {
     UnsafeRoot(PathBuf),
     #[error("application config, state, and cache roots must be distinct")]
     OverlappingRoots,
+    #[error(
+        "XDG_CONFIG_HOME, XDG_DATA_HOME, and XDG_CACHE_HOME must be set together to override CommonKit application roots"
+    )]
+    IncompleteRootOverride,
     #[error("unsupported operating system: {0}")]
     UnsupportedPlatform(String),
     #[error("private path cannot be a symbolic link: {0}")]
@@ -291,4 +317,68 @@ pub enum PlatformError {
     AclFailed(PathBuf),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+
+    #[cfg(not(windows))]
+    const CONFIG_ROOT: &str = "/isolated/config";
+    #[cfg(windows)]
+    const CONFIG_ROOT: &str = r"C:\isolated\config";
+    #[cfg(not(windows))]
+    const DATA_ROOT: &str = "/isolated/data";
+    #[cfg(windows)]
+    const DATA_ROOT: &str = r"C:\isolated\data";
+    #[cfg(not(windows))]
+    const CACHE_ROOT: &str = "/isolated/cache";
+    #[cfg(windows)]
+    const CACHE_ROOT: &str = r"C:\isolated\cache";
+
+    fn roots(values: &[(&str, &str)]) -> Result<Option<AppPaths>, PlatformError> {
+        configured_app_paths(|name| {
+            values
+                .iter()
+                .find(|(key, _)| OsStr::new(key) == name)
+                .map(|(_, value)| OsString::from(value))
+        })
+    }
+
+    #[test]
+    fn complete_explicit_roots_are_used_without_platform_directory_discovery() {
+        let paths = roots(&[
+            ("XDG_CONFIG_HOME", CONFIG_ROOT),
+            ("XDG_DATA_HOME", DATA_ROOT),
+            ("XDG_CACHE_HOME", CACHE_ROOT),
+        ])
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(paths.config, Path::new(CONFIG_ROOT));
+        assert_eq!(paths.state, Path::new(DATA_ROOT).join("state"));
+        assert_eq!(paths.cache, Path::new(CACHE_ROOT));
+    }
+
+    #[test]
+    fn partial_or_unsafe_explicit_roots_fail_closed() {
+        assert!(matches!(
+            roots(&[("XDG_CONFIG_HOME", CONFIG_ROOT)]),
+            Err(PlatformError::IncompleteRootOverride)
+        ));
+        assert!(matches!(
+            roots(&[
+                ("XDG_CONFIG_HOME", CONFIG_ROOT),
+                ("XDG_DATA_HOME", "relative-data"),
+                ("XDG_CACHE_HOME", CACHE_ROOT),
+            ]),
+            Err(PlatformError::UnsafeRoot(_))
+        ));
+    }
+
+    #[test]
+    fn absent_explicit_roots_preserve_platform_directory_discovery() {
+        assert_eq!(roots(&[]).unwrap(), None);
+    }
 }

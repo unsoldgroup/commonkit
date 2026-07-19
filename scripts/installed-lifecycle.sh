@@ -107,7 +107,10 @@ stop_daemon() {
 }
 start_daemon() {
   "$commonkit" daemon install >/dev/null
-  "$commonkit" daemon start >/dev/null
+  if ! "$commonkit" daemon start >/dev/null; then
+    cat "$scratch/service/commonkitd.log" >&2 || true
+    return 1
+  fi
   for _ in $(seq 1 150); do
     if "$commonkit" relay status >/dev/null 2>&1; then return; fi
     sleep 0.1
