@@ -137,7 +137,7 @@ fn configured_app_paths(
             PathBuf::from(cache),
         )
         .map(Some),
-        _ => Err(PlatformError::IncompleteRootOverride),
+        _ => Ok(None),
     }
 }
 
@@ -299,10 +299,6 @@ pub enum PlatformError {
     UnsafeRoot(PathBuf),
     #[error("application config, state, and cache roots must be distinct")]
     OverlappingRoots,
-    #[error(
-        "XDG_CONFIG_HOME, XDG_DATA_HOME, and XDG_CACHE_HOME must be set together to override CommonKit application roots"
-    )]
-    IncompleteRootOverride,
     #[error("unsupported operating system: {0}")]
     UnsupportedPlatform(String),
     #[error("private path cannot be a symbolic link: {0}")]
@@ -362,11 +358,20 @@ mod tests {
     }
 
     #[test]
-    fn partial_or_unsafe_explicit_roots_fail_closed() {
-        assert!(matches!(
-            roots(&[("XDG_CONFIG_HOME", CONFIG_ROOT)]),
-            Err(PlatformError::IncompleteRootOverride)
-        ));
+    fn partial_standard_xdg_roots_preserve_platform_directory_discovery() {
+        assert_eq!(roots(&[("XDG_CONFIG_HOME", CONFIG_ROOT)]).unwrap(), None);
+        assert_eq!(
+            roots(&[
+                ("XDG_CONFIG_HOME", CONFIG_ROOT),
+                ("XDG_CACHE_HOME", CACHE_ROOT),
+            ])
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn unsafe_complete_explicit_roots_fail_closed() {
         assert!(matches!(
             roots(&[
                 ("XDG_CONFIG_HOME", CONFIG_ROOT),
