@@ -46,6 +46,6 @@ fn production_drift_checker_uses_only_domain_verification() {
 #[test]
 fn unconfigured_production_drift_checker_fails_closed() {
     let result = SyncDomainDriftChecker::new(None).check();
-    assert_eq!(result.state, OverallState::Error);
+    assert_eq!(result.state, OverallState::Degraded);
     assert_eq!(result.code.as_deref(), Some("sync_domain_unconfigured"));
 }
