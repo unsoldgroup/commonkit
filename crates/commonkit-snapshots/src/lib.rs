@@ -273,6 +273,205 @@ pub trait PortableAuthorityPublisher {
     ) -> Result<String, SnapshotError>;
 }
 
+/// Git-backed authority publisher. It never commits from the user's working tree: the exact
+/// portable subtree is copied into an isolated clone of the trusted remote parent, committed, and
+/// pushed without force. A concurrent remote update therefore fails before local authority is
+/// installed.
+pub struct ProcessGitAuthorityPublisher {
+    executable: PathBuf,
+    repository: PathBuf,
+    trusted_remote_url: String,
+    branch: String,
+    portable_relative: PathBuf,
+    staging_root: PathBuf,
+}
+
+impl ProcessGitAuthorityPublisher {
+    pub fn new(
+        executable: impl Into<PathBuf>,
+        repository: impl Into<PathBuf>,
+        trusted_remote_url: impl Into<String>,
+        branch: impl Into<String>,
+        portable_relative: impl Into<PathBuf>,
+        staging_root: impl Into<PathBuf>,
+    ) -> Result<Self, SnapshotError> {
+        let value = Self {
+            executable: executable.into(),
+            repository: repository.into(),
+            trusted_remote_url: trusted_remote_url.into(),
+            branch: branch.into(),
+            portable_relative: portable_relative.into(),
+            staging_root: staging_root.into(),
+        };
+        if !value.executable.is_absolute()
+            || !value.repository.is_absolute()
+            || value.trusted_remote_url.trim().is_empty()
+            || !safe_git_branch(&value.branch)
+            || !safe_relative_path(&value.portable_relative)
+            || !value.staging_root.is_absolute()
+        {
+            return Err(SnapshotError::InvalidObjectStore);
+        }
+        Ok(value)
+    }
+
+    pub fn checked_out_revision(&self) -> Result<String, SnapshotError> {
+        self.git_output(&self.repository, &["rev-parse", "HEAD"])
+    }
+
+    pub fn trusted_remote_revision(&self) -> Result<String, SnapshotError> {
+        let reference = format!("refs/heads/{}", self.branch);
+        let output = Command::new(&self.executable)
+            .args([
+                "ls-remote",
+                "--exit-code",
+                self.trusted_remote_url.as_str(),
+                reference.as_str(),
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !output.status.success() {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
+        let text =
+            std::str::from_utf8(&output.stdout).map_err(|_| SnapshotError::TransactionIntegrity)?;
+        let mut fields = text.split_whitespace();
+        let revision = fields
+            .next()
+            .filter(|revision| valid_git_revision(revision))
+            .ok_or(SnapshotError::TransactionIntegrity)?;
+        let found_reference = fields.next().ok_or(SnapshotError::TransactionIntegrity)?;
+        if found_reference != reference || fields.next().is_some() {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        Ok(revision.into())
+    }
+
+    fn git_output(&self, repository: &Path, args: &[&str]) -> Result<String, SnapshotError> {
+        let output = Command::new(&self.executable)
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !output.status.success() {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
+        let value = std::str::from_utf8(&output.stdout)
+            .map_err(|_| SnapshotError::TransactionIntegrity)?
+            .trim();
+        if value.is_empty() {
+            return Err(SnapshotError::TransactionIntegrity);
+        }
+        Ok(value.into())
+    }
+
+    fn git_status(&self, repository: &Path, args: &[&str]) -> Result<(), SnapshotError> {
+        let output = Command::new(&self.executable)
+            .arg("-C")
+            .arg(repository)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(SnapshotError::StalePortableAuthority)
+        }
+    }
+}
+
+impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
+    fn publish(
+        &mut self,
+        expected_parent: &str,
+        staged_portable_root: &Path,
+    ) -> Result<String, SnapshotError> {
+        if !valid_git_revision(expected_parent)
+            || self.checked_out_revision()? != expected_parent
+            || self.trusted_remote_revision()? != expected_parent
+        {
+            return Err(SnapshotError::StalePortableAuthority);
+        }
+        std::fs::create_dir_all(&self.staging_root)
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        let clone = self
+            .staging_root
+            .join(format!("git-authority-{:032x}", rand::random::<u128>()));
+        let result = (|| {
+            let status = Command::new(&self.executable)
+                .args(["clone", "--no-checkout", "--single-branch", "--branch"])
+                .arg(&self.branch)
+                .arg(&self.trusted_remote_url)
+                .arg(&clone)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+            if !status.success()
+                || self.git_output(&clone, &["rev-parse", "HEAD"])? != expected_parent
+            {
+                return Err(SnapshotError::StalePortableAuthority);
+            }
+            self.git_status(&clone, &["checkout", "--detach", expected_parent])?;
+            let destination = clone.join(&self.portable_relative);
+            if destination.exists() {
+                std::fs::remove_dir_all(&destination)
+                    .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+            }
+            copy_portable_tree(staged_portable_root, &destination)?;
+            let portable = self
+                .portable_relative
+                .to_str()
+                .ok_or(SnapshotError::InvalidObjectStore)?;
+            self.git_status(&clone, &["add", "--", portable])?;
+            self.git_status(
+                &clone,
+                &[
+                    "-c",
+                    "user.name=CommonKit",
+                    "-c",
+                    "user.email=commonkit@localhost",
+                    "commit",
+                    "-m",
+                    "commonkit: publish portable authority",
+                ],
+            )?;
+            let revision = self.git_output(&clone, &["rev-parse", "HEAD"])?;
+            let destination_ref = format!("HEAD:refs/heads/{}", self.branch);
+            self.git_status(
+                &clone,
+                &["push", self.trusted_remote_url.as_str(), &destination_ref],
+            )?;
+            if self.trusted_remote_revision()? != revision {
+                return Err(SnapshotError::StalePortableAuthority);
+            }
+            let remote_ref = format!("refs/heads/{}", self.branch);
+            self.git_status(
+                &self.repository,
+                &[
+                    "fetch",
+                    "--no-tags",
+                    self.trusted_remote_url.as_str(),
+                    &remote_ref,
+                ],
+            )?;
+            let local_ref = format!("refs/heads/{}", self.branch);
+            self.git_status(
+                &self.repository,
+                &["update-ref", &local_ref, &revision, expected_parent],
+            )?;
+            Ok(revision)
+        })();
+        let _ = std::fs::remove_dir_all(&clone);
+        result
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PortableAuthorityFailpoint {
     None,
@@ -450,16 +649,32 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
             return Err(SnapshotError::TransactionIntegrity);
         }
         if let Some(previous) = &intent.previous_revision {
-            let (_, current_revision): (PortableAuthorityRecord, String) =
+            let (current_record, current_revision): (PortableAuthorityRecord, String) =
                 read_authenticated_envelope(
                     &self.path(database),
                     self.cipher,
                     Self::aad(database).as_bytes(),
                 )?;
+            if current_revision == intent.next_revision && current_record == intent.next_record {
+                self.advance_trusted_anchor(database, &intent.next_record, &intent.next_revision)?;
+                return std::fs::remove_file(intent_path)
+                    .map_err(|_| SnapshotError::ObjectStoreFailed);
+            }
             if &current_revision != previous {
                 return Err(SnapshotError::PortableAuthorityRollback);
             }
         } else if self.path(database).exists() {
+            let (current_record, current_revision): (PortableAuthorityRecord, String) =
+                read_authenticated_envelope(
+                    &self.path(database),
+                    self.cipher,
+                    Self::aad(database).as_bytes(),
+                )?;
+            if current_revision == intent.next_revision && current_record == intent.next_record {
+                self.advance_trusted_anchor(database, &intent.next_record, &intent.next_revision)?;
+                return std::fs::remove_file(intent_path)
+                    .map_err(|_| SnapshotError::ObjectStoreFailed);
+            }
             return Err(SnapshotError::PortableAuthorityRollback);
         }
         write_authenticated_envelope(
@@ -2047,6 +2262,37 @@ fn copy_verified_file(source: &Path, destination: &Path) -> Result<(), SnapshotE
     std::fs::write(&temporary, &bytes).map_err(|_| SnapshotError::ObjectStoreFailed)?;
     std::fs::rename(&temporary, destination).map_err(|_| SnapshotError::ObjectStoreFailed)?;
     Ok(())
+}
+
+fn safe_relative_path(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && !path.is_absolute()
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(value) if !value.is_empty()
+            )
+        })
+}
+
+fn safe_git_branch(branch: &str) -> bool {
+    !branch.is_empty()
+        && !branch.starts_with('-')
+        && !branch.starts_with('/')
+        && !branch.ends_with('/')
+        && !branch.ends_with('.')
+        && !branch.contains("..")
+        && !branch.contains("@{")
+        && branch
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'/'))
+}
+
+fn valid_git_revision(revision: &str) -> bool {
+    matches!(revision.len(), 40 | 64)
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn snapshot_aad(

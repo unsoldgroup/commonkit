@@ -219,7 +219,18 @@ struct SnapshotConfig {
     portable_state: PathBuf,
     key_reference: CredentialReference,
     object_store: SnapshotObjectStoreConfig,
+    git_authority: Option<SnapshotGitAuthorityConfig>,
     databases: Vec<SnapshotDatabase>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SnapshotGitAuthorityConfig {
+    executable: PathBuf,
+    repository: PathBuf,
+    trusted_remote_url: String,
+    branch: String,
+    staging_root: PathBuf,
 }
 #[derive(Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
@@ -777,14 +788,33 @@ impl ProductionDomainRegistry {
                         portable_state: config.portable_state,
                         key_reference: config.key_reference,
                         object_store: config.object_store,
+                        git_authority: config.git_authority,
                         databases,
                         lock: Mutex::new(()),
                     };
                     let cipher = domain
                         .cipher()
                         .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-                    let portable = PortableAuthorityStore::open(&domain.portable_state, &cipher)
-                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    if domain.git_authority.is_some() {
+                        let publisher = domain
+                            .git_authority_publisher()
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        let checked_out = publisher
+                            .checked_out_revision()
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        let trusted_remote = publisher
+                            .trusted_remote_revision()
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                        if checked_out != trusted_remote {
+                            return Err(ProductionDomainError::UnsafeConfig);
+                        }
+                    }
+                    let portable = PortableAuthorityStore::open_with_trusted_anchor(
+                        &domain.portable_state,
+                        domain.root.join("portable-authority-anchors"),
+                        &cipher,
+                    )
+                    .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     let local = AuthorityStore::open(domain.root.join("authority"))
                         .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     for database in domain.databases.values() {
@@ -2127,6 +2157,7 @@ struct ProductionSnapshotDomain {
     portable_state: PathBuf,
     key_reference: CredentialReference,
     object_store: SnapshotObjectStoreConfig,
+    git_authority: Option<SnapshotGitAuthorityConfig>,
     databases: BTreeMap<String, SnapshotDatabase>,
     lock: Mutex<()>,
 }
@@ -2190,6 +2221,36 @@ impl SnapshotRequest {
     }
 }
 impl ProductionSnapshotDomain {
+    fn portable_authority<'a>(
+        &self,
+        cipher: &'a XChaCha20Cipher,
+    ) -> Result<PortableAuthorityStore<'a, XChaCha20Cipher>, SnapshotError> {
+        PortableAuthorityStore::open_with_trusted_anchor(
+            &self.portable_state,
+            self.root.join("portable-authority-anchors"),
+            cipher,
+        )
+    }
+
+    fn git_authority_publisher(&self) -> Result<ProcessGitAuthorityPublisher, DomainFailure> {
+        let config = self
+            .git_authority
+            .as_ref()
+            .ok_or(DomainFailure::VerificationFailed)?;
+        let portable_relative = self
+            .portable_state
+            .strip_prefix(&config.repository)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        ProcessGitAuthorityPublisher::new(
+            &config.executable,
+            &config.repository,
+            &config.trusted_remote_url,
+            &config.branch,
+            portable_relative,
+            &config.staging_root,
+        )
+        .map_err(|_| DomainFailure::OperationFailed)
+    }
     fn database_path_for_target<'a>(
         database: &'a SnapshotDatabase,
         target: &str,
@@ -2315,12 +2376,25 @@ impl ProductionSnapshotDomain {
         }
         let authority = AuthorityStore::open(self.root.join("authority"))
             .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        let portable = self
+            .portable_authority(&cipher)
+            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
         for run_id in authority
             .unfinished_promotions()
             .map_err(|_| ProductionDomainError::UnsafeConfig)?
         {
+            let plan = authority
+                .prepared_promotion(&run_id)
+                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+            let shared = portable
+                .read(&plan.database)
+                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
             authority
-                .recover_promotion(&run_id)
+                .recover_promotion_against_portable(
+                    &run_id,
+                    &shared.record.current_writer,
+                    &shared.revision,
+                )
                 .map_err(|_| ProductionDomainError::UnsafeConfig)?;
         }
         Ok(())
@@ -2404,7 +2478,8 @@ impl ProductionSnapshotDomain {
             output.insert(stored.snapshot_id.clone(), stored);
         }
         let all_manifests = output.into_values().collect::<Vec<_>>();
-        let authority_store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+        let authority_store = self
+            .portable_authority(&cipher)
             .map_err(|_| DomainFailure::VerificationFailed)?;
         let mut manifests = Vec::new();
         for database in self.databases.values() {
@@ -2526,7 +2601,8 @@ impl ProductionSnapshotDomain {
     }
     fn writers(&self) -> Result<BTreeMap<String, String>, DomainFailure> {
         let cipher = self.cipher()?;
-        let store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+        let store = self
+            .portable_authority(&cipher)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let mut writers = BTreeMap::new();
         for (id, database) in &self.databases {
@@ -2651,7 +2727,8 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .get(&id)
             .ok_or(DomainFailure::InvalidRequest)?;
         let cipher = self.cipher()?;
-        let portable_authority = PortableAuthorityStore::open(&self.portable_state, &cipher)
+        let portable_authority = self
+            .portable_authority(&cipher)
             .map_err(|_| DomainFailure::OperationFailed)?
             .read(&database.id)
             .map_err(|_| DomainFailure::VerificationFailed)?;
@@ -2714,7 +2791,8 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             .put(&encrypted_object_digest, &encrypted_manifest)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let descriptor_digest = self.write_portable_descriptor(&stored, &encrypted_manifest)?;
-        let authority_store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+        let authority_store = self
+            .portable_authority(&cipher)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let updated_authority = match authority_store.compare_and_swap_head(
             &database.id,
@@ -2751,7 +2829,8 @@ impl SnapshotDomain for ProductionSnapshotDomain {
     fn list(&self) -> Result<Value, DomainFailure> {
         let writers = self.writers()?;
         let cipher = self.cipher()?;
-        let authority_store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+        let authority_store = self
+            .portable_authority(&cipher)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let authority_revisions = self
             .databases
@@ -2864,10 +2943,22 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         let latest = Self::validated_chain_head(self.manifests()?, &id)?
             .ok_or(DomainFailure::InvalidRequest)?;
         let cipher = self.cipher()?;
-        let portable_store = PortableAuthorityStore::open(&self.portable_state, &cipher)
+        let portable_store = self
+            .portable_authority(&cipher)
             .map_err(|_| DomainFailure::OperationFailed)?;
+        let mut git_publisher = self.git_authority_publisher()?;
+        let checked_out_revision = git_publisher
+            .checked_out_revision()
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        let trusted_remote_revision = git_publisher
+            .trusted_remote_revision()
+            .map_err(|_| DomainFailure::VerificationFailed)?;
         let portable_authority = portable_store
-            .read(&database.id)
+            .read_at_repository_revision(
+                &database.id,
+                &checked_out_revision,
+                &trusted_remote_revision,
+            )
             .map_err(|_| DomainFailure::VerificationFailed)?;
         if portable_authority.record.accepted_head.as_deref()
             != Some(latest.manifest.content_digest.as_str())
@@ -2895,12 +2986,23 @@ impl SnapshotDomain for ProductionSnapshotDomain {
         local_authority
             .prepare_promotion(promotion.clone())
             .map_err(|_| DomainFailure::VerificationFailed)?;
-        let updated_authority = portable_store
-            .compare_and_swap_writer(
+        let published_authority = portable_store
+            .compare_and_swap_writer_published(
                 &database.id,
                 &portable_authority.revision,
                 &current_writer,
                 &target,
+                &trusted_remote_revision,
+                &mut git_publisher,
+            )
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        let repository_revision = published_authority.repository_revision;
+        let updated_authority = published_authority.authority;
+        local_authority
+            .confirm_portable_promotion(
+                &promotion.run_id,
+                &updated_authority.record.current_writer,
+                &updated_authority.revision,
             )
             .map_err(|_| DomainFailure::VerificationFailed)?;
         local_authority
@@ -2914,6 +3016,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
             "writer":target,
             "authorityRevision":updated_authority.revision,
             "authorityGeneration":updated_authority.record.generation,
+            "repositoryRevision":repository_revision,
             "receipt":receipt
         }))
     }

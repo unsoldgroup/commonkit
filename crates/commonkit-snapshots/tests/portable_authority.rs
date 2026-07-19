@@ -6,7 +6,7 @@ use std::{
 
 use commonkit_snapshots::{
     DatabaseId, DeterministicTestCipher, PortableAuthorityFailpoint, PortableAuthorityPublisher,
-    PortableAuthorityStore, SnapshotError,
+    PortableAuthorityStore, ProcessGitAuthorityPublisher, SnapshotError,
 };
 use sha2::{Digest, Sha256};
 
@@ -356,6 +356,123 @@ fn fresh_clone_rejects_a_lagging_checkout_against_the_trusted_remote_head() {
         store
             .read_at_repository_revision(&database, "git-old-checkout", "git-current-remote-head",),
         Err(SnapshotError::PortableAuthorityRollback)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn concrete_git_publisher_allows_only_one_clone_to_advance_the_remote_parent() {
+    fn git(directory: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("/usr/bin/git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().into()
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let remote = root.path().join("remote.git");
+    let seed = root.path().join("seed");
+    fs::create_dir(&remote).unwrap();
+    git(&remote, &["init", "--bare", "--initial-branch=main"]);
+    fs::create_dir(&seed).unwrap();
+    git(&seed, &["init", "--initial-branch=main"]);
+    git(&seed, &["config", "user.name", "CommonKit Test"]);
+    git(&seed, &["config", "user.email", "commonkit-test@localhost"]);
+    let cipher = DeterministicTestCipher::new([80; 32]);
+    let database = DatabaseId::new("context-mode").unwrap();
+    PortableAuthorityStore::open(seed.join("kit"), &cipher)
+        .unwrap()
+        .initialize(&database, "machine-a")
+        .unwrap();
+    git(&seed, &["add", "kit"]);
+    git(&seed, &["commit", "-m", "seed authority"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&seed, &["push", "-u", "origin", "main"]);
+
+    let clone_a = root.path().join("clone-a");
+    let clone_b = root.path().join("clone-b");
+    let remote_text = remote.to_str().unwrap();
+    let status_a = std::process::Command::new("/usr/bin/git")
+        .args([
+            "clone",
+            "--branch",
+            "main",
+            remote_text,
+            clone_a.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    let status_b = std::process::Command::new("/usr/bin/git")
+        .args([
+            "clone",
+            "--branch",
+            "main",
+            remote_text,
+            clone_b.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(status_a.success() && status_b.success());
+    let parent = git(&clone_a, &["rev-parse", "HEAD"]);
+    let initial = PortableAuthorityStore::open(clone_a.join("kit"), &cipher)
+        .unwrap()
+        .read(&database)
+        .unwrap();
+    let mut publisher_a = ProcessGitAuthorityPublisher::new(
+        "/usr/bin/git",
+        &clone_a,
+        remote_text,
+        "main",
+        "kit",
+        root.path().join("publisher-staging-a"),
+    )
+    .unwrap();
+    PortableAuthorityStore::open(clone_a.join("kit"), &cipher)
+        .unwrap()
+        .compare_and_swap_writer_published(
+            &database,
+            &initial.revision,
+            "machine-a",
+            "machine-b",
+            &parent,
+            &mut publisher_a,
+        )
+        .unwrap();
+
+    let mut publisher_b = ProcessGitAuthorityPublisher::new(
+        "/usr/bin/git",
+        &clone_b,
+        remote_text,
+        "main",
+        "kit",
+        root.path().join("publisher-staging-b"),
+    )
+    .unwrap();
+    assert_eq!(
+        PortableAuthorityStore::open(clone_b.join("kit"), &cipher)
+            .unwrap()
+            .compare_and_swap_writer_published(
+                &database,
+                &initial.revision,
+                "machine-a",
+                "machine-c",
+                &parent,
+                &mut publisher_b,
+            )
+            .unwrap_err(),
+        SnapshotError::StalePortableAuthority
     );
 }
 
