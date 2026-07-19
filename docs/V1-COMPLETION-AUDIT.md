@@ -1,6 +1,6 @@
 # CommonKit v1 completion audit
 
-Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `5c6777e`. The five pre-existing formatting-only worktree changes were excluded from this audit. “Met locally” means the production Rust path and its focused contracts pass on the audit host; it does not stand in for production signing, notarization, published updater, or hosted multi-OS evidence.
+Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` through `32a8626`. “Met locally” means the production Rust path and its focused contracts pass on the audit host; it does not stand in for production signing, notarization, published updater, or hosted multi-OS evidence.
 
 ## Twelve-flow matrix
 
@@ -15,7 +15,7 @@ Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` thro
 | 7 | Multiple targets and five-layer composition | Partial | Five-layer composition, monotonic organization policy, provenance, target inventory, local execution, controller-side provider materialization, portable artifact staging, and semantic typed-SSH plan/apply/recovery pass. | Production `headless.json` still represents one active sync target at a time; no multi-target selection/iteration surface or recorded remote support-matrix run exists. |
 | 8 | Scheduled read-only drift checks | Met locally | `commonkitd` constructs `DriftScheduler`; persistence, enable/disable/status, overlap suppression, read-only verification, degraded reporting, and CLI/desktop mutation surfaces pass focused tests. | Installed unattended execution evidence. |
 | 9 | Optional MCP relay state | Met locally | Rust relay lifecycle, transactional reconciliation, stable endpoint, HTTP upstreams, migration, failure behavior, and redaction are implemented. The shared Node/Rust black-box compatibility suite passed against the current `commonkitd` binary. | Installed lifecycle on the release matrix; legacy retirement remains a later decision. |
-| 10 | Coding-agent adapters and SkillOpt | Partial | Pinned APM 0.25.0, chezmoi 2.70.4 safe isolation, native fallback, provider artifacts, ownership validation, production Git-provider materialization, local/SSH planning, and authenticated SkillOpt canary recovery exist. | The full SkillOpt suite produced one `ProviderIsolationBreached` failure and then passed in isolation, making the isolation gate order/environment-sensitive. First-run provider selection and hosted provider matrices also remain. |
+| 10 | Coding-agent adapters and SkillOpt | Met locally | Pinned APM 0.25.0, chezmoi 2.70.4 safe isolation, native fallback, provider artifacts, ownership validation, production Git-provider materialization, local/SSH planning, independent SkillOpt harness isolation, and authenticated canary recovery pass focused suites. | Hosted provider matrices and installed provider execution remain release evidence. |
 | 11 | Redacted diagnostics | Met locally | Schema-bound diagnostics are exposed by service, CLI, MCP, and desktop; focused redaction and secret-scanning contracts pass. | Installed malicious-input export evidence on all supported platforms. |
 | 12 | OSS onboarding, schemas, threat model, CI, packaging, and releases | Partial | README now documents the Rust v1 flow. Schemas, threat model, support/migration/release docs, three-OS CI, provider gates, packaging, signatures, SBOM, updater fixtures, and installed unsigned lifecycle automation exist. | Production signing/notarization identities, two published signed versions, lifecycle workflow evidence, and installed reconciliation/snapshot coverage are external release gates. |
 
@@ -29,7 +29,7 @@ Audit basis: committed implementation on `uns-1274-commonkit-v1-rust-tauri` thro
 - Shared relay compatibility: passed with both legacy Node and the current Rust daemon.
 - Skill deployment/canary recovery: 7 tests passed.
 - Release-readiness contracts: 7 tests passed.
-- SkillOpt: the full crate run failed one real provider-isolation test with `ProviderIsolationBreached`; the same test passed immediately when rerun alone. This is a release-blocking flaky safety gate until diagnosed and made deterministic.
+- SkillOpt: the first full crate run exposed an order-sensitive detached-forgery fixture; commit `32a8626` isolated the fixture path, and the complete crate then passed (14 tests plus doc tests).
 
 ## Priority findings
 
@@ -39,10 +39,9 @@ None found in the audited committed paths.
 
 ### P1
 
-1. Make the SkillOpt real isolation test deterministic. A safety boundary that passes only in isolation cannot be used as release evidence.
-2. Finish first-run provider selection/configuration so a user can choose an APM or chezmoi-backed loadout without manually authoring `headless.json`.
-3. Add a production multi-target selection/iteration model; one configured sync target is not the complete multiple-target flow.
-4. Exercise installed reconciliation, verification, snapshot, recovery, update, and uninstall on macOS, Linux, and Windows. The current unsigned CI lifecycle and signed release workflow do not yet provide that complete evidence.
+1. Finish first-run provider selection/configuration so a user can choose an APM or chezmoi-backed loadout without manually authoring `headless.json`.
+2. Add a production multi-target selection/iteration model; one configured sync target is not the complete multiple-target flow.
+3. Exercise installed reconciliation, verification, snapshot, recovery, update, and uninstall on macOS, Linux, and Windows. The current unsigned CI lifecycle and signed release workflow do not yet provide that complete evidence.
 
 ## Local implementation versus external release gates
 
@@ -57,4 +56,4 @@ External or hosted evidence still required:
 
 ## Conclusion
 
-Do not mark CommonKit v1 fully release-ready yet. Seven of the twelve flows are implemented and pass local production-path contracts; five remain partial because of first-run provider selection, multi-target product wiring, the flaky SkillOpt isolation gate, or external signed/platform evidence. The remaining work is no longer a reconciliation-core rewrite.
+Do not mark CommonKit v1 fully release-ready yet. Eight of the twelve flows are implemented and pass local production-path contracts; four remain partial because of first-run provider selection, multi-target product wiring, or external signed/platform evidence. The remaining work is no longer a reconciliation-core rewrite.
