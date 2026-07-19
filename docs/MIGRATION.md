@@ -22,11 +22,14 @@ Snapshot commits have a two-level compare-and-swap contract. CommonKit performs 
 
 Authority consumers must keep the authenticated monotonic anchor outside `portableState` in protected target-local state. A fresh or lagging clone must call the repository-bound read contract with both its checked-out commit and an independently fetched trusted remote branch head; they must match. Authority mutations must use the published CAS contract, which builds the change in an isolated staged tree and asks the Git publisher to update the expected remote parent before installing it locally. The publisher must reject non-fast-forward updates. These two checks are complementary: the local anchor detects whole-tree replay on a machine that has seen newer state, while the trusted remote-head comparison protects a fresh machine.
 
-Git-backed authority also requires a remote immutable generation anchor. For a new kit, set
+Git-backed authority also requires the protected append-only remote ref
+`refs/commonkit-authority/<database>`. Its commit ancestry is the generation chain. Configure the
+Git server to reject deletion and non-fast-forward updates to `refs/commonkit-authority/*`; on
+GitHub this requires a repository ruleset for that namespace with bypass disabled. For a new kit, set
 `snapshots.gitAuthority.bootstrap: true` only for the first initialization; CommonKit may use
 it only when the portable authority record is absent, and atomically publishes the genesis
 record and anchor. Existing kits must not use bootstrap as recovery. If their anchor namespace
-is missing, startup fails closed and an operator must investigate remote tag deletion or
+is missing, startup fails closed and an operator must investigate remote ref deletion or
 rollback rather than recreating trust from the checked-out branch.
 
 Writer promotions persist `prepared`, `cas_confirmed`, or `aborted` state outside the portable tree. Startup commits a prepared promotion only when authenticated portable authority names its candidate; if portable authority still names the previous writer, startup records an abort. An authenticated publish intent makes a crash after immutable history but before the mutable pointer repairable without treating an ordinary stale-pointer replay as a valid transition.

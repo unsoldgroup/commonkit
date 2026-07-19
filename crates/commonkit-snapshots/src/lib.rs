@@ -361,14 +361,13 @@ impl ProcessGitAuthorityPublisher {
     }
 
     fn anchor_ref(publication: &PortablePublication) -> String {
+        format!("refs/commonkit-authority/{}", publication.database)
+    }
+
+    fn authority_commit_message(publication: &PortablePublication) -> String {
         format!(
-            "refs/tags/commonkit-authority/{}/{}-{}",
-            publication.database,
-            publication.generation,
-            publication
-                .authority_revision
-                .strip_prefix("sha256:")
-                .unwrap_or("invalid")
+            "commonkit: publish portable authority\n\nCommonKit-Authority-Database: {}\nCommonKit-Authority-Generation: {}\nCommonKit-Authority-Revision: {}",
+            publication.database, publication.generation, publication.authority_revision
         )
     }
 
@@ -405,43 +404,13 @@ impl ProcessGitAuthorityPublisher {
         authority_revision: &str,
     ) -> Result<(), SnapshotError> {
         validate_digest(authority_revision)?;
-        let pattern = format!("refs/tags/commonkit-authority/{database}/*");
-        let refs = self.remote_refs(&pattern)?;
-        if refs.is_empty() {
+        let anchor_ref = format!("refs/commonkit-authority/{database}");
+        let refs = self.remote_refs(&anchor_ref)?;
+        if refs.len() != 1 || refs[0].1 != anchor_ref {
             return Err(SnapshotError::PortableAuthorityRollback);
         }
-        let mut parsed = refs
-            .into_iter()
-            .map(|(commit, reference)| {
-                let leaf = reference
-                    .rsplit('/')
-                    .next()
-                    .ok_or(SnapshotError::TransactionIntegrity)?;
-                let (generation, revision) = leaf
-                    .split_once('-')
-                    .ok_or(SnapshotError::TransactionIntegrity)?;
-                let generation = generation
-                    .parse::<u64>()
-                    .map_err(|_| SnapshotError::TransactionIntegrity)?;
-                Ok((generation, format!("sha256:{revision}"), commit))
-            })
-            .collect::<Result<Vec<_>, SnapshotError>>()?;
-        parsed.sort_by_key(|item| item.0);
-        let latest = parsed
-            .last()
-            .ok_or(SnapshotError::PortableAuthorityRollback)?;
+        let anchor_commit = &refs[0].0;
         let remote_head = self.trusted_remote_revision()?;
-        if parsed
-            .iter()
-            .rev()
-            .take_while(|item| item.0 == latest.0)
-            .count()
-            != 1
-            || latest.0 != generation
-            || latest.1 != authority_revision
-        {
-            return Err(SnapshotError::PortableAuthorityRollback);
-        }
         let remote_ref = format!("refs/heads/{}", self.branch);
         self.git_status(
             &self.repository,
@@ -450,16 +419,54 @@ impl ProcessGitAuthorityPublisher {
                 "--no-tags",
                 self.trusted_remote_url.as_str(),
                 &remote_ref,
+                &format!("{anchor_ref}:{anchor_ref}"),
             ],
         )?;
+        let anchored_message = self.git_output(
+            &self.repository,
+            &["show", "--no-patch", "--format=%B", anchor_commit],
+        )?;
+        let expected_publication = PortablePublication {
+            database: database.clone(),
+            generation,
+            authority_revision: authority_revision.into(),
+        };
+        if anchored_message != Self::authority_commit_message(&expected_publication) {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
         let ancestry = Command::new(&self.executable)
             .arg("-C")
             .arg(&self.repository)
-            .args(["merge-base", "--is-ancestor", &latest.2, &remote_head])
+            .args(["merge-base", "--is-ancestor", anchor_commit, &remote_head])
             .stdin(Stdio::null())
             .status()
             .map_err(|_| SnapshotError::ObjectStoreFailed)?;
         if !ancestry.success() {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        // The protected anchor names the last authority publication. Later commits may advance
+        // the kit branch, but they must not alter CommonKit's portable subtree behind the
+        // authority chain. This binds the caller's authenticated generation/revision to the
+        // anchored tree rather than to a rollbackable branch tip.
+        let portable = self
+            .portable_relative
+            .to_str()
+            .ok_or(SnapshotError::InvalidObjectStore)?;
+        let portable_unchanged = Command::new(&self.executable)
+            .arg("-C")
+            .arg(&self.repository)
+            .args([
+                "diff",
+                "--quiet",
+                anchor_commit,
+                &remote_head,
+                "--",
+                portable,
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !portable_unchanged.success() {
             return Err(SnapshotError::PortableAuthorityRollback);
         }
         Ok(())
@@ -473,8 +480,8 @@ impl ProcessGitAuthorityPublisher {
         staged_portable_root: &Path,
         publication: &PortablePublication,
     ) -> Result<String, SnapshotError> {
-        let pattern = format!("refs/tags/commonkit-authority/{}/*", publication.database);
-        if !self.remote_refs(&pattern)?.is_empty() {
+        let anchor_ref = Self::anchor_ref(publication);
+        if !self.remote_refs(&anchor_ref)?.is_empty() {
             return Err(SnapshotError::StalePortableAuthority);
         }
         let expected_parent = self.trusted_remote_revision()?;
@@ -601,8 +608,6 @@ impl ProcessGitAuthorityPublisher {
         {
             return Err(SnapshotError::PortableAuthorityRollback);
         }
-        let source = pending.clone.join(&self.portable_relative);
-        let destination = self.repository.join(&self.portable_relative);
         // Prior successful publications intentionally advance the branch ref before installing
         // their managed subtree. Reconcile only that CommonKit-owned subtree to the validated
         // local commit so an interrupted index cannot block the later fast-forward. Unrelated
@@ -624,10 +629,12 @@ impl ProcessGitAuthorityPublisher {
                 &["merge", "--ff-only", "--no-edit", &remote_head],
             )?;
         }
-        if destination.exists() {
-            std::fs::remove_dir_all(&destination).map_err(|_| SnapshotError::ObjectStoreFailed)?;
-        }
-        copy_portable_tree(&source, &destination)?;
+        // Whether recovery advanced the whole branch or resumed after the local ref update, bind
+        // both index and worktree for the managed subtree to the validated current remote commit.
+        self.git_status(
+            &self.repository,
+            &["checkout", &remote_head, "--", portable],
+        )?;
         std::fs::remove_file(&path).map_err(|_| SnapshotError::ObjectStoreFailed)?;
         let _ = std::fs::remove_dir_all(&pending.clone);
         let _ = publication;
@@ -762,22 +769,21 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
                 .stdin(Stdio::null())
                 .status()
                 .map_err(|_| SnapshotError::ObjectStoreFailed)?;
-            if !staged_changes.success() {
-                if let Err(error) = self.git_status(
-                    &clone,
-                    &[
-                        "-c",
-                        "user.name=CommonKit",
-                        "-c",
-                        "user.email=commonkit@localhost",
-                        "commit",
-                        "-m",
-                        "commonkit: publish portable authority",
-                    ],
-                ) {
-                    let _ = std::fs::remove_file(self.pending_path());
-                    return Err(error);
-                }
+            let commit_message = Self::authority_commit_message(publication);
+            let mut commit_args = vec![
+                "-c",
+                "user.name=CommonKit",
+                "-c",
+                "user.email=commonkit@localhost",
+                "commit",
+            ];
+            if staged_changes.success() {
+                commit_args.push("--allow-empty");
+            }
+            commit_args.extend(["-m", commit_message.as_str()]);
+            if let Err(error) = self.git_status(&clone, &commit_args) {
+                let _ = std::fs::remove_file(self.pending_path());
+                return Err(error);
             }
             let revision = self.git_output(&clone, &["rev-parse", "HEAD"])?;
             std::fs::create_dir_all(&self.staging_root)
@@ -831,12 +837,10 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
             if self.failpoint == PublisherFailpoint::AfterLocalRefBeforePortableInstall {
                 return Err(SnapshotError::Interrupted);
             }
-            let destination = self.repository.join(&self.portable_relative);
-            if destination.exists() {
-                std::fs::remove_dir_all(&destination)
-                    .map_err(|_| SnapshotError::ObjectStoreFailed)?;
-            }
-            copy_portable_tree(&clone.join(&self.portable_relative), &destination)?;
+            // HEAD is the branch symbolic ref, so update-ref advances HEAD without touching the
+            // index or worktree. Reconcile only CommonKit's subtree from that exact commit; this
+            // updates both index and worktree while preserving unrelated user changes.
+            self.git_status(&self.repository, &["checkout", &revision, "--", portable])?;
             std::fs::remove_file(self.pending_path())
                 .map_err(|_| SnapshotError::ObjectStoreFailed)?;
             Ok(revision)

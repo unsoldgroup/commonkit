@@ -21,15 +21,19 @@ payload and checked again by the durable executor, so a stale or replayed
 confirmation cannot authorize a different reviewed state.
 - `snapshots` maps database IDs to configured local database paths, source formats, and target identities. `portableState` is a required directory inside the Git kit: CommonKit atomically writes content-addressed snapshot descriptors there after uploading both the encrypted database and encrypted manifest to the object store. A second machine discovers the descriptor from Git and fetches the authenticated ciphertext; the separately provisioned key reference never enters Git. Use `sqlite` for SQLite databases so planning uses the online backup API and consumes WAL state consistently; `file` is reserved for stores whose own lifecycle guarantees a consistent single-file image. `observedPaths` explicitly maps any other locally inspectable target identity to its database path. Promotion hashes consistent exports of both the recorded writer and candidate itself; an unconfigured/unavailable target fails closed, and caller-provided digest assertions are rejected. The production `s3` backend uses the AWS CLI credential chain, keeping credentials outside CommonKit configuration; `local` is an explicit test/development backend. Authoritative-writer assignments are durable and list responses contain decrypted metadata only.
 
-When `snapshots.gitAuthority` is configured, normal startup requires an immutable
-`refs/tags/commonkit-authority/<database>/...` anchor on the trusted remote. An empty
-anchor namespace is treated as rollback, including on a fresh clone. The one exception is
+When `snapshots.gitAuthority` is configured, normal startup requires the append-only
+`refs/commonkit-authority/<database>` chain ref on the trusted remote. Its commit ancestry
+encodes every accepted authority generation. A missing ref is treated as rollback, including on
+a fresh clone. The remote must protect `refs/commonkit-authority/*` from deletion and
+non-fast-forward updates (for GitHub, install a repository ruleset covering that ref namespace and
+disallow bypass). CommonKit atomically fast-forwards the kit branch and authority ref, but remote
+protection is the durable trust boundary. The one exception is
 explicit genesis: set `gitAuthority.bootstrap` to `true` only while CommonKit creates a
 previously absent portable authority record. CommonKit publishes that record and its first
 anchor atomically. Bootstrap is never applied to an existing record, so deleting every
 anchor cannot silently reset trust; remove the flag after initialization as an operational
-guardrail. Later unrelated fast-forward kit commits are valid because the newest authority
-anchor need only be an ancestor of the trusted branch head.
+guardrail. Later unrelated fast-forward kit commits are valid because the authority chain tip
+need only be an ancestor of the trusted branch head and the portable subtree must remain identical.
 
 Example shape (digests abbreviated here must be full valid `sha256:` values in real configuration):
 

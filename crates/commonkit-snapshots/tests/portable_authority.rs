@@ -521,6 +521,10 @@ fn concrete_git_publisher_recovers_both_post_push_interruption_windows() {
                 .current_writer,
             "machine-b"
         );
+        assert!(
+            GitFixture::git(&fixture.clone, &["status", "--porcelain", "--", "kit"]).is_empty(),
+            "recovery must synchronize the portable worktree and index"
+        );
     }
 }
 
@@ -657,6 +661,19 @@ fn fresh_clone_rejects_a_force_rolled_back_branch_using_remote_generation_anchor
         )
         .unwrap();
 
+    // Legacy per-generation tags are no longer part of the trust decision. Even if an old
+    // repository still has them and an attacker removes the newest one, the protected authority
+    // chain ref remains the monotonic source of truth.
+    let legacy_tag = format!("refs/tags/commonkit-authority/{}/latest", fixture.database);
+    GitFixture::git(
+        &fixture.clone,
+        &["push", "origin", &format!("HEAD:{legacy_tag}")],
+    );
+    GitFixture::git(
+        &fixture.clone,
+        &["push", "origin", &format!(":{legacy_tag}")],
+    );
+
     GitFixture::git(
         &fixture.clone,
         &[
@@ -753,25 +770,11 @@ fn fresh_clone_accepts_authority_when_latest_anchor_precedes_unrelated_kit_commi
 #[test]
 fn missing_remote_anchor_namespace_fails_closed() {
     let fixture = GitFixture::new();
-    let output = std::process::Command::new("/usr/bin/git")
-        .args([
-            "ls-remote",
-            fixture.remote.to_str().unwrap(),
-            &format!("refs/tags/commonkit-authority/{}/*", fixture.database),
-        ])
-        .output()
-        .unwrap();
-    assert!(output.status.success());
-    for reference in String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| line.split_whitespace().nth(1).unwrap().to_owned())
-    {
-        GitFixture::git(
-            &fixture.clone,
-            &["push", "origin", &format!(":{reference}")],
-        );
-    }
+    let reference = format!("refs/commonkit-authority/{}", fixture.database);
+    GitFixture::git(
+        &fixture.clone,
+        &["push", "origin", &format!(":{reference}")],
+    );
     let authority = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
         .unwrap()
         .read(&fixture.database)
@@ -784,6 +787,80 @@ fn missing_remote_anchor_namespace_fails_closed() {
         ),
         Err(SnapshotError::PortableAuthorityRollback)
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn protected_remote_rejects_authority_ref_deletion_and_non_fast_forward() {
+    let fixture = GitFixture::new_protected();
+    let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .compare_and_swap_writer_published(
+            &fixture.database,
+            &initial.revision,
+            "machine-a",
+            "machine-b",
+            &fixture.parent,
+            &mut fixture.publisher(),
+        )
+        .unwrap();
+    let reference = format!("refs/commonkit-authority/{}", fixture.database);
+    let deletion = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(&fixture.clone)
+        .args(["push", "origin", &format!(":{reference}")])
+        .status()
+        .unwrap();
+    assert!(!deletion.success());
+
+    let rewrite = std::process::Command::new("/usr/bin/git")
+        .arg("-C")
+        .arg(&fixture.clone)
+        .args([
+            "push",
+            "--force",
+            "origin",
+            &format!("{}:{reference}", fixture.parent),
+        ])
+        .status()
+        .unwrap();
+    assert!(!rewrite.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_synchronizes_portable_index_and_unrelated_commit_preserves_it() {
+    let fixture = GitFixture::new();
+    let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .compare_and_swap_writer_published(
+            &fixture.database,
+            &initial.revision,
+            "machine-a",
+            "machine-b",
+            &fixture.parent,
+            &mut fixture.publisher(),
+        )
+        .unwrap();
+
+    assert!(GitFixture::git(&fixture.clone, &["status", "--porcelain", "--", "kit"]).is_empty());
+    let portable_tree = GitFixture::git(&fixture.clone, &["rev-parse", "HEAD:kit"]);
+    fs::write(fixture.clone.join("unrelated.txt"), b"unrelated\n").unwrap();
+    GitFixture::git(&fixture.clone, &["add", "unrelated.txt"]);
+    GitFixture::git(&fixture.clone, &["commit", "-m", "unrelated commit"]);
+    assert_eq!(
+        GitFixture::git(&fixture.clone, &["rev-parse", "HEAD:kit"]),
+        portable_tree
+    );
+    assert!(GitFixture::git(&fixture.clone, &["status", "--porcelain"]).is_empty());
 }
 
 #[cfg(unix)]
@@ -815,6 +892,14 @@ impl GitFixture {
     }
 
     fn new() -> Self {
+        Self::new_with_protection(false)
+    }
+
+    fn new_protected() -> Self {
+        Self::new_with_protection(true)
+    }
+
+    fn new_with_protection(protect_authority_ref: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let remote = root.path().join("remote.git");
         let seed = root.path().join("seed");
@@ -852,7 +937,7 @@ impl GitFixture {
                 .success()
         );
         let parent = Self::git(&clone, &["rev-parse", "HEAD"]);
-        let fixture = Self {
+        let mut fixture = Self {
             root,
             remote,
             clone,
@@ -875,6 +960,17 @@ impl GitFixture {
                 },
             )
             .unwrap();
+        fixture.parent = Self::git(&fixture.clone, &["rev-parse", "HEAD"]);
+        if protect_authority_ref {
+            let hook = fixture.remote.join("hooks/update");
+            fs::write(
+                &hook,
+                b"#!/bin/sh\nref=$1\nold=$2\nnew=$3\ncase \"$ref\" in\n  refs/commonkit-authority/*)\n    zero=0000000000000000000000000000000000000000\n    test \"$new\" != \"$zero\" || exit 1\n    test \"$old\" = \"$zero\" || git merge-base --is-ancestor \"$old\" \"$new\" || exit 1\n    ;;\nesac\nexit 0\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
         fixture
     }
 

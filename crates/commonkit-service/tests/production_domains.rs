@@ -970,28 +970,14 @@ fn fresh_clone_rejects_deleted_anchors_and_force_rolled_back_snapshot_authority_
         .create(serde_json::json!({"databaseId":"context-mode"}))
         .unwrap();
 
-    let anchors = std::process::Command::new(git_executable())
-        .args([
-            "ls-remote",
-            remote.to_str().unwrap(),
-            "refs/tags/commonkit-authority/context-mode/*",
-        ])
-        .output()
+    let reference = "refs/commonkit-authority/context-mode";
+    let status = std::process::Command::new(git_executable())
+        .arg("-C")
+        .arg(root)
+        .args(["push", remote.to_str().unwrap(), &format!(":{reference}")])
+        .status()
         .unwrap();
-    assert!(anchors.status.success());
-    for reference in String::from_utf8(anchors.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| line.split_whitespace().nth(1).unwrap().to_owned())
-    {
-        let status = std::process::Command::new(git_executable())
-            .arg("-C")
-            .arg(root)
-            .args(["push", remote.to_str().unwrap(), &format!(":{reference}")])
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
+    assert!(status.success());
     assert!(
         ProductionDomainRegistry::load(
             &config,
