@@ -1,0 +1,3 @@
+apps/desktop/src-tauri/tests/fixtures/updater/*.payload -text
+apps/desktop/src-tauri/tests/fixtures/updater/*.payload.sig text eol=lf
+apps/desktop/src-tauri/tests/fixtures/updater/public.key text eol=lf
