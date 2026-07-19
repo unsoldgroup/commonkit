@@ -668,7 +668,10 @@ fn router_with_control_and_relay(
         .route("/control/v1/targets/select", post(select_targets))
         .route("/control/v1/targets/{id}/sync/plan", post(target_sync_plan))
         .route("/control/v1/targets/{id}/verify", post(target_verify))
-        .route("/control/v1/targets/{id}/git", get(target_git_inspect).post(target_git_fetch))
+        .route(
+            "/control/v1/targets/{id}/git",
+            get(target_git_inspect).post(target_git_fetch),
+        )
         .route("/control/v1/policy/summary", get(policy_summary))
         .route(
             "/control/v1/targets/{target}/plans/{plan}/apply",
@@ -2237,13 +2240,23 @@ async fn target_git_fetch(
 
 async fn target_git(state: ApiState, target: String, fetch: bool) -> Result<Json<Value>, ApiError> {
     let target = StableId::parse(target).map_err(|_| ApiError::bad_request("invalid_target_id"))?;
-    let domain = state.control.target_sync_domain(&target).map_err(ApiError::from)?;
+    let domain = state
+        .control
+        .target_sync_domain(&target)
+        .map_err(ApiError::from)?;
     safe_domain_result(domain.git_sync(fetch))
 }
 
 async fn policy_summary(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
-    let domain = state.control.inner.runtime.read().expect("control runtime lock")
-        .domains.composition.clone()
+    let domain = state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .composition
+        .clone()
         .ok_or_else(|| ApiError::unavailable_code("composition_domain_unconfigured"))?;
     safe_domain_result(domain.policy_summary())
 }

@@ -4,8 +4,8 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, header};
 use commonkit_contracts::StableId;
 use commonkit_service::{
-    ApplyStatus, CompositionDomain, ControlPlane, ControlToken, CredentialDomain, DomainFailure, EventHub,
-    ExecutionResult, HeadlessDomainRegistry, PlanExecutor, ServiceStatus, SnapshotDomain,
+    ApplyStatus, CompositionDomain, ControlPlane, ControlToken, CredentialDomain, DomainFailure,
+    EventHub, ExecutionResult, HeadlessDomainRegistry, PlanExecutor, ServiceStatus, SnapshotDomain,
     SyncDomain, router, router_with_control,
 };
 use serde_json::Value;
@@ -87,8 +87,12 @@ impl PlanExecutor for UnusedExecutor {
 
 struct EchoDomains;
 impl CompositionDomain for EchoDomains {
-    fn compose(&self) -> Result<Value, DomainFailure> { Ok(serde_json::json!({"spec":{}})) }
-    fn explain(&self, _: &str) -> Result<Value, DomainFailure> { Err(DomainFailure::InvalidRequest) }
+    fn compose(&self) -> Result<Value, DomainFailure> {
+        Ok(serde_json::json!({"spec":{}}))
+    }
+    fn explain(&self, _: &str) -> Result<Value, DomainFailure> {
+        Err(DomainFailure::InvalidRequest)
+    }
     fn policy_summary(&self) -> Result<Value, DomainFailure> {
         Ok(serde_json::json!({"state":"valid","violations":[]}))
     }
@@ -171,7 +175,14 @@ async fn configured_domains_receive_authenticated_consent_checked_requests() {
         "verify"
     );
     assert_eq!(
-        call(app.clone(), &token, "GET", "/control/v1/policy/summary", serde_json::json!({})).await,
+        call(
+            app.clone(),
+            &token,
+            "GET",
+            "/control/v1/policy/summary",
+            serde_json::json!({})
+        )
+        .await,
         serde_json::json!({"state":"valid","violations":[]})
     );
     assert_eq!(

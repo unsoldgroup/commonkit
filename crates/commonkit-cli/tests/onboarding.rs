@@ -26,7 +26,10 @@ fn request(root: &Path, mode: InitMode, repository: &str) -> InitRequest {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "external providers fail closed on macOS")]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn connect_with_apm_validates_the_pin_and_writes_a_provider_pipeline() {
     let temporary = tempfile::tempdir().unwrap();
     let bin = temporary.path().join("bin");
@@ -213,7 +216,10 @@ fn create_provisions_a_private_repository_and_pushes_only_portable_files() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "external providers fail closed on macOS")]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn create_imports_apm_inputs_and_materializes_the_first_plan() {
     let temporary = tempfile::tempdir().unwrap();
     let bin = temporary.path().join("bin");
@@ -252,7 +258,10 @@ exit 93
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "external providers fail closed on macOS")]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn create_clones_an_empty_repository_before_importing_provider_files() {
     struct RealCloneRunner {
         remote: std::path::PathBuf,
@@ -347,7 +356,10 @@ fn create_clones_an_empty_repository_before_importing_provider_files() {
 }
 
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "external providers fail closed on macOS")]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "external providers fail closed on macOS"
+)]
 fn create_imports_chezmoi_source_and_rejects_symlinks() {
     let temporary = tempfile::tempdir().unwrap();
     let bin = temporary.path().join("bin");

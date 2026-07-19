@@ -1836,7 +1836,10 @@ struct RollbackRequest {
 }
 impl SyncDomain for ProductionSyncDomain {
     fn git_sync(&self, fetch: bool) -> Result<Value, DomainFailure> {
-        let source = self.config.provider_pipeline.as_ref()
+        let source = self
+            .config
+            .provider_pipeline
+            .as_ref()
             .map(|pipeline| &pipeline.source)
             .ok_or(DomainFailure::OperationFailed)?;
         let mut repository = GitRepository::new(
@@ -1844,7 +1847,9 @@ impl SyncDomain for ProductionSyncDomain {
             source.trusted_remote_url.clone(),
             "origin",
         );
-        let status = repository.inspect(fetch).map_err(|_| DomainFailure::OperationFailed)?;
+        let status = repository
+            .inspect(fetch)
+            .map_err(|_| DomainFailure::OperationFailed)?;
         let state = match status.disposition {
             GitSyncDisposition::Clean => "clean",
             GitSyncDisposition::Dirty => "dirty",
