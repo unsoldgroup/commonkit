@@ -682,7 +682,7 @@ fn router_with_control_and_relay(
         .route("/control/v1/snapshots/restore", post(snapshot_restore))
         .route("/control/v1/snapshots/promote", post(snapshot_promote))
         .route("/control/v1/rollback", post(rollback_run))
-        .route("/control/v1/plans", post(register_plan))
+        .route("/control/v1/plans", post(plan_registration_disabled))
         .route("/control/v1/plans/{id}", get(get_plan))
         .route("/control/v1/plans/{id}/apply", post(apply_plan))
         .route("/control/v1/operations/{id}", get(get_operation))
@@ -2236,15 +2236,8 @@ async fn target_apply_plan(
     ))
 }
 
-async fn register_plan(
-    State(state): State<ApiState>,
-    Json(plan): Json<Plan>,
-) -> Result<(StatusCode, Json<Plan>), ApiError> {
-    state
-        .control
-        .register_plan(plan)
-        .map(|plan| (StatusCode::CREATED, Json(plan)))
-        .map_err(ApiError::from)
+async fn plan_registration_disabled() -> ApiError {
+    ApiError::forbidden("plan_registration_disabled")
 }
 
 async fn get_plan(
@@ -2334,6 +2327,14 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code,
             message: None,
+        }
+    }
+
+    fn forbidden(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code,
+            message: Some("Plans must be created by CommonKit's authoritative planning endpoints"),
         }
     }
 

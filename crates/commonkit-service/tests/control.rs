@@ -481,6 +481,69 @@ async fn apply_endpoint_requires_explicit_confirmation_and_idempotency() {
 }
 
 #[tokio::test]
+async fn caller_authored_plan_registration_is_rejected_before_execution() {
+    let token = ControlToken::generate();
+    let executor = Arc::new(SuccessfulExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let control = ControlPlane::new(executor.clone());
+    let injected = plan();
+    let injected_id = injected.id.clone();
+    let application = router_with_control(
+        token.clone(),
+        Arc::new(RwLock::new(ServiceStatus::default())),
+        "127.0.0.1:3764",
+        EventHub::new(8),
+        control,
+    );
+
+    let response = application
+        .clone()
+        .oneshot(
+            Request::post("/control/v1/plans")
+                .header(header::HOST, "127.0.0.1:3764")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose_for_client()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(serde_json::to_vec(&injected).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&body).unwrap()["error"]["code"],
+        "plan_registration_disabled"
+    );
+
+    let apply = application
+        .oneshot(
+            Request::post(format!("/control/v1/plans/{injected_id}/apply"))
+                .header(header::HOST, "127.0.0.1:3764")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose_for_client()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("idempotency-key", "injected-plan")
+                .body(Body::from(
+                    r#"{"confirmed":true,"confirmationId":"attacker-authored"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(apply.status(), StatusCode::NOT_FOUND);
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn relay_endpoint_rejects_caller_supplied_resolved_declarations() {
     let token = ControlToken::generate();
     let application = router_with_control(

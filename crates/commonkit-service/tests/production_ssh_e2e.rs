@@ -239,15 +239,6 @@ async fn apply_and_wait(
     confirmation: &str,
     key: &str,
 ) -> Value {
-    call(
-        app.clone(),
-        token,
-        "POST",
-        "/control/v1/plans",
-        plan.clone(),
-        None,
-    )
-    .await;
     let operation = call(
         app.clone(),
         token,
