@@ -230,6 +230,10 @@ pub enum TargetFilesystemError {
     InvalidSshConfig(&'static str),
     #[error("remote host key does not match the configured fingerprint")]
     HostKeyMismatch,
+    #[error(
+        "multiple target host keys match the configured fingerprint; remove duplicate known_hosts entries"
+    )]
+    AmbiguousHostKeyPin,
     #[error("remote helper failed ({status}): {message}")]
     RemoteFailure { status: i32, message: String },
     #[error("remote helper returned an invalid or unexpected response")]

@@ -29,7 +29,13 @@ impl OpenSshConfig {
         let host = host.into();
         let user = user.into();
         let fingerprint = fingerprint.into();
-        if host.is_empty() || host.starts_with('-') || host.chars().any(char::is_whitespace) {
+        if host.is_empty()
+            || host.starts_with('-')
+            || host.chars().any(char::is_whitespace)
+            || host
+                .chars()
+                .any(|character| matches!(character, ',' | '[' | ']' | '*' | '?' | '!' | '|'))
+        {
             return Err(TargetFilesystemError::InvalidSshConfig("invalid host"));
         }
         if user.is_empty()
@@ -105,6 +111,7 @@ pub struct OpenSshTransport<R> {
     config: OpenSshConfig,
     runner: R,
     host_verified: bool,
+    pinned_known_hosts: Option<tempfile::NamedTempFile>,
 }
 
 impl<R: RemoteProcessRunner> OpenSshTransport<R> {
@@ -113,6 +120,7 @@ impl<R: RemoteProcessRunner> OpenSshTransport<R> {
             config,
             runner,
             host_verified: false,
+            pinned_known_hosts: None,
         })
     }
     pub fn into_runner(self) -> R {
@@ -123,20 +131,70 @@ impl<R: RemoteProcessRunner> OpenSshTransport<R> {
         if self.host_verified {
             return Ok(());
         }
-        let args = vec![
-            "-lf".into(),
+        let host_token = if self.config.port == 22 {
+            self.config.host.clone()
+        } else {
+            format!("[{}]:{}", self.config.host, self.config.port)
+        };
+        let lookup_args = vec![
+            "-F".into(),
+            host_token.clone(),
+            "-f".into(),
             self.config.known_hosts.to_string_lossy().into_owned(),
-            "-E".into(),
-            "sha256".into(),
         ];
-        let out = self.runner.run("ssh-keygen", &args, &[])?;
-        if out.status != 0
-            || !String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .any(|field| field == self.config.fingerprint)
-        {
+        let lookup = self.runner.run("ssh-keygen", &lookup_args, &[])?;
+        if lookup.status != 0 {
             return Err(TargetFilesystemError::HostKeyMismatch);
         }
+
+        // `ssh-keygen -F` resolves both cleartext and hashed known_hosts entries.
+        // Fingerprint each returned key independently so a matching key for an
+        // unrelated destination can never satisfy this pin.
+        let records = String::from_utf8_lossy(&lookup.stdout)
+            .lines()
+            .filter(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let mut matching = Vec::new();
+        for record in records {
+            let fields = record.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 3 || fields[0].starts_with('@') {
+                return Err(TargetFilesystemError::HostKeyMismatch);
+            }
+            let recorded_hosts = fields[0];
+            if !recorded_hosts.starts_with("|1|")
+                && !recorded_hosts
+                    .split(',')
+                    .any(|candidate| candidate == host_token)
+            {
+                return Err(TargetFilesystemError::HostKeyMismatch);
+            }
+            let fingerprint_args = vec!["-lf".into(), "-".into(), "-E".into(), "sha256".into()];
+            let fingerprint = self.runner.run(
+                "ssh-keygen",
+                &fingerprint_args,
+                format!("{record}\n").as_bytes(),
+            )?;
+            if fingerprint.status == 0
+                && String::from_utf8_lossy(&fingerprint.stdout)
+                    .split_whitespace()
+                    .any(|field| field == self.config.fingerprint)
+            {
+                matching.push(record);
+            }
+        }
+        if matching.len() != 1 {
+            return Err(if matching.is_empty() {
+                TargetFilesystemError::HostKeyMismatch
+            } else {
+                TargetFilesystemError::AmbiguousHostKeyPin
+            });
+        }
+
+        let mut pinned = tempfile::NamedTempFile::new()?;
+        writeln!(pinned, "{}", matching[0])?;
+        pinned.flush()?;
+        self.pinned_known_hosts = Some(pinned);
         self.host_verified = true;
         Ok(())
     }
@@ -153,7 +211,11 @@ impl<R: RemoteProcessRunner> OpenSshTransport<R> {
             "-o".into(),
             format!(
                 "UserKnownHostsFile={}",
-                self.config.known_hosts.to_string_lossy()
+                self.pinned_known_hosts
+                    .as_ref()
+                    .expect("host verification creates isolated known_hosts")
+                    .path()
+                    .to_string_lossy()
             ),
             "-p".into(),
             self.config.port.to_string(),

@@ -36,7 +36,122 @@ fn host_key_mismatch_fails_before_contacting_the_target() {
     let mut runner = FakeRunner::default();
     runner.outputs.push_back(ProcessOutput {
         status: 0,
-        stdout: b"256 SHA256:WRONG host (ED25519)\n".to_vec(),
+        stdout: b"build.example.com ssh-ed25519 AAAAwrong\n".to_vec(),
+        stderr: vec![],
+    });
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: b"256 SHA256:WRONG build.example.com (ED25519)\n".to_vec(),
+        stderr: vec![],
+    });
+    let mut transport = OpenSshTransport::new(config(), runner).unwrap();
+    let error = transport
+        .perform(SshFilesystemRequest::ReadFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: commonkit_adapters::NormalizedManagedPath::parse(".config/tool").unwrap(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        commonkit_adapters::TargetFilesystemError::HostKeyMismatch
+    ));
+    assert_eq!(transport.into_runner().calls.len(), 2);
+}
+
+#[test]
+fn unrelated_matching_pin_cannot_authorize_a_wrong_target_key() {
+    let mut runner = FakeRunner::default();
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: b"build.example.com ssh-ed25519 AAAAtarget-wrong\n".to_vec(),
+        stderr: vec![],
+    });
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: b"256 SHA256:WRONG build.example.com (ED25519)\n".to_vec(),
+        stderr: vec![],
+    });
+    let mut transport = OpenSshTransport::new(config(), runner).unwrap();
+    let error = transport
+        .perform(SshFilesystemRequest::ReadFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: commonkit_adapters::NormalizedManagedPath::parse(".config/tool").unwrap(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        commonkit_adapters::TargetFilesystemError::HostKeyMismatch
+    ));
+    let calls = transport.into_runner().calls;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0].1,
+        vec!["-F", "build.example.com", "-f", "/state/known_hosts"]
+    );
+}
+
+#[test]
+fn non_default_port_uses_bracketed_known_hosts_identity() {
+    let config = OpenSshConfig::new(
+        "build.example.com",
+        "commonkit",
+        2222,
+        PathBuf::from("/state/known_hosts"),
+        "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    )
+    .unwrap();
+    let mut runner = FakeRunner::default();
+    runner.outputs.push_back(ProcessOutput {
+        status: 1,
+        stdout: vec![],
+        stderr: vec![],
+    });
+    let mut transport = OpenSshTransport::new(config, runner).unwrap();
+    let _ = transport.perform(SshFilesystemRequest::ReadFile {
+        root_id: StableId::parse("home").unwrap(),
+        path: commonkit_adapters::NormalizedManagedPath::parse(".config/tool").unwrap(),
+    });
+    assert_eq!(
+        transport.into_runner().calls[0].1,
+        vec!["-F", "[build.example.com]:2222", "-f", "/state/known_hosts"]
+    );
+}
+
+#[test]
+fn duplicate_matching_target_keys_fail_as_ambiguous() {
+    let mut runner = FakeRunner::default();
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: b"build.example.com ssh-ed25519 AAAAfirst\nbuild.example.com ssh-ed25519 AAAAduplicate\n".to_vec(),
+        stderr: vec![],
+    });
+    for _ in 0..2 {
+        runner.outputs.push_back(ProcessOutput {
+            status: 0,
+            stdout: b"256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA build.example.com (ED25519)\n".to_vec(),
+            stderr: vec![],
+        });
+    }
+    let mut transport = OpenSshTransport::new(config(), runner).unwrap();
+    let error = transport
+        .perform(SshFilesystemRequest::ReadFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: commonkit_adapters::NormalizedManagedPath::parse(".config/tool").unwrap(),
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        commonkit_adapters::TargetFilesystemError::AmbiguousHostKeyPin
+    ));
+    assert_eq!(transport.into_runner().calls.len(), 3);
+}
+
+#[test]
+fn wildcard_record_is_not_treated_as_the_exact_target_identity() {
+    let mut runner = FakeRunner::default();
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: b"*.example.com ssh-ed25519 AAAAkey\n".to_vec(),
         stderr: vec![],
     });
     let mut transport = OpenSshTransport::new(config(), runner).unwrap();
@@ -54,11 +169,54 @@ fn host_key_mismatch_fails_before_contacting_the_target() {
 }
 
 #[test]
+fn hashed_exact_host_record_is_preserved_for_strict_ssh_checking() {
+    let hashed_record = "|1|salt|hash ssh-ed25519 AAAAcorrect";
+    let mut runner = FakeRunner::default();
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: format!("# Host build.example.com found: line 1\n{hashed_record}\n").into_bytes(),
+        stderr: vec![],
+    });
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout:
+            b"256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA build.example.com (ED25519)\n"
+                .to_vec(),
+        stderr: vec![],
+    });
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: serde_json::to_vec(&SshFilesystemResponse::Absent).unwrap(),
+        stderr: vec![],
+    });
+    let mut transport = OpenSshTransport::new(config(), runner).unwrap();
+    assert_eq!(
+        transport
+            .perform(SshFilesystemRequest::ReadFile {
+                root_id: StableId::parse("home").unwrap(),
+                path: commonkit_adapters::NormalizedManagedPath::parse(".config/tool").unwrap(),
+            })
+            .unwrap(),
+        SshFilesystemResponse::Absent
+    );
+    let calls = transport.into_runner().calls;
+    assert_eq!(calls[1].2, format!("{hashed_record}\n").as_bytes());
+    assert_eq!(calls[2].1[6], "StrictHostKeyChecking=yes");
+}
+
+#[test]
 fn remote_failures_do_not_expose_remote_stderr() {
     let mut runner = FakeRunner::default();
     runner.outputs.push_back(ProcessOutput {
         status: 0,
-        stdout: b"256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA host (ED25519)\n".to_vec(),
+        stdout: b"build.example.com ssh-ed25519 AAAAcorrect\n".to_vec(),
+        stderr: vec![],
+    });
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout:
+            b"256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA build.example.com (ED25519)\n"
+                .to_vec(),
         stderr: vec![],
     });
     runner.outputs.push_back(ProcessOutput {
@@ -101,6 +259,11 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
     let mut runner = FakeRunner::default();
     runner.outputs.push_back(ProcessOutput {
         status: 0,
+        stdout: b"build.example.com ssh-ed25519 AAAAcorrect\n".to_vec(),
+        stderr: vec![],
+    });
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
         stdout:
             b"256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA build.example.com (ED25519)\n"
                 .to_vec(),
@@ -120,11 +283,21 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
 
     assert_eq!(transport.perform(request.clone()).unwrap(), response);
     let runner = transport.into_runner();
-    assert_eq!(runner.calls.len(), 2);
+    assert_eq!(runner.calls.len(), 3);
     assert_eq!(runner.calls[0].0, "ssh-keygen");
-    assert_eq!(runner.calls[1].0, "ssh");
     assert_eq!(
-        runner.calls[1].1,
+        runner.calls[0].1,
+        vec!["-F", "build.example.com", "-f", "/state/known_hosts"]
+    );
+    assert_eq!(runner.calls[1].0, "ssh-keygen");
+    assert_eq!(runner.calls[1].1, vec!["-lf", "-", "-E", "sha256"]);
+    assert_eq!(
+        runner.calls[1].2,
+        b"build.example.com ssh-ed25519 AAAAcorrect\n"
+    );
+    assert_eq!(runner.calls[2].0, "ssh");
+    assert_eq!(
+        runner.calls[2].1,
         vec![
             "-T",
             "-o",
@@ -134,7 +307,7 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
-            "UserKnownHostsFile=/state/known_hosts",
+            runner.calls[2].1[8].as_str(),
             "-p",
             "22",
             "--",
@@ -144,7 +317,12 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
         ]
     );
     assert_eq!(
-        serde_json::from_slice::<SshFilesystemRequest>(&runner.calls[1].2).unwrap(),
+        serde_json::from_slice::<SshFilesystemRequest>(&runner.calls[2].2).unwrap(),
         request
+    );
+    assert!(runner.calls[2].1[8].starts_with("UserKnownHostsFile="));
+    assert_ne!(
+        runner.calls[2].1[8],
+        "UserKnownHostsFile=/state/known_hosts"
     );
 }
