@@ -209,6 +209,8 @@ impl<R: RemoteProcessRunner> OpenSshTransport<R> {
             "-o".into(),
             "StrictHostKeyChecking=yes".into(),
             "-o".into(),
+            "GlobalKnownHostsFile=none".into(),
+            "-o".into(),
             format!(
                 "UserKnownHostsFile={}",
                 self.pinned_known_hosts

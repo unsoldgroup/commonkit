@@ -14,6 +14,16 @@ fn temporary_directory(test: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("commonkit-{test}-{}-{nonce}", std::process::id()))
 }
 
+fn isolate_app_paths(command: &mut Command, root: &std::path::Path) {
+    command
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("APPDATA", root.join("appdata"))
+        .env("LOCALAPPDATA", root.join("local-appdata"));
+}
+
 fn layer(id: &str, kind: &str, spec: Value) -> Value {
     json!({
         "schemaVersion": 1,
@@ -161,10 +171,10 @@ fn publishes_the_complete_v1_command_surface() {
 
 #[test]
 fn headless_commands_contact_the_daemon_and_fail_actionably_when_it_is_absent() {
-    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
-        .arg("verify")
-        .output()
-        .expect("verify");
+    let directory = temporary_directory("cli-no-daemon");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_commonkit"));
+    isolate_app_paths(&mut command, &directory);
+    let output = command.arg("verify").output().expect("verify");
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).expect("UTF-8");
     assert!(error.contains("daemon_unavailable"));
@@ -215,7 +225,9 @@ fn skill_schedule_mutation_requires_confirmation_and_daemon_authority() {
         .expect("denied");
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("confirmation_required"));
-    let enabled = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_commonkit"));
+    isolate_app_paths(&mut command, &directory);
+    let enabled = command
         .args(["skills", "schedule", "enable", "--repository"])
         .arg(&directory)
         .arg("--state")
@@ -259,7 +271,9 @@ fn provider_check_converges_through_daemon_authority() {
         serde_json::to_vec(&marker).expect("marker"),
     )
     .expect("marker");
-    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_commonkit"));
+    isolate_app_paths(&mut command, &directory);
+    let output = command
         .args(["skills", "provider", "check", "--environment"])
         .arg(&environment)
         .arg("--lock")

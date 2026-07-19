@@ -201,7 +201,20 @@ fn hashed_exact_host_record_is_preserved_for_strict_ssh_checking() {
     );
     let calls = transport.into_runner().calls;
     assert_eq!(calls[1].2, format!("{hashed_record}\n").as_bytes());
-    assert_eq!(calls[2].1[6], "StrictHostKeyChecking=yes");
+    assert!(
+        calls[2]
+            .1
+            .iter()
+            .any(|arg| arg == "StrictHostKeyChecking=yes")
+    );
+    assert!(
+        calls[2]
+            .1
+            .windows(2)
+            .any(|pair| pair == ["-o", "GlobalKnownHostsFile=none"]),
+        "system-wide trust stores must not bypass the configured exact pin: {:?}",
+        calls[2].1
+    );
 }
 
 #[test]
@@ -307,7 +320,9 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
-            runner.calls[2].1[8].as_str(),
+            "GlobalKnownHostsFile=none",
+            "-o",
+            runner.calls[2].1[10].as_str(),
             "-p",
             "22",
             "--",
@@ -320,7 +335,7 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
         serde_json::from_slice::<SshFilesystemRequest>(&runner.calls[2].2).unwrap(),
         request
     );
-    assert!(runner.calls[2].1[8].starts_with("UserKnownHostsFile="));
+    assert!(runner.calls[2].1[10].starts_with("UserKnownHostsFile="));
     assert_ne!(
         runner.calls[2].1[8],
         "UserKnownHostsFile=/state/known_hosts"
