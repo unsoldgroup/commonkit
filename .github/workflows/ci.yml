@@ -166,7 +166,7 @@ jobs:
           chmod +x "$provider_dir/chezmoi"
           echo "COMMONKIT_APM_025_BIN=$apm_bin" >> "$GITHUB_ENV"
           echo "COMMONKIT_CHEZMOI_2_70_4=$provider_dir/chezmoi" >> "$GITHUB_ENV"
-      - run: cargo test --locked -p commonkit-adapters --test apm_real_provider checksum_pinned_apm_release_materializes_without_touching_live_target -- --exact
+      - run: cargo test --locked -p commonkit-adapters --test apm_real_provider checksum_pinned_apm_release_materializes_without_touching_live_target -- --ignored --exact
       - run: cargo test --locked -p commonkit-adapters --test chezmoi_provider real_chezmoi_release_materializes_supported_fixtures_deterministically -- --ignored --exact
       - name: Remove downloaded providers
         if: always()
@@ -199,7 +199,7 @@ jobs:
           if ((Get-FileHash $chezmoiBin -Algorithm SHA256).Hash.ToLowerInvariant() -ne "531e4b3d1f0814c4e962cd1a380bd4ea85f97aee5cc81ee27eea551339380ff7") { throw "chezmoi checksum mismatch" }
           "COMMONKIT_APM_025_BIN=$apmBin" | Out-File -FilePath $env:GITHUB_ENV -Append
           "COMMONKIT_CHEZMOI_2_70_4=$chezmoiBin" | Out-File -FilePath $env:GITHUB_ENV -Append
-      - run: cargo test --locked -p commonkit-adapters --test apm_real_provider checksum_pinned_apm_release_materializes_without_touching_live_target -- --exact
+      - run: cargo test --locked -p commonkit-adapters --test apm_real_provider checksum_pinned_apm_release_materializes_without_touching_live_target -- --ignored --exact
       - name: Verify pinned chezmoi executable
         shell: pwsh
         run: |

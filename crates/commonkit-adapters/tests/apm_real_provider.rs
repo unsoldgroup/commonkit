@@ -14,6 +14,7 @@ fn digest(seed: char) -> Sha256Digest {
 }
 
 #[test]
+#[ignore = "requires checksum-verified APM 0.25.0 binary"]
 fn checksum_pinned_apm_release_materializes_without_touching_live_target() {
     let executable = PathBuf::from(
         std::env::var_os("COMMONKIT_APM_025_BIN")
@@ -63,15 +64,19 @@ fn checksum_pinned_apm_release_materializes_without_touching_live_target() {
         )
         .unwrap();
     state.verify().unwrap();
-    assert!(state
-        .resources
-        .iter()
-        .any(|resource| resource.intent.path().as_str() == "home/AGENTS.md"));
-    assert!(state.resources.iter().any(|resource| resource
-        .intent
-        .path()
-        .as_str()
-        .starts_with("home/.claude/")));
+    assert!(
+        state
+            .resources
+            .iter()
+            .any(|resource| resource.intent.path().as_str() == "home/AGENTS.md")
+    );
+    assert!(
+        state.resources.iter().any(|resource| resource
+            .intent
+            .path()
+            .as_str()
+            .starts_with("home/.claude/"))
+    );
     assert_eq!(fs::read_dir(live).unwrap().count(), 0);
     fs::remove_dir_all(root).unwrap();
 }

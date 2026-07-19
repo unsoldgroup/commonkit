@@ -159,6 +159,38 @@ test("CI exercises an unsigned installed CLI and daemon lifecycle on every OS", 
   assert.match(workflow, /test:compatibility/);
 });
 
+test("CI isolates the real APM integration behind a checksum-verified provider gate", async () => {
+  const [workflow, integration] = await Promise.all([
+    read(".github/workflows/ci.yml"),
+    read("crates/commonkit-adapters/tests/apm_real_provider.rs"),
+  ]);
+  const exactTest = "checksum_pinned_apm_release_materializes_without_touching_live_target";
+
+  // The ordinary workspace matrix must remain runnable without downloading a
+  // provider, while the real integration remains an explicit required CI test.
+  assert.match(integration, /#\[ignore\s*=\s*"requires checksum-verified APM 0\.25\.0 binary"\]/);
+  assert.match(integration, /COMMONKIT_APM_025_BIN/);
+
+  for (const job of ["providers-unix:", "providers-windows:"]) {
+    const start = workflow.indexOf(job);
+    assert.notEqual(start, -1, `${job} missing`);
+    const remainder = workflow.slice(start + job.length);
+    const nextJobMatch = /\n  [a-z][a-z0-9-]+:\n/.exec(remainder);
+    const nextJob = nextJobMatch
+      ? start + job.length + nextJobMatch.index
+      : -1;
+    const body = workflow.slice(start, nextJob === -1 ? undefined : nextJob);
+    const checksum = body.search(/shasum -a 256 --check|Get-FileHash/);
+    const env = body.indexOf("COMMONKIT_APM_025_BIN");
+    const exact = body.indexOf(
+      `apm_real_provider ${exactTest} -- --ignored --exact`,
+    );
+    assert.ok(checksum >= 0, `${job} must verify the downloaded archive`);
+    assert.ok(env > checksum, `${job} must export only the verified executable`);
+    assert.ok(exact > env, `${job} must run the exact ignored integration after verification`);
+  }
+});
+
 test("release and third-party notice policies are explicit", async () => {
   const [release, notices, migration, support] = await Promise.all([
     read("docs/RELEASING.md"),
