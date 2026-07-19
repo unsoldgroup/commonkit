@@ -604,6 +604,90 @@ fn concrete_git_publisher_recovers_through_a_later_remote_fast_forward() {
 
 #[cfg(unix)]
 #[test]
+fn concrete_git_publisher_recovers_an_older_pending_publication_through_a_later_authority() {
+    let fixture = GitFixture::new();
+    let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    let mut interrupted = fixture.publisher();
+    interrupted.set_failpoint(PublisherFailpoint::AfterPushBeforeLocalRef);
+    assert_eq!(
+        PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+            .unwrap()
+            .compare_and_swap_writer_published(
+                &fixture.database,
+                &initial.revision,
+                "machine-a",
+                "machine-b",
+                &fixture.parent,
+                &mut interrupted,
+            ),
+        Err(SnapshotError::Interrupted)
+    );
+
+    let later = fixture.root.path().join("later-authority-clone");
+    assert!(
+        std::process::Command::new("/usr/bin/git")
+            .args([
+                "clone",
+                "--branch",
+                "main",
+                fixture.remote.to_str().unwrap(),
+                later.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let first_repository_revision = GitFixture::git(&later, &["rev-parse", "HEAD"]);
+    let first = PortableAuthorityStore::open(later.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    let mut later_publisher = ProcessGitAuthorityPublisher::new(
+        "/usr/bin/git",
+        &later,
+        fixture.remote.to_str().unwrap(),
+        "main",
+        "kit",
+        fixture.root.path().join("later-authority-staging"),
+    )
+    .unwrap();
+    let second = PortableAuthorityStore::open(later.join("kit"), &fixture.cipher)
+        .unwrap()
+        .compare_and_swap_writer_published(
+            &fixture.database,
+            &first.revision,
+            "machine-b",
+            "machine-c",
+            &first_repository_revision,
+            &mut later_publisher,
+        )
+        .unwrap();
+    assert_eq!(second.authority.record.generation, 2);
+
+    let recovered = fixture
+        .publisher()
+        .recover_pending_publication()
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.generation, 1);
+    let current = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    assert_eq!(current.record.current_writer, "machine-c");
+    assert_eq!(current.record.generation, 2);
+    assert_eq!(current.revision, second.authority.revision);
+    assert_eq!(
+        GitFixture::git(&fixture.clone, &["rev-parse", "HEAD"]),
+        second.repository_revision
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn concrete_git_publisher_recovery_rejects_a_non_descendant_remote_head() {
     let fixture = GitFixture::new();
     let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
@@ -634,6 +718,57 @@ fn concrete_git_publisher_recovery_rejects_a_non_descendant_remote_head() {
             &format!("{}:main", fixture.parent),
         ],
     );
+
+    assert_eq!(
+        fixture.publisher().recover_pending_publication(),
+        Err(SnapshotError::PortableAuthorityRollback)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn concrete_git_publisher_recovery_rejects_portable_changes_after_the_anchor() {
+    let fixture = GitFixture::new();
+    let initial = PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+        .unwrap()
+        .read(&fixture.database)
+        .unwrap();
+    let mut publisher = fixture.publisher();
+    publisher.set_failpoint(PublisherFailpoint::AfterPushBeforeLocalRef);
+    assert_eq!(
+        PortableAuthorityStore::open(fixture.clone.join("kit"), &fixture.cipher)
+            .unwrap()
+            .compare_and_swap_writer_published(
+                &fixture.database,
+                &initial.revision,
+                "machine-a",
+                "machine-b",
+                &fixture.parent,
+                &mut publisher,
+            ),
+        Err(SnapshotError::Interrupted)
+    );
+
+    let attacker = fixture.root.path().join("portable-tamper-clone");
+    assert!(
+        std::process::Command::new("/usr/bin/git")
+            .args([
+                "clone",
+                "--branch",
+                "main",
+                fixture.remote.to_str().unwrap(),
+                attacker.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap()
+            .success()
+    );
+    GitFixture::git(&attacker, &["config", "user.name", "Attacker"]);
+    GitFixture::git(&attacker, &["config", "user.email", "attacker@localhost"]);
+    fs::write(attacker.join("kit/tampered"), b"not authority published").unwrap();
+    GitFixture::git(&attacker, &["add", "kit/tampered"]);
+    GitFixture::git(&attacker, &["commit", "-m", "tamper portable tree"]);
+    GitFixture::git(&attacker, &["push", "origin", "main"]);
 
     assert_eq!(
         fixture.publisher().recover_pending_publication(),

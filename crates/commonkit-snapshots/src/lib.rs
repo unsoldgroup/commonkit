@@ -308,6 +308,38 @@ struct PendingGitPublication {
     clone: PathBuf,
 }
 
+fn parse_authority_commit_message(message: &str) -> Result<PortablePublication, SnapshotError> {
+    const DATABASE: &str = "CommonKit-Authority-Database: ";
+    const GENERATION: &str = "CommonKit-Authority-Generation: ";
+    const REVISION: &str = "CommonKit-Authority-Revision: ";
+    let mut database = None;
+    let mut generation = None;
+    let mut authority_revision = None;
+    for line in message.lines() {
+        if let Some(value) = line.strip_prefix(DATABASE) {
+            database = Some(DatabaseId::new(value)?);
+        } else if let Some(value) = line.strip_prefix(GENERATION) {
+            generation = Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| SnapshotError::PortableAuthorityRollback)?,
+            );
+        } else if let Some(value) = line.strip_prefix(REVISION) {
+            validate_digest(value)?;
+            authority_revision = Some(value.to_owned());
+        }
+    }
+    let publication = PortablePublication {
+        database: database.ok_or(SnapshotError::PortableAuthorityRollback)?,
+        generation: generation.ok_or(SnapshotError::PortableAuthorityRollback)?,
+        authority_revision: authority_revision.ok_or(SnapshotError::PortableAuthorityRollback)?,
+    };
+    if message != ProcessGitAuthorityPublisher::authority_commit_message(&publication) {
+        return Err(SnapshotError::PortableAuthorityRollback);
+    }
+    Ok(publication)
+}
+
 /// Git-backed authority publisher. It never commits from the user's working tree: the exact
 /// portable subtree is copied into an isolated clone of the trusted remote parent, committed, and
 /// pushed without force. A concurrent remote update therefore fails before local authority is
@@ -527,13 +559,10 @@ impl ProcessGitAuthorityPublisher {
             generation: pending.generation,
             authority_revision: pending.authority_revision.clone(),
         };
-        self.verify_remote_trust_anchor(
-            &pending.database,
-            pending.generation,
-            &pending.authority_revision,
-        )?;
+        let anchor_commit = self.verify_pending_authority_is_anchored(&pending)?;
         let remote_head = self.trusted_remote_revision()?;
         let remote_ref = format!("refs/heads/{}", self.branch);
+        let anchor_ref = Self::anchor_ref(&publication);
         self.git_status(
             &pending.clone,
             &[
@@ -541,6 +570,7 @@ impl ProcessGitAuthorityPublisher {
                 "--no-tags",
                 self.trusted_remote_url.as_str(),
                 &remote_ref,
+                &format!("{anchor_ref}:{anchor_ref}"),
             ],
         )?;
         let publication_is_ancestor = Command::new(&self.executable)
@@ -562,13 +592,16 @@ impl ProcessGitAuthorityPublisher {
             .portable_relative
             .to_str()
             .ok_or(SnapshotError::InvalidObjectStore)?;
+        // A later legitimate authority publication may have changed the portable subtree. Bind
+        // recovery to the newest protected authority anchor, never to the older pending tree, so
+        // completing an old transaction cannot roll the current writer or generation backward.
         let portable_unchanged = Command::new(&self.executable)
             .arg("-C")
             .arg(&pending.clone)
             .args([
                 "diff",
                 "--quiet",
-                &pending.repository_revision,
+                &anchor_commit,
                 &remote_head,
                 "--",
                 portable,
@@ -635,7 +668,7 @@ impl ProcessGitAuthorityPublisher {
             &self.repository,
             &["checkout", &remote_head, "--", portable],
         )?;
-        std::fs::remove_file(&path).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        durable_remove_file(&path)?;
         let _ = std::fs::remove_dir_all(&pending.clone);
         let _ = publication;
         Ok(Some(RecoveredPortablePublication {
@@ -644,6 +677,112 @@ impl ProcessGitAuthorityPublisher {
             authority_revision: pending.authority_revision,
             repository_revision: pending.repository_revision,
         }))
+    }
+
+    fn verify_pending_authority_is_anchored(
+        &self,
+        pending: &PendingGitPublication,
+    ) -> Result<String, SnapshotError> {
+        let publication = PortablePublication {
+            database: pending.database.clone(),
+            generation: pending.generation,
+            authority_revision: pending.authority_revision.clone(),
+        };
+        if self.git_output(
+            &pending.clone,
+            &[
+                "show",
+                "--no-patch",
+                "--format=%B",
+                &pending.repository_revision,
+            ],
+        )? != Self::authority_commit_message(&publication)
+        {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        let anchor_ref = Self::anchor_ref(&publication);
+        let refs = self.remote_refs(&anchor_ref)?;
+        if refs.len() != 1 || refs[0].1 != anchor_ref {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        let anchor_commit = refs[0].0.clone();
+        let remote_head = self.trusted_remote_revision()?;
+        let remote_ref = format!("refs/heads/{}", self.branch);
+        self.git_status(
+            &self.repository,
+            &[
+                "fetch",
+                "--no-tags",
+                self.trusted_remote_url.as_str(),
+                &remote_ref,
+                &format!("{anchor_ref}:{anchor_ref}"),
+            ],
+        )?;
+        for (ancestor, descendant) in [
+            (pending.repository_revision.as_str(), anchor_commit.as_str()),
+            (anchor_commit.as_str(), remote_head.as_str()),
+        ] {
+            let status = Command::new(&self.executable)
+                .arg("-C")
+                .arg(&self.repository)
+                .args(["merge-base", "--is-ancestor", ancestor, descendant])
+                .stdin(Stdio::null())
+                .status()
+                .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+            if !status.success() {
+                return Err(SnapshotError::PortableAuthorityRollback);
+            }
+        }
+        let message = self.git_output(
+            &self.repository,
+            &["show", "--no-patch", "--format=%B", &anchor_commit],
+        )?;
+        let latest = parse_authority_commit_message(&message)?;
+        if latest.database != pending.database || latest.generation < pending.generation {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        let revisions = Command::new(&self.executable)
+            .arg("-C")
+            .arg(&self.repository)
+            .args([
+                "rev-list",
+                "--reverse",
+                &format!("{}..{anchor_commit}", pending.repository_revision),
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        if !revisions.status.success() {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        let revisions = std::str::from_utf8(&revisions.stdout)
+            .map_err(|_| SnapshotError::TransactionIntegrity)?;
+        let mut prior = publication;
+        for revision in revisions.lines() {
+            if !valid_git_revision(revision) {
+                return Err(SnapshotError::PortableAuthorityRollback);
+            }
+            let message = self.git_output(
+                &self.repository,
+                &["show", "--no-patch", "--format=%B", revision],
+            )?;
+            if !message.starts_with("commonkit: publish portable authority") {
+                continue;
+            }
+            let next = parse_authority_commit_message(&message)?;
+            if next.database == pending.database {
+                if next.generation != prior.generation + 1
+                    || next.authority_revision == prior.authority_revision
+                {
+                    return Err(SnapshotError::PortableAuthorityRollback);
+                }
+                prior = next;
+            }
+        }
+        if prior != latest {
+            return Err(SnapshotError::PortableAuthorityRollback);
+        }
+        Ok(anchor_commit)
     }
 
     pub fn checked_out_revision(&self) -> Result<String, SnapshotError> {
@@ -782,7 +921,7 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
             }
             commit_args.extend(["-m", commit_message.as_str()]);
             if let Err(error) = self.git_status(&clone, &commit_args) {
-                let _ = std::fs::remove_file(self.pending_path());
+                let _ = durable_remove_file(&self.pending_path());
                 return Err(error);
             }
             let revision = self.git_output(&clone, &["rev-parse", "HEAD"])?;
@@ -841,8 +980,7 @@ impl PortableAuthorityPublisher for ProcessGitAuthorityPublisher {
             // index or worktree. Reconcile only CommonKit's subtree from that exact commit; this
             // updates both index and worktree while preserving unrelated user changes.
             self.git_status(&self.repository, &["checkout", &revision, "--", portable])?;
-            std::fs::remove_file(self.pending_path())
-                .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+            durable_remove_file(&self.pending_path())?;
             Ok(revision)
         })();
         if !self.pending_path().exists() {
@@ -992,7 +1130,7 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
             Self::aad(database).as_bytes(),
         )?;
         self.advance_trusted_anchor(database, record, &revision)?;
-        std::fs::remove_file(intent_path).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+        durable_remove_file(&intent_path)?;
         Ok(revision)
     }
 
@@ -1037,8 +1175,7 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
                 )?;
             if current_revision == intent.next_revision && current_record == intent.next_record {
                 self.advance_trusted_anchor(database, &intent.next_record, &intent.next_revision)?;
-                return std::fs::remove_file(intent_path)
-                    .map_err(|_| SnapshotError::ObjectStoreFailed);
+                return durable_remove_file(&intent_path);
             }
             if &current_revision != previous {
                 return Err(SnapshotError::PortableAuthorityRollback);
@@ -1052,8 +1189,7 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
                 )?;
             if current_revision == intent.next_revision && current_record == intent.next_record {
                 self.advance_trusted_anchor(database, &intent.next_record, &intent.next_revision)?;
-                return std::fs::remove_file(intent_path)
-                    .map_err(|_| SnapshotError::ObjectStoreFailed);
+                return durable_remove_file(&intent_path);
             }
             return Err(SnapshotError::PortableAuthorityRollback);
         }
@@ -1064,7 +1200,7 @@ impl<'a, C: AuthenticatedCipher> PortableAuthorityStore<'a, C> {
             Self::aad(database).as_bytes(),
         )?;
         self.advance_trusted_anchor(database, &intent.next_record, &intent.next_revision)?;
-        std::fs::remove_file(intent_path).map_err(|_| SnapshotError::ObjectStoreFailed)
+        durable_remove_file(&intent_path)
     }
 
     fn anchor_path(&self, database: &DatabaseId) -> Option<PathBuf> {
@@ -2242,11 +2378,100 @@ fn validate_digest(value: &str) -> Result<(), SnapshotError> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), SnapshotError> {
+    atomic_write_with_failpoint(path, bytes, AtomicWriteFailpoint::None)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AtomicWriteFailpoint {
+    None,
+    BeforeFileSync,
+    BeforeRename,
+    BeforeDirectorySync,
+}
+
+fn atomic_write_with_failpoint(
+    path: &Path,
+    bytes: &[u8],
+    failpoint: AtomicWriteFailpoint,
+) -> Result<(), SnapshotError> {
     let parent = path.parent().ok_or(SnapshotError::ObjectStoreFailed)?;
-    std::fs::create_dir_all(parent).map_err(|_| SnapshotError::ObjectStoreFailed)?;
-    let temporary = path.with_extension("commonkit.tmp");
-    std::fs::write(&temporary, bytes).map_err(|_| SnapshotError::ObjectStoreFailed)?;
-    std::fs::rename(temporary, path).map_err(|_| SnapshotError::ObjectStoreFailed)
+    create_dir_all_durable(parent)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".commonkit-durable-")
+        .tempfile_in(parent)
+        .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temporary
+            .as_file()
+            .set_permissions(metadata.permissions())
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    }
+    use std::io::Write as _;
+    temporary
+        .write_all(bytes)
+        .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    temporary
+        .flush()
+        .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    if failpoint == AtomicWriteFailpoint::BeforeFileSync {
+        return Err(SnapshotError::Interrupted);
+    }
+    temporary
+        .as_file()
+        .sync_all()
+        .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    if failpoint == AtomicWriteFailpoint::BeforeRename {
+        return Err(SnapshotError::Interrupted);
+    }
+    temporary
+        .persist(path)
+        .map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    if failpoint == AtomicWriteFailpoint::BeforeDirectorySync {
+        return Err(SnapshotError::Interrupted);
+    }
+    sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), SnapshotError> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| SnapshotError::ObjectStoreFailed)
+}
+
+fn create_dir_all_durable(path: &Path) -> Result<(), SnapshotError> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(cursor.to_path_buf());
+        cursor = cursor.parent().ok_or(SnapshotError::ObjectStoreFailed)?;
+    }
+    std::fs::create_dir_all(path).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    for created in missing.iter().rev() {
+        if let Some(parent) = created.parent() {
+            sync_directory(parent)?;
+        }
+    }
+    Ok(())
+}
+
+fn durable_remove_file(path: &Path) -> Result<(), SnapshotError> {
+    let parent = path.parent().ok_or(SnapshotError::ObjectStoreFailed)?;
+    std::fs::remove_file(path).map_err(|_| SnapshotError::ObjectStoreFailed)?;
+    sync_directory(parent)
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), SnapshotError> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| SnapshotError::ObjectStoreFailed)
 }
 
 fn replace_file(destination: &Path, staged: &Path) -> Result<(), SnapshotError> {
@@ -2896,5 +3121,78 @@ impl RestoreTarget for InMemoryDatabaseTarget {
     fn rollback_swap(&mut self, previous: Self::Previous) -> Result<(), SnapshotError> {
         self.current = previous;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod durable_write_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_is_not_published_before_its_file_is_synced() {
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("phase.json");
+        atomic_write(&record, b"old").unwrap();
+
+        assert_eq!(
+            atomic_write_with_failpoint(&record, b"new", AtomicWriteFailpoint::BeforeFileSync,),
+            Err(SnapshotError::Interrupted)
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), b"old");
+        assert!(
+            std::fs::read_dir(root.path()).unwrap().all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".commonkit-durable-")),
+            "failed writes must clean their unique temporary file"
+        );
+    }
+
+    #[test]
+    fn a_record_is_not_published_before_its_atomic_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("plan.json");
+        atomic_write(&record, b"old").unwrap();
+
+        assert_eq!(
+            atomic_write_with_failpoint(&record, b"new", AtomicWriteFailpoint::BeforeRename),
+            Err(SnapshotError::Interrupted)
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), b"old");
+    }
+
+    #[test]
+    fn a_renamed_record_is_not_reported_durable_before_its_directory_is_synced() {
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("pending-publication.json");
+
+        assert_eq!(
+            atomic_write_with_failpoint(
+                &record,
+                b"prepared",
+                AtomicWriteFailpoint::BeforeDirectorySync,
+            ),
+            Err(SnapshotError::Interrupted)
+        );
+        assert_eq!(std::fs::read(record).unwrap(), b"prepared");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_durable_record_preserves_its_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let record = root.path().join("authority.json");
+        atomic_write(&record, b"old").unwrap();
+        std::fs::set_permissions(&record, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_write(&record, b"new").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(record).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 }
