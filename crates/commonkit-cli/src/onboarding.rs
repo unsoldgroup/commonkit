@@ -690,6 +690,16 @@ fn validate_distinct_roots(request: &InitRequest) -> Result<(), OnboardingError>
     ];
     for (index, left) in roots.iter().enumerate() {
         for right in &roots[index + 1..] {
+            let platform_private_pair = (*left == &request.config_directory
+                && *right == &request.state_directory)
+                || (*right == &request.config_directory && *left == &request.state_directory);
+            if platform_private_pair
+                && request
+                    .state_directory
+                    .starts_with(&request.config_directory)
+            {
+                continue;
+            }
             if left.starts_with(right) || right.starts_with(left) {
                 return Err(OnboardingError::OverlappingRoots);
             }

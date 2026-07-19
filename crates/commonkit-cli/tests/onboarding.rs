@@ -263,6 +263,18 @@ fn rejects_repository_flags_paths_and_incomplete_existing_destinations() {
     }
 }
 
+#[test]
+fn permits_platform_state_directory_nested_under_private_config_root() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut request = request(temporary.path(), InitMode::Connect, "owner/kit");
+    request.config_directory = temporary
+        .path()
+        .join("Library/Application Support/CommonKit");
+    request.state_directory = request.config_directory.join("state");
+    let error = initialize(&request, &ProcessRunner::new(temporary.path())).unwrap_err();
+    assert!(!error.to_string().contains("must not overlap"));
+}
+
 mod test_support {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
