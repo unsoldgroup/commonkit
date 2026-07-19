@@ -105,13 +105,14 @@ key_file="$scratch/snapshot.key"
 mkdir -p "$snapshot_root"
 printf 'database before snapshot' > "$database"
 node -e 'require("fs").writeFileSync(process.argv[1], Buffer.alloc(32,47))' "$key_file"
-node - "$headless" "$snapshot_root" "$database" "$key_file" "$commonkit" <<'JS'
+node - "$headless" "$snapshot_root" "$database" "$key_file" "$commonkit" "$scratch/kit" <<'JS'
 const fs = require("fs");
-const [configPath, root, database, key, executable] = process.argv.slice(2);
+const [configPath, root, database, key, executable, portableState] = process.argv.slice(2);
 const config = JSON.parse(fs.readFileSync(configPath));
 const lifecycle = { executable, args: ["status"] };
 config.snapshots = {
   root,
+  portableState,
   keyReference: `file://${key}`,
   objectStore: { type: "local" },
   databases: [{ id: "context-mode", path: database, targetId: "local", format: "file",

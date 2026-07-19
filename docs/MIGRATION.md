@@ -16,6 +16,8 @@ Portable MCP declarations describe upstream intent. CommonKit owns the persisten
 
 Git contains declarative layers, provider manifests/locks, policy, and snapshot descriptors only. Credential values, provider staging, artifacts, receipts, backups, SQLite databases, WAL/SHM files, and snapshot ciphertext remain outside the kit repository. Move mutable corpora through encrypted snapshots and explicit authoritative-writer promotion.
 
+Snapshot configuration now requires `portableState`, an absolute directory inside the checked-out Git kit. Existing installations should create that directory, add it to `snapshots.portableState`, make a new snapshot, and commit/push the generated `snapshots/<digest>.json` descriptor. The descriptor contains only stable IDs and the encrypted-manifest object digest. Every receiving machine must independently provision the same snapshot-key reference and object-store credentials. Promotion no longer accepts caller-supplied writer/candidate digests: add `observedPaths` entries for every locally inspectable candidate, or leave promotion unavailable until a target inspection transport is configured.
+
 ## Safe rollout
 
 1. Import configuration and compose without applying.

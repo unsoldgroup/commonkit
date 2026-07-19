@@ -189,7 +189,7 @@ function bindManagementActions(route: Route): void {
   });
   document.querySelector("#snapshot-promote")?.addEventListener("click", () => {
     const databaseId = required("Database ID");
-    const targetId = databaseId ? required("Target ID to promote as authoritative writer") : null;
+    const targetId = databaseId ? required("Target ID shown as observable in promotionEvidence") : null;
     if (!databaseId || !targetId || !window.confirm(`Promote ${targetId} as writer for ${databaseId}?`)) return;
     void showResult(route, () => desktopApi.snapshotPromote(databaseId, targetId, confirmationId("snapshot-promote")));
   });
