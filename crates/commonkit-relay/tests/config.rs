@@ -149,6 +149,23 @@ fn accepts_only_secret_references_for_remote_headers() {
         .expect_err("literal"),
         RelayConfigError::LiteralHeaderSecret
     );
+
+    for unsupported in ["bws:item", "keychain:item", "vault:item"] {
+        assert_eq!(
+            RelayConfig::normalize(json!({
+                "servers": [{
+                    "id": "docs",
+                    "remote": {
+                        "type": "streamable_http",
+                        "url": "https://example.com/mcp",
+                        "headers": {"Authorization": unsupported}
+                    }
+                }]
+            }))
+            .expect_err("unsupported reference must fail before apply"),
+            RelayConfigError::LiteralHeaderSecret
+        );
+    }
 }
 
 #[test]

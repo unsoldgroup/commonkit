@@ -1,6 +1,14 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
+use commonkit_adapters::{
+    ArtifactStore, ExactProviderVersion, FilesystemIntent, MaterializedState,
+    NormalizedManagedPath, ProviderCapability, ProviderCapabilityResource, ProviderInputs,
+    ResourceProvenance, materialize_mcp_client_state,
+};
+use commonkit_contracts::{Sha256Digest, StableId};
+use std::collections::BTreeMap;
+
 use commonkit_service::{BoundServer, ControlToken, EventHub, ServiceStatus};
 use std::io::{Read, Write};
 use tokio::sync::{RwLock, oneshot};
@@ -10,6 +18,73 @@ fn temporary_directory() -> tempfile::TempDir {
         .prefix("commonkit-server-")
         .tempdir()
         .expect("unique server test directory")
+}
+
+fn generated_relay_authorization(
+    directory: &tempfile::TempDir,
+    endpoint: &str,
+    token: &str,
+) -> String {
+    let inputs = ProviderInputs::new(
+        StableId::parse("apm").unwrap(),
+        ExactProviderVersion::parse("0.25.0").unwrap(),
+        "commonkit.apm-provider.v1".into(),
+        BTreeMap::from([(
+            "manifest".into(),
+            Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
+        )]),
+        vec!["agent-context".into()],
+    )
+    .unwrap();
+    let provider = MaterializedState::finalize_with_capabilities(
+        inputs.clone(),
+        vec![],
+        vec![],
+        vec![],
+        vec![ProviderCapabilityResource {
+            capability: ProviderCapability::McpStreamableHttp {
+                id: "docs".into(),
+                name: "Docs".into(),
+                enabled: true,
+                url: "https://upstream.example/mcp".into(),
+                headers: BTreeMap::new(),
+            },
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id.clone(),
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest.clone(),
+                source: "apm.yml:dependencies.mcp[docs]".into(),
+            },
+        }],
+    )
+    .unwrap();
+    let artifacts = ArtifactStore::open(directory.path().join("artifacts")).unwrap();
+    let generated = materialize_mcp_client_state(
+        &[provider],
+        &artifacts,
+        &NormalizedManagedPath::parse("home").unwrap(),
+        endpoint,
+    )
+    .unwrap()
+    .unwrap();
+    let files = generated
+        .resources
+        .iter()
+        .map(|resource| {
+            let FilesystemIntent::File { path, content, .. } = &resource.intent else {
+                panic!("client resource must be a file")
+            };
+            (path.as_str(), artifacts.load(content).unwrap())
+        })
+        .collect::<BTreeMap<_, _>>();
+    let claude: serde_json::Value =
+        serde_json::from_slice(files["home/.mcp.json"].as_slice()).unwrap();
+    let template = claude["mcpServers"]["commonkit-relay"]["headers"]["Authorization"]
+        .as_str()
+        .unwrap();
+    let codex = String::from_utf8(files["home/.codex/config.toml"].clone()).unwrap();
+    assert!(codex.contains("bearer_token_env_var = \"COMMONKIT_RELAY_TOKEN\""));
+    template.replace("${COMMONKIT_RELAY_TOKEN}", token)
 }
 
 #[tokio::test]
@@ -67,15 +142,17 @@ async fn hosts_a_separate_authenticated_loopback_mcp_listener() {
     .await
     .expect("bind");
     let relay = server.relay_address().expect("relay address");
+    let endpoint = format!("http://{relay}/mcp");
+    let authorization = generated_relay_authorization(&directory, &endpoint, &bearer);
     let (shutdown, signal) = oneshot::channel();
     let task = tokio::spawn(server.run_until(async move {
         let _ = signal.await;
     }));
-    let tools_bearer = bearer.clone();
+    let tools_authorization = authorization.clone();
     let response = tokio::task::spawn_blocking(move || {
         let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#;
         let mut stream = std::net::TcpStream::connect(relay).expect("connect relay");
-        write!(stream, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {tools_bearer}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("request");
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {tools_authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("request");
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("response");
         response
@@ -85,7 +162,7 @@ async fn hosts_a_separate_authenticated_loopback_mcp_listener() {
     let initialized = tokio::task::spawn_blocking(move || {
         let body = r#"{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}"#;
         let mut stream = std::net::TcpStream::connect(relay).expect("connect relay");
-        write!(stream, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {bearer}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("request");
+        write!(stream, "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("request");
         let mut response = String::new();
         stream.read_to_string(&mut response).expect("response");
         response

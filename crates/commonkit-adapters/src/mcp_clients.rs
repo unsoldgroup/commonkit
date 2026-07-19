@@ -11,7 +11,8 @@ use crate::{
 };
 
 const CLIENT_PROVIDER_ID: &str = "commonkit-relay-client";
-const CLIENT_PROVIDER_VERSION: &str = "1.0.0";
+const CLIENT_PROVIDER_VERSION: &str = "1.1.0";
+const RELAY_TOKEN_ENV_VAR: &str = "COMMONKIT_RELAY_TOKEN";
 
 #[derive(Debug, Error)]
 pub enum McpClientMaterializationError {
@@ -51,6 +52,7 @@ struct ClaudeServer<'a> {
     #[serde(rename = "type")]
     transport_type: &'static str,
     url: &'a str,
+    headers: BTreeMap<&'static str, &'static str>,
 }
 
 /// Converts verified provider MCP capabilities into portable client files.
@@ -110,11 +112,14 @@ pub fn materialize_mcp_client_state(
             ClaudeServer {
                 transport_type: "streamable-http",
                 url: relay_endpoint,
+                headers: BTreeMap::from([("Authorization", "Bearer ${COMMONKIT_RELAY_TOKEN}")]),
             },
         )]),
     })?;
-    let codex =
-        format!("[mcp_servers.\"commonkit-relay\"]\nurl = \"{relay_endpoint}\"\n").into_bytes();
+    let codex = format!(
+        "[mcp_servers.\"commonkit-relay\"]\nurl = \"{relay_endpoint}\"\nbearer_token_env_var = \"{RELAY_TOKEN_ENV_VAR}\"\n"
+    )
+    .into_bytes();
     let resources = [
         (".mcp.json", claude, "provider-mcp -> claude relay client"),
         (

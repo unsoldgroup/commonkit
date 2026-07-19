@@ -527,7 +527,11 @@ impl RelayLifecycleControl for ManagedRelayRuntime {
         &self,
         desired: &commonkit_relay::RelayConfig,
     ) -> Result<(), commonkit_relay::RelayPlanError> {
-        let manager = HttpUpstreamManager::new(Duration::from_secs(30))
+        let env_root = self
+            .config_path
+            .parent()
+            .ok_or(commonkit_relay::RelayPlanError::UnsafeState)?;
+        let manager = HttpUpstreamManager::with_env_root(Duration::from_secs(30), env_root)
             .map_err(|_| commonkit_relay::RelayPlanError::UnsafeState)?;
         let runtime = RelayRuntime::new(
             self.token.clone(),

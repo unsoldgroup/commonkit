@@ -81,8 +81,13 @@ fn provider_mcp_becomes_content_addressed_claude_and_codex_relay_configs() {
     );
     assert!(rendered["home/.mcp.json"].contains("http://127.0.0.1:3764/mcp"));
     assert!(rendered["home/.mcp.json"].contains("commonkit-relay"));
+    assert!(rendered["home/.mcp.json"].contains("Bearer ${COMMONKIT_RELAY_TOKEN}"));
     assert!(rendered["home/.codex/config.toml"].contains("http://127.0.0.1:3764/mcp"));
     assert!(rendered["home/.codex/config.toml"].contains("mcp_servers.\"commonkit-relay\""));
+    assert!(
+        rendered["home/.codex/config.toml"]
+            .contains("bearer_token_env_var = \"COMMONKIT_RELAY_TOKEN\"")
+    );
     assert!(
         !rendered
             .values()

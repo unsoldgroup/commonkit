@@ -869,7 +869,7 @@ fn validate_local_url(raw: &str, display: bool) -> Result<(), RelayConfigError> 
 }
 
 fn is_secret_reference(value: &str) -> bool {
-    ["env:", "secret:", "bws:", "keychain:", "vault:"]
+    ["env:", "secret:"]
         .iter()
         .any(|prefix| value.starts_with(prefix))
 }

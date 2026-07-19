@@ -6,7 +6,9 @@ use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Response};
 use serde_json::{Value, json};
 
-use crate::{RelayHealth, RelayServerConfig, RelayTool, UpstreamError, UpstreamManager};
+use crate::{
+    EnvFileLoader, RelayHealth, RelayServerConfig, RelayTool, UpstreamError, UpstreamManager,
+};
 
 const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -17,10 +19,23 @@ const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 pub struct HttpUpstreamManager {
     client: Client,
     health: Mutex<BTreeMap<String, RelayHealth>>,
+    env_loader: Option<EnvFileLoader>,
 }
 
 impl HttpUpstreamManager {
     pub fn new(timeout: Duration) -> Result<Self, UpstreamError> {
+        Self::build(timeout, None)
+    }
+
+    pub fn with_env_root(
+        timeout: Duration,
+        root: impl AsRef<std::path::Path>,
+    ) -> Result<Self, UpstreamError> {
+        let loader = EnvFileLoader::new(root).map_err(|_| unavailable())?;
+        Self::build(timeout, Some(loader))
+    }
+
+    fn build(timeout: Duration, env_loader: Option<EnvFileLoader>) -> Result<Self, UpstreamError> {
         if timeout.is_zero() || timeout > Duration::from_secs(120) {
             return Err(unavailable());
         }
@@ -33,11 +48,12 @@ impl HttpUpstreamManager {
         Ok(Self {
             client,
             health: Mutex::new(BTreeMap::new()),
+            env_loader,
         })
     }
 
     fn request(&self, server: &RelayServerConfig, body: Value) -> Result<Value, UpstreamError> {
-        let headers = resolve_headers(server)?;
+        let headers = resolve_headers(server, self.env_loader.as_ref())?;
         let client = self.client.clone();
         let url = server.remote.url.clone();
         let value = std::thread::spawn(move || {
@@ -121,7 +137,15 @@ impl UpstreamManager for HttpUpstreamManager {
     }
 }
 
-fn resolve_headers(server: &RelayServerConfig) -> Result<HeaderMap, UpstreamError> {
+fn resolve_headers(
+    server: &RelayServerConfig,
+    env_loader: Option<&EnvFileLoader>,
+) -> Result<HeaderMap, UpstreamError> {
+    let file_values = match (&server.env_file, env_loader) {
+        (Some(path), Some(loader)) => loader.load(Some(path)).map_err(|_| unavailable())?,
+        (Some(_), None) => return Err(unavailable()),
+        (None, _) => BTreeMap::new(),
+    };
     let mut headers = HeaderMap::new();
     for (name, reference) in &server.remote.headers {
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| unavailable())?;
@@ -129,7 +153,11 @@ fn resolve_headers(server: &RelayServerConfig) -> Result<HeaderMap, UpstreamErro
             .strip_prefix("env:")
             .or_else(|| reference.strip_prefix("secret:"))
             .ok_or_else(unavailable)?;
-        let value = std::env::var(variable).map_err(|_| unavailable())?;
+        let value = file_values
+            .get(variable)
+            .cloned()
+            .or_else(|| std::env::var(variable).ok())
+            .ok_or_else(unavailable)?;
         headers.insert(
             name,
             HeaderValue::from_str(&value).map_err(|_| unavailable())?,
