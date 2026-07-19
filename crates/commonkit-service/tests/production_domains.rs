@@ -9,8 +9,127 @@ use commonkit_reconcile::PlanStore;
 use commonkit_reconcile::{Adapter, ReceiptStore, ReconcileOutcome, Reconciler};
 use commonkit_service::ProductionDomainRegistry;
 
+#[cfg(unix)]
+#[test]
+fn registry_startup_recovers_snapshot_transactions_with_configured_service_lifecycle() {
+    use commonkit_snapshots::{
+        DatabaseId, DatabaseLifecycle, DurableRestore, InMemoryObjectStore, RestoreFailpoint,
+        RestorePlan, SnapshotError, SnapshotService, StaticBackup, XChaCha20Cipher,
+        manifest_digest,
+    };
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    struct InitialLifecycle;
+    impl DatabaseLifecycle for InitialLifecycle {
+        fn stop(&mut self) -> Result<(), SnapshotError> {
+            Ok(())
+        }
+        fn start(&mut self) -> Result<(), SnapshotError> {
+            Ok(())
+        }
+    }
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let secret = b"target-local-key";
+    let key_path = root.join("key");
+    std::fs::write(&key_path, secret).unwrap();
+    let key: [u8; 32] = Sha256::digest(secret).into();
+    let cipher = XChaCha20Cipher::new(key);
+    let mut objects = InMemoryObjectStore::default();
+    let database_id = DatabaseId::new("context-mode").unwrap();
+    let manifest = SnapshotService::new(&cipher)
+        .snapshot(
+            &database_id,
+            "local",
+            None,
+            &StaticBackup::new("file", b"restored".to_vec()),
+            &mut objects,
+        )
+        .unwrap();
+    let database = root.join("context.db");
+    std::fs::write(&database, b"original").unwrap();
+    DurableRestore::open(root.join("snapshots/transactions"), &cipher)
+        .unwrap()
+        .execute(
+            RestorePlan {
+                schema: "commonkit.restore-plan.v1".into(),
+                run_id: "startup-recovery".into(),
+                snapshot_id: "snapshot-1".into(),
+                manifest_digest: manifest_digest(&manifest).unwrap(),
+                database: database_id,
+                expected_content_digest: manifest.content_digest.clone(),
+            },
+            &manifest,
+            &objects,
+            &database,
+            &mut InitialLifecycle,
+            RestoreFailpoint::AfterSwap,
+        )
+        .unwrap_err();
+
+    let lifecycle_log = root.join("lifecycle.log");
+    let script = root.join("lifecycle.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}'\n",
+            lifecycle_log.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let lifecycle = serde_json::json!({
+        "stop": {"executable": script, "args":["stop"]},
+        "start": {"executable": script, "args":["start"]}
+    });
+    let config = root.join("headless.json");
+    write_json(
+        &config,
+        &serde_json::json!({
+            "sync": null,
+            "credentials": null,
+            "snapshots": {
+                "root": root.join("snapshots"),
+                "keyReference": format!("file://{}", key_path.display()),
+                "objectStore": {"type":"local"},
+                "databases": [{"id":"context-mode", "path":database, "targetId":"local", "format":"file", "lifecycle":lifecycle}]
+            }
+        }),
+    );
+    ProductionDomainRegistry::load(
+        &config,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(root.join("context.db")).unwrap(), b"original");
+    assert_eq!(
+        std::fs::read_to_string(lifecycle_log).unwrap(),
+        "stop\nstart\n"
+    );
+}
+
 fn write_json(path: &std::path::Path, value: &impl serde::Serialize) {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+}
+
+fn lifecycle_config() -> serde_json::Value {
+    #[cfg(windows)]
+    let (executable, args) = (
+        std::path::PathBuf::from(std::env::var("WINDIR").unwrap()).join("System32/cmd.exe"),
+        serde_json::json!(["/C", "exit", "0"]),
+    );
+    #[cfg(not(windows))]
+    let (executable, args) = (
+        std::path::PathBuf::from("/usr/bin/true"),
+        serde_json::json!([]),
+    );
+    serde_json::json!({
+        "stop": {"executable": executable, "args": args},
+        "start": {"executable": executable, "args": args}
+    })
 }
 
 #[test]
@@ -74,7 +193,7 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
       }]},
       "snapshots": { "root": root.join("snapshots"), "keyReference": format!("file://{}", source_secret.display()),
         "objectStore": {"type":"local"},
-        "databases": [{"id":"context-mode", "path": database, "targetId":"local", "format":"file"}] }
+        "databases": [{"id":"context-mode", "path": database, "targetId":"local", "format":"file", "lifecycle": lifecycle_config()}] }
     });
     let config_path = root.join("headless.json");
     write_json(&config_path, &config);
@@ -301,7 +420,7 @@ fn invalid_s3_snapshot_backend_fails_at_registry_load() {
                 "root": root.join("snapshots"),
                 "keyReference": format!("file://{}", key.display()),
                 "objectStore": {"type":"s3", "executable":"relative/aws", "endpoint":"http://insecure", "bucket":"bad", "prefix":"."},
-                "databases": [{"id":"context-mode", "path":root.join("context.sqlite"), "targetId":"local", "format":"sqlite"}]
+                "databases": [{"id":"context-mode", "path":root.join("context.sqlite"), "targetId":"local", "format":"sqlite", "lifecycle": lifecycle_config()}]
             }
         }),
     );

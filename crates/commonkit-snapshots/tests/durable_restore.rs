@@ -1,10 +1,10 @@
 use std::fs;
 
 use commonkit_snapshots::{
-    manifest_digest, Authority, AuthorityStore, DatabaseId, DatabaseLifecycle,
-    DeterministicTestCipher, DurableRestore, InMemoryObjectStore, PromotionFailpoint,
-    PromotionPlan, RestoreFailpoint, RestorePlan, RestoreState, SnapshotError, SnapshotService,
-    SqliteBackup, StaticBackup,
+    Authority, AuthorityStore, DatabaseId, DatabaseLifecycle, DeterministicTestCipher,
+    DurableRestore, InMemoryObjectStore, PromotionFailpoint, PromotionPlan, RestoreFailpoint,
+    RestorePlan, RestoreState, SnapshotError, SnapshotService, SqliteBackup, StaticBackup,
+    manifest_digest,
 };
 
 #[derive(Default)]
@@ -87,6 +87,35 @@ fn fresh_process_recovers_an_interrupted_swap_from_encrypted_preimage() {
 }
 
 #[test]
+fn startup_discovery_returns_only_integrity_checked_unfinished_transactions() {
+    let (root, cipher, objects, manifest, plan) = fixture();
+    let database = root.path().join("context.db");
+    fs::write(&database, b"original database").unwrap();
+    DurableRestore::open(root.path().join("state"), &cipher)
+        .unwrap()
+        .execute(
+            plan,
+            &manifest,
+            &objects,
+            &database,
+            &mut Lifecycle::default(),
+            RestoreFailpoint::AfterSwap,
+        )
+        .unwrap_err();
+
+    let fresh = DurableRestore::open(root.path().join("state"), &cipher).unwrap();
+    assert_eq!(
+        fresh
+            .unfinished_runs()
+            .unwrap()
+            .into_iter()
+            .map(|plan| plan.run_id)
+            .collect::<Vec<_>>(),
+        ["restore-run-1"]
+    );
+}
+
+#[test]
 fn tampered_receipt_and_preimage_fail_closed() {
     let (root, cipher, objects, manifest, plan) = fixture();
     let database = root.path().join("context.db");
@@ -107,6 +136,41 @@ fn tampered_receipt_and_preimage_fail_closed() {
     let middle = receipt.len() / 2;
     receipt[middle] ^= 1;
     fs::write(&receipt_path, receipt).unwrap();
+    assert_eq!(
+        DurableRestore::open(root.path().join("state"), &cipher)
+            .unwrap()
+            .recover("restore-run-1", &database, &mut Lifecycle::default())
+            .unwrap_err(),
+        SnapshotError::TransactionIntegrity
+    );
+}
+
+#[test]
+fn recomputing_an_unkeyed_receipt_digest_cannot_forge_restore_state() {
+    use sha2::{Digest, Sha256};
+
+    let (root, cipher, objects, manifest, plan) = fixture();
+    let database = root.path().join("context.db");
+    fs::write(&database, b"original database").unwrap();
+    DurableRestore::open(root.path().join("state"), &cipher)
+        .unwrap()
+        .execute(
+            plan,
+            &manifest,
+            &objects,
+            &database,
+            &mut Lifecycle::default(),
+            RestoreFailpoint::AfterSwap,
+        )
+        .unwrap_err();
+    let receipt_path = root.path().join("state/runs/restore-run-1/receipt.json");
+    let mut envelope: serde_json::Value =
+        serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+    envelope["value"]["state"] = serde_json::json!("verified");
+    let canonical = serde_jcs::to_vec(&envelope["value"]).unwrap();
+    envelope["digest"] = serde_json::json!(format!("sha256:{:x}", Sha256::digest(canonical)));
+    fs::write(&receipt_path, serde_json::to_vec(&envelope).unwrap()).unwrap();
+
     assert_eq!(
         DurableRestore::open(root.path().join("state"), &cipher)
             .unwrap()
@@ -244,10 +308,35 @@ fn fresh_process_finishes_a_promotion_interrupted_after_authority_write() {
         .recover_promotion("promotion-crash")
         .unwrap();
     assert_eq!(receipt.authoritative_writer, "writer-b");
-    assert!(root
-        .path()
-        .join("promotions/promotion-crash/receipt.json")
-        .is_file());
+    assert!(
+        root.path()
+            .join("promotions/promotion-crash/receipt.json")
+            .is_file()
+    );
+}
+
+#[test]
+fn startup_discovery_finds_unfinished_promotions() {
+    let root = tempfile::tempdir().unwrap();
+    let database = DatabaseId::new("context-mode").unwrap();
+    let store = AuthorityStore::open(root.path()).unwrap();
+    store.initialize(&database, "writer-a").unwrap();
+    store
+        .promote_with_failpoint(
+            PromotionPlan {
+                schema: "commonkit.promotion-plan.v1".into(),
+                run_id: "promotion-crash".into(),
+                database,
+                previous_writer: "writer-a".into(),
+                candidate_writer: "writer-b".into(),
+                latest_snapshot_digest: "sha256:snapshot".into(),
+                current_writer_digest: "sha256:snapshot".into(),
+                candidate_digest: "sha256:snapshot".into(),
+            },
+            PromotionFailpoint::AfterAuthorityWrite,
+        )
+        .unwrap_err();
+    assert_eq!(store.unfinished_promotions().unwrap(), ["promotion-crash"]);
 }
 
 #[test]

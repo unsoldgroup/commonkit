@@ -310,6 +310,42 @@ impl AuthorityStore {
         self.finish_promotion(plan, plan_digest, &run)
     }
 
+    /// Enumerates authenticated promotion plans that do not yet have a receipt. Any malformed,
+    /// symlinked, or mismatched entry fails the entire scan closed.
+    pub fn unfinished_promotions(&self) -> Result<Vec<String>, SnapshotError> {
+        let mut runs = Vec::new();
+        for entry in std::fs::read_dir(self.root.join("promotions"))
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?
+        {
+            let entry = entry.map_err(|_| SnapshotError::TransactionIntegrity)?;
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|_| SnapshotError::TransactionIntegrity)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(SnapshotError::TransactionIntegrity);
+            }
+            let run_id = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| SnapshotError::TransactionIntegrity)?;
+            let (plan, _): (PromotionPlan, String) =
+                read_envelope(&entry.path().join("plan.json"))?;
+            if plan.run_id != run_id {
+                return Err(SnapshotError::TransactionIntegrity);
+            }
+            if !entry.path().join("receipt.json").exists() {
+                runs.push(run_id);
+            } else {
+                let (receipt, _): (PromotionReceipt, String) =
+                    read_envelope(&entry.path().join("receipt.json"))?;
+                if receipt.run_id != plan.run_id {
+                    return Err(SnapshotError::TransactionIntegrity);
+                }
+            }
+        }
+        runs.sort();
+        Ok(runs)
+    }
+
     fn finish_promotion(
         &self,
         plan: PromotionPlan,
@@ -347,6 +383,8 @@ pub enum RestoreState {
 struct IntegrityEnvelope<T> {
     value: T,
     digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authentication: Option<Vec<u8>>,
 }
 
 /// Target-local content-addressed store. Values are already authenticated ciphertext; reads
@@ -424,7 +462,12 @@ impl<'a, C: AuthenticatedCipher> DurableRestore<'a, C> {
         validate_plan(&plan, manifest)?;
         let run = self.root.join("runs").join(&plan.run_id);
         std::fs::create_dir_all(&run).map_err(|_| SnapshotError::ObjectStoreFailed)?;
-        let plan_digest = write_envelope(&run.join("plan.json"), &plan)?;
+        let plan_digest = write_authenticated_envelope(
+            &run.join("plan.json"),
+            &plan,
+            self.cipher,
+            restore_auth_aad("plan", &plan.run_id).as_bytes(),
+        )?;
         let mut receipt = RestoreReceipt {
             schema: "commonkit.restore-receipt.v1".into(),
             run_id: plan.run_id.clone(),
@@ -453,9 +496,9 @@ impl<'a, C: AuthenticatedCipher> DurableRestore<'a, C> {
         receipt.state = RestoreState::Prepared;
         self.write_receipt(&run, &receipt)?;
 
-        lifecycle.stop()?;
         receipt.state = RestoreState::Swapping;
         self.write_receipt(&run, &receipt)?;
+        lifecycle.stop()?;
         replace_file(database_path, &staged)?;
         receipt.state = RestoreState::Swapped;
         self.write_receipt(&run, &receipt)?;
@@ -480,8 +523,16 @@ impl<'a, C: AuthenticatedCipher> DurableRestore<'a, C> {
         lifecycle: &mut impl DatabaseLifecycle,
     ) -> Result<RestoreReceipt, SnapshotError> {
         let run = self.root.join("runs").join(run_id);
-        let (plan, plan_digest): (RestorePlan, String) = read_envelope(&run.join("plan.json"))?;
-        let (mut receipt, _): (RestoreReceipt, String) = read_envelope(&run.join("receipt.json"))?;
+        let (plan, plan_digest): (RestorePlan, String) = read_authenticated_envelope(
+            &run.join("plan.json"),
+            self.cipher,
+            restore_auth_aad("plan", run_id).as_bytes(),
+        )?;
+        let (mut receipt, _): (RestoreReceipt, String) = read_authenticated_envelope(
+            &run.join("receipt.json"),
+            self.cipher,
+            restore_auth_aad("receipt", run_id).as_bytes(),
+        )?;
         if receipt.run_id != plan.run_id || receipt.plan_digest != plan_digest {
             return Err(SnapshotError::TransactionIntegrity);
         }
@@ -498,6 +549,50 @@ impl<'a, C: AuthenticatedCipher> DurableRestore<'a, C> {
                 Ok(receipt)
             }
         }
+    }
+
+    /// Returns authenticated plans for every non-terminal restore transaction. Recovery callers
+    /// can use the database ID to select the configured live path and lifecycle after restart.
+    pub fn unfinished_runs(&self) -> Result<Vec<RestorePlan>, SnapshotError> {
+        let mut plans = Vec::new();
+        for entry in std::fs::read_dir(self.root.join("runs"))
+            .map_err(|_| SnapshotError::ObjectStoreFailed)?
+        {
+            let entry = entry.map_err(|_| SnapshotError::TransactionIntegrity)?;
+            let metadata = std::fs::symlink_metadata(entry.path())
+                .map_err(|_| SnapshotError::TransactionIntegrity)?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(SnapshotError::TransactionIntegrity);
+            }
+            let run_id = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| SnapshotError::TransactionIntegrity)?;
+            let (plan, plan_digest): (RestorePlan, String) = read_authenticated_envelope(
+                &entry.path().join("plan.json"),
+                self.cipher,
+                restore_auth_aad("plan", &run_id).as_bytes(),
+            )?;
+            let (receipt, _): (RestoreReceipt, String) = read_authenticated_envelope(
+                &entry.path().join("receipt.json"),
+                self.cipher,
+                restore_auth_aad("receipt", &run_id).as_bytes(),
+            )?;
+            if plan.run_id != run_id
+                || receipt.run_id != run_id
+                || receipt.plan_digest != plan_digest
+            {
+                return Err(SnapshotError::TransactionIntegrity);
+            }
+            if !matches!(
+                receipt.state,
+                RestoreState::Verified | RestoreState::RolledBack
+            ) {
+                plans.push(plan);
+            }
+        }
+        plans.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        Ok(plans)
     }
 
     fn rollback(
@@ -529,8 +624,18 @@ impl<'a, C: AuthenticatedCipher> DurableRestore<'a, C> {
     }
 
     fn write_receipt(&self, run: &Path, receipt: &RestoreReceipt) -> Result<(), SnapshotError> {
-        write_envelope(&run.join("receipt.json"), receipt).map(|_| ())
+        write_authenticated_envelope(
+            &run.join("receipt.json"),
+            receipt,
+            self.cipher,
+            restore_auth_aad("receipt", &receipt.run_id).as_bytes(),
+        )
+        .map(|_| ())
     }
+}
+
+fn restore_auth_aad(kind: &str, run_id: &str) -> String {
+    format!("commonkit.restore-{kind}-authentication.v1\0{run_id}")
 }
 
 fn validate_plan(plan: &RestorePlan, manifest: &SnapshotManifest) -> Result<(), SnapshotError> {
@@ -558,10 +663,65 @@ fn write_envelope<T: Serialize>(path: &Path, value: &T) -> Result<String, Snapsh
     let envelope = IntegrityEnvelope {
         value,
         digest: digest.clone(),
+        authentication: None,
     };
     let bytes = serde_jcs::to_vec(&envelope).map_err(|_| SnapshotError::TransactionIntegrity)?;
     atomic_write(path, &bytes)?;
     Ok(digest)
+}
+
+fn write_authenticated_envelope<T: Serialize>(
+    path: &Path,
+    value: &T,
+    cipher: &impl AuthenticatedCipher,
+    aad: &[u8],
+) -> Result<String, SnapshotError> {
+    let value_bytes = serde_jcs::to_vec(value).map_err(|_| SnapshotError::TransactionIntegrity)?;
+    let digest = sha256(&value_bytes);
+    let authentication = cipher.seal(&[], &authentication_aad(aad, &digest))?;
+    let envelope = IntegrityEnvelope {
+        value,
+        digest: digest.clone(),
+        authentication: Some(authentication),
+    };
+    let bytes = serde_jcs::to_vec(&envelope).map_err(|_| SnapshotError::TransactionIntegrity)?;
+    atomic_write(path, &bytes)?;
+    Ok(digest)
+}
+
+fn read_authenticated_envelope<T: Serialize + for<'de> Deserialize<'de>>(
+    path: &Path,
+    cipher: &impl AuthenticatedCipher,
+    aad: &[u8],
+) -> Result<(T, String), SnapshotError> {
+    let bytes = std::fs::read(path).map_err(|_| SnapshotError::TransactionIntegrity)?;
+    let envelope: IntegrityEnvelope<T> =
+        serde_json::from_slice(&bytes).map_err(|_| SnapshotError::TransactionIntegrity)?;
+    let actual = sha256(
+        &serde_jcs::to_vec(&envelope.value).map_err(|_| SnapshotError::TransactionIntegrity)?,
+    );
+    if actual != envelope.digest {
+        return Err(SnapshotError::TransactionIntegrity);
+    }
+    let authentication = envelope
+        .authentication
+        .ok_or(SnapshotError::TransactionIntegrity)?;
+    if !cipher
+        .open(&authentication, &authentication_aad(aad, &envelope.digest))
+        .map_err(|_| SnapshotError::TransactionIntegrity)?
+        .is_empty()
+    {
+        return Err(SnapshotError::TransactionIntegrity);
+    }
+    Ok((envelope.value, envelope.digest))
+}
+
+fn authentication_aad(aad: &[u8], digest: &str) -> Vec<u8> {
+    let mut output = Vec::with_capacity(aad.len() + 1 + digest.len());
+    output.extend_from_slice(aad);
+    output.push(0);
+    output.extend_from_slice(digest.as_bytes());
+    output
 }
 
 fn read_envelope<T: Serialize + for<'de> Deserialize<'de>>(

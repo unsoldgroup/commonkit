@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
@@ -100,6 +101,22 @@ struct SnapshotDatabase {
     path: PathBuf,
     target_id: String,
     format: SnapshotSourceFormat,
+    lifecycle: DatabaseLifecycleConfig,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DatabaseLifecycleConfig {
+    stop: LifecycleCommand,
+    start: LifecycleCommand,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LifecycleCommand {
+    executable: PathBuf,
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -205,6 +222,9 @@ impl ProductionDomainRegistry {
                     fs::create_dir_all(config.root.join("objects"))?;
                     fs::create_dir_all(config.root.join("manifests"))?;
                     let databases = unique_databases(config.databases)?;
+                    for database in databases.values() {
+                        validate_lifecycle(&database.lifecycle)?;
+                    }
                     let authorities = AuthorityStore::open(config.root.join("authority"))
                         .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     for database in databases.values() {
@@ -212,13 +232,15 @@ impl ProductionDomainRegistry {
                             .initialize(&database.id, &database.target_id)
                             .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     }
-                    Ok(Arc::new(ProductionSnapshotDomain {
+                    let domain = ProductionSnapshotDomain {
                         root: config.root,
                         key_reference: config.key_reference,
                         object_store: config.object_store,
                         databases,
                         lock: Mutex::new(()),
-                    }))
+                    };
+                    domain.recover_unfinished()?;
+                    Ok(Arc::new(domain))
                 },
             )
             .transpose()?;
@@ -283,6 +305,20 @@ fn validate_object_store(config: &SnapshotObjectStoreConfig) -> Result<(), Produ
             .map_err(|_| ProductionDomainError::UnsafeConfig)
         }
     }
+}
+
+fn validate_lifecycle(config: &DatabaseLifecycleConfig) -> Result<(), ProductionDomainError> {
+    for command in [&config.stop, &config.start] {
+        if !command.executable.is_absolute() {
+            return Err(ProductionDomainError::UnsafeConfig);
+        }
+        let metadata = fs::symlink_metadata(&command.executable)
+            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ProductionDomainError::UnsafeConfig);
+        }
+    }
+    Ok(())
 }
 
 struct ProductionCompositionDomain {
@@ -636,6 +672,39 @@ impl SnapshotRequest {
     }
 }
 impl ProductionSnapshotDomain {
+    fn recover_unfinished(&self) -> Result<(), ProductionDomainError> {
+        let cipher = self
+            .cipher()
+            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        let transaction_root = self.root.join("transactions");
+        let mut restores = DurableRestore::open(&transaction_root, &cipher)
+            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        for plan in restores
+            .unfinished_runs()
+            .map_err(|_| ProductionDomainError::UnsafeConfig)?
+        {
+            let database = self
+                .databases
+                .get(&plan.database.to_string())
+                .ok_or(ProductionDomainError::UnsafeConfig)?;
+            let mut lifecycle = ProcessDatabaseLifecycle(&database.lifecycle);
+            restores
+                .recover(&plan.run_id, &database.path, &mut lifecycle)
+                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        }
+        let authority = AuthorityStore::open(self.root.join("authority"))
+            .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        for run_id in authority
+            .unfinished_promotions()
+            .map_err(|_| ProductionDomainError::UnsafeConfig)?
+        {
+            authority
+                .recover_promotion(&run_id)
+                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+        }
+        Ok(())
+    }
+
     fn objects(&self) -> Result<SnapshotObjects, DomainFailure> {
         match &self.object_store {
             SnapshotObjectStoreConfig::Local => Ok(SnapshotObjects::Local(LocalObjects(
@@ -714,13 +783,34 @@ impl ProductionSnapshotDomain {
     }
 }
 
-struct QuiescedDatabase;
-impl DatabaseLifecycle for QuiescedDatabase {
+struct ProcessDatabaseLifecycle<'a>(&'a DatabaseLifecycleConfig);
+impl ProcessDatabaseLifecycle<'_> {
+    fn run(command: &LifecycleCommand) -> Result<(), SnapshotError> {
+        if !command.executable.is_absolute() {
+            return Err(SnapshotError::LifecycleFailed);
+        }
+        let metadata = fs::symlink_metadata(&command.executable)
+            .map_err(|_| SnapshotError::LifecycleFailed)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(SnapshotError::LifecycleFailed);
+        }
+        let status = Command::new(&command.executable)
+            .args(&command.args)
+            .status()
+            .map_err(|_| SnapshotError::LifecycleFailed)?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(SnapshotError::LifecycleFailed)
+        }
+    }
+}
+impl DatabaseLifecycle for ProcessDatabaseLifecycle<'_> {
     fn stop(&mut self) -> Result<(), SnapshotError> {
-        Ok(())
+        Self::run(&self.0.stop)
     }
     fn start(&mut self) -> Result<(), SnapshotError> {
-        Ok(())
+        Self::run(&self.0.start)
     }
 }
 impl SnapshotDomain for ProductionSnapshotDomain {
@@ -830,7 +920,7 @@ impl SnapshotDomain for ProductionSnapshotDomain {
                 &stored.manifest,
                 &self.objects()?,
                 &database.path,
-                &mut QuiescedDatabase,
+                &mut ProcessDatabaseLifecycle(&database.lifecycle),
                 RestoreFailpoint::None,
             )
             .map_err(|_| DomainFailure::VerificationFailed)?;
