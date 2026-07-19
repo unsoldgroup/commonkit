@@ -159,6 +159,33 @@ fn materializes_locally_then_stages_and_verifies_portable_artifacts_over_typed_s
 }
 
 #[test]
+fn stages_pipeline_output_without_re_running_the_provider() {
+    let (root, staging, artifacts) = roots("pipeline-output");
+    let workspace = ProviderWorkspace::open(&staging, &[]).unwrap();
+    let store = ArtifactStore::open(&artifacts).unwrap();
+    let provider = FixtureProvider {
+        id: StableId::parse("chezmoi").unwrap(),
+        content: b"portable pipeline output".to_vec(),
+        sensitivity: ContentSensitivity::Portable,
+        unsupported: false,
+    };
+    let state = provider.materialize(&context(), &workspace, &store).unwrap();
+    let mut transport = RecordingTransport::default();
+    let receipt = RemoteProviderStager::new(&mut transport)
+        .stage_materialized(
+            &state,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-pipeline").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(receipt.materialized_state_digest, state.digest);
+    assert_eq!(receipt.target_id.as_str(), "remote-linux");
+    assert_eq!(transport.requests.len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unsupported_or_sensitive_output_never_reaches_remote_target() {
     for (name, sensitivity, unsupported) in [
         ("unsupported", ContentSensitivity::Portable, true),

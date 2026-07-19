@@ -40,8 +40,20 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
         run_id: StableId,
     ) -> Result<RemoteMaterializationReceipt, RemoteProviderStagingError> {
         let state = provider.materialize(context, workspace, artifacts)?;
+        self.stage_materialized(&state, artifacts, context.target_id.clone(), run_id)
+    }
+
+    /// Stages an already materialized and ownership-validated provider result. This keeps SSH
+    /// target selection on the same controller pipeline and never re-runs provider resolution.
+    pub fn stage_materialized(
+        &mut self,
+        state: &MaterializedState,
+        artifacts: &ArtifactStore,
+        target_id: StableId,
+        run_id: StableId,
+    ) -> Result<RemoteMaterializationReceipt, RemoteProviderStagingError> {
         state.verify()?;
-        self.validate_before_remote_contact(&state)?;
+        self.validate_before_remote_contact(state)?;
 
         let mut references = state
             .resources
@@ -89,11 +101,11 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
         }
 
         Ok(RemoteMaterializationReceipt {
-            target_id: context.target_id.clone(),
-            provider_id: state.inputs.provider_id,
+            target_id,
+            provider_id: state.inputs.provider_id.clone(),
             provider_version: state.inputs.provider_version.to_string(),
-            provider_inputs_digest: state.inputs.input_set_digest,
-            materialized_state_digest: state.digest,
+            provider_inputs_digest: state.inputs.input_set_digest.clone(),
+            materialized_state_digest: state.digest.clone(),
             artifact_digests,
         })
     }

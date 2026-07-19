@@ -427,9 +427,8 @@ fn configured_git_provider_pipeline_materializes_native_state_before_local_plann
         root.join("receipts-pipeline"),
     )
     .unwrap();
-    let plan = registry
-        .sync
-        .unwrap()
+    let sync = registry.sync.unwrap();
+    let plan = sync
         .plan(serde_json::json!({"confirmed":true,"confirmationId":"provider-plan"}))
         .unwrap();
     assert_eq!(plan["operations"].as_array().unwrap().len(), 1);
@@ -442,6 +441,15 @@ fn configured_git_provider_pipeline_materializes_native_state_before_local_plann
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(states.len(), 1);
+    std::fs::write(
+        root.join("checkout/portable/editor.conf"),
+        b"uncommitted drift\n",
+    )
+    .unwrap();
+    assert_eq!(
+        sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"stale-source"})),
+        Err(commonkit_service::DomainFailure::OperationFailed)
+    );
 }
 
 fn git(directory: &std::path::Path, arguments: &[&str]) {
