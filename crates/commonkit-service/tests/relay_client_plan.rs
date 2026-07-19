@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
 use commonkit_adapters::{
@@ -71,8 +72,17 @@ fn local_provider_mcp_clients_share_the_plan_receipt_and_rollback_path() {
     .unwrap();
     let plans = Arc::new(PlanStore::open(root.join("plans")).unwrap());
     let receipts_root = root.join("receipts");
-    let registry =
-        ProductionDomainRegistry::load(&config, plans.clone(), receipts_root.clone()).unwrap();
+    // Model the daemon-owned relay listener: provider clients must use its
+    // discovered ephemeral address, not a compile-time default.
+    let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let relay_address = relay_listener.local_addr().unwrap();
+    let registry = ProductionDomainRegistry::load_optional_with_relay_endpoint(
+        &config,
+        plans.clone(),
+        receipts_root.clone(),
+        relay_address,
+    )
+    .unwrap();
     let sync = registry.sync.as_ref().unwrap();
     let plan: commonkit_contracts::Plan = serde_json::from_value(
         sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"review"}))
@@ -100,10 +110,17 @@ fn local_provider_mcp_clients_share_the_plan_receipt_and_rollback_path() {
     );
     for path in ["home/.mcp.json", "home/.codex/config.toml"] {
         let rendered = fs::read_to_string(target.join(path)).unwrap();
-        assert!(rendered.contains("http://127.0.0.1:3764/mcp"));
+        assert!(rendered.contains(&format!("http://127.0.0.1:{}/mcp", relay_address.port())));
         assert!(!rendered.contains("upstream.example"));
         assert!(!rendered.contains("DOCS_TOKEN"));
     }
+    assert!(
+        TcpStream::connect(SocketAddr::from((
+            Ipv4Addr::LOCALHOST,
+            relay_address.port()
+        )))
+        .is_ok()
+    );
     let receipt_store = ReceiptStore::open(&receipts_root).unwrap();
     let run_id = receipt_store.run_ids().unwrap().pop().unwrap();
     sync.rollback(serde_json::json!({

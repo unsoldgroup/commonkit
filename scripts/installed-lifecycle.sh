@@ -150,10 +150,9 @@ config.snapshots = {
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 JS
 
-# Desktop-owned onboarding reload boundary: the process began without
-# headless.json, so reload it before consuming the first materialized plan.
-"$commonkit" daemon restart >/dev/null
-for _ in $(seq 1 150); do "$commonkit" relay status >/dev/null 2>&1 && break; sleep 0.1; done
+# The same authenticated atomic reload used by Desktop must adopt onboarding
+# state without replacing either an owned or service-manager-owned process.
+"$commonkit" daemon reload-domains --confirmed >/dev/null
 
 "$commonkit" status >/dev/null
 "$commonkit" compose >/dev/null

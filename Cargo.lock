@@ -397,6 +397,7 @@ dependencies = [
  "commonkit-reconcile",
  "commonkit-service",
  "commonkit-skills",
+ "libc",
  "reqwest",
  "serde",
  "serde_json",

@@ -3,7 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 const LABEL: &str = "com.unsoldgroup.commonkitd";
@@ -24,6 +24,36 @@ pub struct DaemonServiceStatus {
     pub installed: bool,
     pub running: bool,
     pub definition: PathBuf,
+}
+
+/// A fixed, machine-readable task-state probe. PowerShell's numeric
+/// `ScheduledTaskState` value 4 means Running; no localized text is parsed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowsTaskStatusProbe {
+    pub program: &'static str,
+    pub arguments: Vec<&'static str>,
+}
+
+pub fn windows_task_status_probe() -> WindowsTaskStatusProbe {
+    WindowsTaskStatusProbe {
+        program: "powershell.exe",
+        arguments: vec![
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$ErrorActionPreference='Stop'; $task=Get-ScheduledTask -TaskName 'com.unsoldgroup.commonkitd'; if ([int]$task.State -eq 4) { exit 0 } else { exit 3 }",
+        ],
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProcessIdentity {
+    pid: u32,
+    executable: PathBuf,
+    start_token: String,
+    service_root: PathBuf,
 }
 
 pub struct DaemonService {
@@ -78,6 +108,8 @@ impl DaemonService {
         };
         let root = if let Some(root) = std::env::var_os("COMMONKIT_SERVICE_ROOT") {
             PathBuf::from(root)
+        } else if backend == DaemonBackend::ProcessFallback {
+            home()?.join(".config/commonkit/service")
         } else if cfg!(target_os = "macos") {
             home()?.join("Library/LaunchAgents")
         } else if cfg!(target_os = "windows") {
@@ -108,7 +140,7 @@ impl DaemonService {
                 escape_systemd(&self.executable.to_string_lossy())
             ),
             DaemonBackend::WindowsTask => format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context=\"Author\"><Exec><Command>{executable}</Command></Exec></Actions></Task>"
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><RestartOnFailure><Interval>PT1M</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context=\"Author\"><Exec><Command>{executable}</Command></Exec></Actions></Task>"
             ),
             DaemonBackend::ProcessFallback => format!(
                 "{{\"executable\":{}}}\n",
@@ -127,6 +159,9 @@ impl DaemonService {
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700))?;
+        }
+        if self.backend == DaemonBackend::Launchd && self.is_running()? {
+            self.launchctl(&["bootout", &format!("{}/{LABEL}", launch_domain()?)])?;
         }
         write_atomic_private(&self.definition_path(), self.render_definition().as_bytes())?;
         match self.backend {
@@ -184,16 +219,18 @@ impl DaemonService {
                 // bootout is performed by stop; absence is already tolerated there.
             }
             DaemonBackend::SystemdUser => {
-                let _ = run("systemctl", &["--user", "disable", "commonkitd.service"]);
-                let _ = run("systemctl", &["--user", "daemon-reload"]);
+                run("systemctl", &["--user", "disable", "commonkitd.service"])?;
             }
             DaemonBackend::WindowsTask => {
-                let _ = run("schtasks.exe", &["/Delete", "/TN", LABEL, "/F"]);
+                run("schtasks.exe", &["/Delete", "/TN", LABEL, "/F"])?;
             }
             DaemonBackend::ProcessFallback => {}
         }
         remove_if_file(&self.definition_path())?;
         remove_if_file(&self.pid_path())?;
+        if self.backend == DaemonBackend::SystemdUser {
+            run("systemctl", &["--user", "daemon-reload"])?;
+        }
         self.status()
     }
 
@@ -222,12 +259,9 @@ impl DaemonService {
                 "systemctl",
                 &["--user", "is-active", "--quiet", "commonkitd.service"],
             )),
-            DaemonBackend::WindowsTask => Ok(run_status(
-                "schtasks.exe",
-                &["/Query", "/TN", LABEL, "/FO", "LIST"],
-            )),
-            DaemonBackend::ProcessFallback => match fs::read_to_string(self.pid_path()) {
-                Ok(pid) => Ok(process_alive(pid.trim())),
+            DaemonBackend::WindowsTask => Ok(windows_task_running()),
+            DaemonBackend::ProcessFallback => match read_process_identity(&self.pid_path()) {
+                Ok(expected) => self.process_identity_matches(&expected),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(error) => Err(error.into()),
             },
@@ -238,16 +272,33 @@ impl DaemonService {
         if self.is_running()? {
             return Ok(());
         }
+        remove_if_file(&self.pid_path())?;
         let log = OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.root.join("commonkitd.log"))?;
-        let child = Command::new(&self.executable)
+        let mut child = Command::new(&self.executable)
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone()?))
             .stderr(Stdio::from(log))
             .spawn()?;
-        write_atomic_private(&self.pid_path(), child.id().to_string().as_bytes())
+        let identity = match observe_process_identity(child.id(), &self.root)? {
+            Some(identity) => identity,
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(DaemonLifecycleError::ProcessIdentityUnavailable);
+            }
+        };
+        let expected_executable = canonical_path(&self.executable)?;
+        if identity.executable != expected_executable {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(DaemonLifecycleError::ProcessIdentityMismatch);
+        }
+        let bytes = serde_json::to_vec(&identity)
+            .map_err(|error| DaemonLifecycleError::InvalidProcessIdentity(error.to_string()))?;
+        write_atomic_private(&self.pid_path(), &bytes)
     }
 
     fn stop_if_running(&self) -> Result<(), DaemonLifecycleError> {
@@ -263,8 +314,11 @@ impl DaemonService {
             }
             DaemonBackend::WindowsTask => run("schtasks.exe", &["/End", "/TN", LABEL])?,
             DaemonBackend::ProcessFallback => {
-                let pid = fs::read_to_string(self.pid_path())?;
-                terminate_process(pid.trim())?;
+                let expected = read_process_identity(&self.pid_path())?;
+                if !self.process_identity_matches(&expected)? {
+                    return Err(DaemonLifecycleError::StaleProcessIdentity);
+                }
+                terminate_process(&expected.pid.to_string())?;
                 remove_if_file(&self.pid_path())?;
             }
         }
@@ -273,6 +327,17 @@ impl DaemonService {
 
     fn launchctl(&self, args: &[&str]) -> Result<(), DaemonLifecycleError> {
         run("launchctl", args)
+    }
+    fn process_identity_matches(
+        &self,
+        expected: &ProcessIdentity,
+    ) -> Result<bool, DaemonLifecycleError> {
+        if expected.executable != canonical_path(&self.executable)?
+            || expected.service_root != canonical_path(&self.root)?
+        {
+            return Ok(false);
+        }
+        Ok(observe_process_identity(expected.pid, &self.root)?.as_ref() == Some(expected))
     }
     fn pid_path(&self) -> PathBuf {
         self.root.join("commonkitd.pid")
@@ -317,12 +382,143 @@ fn run_status(program: &str, args: &[&str]) -> bool {
         .status()
         .is_ok_and(|s| s.success())
 }
-fn process_alive(pid: &str) -> bool {
-    if cfg!(windows) {
-        run_status("tasklist.exe", &["/FI", &format!("PID eq {pid}"), "/NH"])
-    } else {
-        run_status("kill", &["-0", pid])
+fn canonical_path(path: &Path) -> Result<PathBuf, io::Error> {
+    path.canonicalize()
+}
+
+fn read_process_identity(path: &Path) -> Result<ProcessIdentity, io::Error> {
+    let bytes = fs::read(path)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn observe_process_identity(
+    pid: u32,
+    service_root: &Path,
+) -> Result<Option<ProcessIdentity>, DaemonLifecycleError> {
+    let service_root = canonical_path(service_root)?;
+    #[cfg(target_os = "linux")]
+    {
+        let executable = match fs::read_link(format!("/proc/{pid}/exe")) {
+            Ok(path) => canonical_path(&path)?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let close = stat
+            .rfind(')')
+            .ok_or(DaemonLifecycleError::ProcessIdentityUnavailable)?;
+        let fields: Vec<_> = stat[close + 1..].split_whitespace().collect();
+        let start_token = fields
+            .get(19)
+            .ok_or(DaemonLifecycleError::ProcessIdentityUnavailable)?
+            .to_string();
+        return Ok(Some(ProcessIdentity {
+            pid,
+            executable,
+            start_token,
+            service_root,
+        }));
     }
+    #[cfg(target_os = "macos")]
+    {
+        use std::ffi::CStr;
+        use std::mem::{size_of, MaybeUninit};
+        use std::os::unix::ffi::OsStrExt;
+
+        let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        // SAFETY: `info` points to a correctly sized writable proc_bsdinfo and
+        // is only assumed initialized when libproc reports the complete size.
+        let info_size = unsafe {
+            libc::proc_pidinfo(
+                pid as i32,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size_of::<libc::proc_bsdinfo>() as i32,
+            )
+        };
+        if info_size == 0 {
+            return Ok(None);
+        }
+        if info_size != size_of::<libc::proc_bsdinfo>() as i32 {
+            return Err(DaemonLifecycleError::ProcessIdentityUnavailable);
+        }
+        // SAFETY: the exact-size check above proves libproc initialized info.
+        let info = unsafe { info.assume_init() };
+
+        let mut path = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize + 1];
+        // SAFETY: `path` is a writable buffer with the supplied byte length.
+        let path_size = unsafe {
+            libc::proc_pidpath(
+                pid as i32,
+                path.as_mut_ptr().cast(),
+                libc::PROC_PIDPATHINFO_MAXSIZE as u32,
+            )
+        };
+        if path_size <= 0 {
+            return Err(DaemonLifecycleError::ProcessIdentityUnavailable);
+        }
+        path[path_size as usize] = 0;
+        // SAFETY: proc_pidpath returned `path_size` initialized bytes and the
+        // next byte was set to NUL above.
+        let executable = unsafe { CStr::from_ptr(path.as_ptr().cast()) };
+        return Ok(Some(ProcessIdentity {
+            pid,
+            executable: canonical_path(Path::new(std::ffi::OsStr::from_bytes(
+                executable.to_bytes(),
+            )))?,
+            start_token: format!("{}:{}", info.pbi_start_tvsec, info.pbi_start_tvusec),
+            service_root,
+        }));
+    }
+    #[cfg(windows)]
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "PascalCase")]
+        struct WindowsProcess {
+            executable_path: PathBuf,
+            creation_date: String,
+        }
+        let script = format!("$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; if ($null -eq $p) {{ exit 3 }}; $p | Select-Object ExecutablePath,CreationDate | ConvertTo-Json -Compress");
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                &script,
+            ])
+            .stdin(Stdio::null())
+            .output()?;
+        if output.status.code() == Some(3) {
+            return Ok(None);
+        }
+        if !output.status.success() {
+            return Err(DaemonLifecycleError::CommandFailed("powershell.exe".into()));
+        }
+        let observed: WindowsProcess = serde_json::from_slice(&output.stdout)
+            .map_err(|error| DaemonLifecycleError::InvalidProcessIdentity(error.to_string()))?;
+        return Ok(Some(ProcessIdentity {
+            pid,
+            executable: canonical_path(&observed.executable_path)?,
+            start_token: observed.creation_date,
+            service_root,
+        }));
+    }
+    #[allow(unreachable_code)]
+    Ok(None)
+}
+
+fn windows_task_running() -> bool {
+    let probe = windows_task_status_probe();
+    Command::new(probe.program)
+        .args(probe.arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 fn terminate_process(pid: &str) -> Result<(), DaemonLifecycleError> {
     if cfg!(windows) {
@@ -333,7 +529,11 @@ fn terminate_process(pid: &str) -> Result<(), DaemonLifecycleError> {
 }
 fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), DaemonLifecycleError> {
     use std::io::Write;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| DaemonLifecycleError::ClockInvalid)?
+        .as_nanos();
+    let temporary = path.with_extension(format!("tmp-{}-{nonce}", std::process::id()));
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -350,6 +550,7 @@ fn write_atomic_private(path: &Path, bytes: &[u8]) -> Result<(), DaemonLifecycle
             let _ = fs::remove_file(&temporary);
             return Err(DaemonLifecycleError::UnsafeDefinition);
         }
+        #[cfg(windows)]
         fs::remove_file(path)?;
     }
     fs::rename(temporary, path)?;
@@ -384,6 +585,16 @@ pub enum DaemonLifecycleError {
     UnsafeServiceRoot,
     #[error("service definition must be a regular non-symlink file")]
     UnsafeDefinition,
+    #[error("stored daemon PID no longer identifies the configured executable")]
+    StaleProcessIdentity,
+    #[error("the daemon process identity could not be observed")]
+    ProcessIdentityUnavailable,
+    #[error("the started daemon executable does not match the configured executable")]
+    ProcessIdentityMismatch,
+    #[error("stored daemon process identity is invalid: {0}")]
+    InvalidProcessIdentity(String),
+    #[error("system clock is before the Unix epoch")]
+    ClockInvalid,
     #[error("home directory is unavailable")]
     HomeMissing,
     #[error("service path is not UTF-8")]

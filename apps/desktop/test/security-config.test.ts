@@ -33,14 +33,26 @@ test("published installer lifecycle launches the installed desktop and waits for
   assert.match(workflow, /serviceState/);
 });
 
-test("installed lifecycle proves onboarding reloads a daemon that started unconfigured", async () => {
+test("installed lifecycle atomically reloads an already-running daemon after onboarding", async () => {
   const lifecycle = await readFile(new URL("../../../scripts/installed-lifecycle.sh", import.meta.url), "utf8");
   const firstStart = lifecycle.indexOf("trap stop_daemon EXIT\nstart_daemon");
   const initialized = lifecycle.indexOf('"$commonkit" init connect');
-  const reload = lifecycle.indexOf("# Desktop-owned onboarding reload boundary");
+  const reload = lifecycle.indexOf('daemon reload-domains --confirmed');
   const firstPlan = lifecycle.indexOf('"$commonkit" sync --confirmed');
   assert.ok(firstStart >= 0 && firstStart < initialized, "daemon must start before onboarding writes headless.json");
-  assert.ok(reload > initialized && reload < firstPlan, "owned daemon must reload before the first plan is used");
+  assert.ok(reload > initialized && reload < firstPlan, "running daemon must adopt domains before the first plan is used");
+  assert.equal(lifecycle.indexOf('daemon restart', initialized), -1, "onboarding must not replace an attached daemon");
+});
+
+test("desktop preflights and reloads through the authenticated daemon API regardless of process ownership", async () => {
+  const source = await readFile(new URL("src/lib.rs", root), "utf8");
+  const onboarding = source.slice(source.indexOf("fn onboarding_initialize"), source.indexOf("impl ServiceClient"));
+  const preflight = onboarding.indexOf('reqwest::Method::GET,\n        "/domains/reload"');
+  const initialize = onboarding.indexOf("let result = initialize(");
+  const reload = onboarding.indexOf('reqwest::Method::POST,\n        "/domains/reload"');
+  assert.ok(preflight >= 0 && preflight < initialize);
+  assert.ok(reload > initialize);
+  assert.doesNotMatch(onboarding, /reload_owned_after_onboarding|ExternalServiceReloadRequired/);
 });
 
 test("release builds bundle target-matched CLI and daemon before Tauri packaging", async () => {

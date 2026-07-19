@@ -1,6 +1,6 @@
 //! Authenticated, loopback-only CommonKit local control API.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -633,6 +633,10 @@ fn router_with_control_and_relay(
     Router::new()
         .route("/control/v1/status", get(get_status))
         .route("/control/v1/health", get(health))
+        .route(
+            "/control/v1/domains/reload",
+            get(domain_reload_preflight).post(reload_domains),
+        )
         .route("/control/v1/events", get(get_events))
         .route("/control/v1/diagnostics", get(get_diagnostics))
         .route("/control/v1/compose", get(compose_state))
@@ -723,6 +727,44 @@ fn router_with_control_and_relay(
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
+}
+
+async fn domain_reload_preflight(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let supported = state
+        .control
+        .inner
+        .runtime_reloader
+        .read()
+        .expect("runtime reloader lock")
+        .is_some();
+    if !supported {
+        return Err(ApiError::unavailable_code("domain_reload_unavailable"));
+    }
+    Ok(Json(serde_json::json!({"supported": true, "atomic": true})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DomainReloadRequest {
+    confirmed: bool,
+}
+
+async fn reload_domains(
+    State(state): State<ApiState>,
+    Json(request): Json<DomainReloadRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !request.confirmed {
+        return Err(ApiError::conflict("confirmation_required"));
+    }
+    state
+        .control
+        .reload_runtime()
+        .map_err(|_| ApiError::conflict("domain_reload_rejected"))?;
+    state.events.publish(
+        "domains.reloaded",
+        serde_json::json!({"status": "reloaded"}),
+    );
+    Ok(Json(serde_json::json!({"status": "reloaded"})))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1527,12 +1569,21 @@ struct ControlPlaneInner {
     plan_store: Option<Arc<PlanStore>>,
     operations: std::sync::RwLock<BTreeMap<Sha256Digest, ApplyOperation>>,
     idempotency: std::sync::Mutex<BTreeMap<String, (Sha256Digest, StableId, Sha256Digest)>>,
-    executor: Arc<dyn PlanExecutor>,
     scheduler_store: std::sync::RwLock<Option<Arc<SchedulerStore>>>,
-    domains: std::sync::RwLock<HeadlessDomainRegistry>,
-    targets: std::sync::RwLock<Option<Arc<TargetInventory>>>,
-    target_sync: std::sync::RwLock<BTreeMap<StableId, Arc<dyn SyncDomain>>>,
+    runtime: std::sync::RwLock<ControlRuntime>,
+    runtime_reloader: std::sync::RwLock<Option<Arc<dyn RuntimeReloader>>>,
     relay_execution_paths: std::sync::RwLock<Option<(PathBuf, PathBuf)>>,
+}
+
+struct ControlRuntime {
+    executor: Arc<dyn PlanExecutor>,
+    domains: HeadlessDomainRegistry,
+    targets: Option<Arc<TargetInventory>>,
+    target_sync: BTreeMap<StableId, Arc<dyn SyncDomain>>,
+}
+
+trait RuntimeReloader: Send + Sync {
+    fn reload(&self, control: &ControlPlane) -> Result<(), ServiceError>;
 }
 
 impl ControlPlane {
@@ -1543,11 +1594,14 @@ impl ControlPlane {
                 plan_store: None,
                 operations: std::sync::RwLock::new(BTreeMap::new()),
                 idempotency: std::sync::Mutex::new(BTreeMap::new()),
-                executor,
                 scheduler_store: std::sync::RwLock::new(None),
-                domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
-                targets: std::sync::RwLock::new(None),
-                target_sync: std::sync::RwLock::new(BTreeMap::new()),
+                runtime: std::sync::RwLock::new(ControlRuntime {
+                    executor,
+                    domains: HeadlessDomainRegistry::default(),
+                    targets: None,
+                    target_sync: BTreeMap::new(),
+                }),
+                runtime_reloader: std::sync::RwLock::new(None),
                 relay_execution_paths: std::sync::RwLock::new(None),
             }),
         }
@@ -1560,11 +1614,14 @@ impl ControlPlane {
                 plan_store: Some(plan_store),
                 operations: std::sync::RwLock::new(BTreeMap::new()),
                 idempotency: std::sync::Mutex::new(BTreeMap::new()),
-                executor,
                 scheduler_store: std::sync::RwLock::new(None),
-                domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
-                targets: std::sync::RwLock::new(None),
-                target_sync: std::sync::RwLock::new(BTreeMap::new()),
+                runtime: std::sync::RwLock::new(ControlRuntime {
+                    executor,
+                    domains: HeadlessDomainRegistry::default(),
+                    targets: None,
+                    target_sync: BTreeMap::new(),
+                }),
+                runtime_reloader: std::sync::RwLock::new(None),
                 relay_execution_paths: std::sync::RwLock::new(None),
             }),
         }
@@ -1579,24 +1636,27 @@ impl ControlPlane {
     }
 
     pub fn set_headless_domains(&self, domains: HeadlessDomainRegistry) {
-        *self.inner.domains.write().expect("domain registry lock") = domains;
+        self.inner
+            .runtime
+            .write()
+            .expect("control runtime lock")
+            .domains = domains;
     }
 
     pub fn set_target_inventory(&self, inventory: Arc<TargetInventory>) {
-        *self.inner.targets.write().expect("target inventory lock") = Some(inventory);
+        self.inner
+            .runtime
+            .write()
+            .expect("control runtime lock")
+            .targets = Some(inventory);
     }
 
     pub fn set_target_sync_domains(
         &self,
         domains: BTreeMap<StableId, Arc<dyn SyncDomain>>,
     ) -> Result<(), ControlError> {
-        if let Some(inventory) = self
-            .inner
-            .targets
-            .read()
-            .expect("target inventory lock")
-            .as_ref()
-        {
+        let mut runtime = self.inner.runtime.write().expect("control runtime lock");
+        if let Some(inventory) = runtime.targets.as_ref() {
             let known = inventory
                 .targets()
                 .into_iter()
@@ -1606,7 +1666,33 @@ impl ControlPlane {
                 return Err(ControlError::UnknownTargetDomain);
             }
         }
-        *self.inner.target_sync.write().expect("target domain lock") = domains;
+        runtime.target_sync = domains;
+        Ok(())
+    }
+
+    fn replace_runtime(
+        &self,
+        executor: Arc<dyn PlanExecutor>,
+        domains: HeadlessDomainRegistry,
+        targets: Option<Arc<TargetInventory>>,
+        target_sync: BTreeMap<StableId, Arc<dyn SyncDomain>>,
+    ) -> Result<(), ControlError> {
+        if let Some(inventory) = targets.as_ref() {
+            let known = inventory
+                .targets()
+                .into_iter()
+                .map(|target| target.id)
+                .collect::<BTreeSet<_>>();
+            if target_sync.keys().any(|target| !known.contains(target)) {
+                return Err(ControlError::UnknownTargetDomain);
+            }
+        }
+        *self.inner.runtime.write().expect("control runtime lock") = ControlRuntime {
+            executor,
+            domains,
+            targets,
+            target_sync,
+        };
         Ok(())
     }
 
@@ -1618,25 +1704,51 @@ impl ControlPlane {
             .expect("relay execution path lock") = Some((live, state));
     }
 
+    fn set_runtime_reloader(&self, reloader: Arc<dyn RuntimeReloader>) {
+        *self
+            .inner
+            .runtime_reloader
+            .write()
+            .expect("runtime reloader lock") = Some(reloader);
+    }
+
+    fn reload_runtime(&self) -> Result<(), ServiceError> {
+        let reloader = self
+            .inner
+            .runtime_reloader
+            .read()
+            .expect("runtime reloader lock")
+            .clone()
+            .ok_or(ServiceError::ReloadUnavailable)?;
+        reloader.reload(self)
+    }
+
     fn target_sync_domain(&self, target: &StableId) -> Result<Arc<dyn SyncDomain>, ControlError> {
         self.inner
-            .target_sync
+            .runtime
             .read()
-            .expect("target domain lock")
+            .expect("control runtime lock")
+            .target_sync
             .get(target)
             .cloned()
             .ok_or(ControlError::TargetDomainUnavailable)
     }
 
     pub fn targets(&self) -> Result<(Vec<TargetRecord>, Vec<StableId>), ControlError> {
-        let targets = self.inner.targets.read().expect("target inventory lock");
-        let inventory = targets.as_ref().ok_or(ControlError::TargetsUnavailable)?;
+        let runtime = self.inner.runtime.read().expect("control runtime lock");
+        let inventory = runtime
+            .targets
+            .as_ref()
+            .ok_or(ControlError::TargetsUnavailable)?;
         Ok((inventory.targets(), inventory.selected()))
     }
 
     pub fn select_targets(&self, selected: Vec<StableId>) -> Result<Vec<StableId>, ControlError> {
-        let targets = self.inner.targets.read().expect("target inventory lock");
-        let inventory = targets.as_ref().ok_or(ControlError::TargetsUnavailable)?;
+        let runtime = self.inner.runtime.read().expect("control runtime lock");
+        let inventory = runtime
+            .targets
+            .as_ref()
+            .ok_or(ControlError::TargetsUnavailable)?;
         inventory.select(selected)?;
         Ok(inventory.selected())
     }
@@ -1849,11 +1961,15 @@ impl ControlPlane {
     }
 
     fn execute_job(&self, job: ExecutionJob) -> ApplyOperation {
-        let execution = self.inner.executor.execute_bound(
-            &job.plan,
-            &job.confirmation_id,
-            &job.idempotency_key,
-        );
+        let executor = self
+            .inner
+            .runtime
+            .read()
+            .expect("control runtime lock")
+            .executor
+            .clone();
+        let execution =
+            executor.execute_bound(&job.plan, &job.confirmation_id, &job.idempotency_key);
         let completed = ApplyOperation {
             id: job.operation_id.clone(),
             plan_id: job.plan.id,
@@ -2197,9 +2313,10 @@ async fn compose_state(State(state): State<ApiState>) -> Result<Json<Value>, Api
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .composition
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("composition_domain_unconfigured"))?;
@@ -2222,9 +2339,10 @@ async fn explain_state(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .composition
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("composition_domain_unconfigured"))?;
@@ -2708,9 +2826,10 @@ async fn sync_plan(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .sync
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
@@ -2725,9 +2844,10 @@ async fn verify_target(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .sync
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
@@ -2742,9 +2862,10 @@ async fn rollback_run(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .sync
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
@@ -2759,9 +2880,10 @@ async fn credentials_apply(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .credentials
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("credential_domain_unconfigured"))?;
@@ -2776,9 +2898,10 @@ async fn credentials_verify(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .credentials
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("credential_domain_unconfigured"))?;
@@ -2793,9 +2916,10 @@ async fn snapshot_create(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .snapshots
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("snapshot_domain_unconfigured"))?;
@@ -2806,9 +2930,10 @@ async fn snapshot_list(State(state): State<ApiState>) -> Result<Json<Value>, Api
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .snapshots
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("snapshot_domain_unconfigured"))?;
@@ -2823,9 +2948,10 @@ async fn snapshot_restore(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .snapshots
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("snapshot_domain_unconfigured"))?;
@@ -2840,9 +2966,10 @@ async fn snapshot_promote(
     let domain = state
         .control
         .inner
-        .domains
+        .runtime
         .read()
-        .expect("domain registry lock")
+        .expect("control runtime lock")
+        .domains
         .snapshots
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("snapshot_domain_unconfigured"))?;
@@ -3181,11 +3308,18 @@ pub struct DaemonDiscovery {
     pub pid: u32,
     pub started_at_unix_ms: u128,
     pub port: u16,
+    /// Port of the target-local MCP relay owned by this daemon. Provider
+    /// clients must consume this value instead of assuming a fixed port.
+    pub relay_port: Option<u16>,
     pub token_id: String,
 }
 
 impl DaemonDiscovery {
-    pub fn new(port: u16, token: &ControlToken) -> Result<Self, ServiceError> {
+    pub fn new(
+        port: u16,
+        relay_port: Option<u16>,
+        token: &ControlToken,
+    ) -> Result<Self, ServiceError> {
         Ok(Self {
             schema_version: SCHEMA_VERSION,
             pid: std::process::id(),
@@ -3194,6 +3328,7 @@ impl DaemonDiscovery {
                 .map_err(|_| ServiceError::Clock)?
                 .as_millis(),
             port,
+            relay_port,
             token_id: token.expose_for_client()[..12].into(),
         })
     }
@@ -3253,6 +3388,51 @@ pub struct BoundServer {
     scheduler: Arc<DriftScheduler<ProductionDriftChecker>>,
 }
 
+struct ProductionRuntimeReloader {
+    config_path: PathBuf,
+    paths: commonkit_platform::AppPaths,
+    plan_store: Arc<PlanStore>,
+    relay_address: SocketAddr,
+    relay_runtime: Arc<ManagedRelayRuntime>,
+}
+
+impl RuntimeReloader for ProductionRuntimeReloader {
+    fn reload(&self, control: &ControlPlane) -> Result<(), ServiceError> {
+        // Build and validate the complete replacement before taking the one
+        // runtime write lock. A rejected config leaves the active domains and
+        // executor untouched.
+        let registry = ProductionDomainRegistry::load_optional_with_relay_endpoint(
+            &self.config_path,
+            self.plan_store.clone(),
+            self.paths.receipts.clone(),
+            self.relay_address,
+        )?;
+        let target_executors =
+            registry.target_executors(self.plan_store.clone(), &self.paths.receipts)?;
+        let local_executor = Arc::new(
+            LocalPlanExecutor::open(
+                self.plan_store.clone(),
+                &self.paths.receipts,
+                &self.paths.config,
+                self.paths.state.join("filesystem"),
+            )
+            .map_err(|_| ServiceError::ReloadFailed)?
+            .with_relay(
+                self.paths.config.join("relay.json"),
+                self.paths.state.join("relay"),
+                self.relay_runtime.clone(),
+            ),
+        );
+        let fallback = Arc::new(TargetDispatchPlanExecutor::new(local_executor, None));
+        let executor = Arc::new(TargetIdentityPlanExecutor::new(fallback, target_executors));
+        let targets = registry.targets.clone();
+        let target_sync = registry.target_sync_domains.clone();
+        control
+            .replace_runtime(executor, registry.into_headless(), targets, target_sync)
+            .map_err(|_| ServiceError::ReloadFailed)
+    }
+}
+
 impl BoundServer {
     pub async fn bind(
         address: SocketAddr,
@@ -3299,7 +3479,18 @@ impl BoundServer {
         }
         let listener = tokio::net::TcpListener::bind(address).await?;
         let local = listener.local_addr()?;
-        let discovery = DaemonDiscovery::new(local.port(), &token)?;
+        let relay_listener = match relay_address {
+            Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
+            None => None,
+        };
+        let relay_address = relay_listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok());
+        let discovery = DaemonDiscovery::new(
+            local.port(),
+            relay_address.map(|address| address.port()),
+            &token,
+        )?;
         discovery.persist(discovery_path.as_ref())?;
         let plan_root = discovery_path
             .as_ref()
@@ -3330,16 +3521,24 @@ impl BoundServer {
                 relay_runtime.clone(),
             ),
         );
-        let production_domains = ProductionDomainRegistry::load_optional(
-            &paths.config.join("headless.json"),
-            plan_store.clone(),
-            paths.receipts.clone(),
-        )?;
+        let production_domains = match relay_address {
+            Some(address) => ProductionDomainRegistry::load_optional_with_relay_endpoint(
+                &paths.config.join("headless.json"),
+                plan_store.clone(),
+                paths.receipts.clone(),
+                address,
+            )?,
+            None => ProductionDomainRegistry::load_optional(
+                &paths.config.join("headless.json"),
+                plan_store.clone(),
+                paths.receipts.clone(),
+            )?,
+        };
         let target_executors =
             production_domains.target_executors(plan_store.clone(), &paths.receipts)?;
         let fallback = Arc::new(TargetDispatchPlanExecutor::new(local_executor, None));
         let executor = Arc::new(TargetIdentityPlanExecutor::new(fallback, target_executors));
-        let control = ControlPlane::with_plan_store(executor, plan_store);
+        let control = ControlPlane::with_plan_store(executor, plan_store.clone());
         control
             .set_relay_execution_paths(paths.config.join("relay.json"), paths.state.join("relay"));
         let drift_checker = Arc::new(match production_domains.targets.clone() {
@@ -3371,6 +3570,15 @@ impl BoundServer {
         )
         .map_err(|_| ServiceError::UnsafeDiscoveryPath)?;
         control.set_scheduler_store(Arc::new(scheduler_store.clone()));
+        if let Some(relay_address) = relay_address {
+            control.set_runtime_reloader(Arc::new(ProductionRuntimeReloader {
+                config_path: paths.config.join("headless.json"),
+                paths: paths.clone(),
+                plan_store: plan_store.clone(),
+                relay_address,
+                relay_runtime: relay_runtime.clone(),
+            }));
+        }
         let scheduler = Arc::new(
             DriftScheduler::with_store(
                 drift_checker,
@@ -3390,16 +3598,9 @@ impl BoundServer {
             skills,
             skill_canary,
         );
-        let relay = match relay_address {
-            Some(address) => Some((
-                tokio::net::TcpListener::bind(address).await?,
-                relay_router(relay_runtime),
-            )),
-            None => None,
-        };
-        let relay_address = relay
-            .as_ref()
-            .and_then(|(listener, _)| listener.local_addr().ok());
+        // The listener is bound before provider domains are loaded so its
+        // actual address can be included in discovery and desired state.
+        let relay = relay_listener.map(|listener| (listener, relay_router(relay_runtime)));
         Ok(Self {
             listener,
             application,
@@ -3593,6 +3794,10 @@ pub enum ServiceError {
     Clock,
     #[error("daemon discovery path must have a parent directory")]
     UnsafeDiscoveryPath,
+    #[error("daemon domain reload is unavailable")]
+    ReloadUnavailable,
+    #[error("daemon domain reload failed validation")]
+    ReloadFailed,
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
@@ -3601,4 +3806,99 @@ pub enum ServiceError {
     PlanStore(#[from] PlanStoreError),
     #[error(transparent)]
     ProductionDomains(#[from] ProductionDomainError),
+}
+
+#[cfg(test)]
+mod runtime_reload_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    struct AdoptedSync;
+    impl SyncDomain for AdoptedSync {
+        fn plan(&self, _: Value) -> Result<Value, DomainFailure> {
+            Ok(serde_json::json!({"adopted": true}))
+        }
+        fn verify(&self, _: Value) -> Result<Value, DomainFailure> {
+            Ok(Value::Null)
+        }
+        fn rollback(&self, _: Value) -> Result<Value, DomainFailure> {
+            Ok(Value::Null)
+        }
+    }
+
+    struct AdoptDomains;
+    impl RuntimeReloader for AdoptDomains {
+        fn reload(&self, control: &ControlPlane) -> Result<(), ServiceError> {
+            control.set_headless_domains(HeadlessDomainRegistry {
+                sync: Some(Arc::new(AdoptedSync)),
+                ..HeadlessDomainRegistry::default()
+            });
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_reload_adopts_domains_without_restarting_the_daemon() {
+        let token = ControlToken::generate();
+        let status = Arc::new(RwLock::new(ServiceStatus::default()));
+        let control = ControlPlane::new(Arc::new(UnavailableExecutor));
+        control.set_runtime_reloader(Arc::new(AdoptDomains));
+        let app = router_with_control(
+            token.clone(),
+            status,
+            "127.0.0.1:12345",
+            EventHub::new(8),
+            control,
+        );
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::get("/control/v1/domains/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        for (method, body) in [("GET", ""), ("POST", r#"{"confirmed":true}"#)] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/control/v1/domains/reload")
+                        .header(
+                            header::AUTHORIZATION,
+                            format!("Bearer {}", token.expose_for_client()),
+                        )
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let adopted = app
+            .oneshot(
+                Request::post("/control/v1/sync/plan")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", token.expose_for_client()),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"confirmed":true,"confirmationId":"review"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(adopted.status(), StatusCode::OK);
+    }
 }

@@ -105,6 +105,10 @@ enum DaemonCommand {
     Start,
     Status,
     Restart,
+    ReloadDomains {
+        #[arg(long)]
+        confirmed: bool,
+    },
     Uninstall,
 }
 
@@ -758,6 +762,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_daemon_lifecycle(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
+    if let DaemonCommand::ReloadDomains { confirmed } = &command {
+        if !*confirmed {
+            return Err("confirmation_required: pass --confirmed to reload daemon domains".into());
+        }
+        return print_daemon(daemon_control(
+            "POST",
+            "/control/v1/domains/reload",
+            Some(json!({"confirmed": true})),
+            None,
+        ));
+    }
     let current = std::env::current_exe()?;
     let extension = if cfg!(windows) { ".exe" } else { "" };
     let daemon = current
@@ -773,6 +788,7 @@ fn run_daemon_lifecycle(command: DaemonCommand) -> Result<(), Box<dyn Error>> {
         DaemonCommand::Start => service.start()?,
         DaemonCommand::Status => service.status()?,
         DaemonCommand::Restart => service.restart()?,
+        DaemonCommand::ReloadDomains { .. } => unreachable!("handled above"),
         DaemonCommand::Uninstall => service.uninstall()?,
     };
     println!("{}", serde_json::to_string_pretty(&status)?);

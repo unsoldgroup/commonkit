@@ -136,43 +136,6 @@ impl ServiceSupervisor {
         Ok(true)
     }
 
-    fn reload_owned_after_onboarding(&self, client: &ServiceClient) -> Result<(), DesktopError> {
-        if self
-            .child
-            .lock()
-            .map_err(|_| DesktopError::ServiceLaunchFailed)?
-            .is_none()
-        {
-            return Err(DesktopError::ExternalServiceReloadRequired);
-        }
-        let runtime = RuntimeBinaryLayout::discover()?;
-        let replaced = self.replace_owned_child(|| {
-            Command::new(&runtime.daemon)
-                .args(["--port", "0", "--relay-port", "0"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .map_err(|_| DesktopError::ServiceLaunchFailed)
-        })?;
-        if !replaced {
-            return Err(DesktopError::ExternalServiceReloadRequired);
-        }
-
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if service_is_authenticated(client) {
-                return Ok(());
-            }
-            if self.child_exited()? {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        self.stop();
-        Err(DesktopError::ServiceReloadFailed)
-    }
-
     fn stop(&self) {
         let Ok(mut slot) = self.child.lock() else { return };
         if let Some(mut child) = slot.take() {
@@ -450,13 +413,15 @@ fn path_string(path: &std::path::Path) -> Result<String, DesktopError> {
 #[tauri::command]
 fn onboarding_initialize(
     request: OnboardingRequest,
-    supervisor: tauri::State<'_, ServiceSupervisor>,
     client: tauri::State<'_, ServiceClient>,
 ) -> Result<serde_json::Value, DesktopError> {
     let _ = onboarding_arguments(&request)?;
     use commonkit_cli::onboarding::{
         InitMode, InitRequest, ProcessRunner, ProviderSelection, initialize,
     };
+    // Fail before cloning, committing, or publishing anything when the
+    // attached daemon cannot atomically adopt the resulting domains.
+    tauri::async_runtime::block_on(client.json(reqwest::Method::GET, "/domains/reload", None))?;
     let paths = AppPaths::discover().map_err(|_| DesktopError::OnboardingFailed)?;
     let provider = match request.provider.as_str() {
         "native" => ProviderSelection::Native,
@@ -480,6 +445,12 @@ fn onboarding_initialize(
     let result = initialize(
         &InitRequest {
             mode: if request.mode == "create" {
+    let headless_config = paths.config.join("headless.json");
+    let previous_config = match std::fs::read(&headless_config) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
                 InitMode::Create
             } else {
                 InitMode::Connect
@@ -497,13 +468,58 @@ fn onboarding_initialize(
         &ProcessRunner::from_path(),
     )
     .map_err(|_| DesktopError::OnboardingFailed)?;
-    supervisor.reload_owned_after_onboarding(client.inner())?;
+    if tauri::async_runtime::block_on(client.json(
+        reqwest::Method::POST,
+        "/domains/reload",
+        Some(serde_json::json!({"confirmed": true})),
+    ))
+    .is_err()
+    {
+        restore_headless_config(&headless_config, previous_config.as_deref())?;
+        // The old runtime remains active if validation failed. Re-adopt the
+        // restored file so durable and in-memory state agree before returning.
+        let _ = tauri::async_runtime::block_on(client.json(
+            reqwest::Method::POST,
+            "/domains/reload",
+            Some(serde_json::json!({"confirmed": true})),
+        ));
+        return Err(DesktopError::ServiceReloadFailed);
+    }
     serde_json::to_value(result).map_err(Into::into)
 }
 
 impl ServiceClient {
     fn discover() -> Result<Self, DesktopError> {
         let paths = AppPaths::discover().map_err(|_| DesktopError::ServiceUnavailable)?;
+fn restore_headless_config(path: &Path, previous: Option<&[u8]>) -> Result<(), DesktopError> {
+    match previous {
+        Some(bytes) => {
+            let temporary = path.with_extension(format!("rollback-{}.tmp", std::process::id()));
+            let mut options = std::fs::OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            use std::io::Write;
+            let mut file = options.open(&temporary)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            #[cfg(windows)]
+            std::fs::remove_file(path)?;
+            std::fs::rename(temporary, path)?;
+        }
+        None => match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        },
+    }
+    Ok(())
+}
+
         Ok(Self {
             discovery: paths.state.join("daemon.json"),
             token: paths.config.join("control.token"),
