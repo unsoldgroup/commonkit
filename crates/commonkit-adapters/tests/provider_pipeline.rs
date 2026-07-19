@@ -106,7 +106,9 @@ fn materializes_providers_into_digest_addressed_state_after_ownership_validation
         std::fs::remove_dir_all(&states).unwrap();
         std::fs::create_dir(&redirected).unwrap();
         symlink(&redirected, &states).unwrap();
-        let error = pipeline.materialize_all(&[&provider], &context).unwrap_err();
+        let error = pipeline
+            .materialize_all(&[&provider], &context)
+            .unwrap_err();
         assert!(error.to_string().contains("non-symlink directory"));
         assert_eq!(std::fs::read_dir(redirected).unwrap().count(), 0);
     }

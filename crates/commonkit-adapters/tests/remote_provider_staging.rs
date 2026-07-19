@@ -169,7 +169,9 @@ fn stages_pipeline_output_without_re_running_the_provider() {
         sensitivity: ContentSensitivity::Portable,
         unsupported: false,
     };
-    let state = provider.materialize(&context(), &workspace, &store).unwrap();
+    let state = provider
+        .materialize(&context(), &workspace, &store)
+        .unwrap();
     let mut transport = RecordingTransport::default();
     let receipt = RemoteProviderStager::new(&mut transport)
         .stage_materialized(

@@ -87,7 +87,10 @@ fn target_platform_facts_change_provider_inputs_not_controller_constants() {
     let linux = fixture.provider().inspect_inputs(&linux_context).unwrap();
 
     assert_ne!(mac.input_set_digest, linux.input_set_digest);
-    assert_ne!(mac.input_digests["targetPlatform"], linux.input_digests["targetPlatform"]);
+    assert_ne!(
+        mac.input_digests["targetPlatform"],
+        linux.input_digests["targetPlatform"]
+    );
 }
 
 #[test]

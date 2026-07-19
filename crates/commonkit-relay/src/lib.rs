@@ -19,8 +19,8 @@ pub use runtime::{
     UpstreamError, UpstreamManager,
 };
 pub use transaction::{
-    LegacyRelayError, LegacyRelayReader, RelayAdapter, RelayLifecycleControl, RelayMutationInputs, RelayPlanError,
-    RelayPlanRequest, plan_relay_operation,
+    LegacyRelayError, LegacyRelayReader, RelayAdapter, RelayLifecycleControl, RelayMutationInputs,
+    RelayPlanError, RelayPlanRequest, plan_relay_operation,
 };
 pub use upstream_http::HttpUpstreamManager;
 
