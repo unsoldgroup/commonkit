@@ -4,13 +4,14 @@ use commonkit_contracts::{Sha256Digest, StableId, digest_domain_json};
 use commonkit_reconcile::PlanStore;
 use commonkit_service::ProductionDomainRegistry;
 use commonkit_service::{TargetInventory, TargetRecord, TargetTransport};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use commonkit_service::{
-    ApplyStatus, ControlPlane, ControlToken, EventHub, ExecutionResult, PlanExecutor,
-    ServiceStatus, router_with_control,
+    ApplyStatus, ControlPlane, ControlToken, DomainFailure, EventHub, ExecutionResult,
+    PlanExecutor, ServiceStatus, SyncDomain, router_with_control,
 };
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -120,6 +121,19 @@ impl PlanExecutor for NeverExecute {
     }
 }
 
+struct TargetEcho(&'static str);
+impl SyncDomain for TargetEcho {
+    fn plan(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Ok(serde_json::json!({"targetId":self.0,"planId":format!("plan-{}", self.0)}))
+    }
+    fn verify(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Ok(serde_json::json!({"targetId":self.0,"state":"healthy"}))
+    }
+    fn rollback(&self, _: serde_json::Value) -> Result<serde_json::Value, DomainFailure> {
+        Err(DomainFailure::InvalidRequest)
+    }
+}
+
 #[tokio::test]
 async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
     let temporary = tempfile::tempdir().unwrap();
@@ -143,6 +157,18 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
     );
     let control = ControlPlane::new(Arc::new(NeverExecute));
     control.set_target_inventory(inventory);
+    control
+        .set_target_sync_domains(BTreeMap::from([
+            (
+                StableId::parse("local").unwrap(),
+                Arc::new(TargetEcho("local")) as Arc<dyn SyncDomain>,
+            ),
+            (
+                StableId::parse("remote").unwrap(),
+                Arc::new(TargetEcho("remote")) as Arc<dyn SyncDomain>,
+            ),
+        ]))
+        .unwrap();
     let token = ControlToken::generate();
     let app = router_with_control(
         token.clone(),
@@ -194,6 +220,7 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
     );
 
     let selected = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -215,6 +242,29 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
     let body: serde_json::Value =
         serde_json::from_slice(&to_bytes(selected.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["selected"], serde_json::json!(["remote"]));
+
+    let plan = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/control/v1/targets/remote/sync/plan")
+                .header(header::HOST, "127.0.0.1:3764")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose_for_client()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"confirmed":true,"confirmationId":"target-plan"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plan.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(plan.into_body(), 4096).await.unwrap()).unwrap();
+    assert_eq!(body["targetId"], "remote");
 }
 
 #[test]

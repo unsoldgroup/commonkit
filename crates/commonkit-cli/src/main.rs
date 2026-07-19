@@ -102,6 +102,14 @@ enum TargetCommand {
         #[arg(long)]
         confirmed: bool,
     },
+    Plan {
+        targets: Vec<String>,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    Verify {
+        targets: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -567,6 +575,46 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     ),
                     None,
                 )?)?,
+                TargetCommand::Plan {
+                    confirmed: false, ..
+                } => {
+                    return Err(
+                        "confirmation_required: each target plan requires --confirmed".into(),
+                    );
+                }
+                TargetCommand::Plan {
+                    targets,
+                    confirmed: true,
+                } => {
+                    if targets.is_empty() {
+                        return Err("at least one target is required".into());
+                    }
+                    let mut plans = Vec::with_capacity(targets.len());
+                    for target in targets {
+                        plans.push(daemon_control(
+                            "POST",
+                            &format!("/control/v1/targets/{target}/sync/plan"),
+                            Some(json!({"confirmed":true,"confirmationId":format!("cli-plan-{target}")})),
+                            None,
+                        )?);
+                    }
+                    print_daemon(Value::Array(plans))?;
+                }
+                TargetCommand::Verify { targets } => {
+                    if targets.is_empty() {
+                        return Err("at least one target is required".into());
+                    }
+                    let mut results = Vec::with_capacity(targets.len());
+                    for target in targets {
+                        results.push(daemon_control(
+                            "POST",
+                            &format!("/control/v1/targets/{target}/verify"),
+                            Some(json!({})),
+                            None,
+                        )?);
+                    }
+                    print_daemon(Value::Array(results))?;
+                }
             }
         }
         Command::Compose { layers } => {

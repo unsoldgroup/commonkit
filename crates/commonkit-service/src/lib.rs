@@ -639,6 +639,8 @@ fn router_with_control_and_relay(
         .route("/control/v1/sync/plan", post(sync_plan))
         .route("/control/v1/targets", get(list_targets))
         .route("/control/v1/targets/select", post(select_targets))
+        .route("/control/v1/targets/{id}/sync/plan", post(target_sync_plan))
+        .route("/control/v1/targets/{id}/verify", post(target_verify))
         .route("/control/v1/verify", post(verify_target))
         .route(
             "/control/v1/credentials/readiness",
@@ -1267,6 +1269,7 @@ struct ControlPlaneInner {
     scheduler_store: std::sync::RwLock<Option<Arc<SchedulerStore>>>,
     domains: std::sync::RwLock<HeadlessDomainRegistry>,
     targets: std::sync::RwLock<Option<Arc<TargetInventory>>>,
+    target_sync: std::sync::RwLock<BTreeMap<StableId, Arc<dyn SyncDomain>>>,
 }
 
 impl ControlPlane {
@@ -1281,6 +1284,7 @@ impl ControlPlane {
                 scheduler_store: std::sync::RwLock::new(None),
                 domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
                 targets: std::sync::RwLock::new(None),
+                target_sync: std::sync::RwLock::new(BTreeMap::new()),
             }),
         }
     }
@@ -1296,6 +1300,7 @@ impl ControlPlane {
                 scheduler_store: std::sync::RwLock::new(None),
                 domains: std::sync::RwLock::new(HeadlessDomainRegistry::default()),
                 targets: std::sync::RwLock::new(None),
+                target_sync: std::sync::RwLock::new(BTreeMap::new()),
             }),
         }
     }
@@ -1314,6 +1319,40 @@ impl ControlPlane {
 
     pub fn set_target_inventory(&self, inventory: Arc<TargetInventory>) {
         *self.inner.targets.write().expect("target inventory lock") = Some(inventory);
+    }
+
+    pub fn set_target_sync_domains(
+        &self,
+        domains: BTreeMap<StableId, Arc<dyn SyncDomain>>,
+    ) -> Result<(), ControlError> {
+        if let Some(inventory) = self
+            .inner
+            .targets
+            .read()
+            .expect("target inventory lock")
+            .as_ref()
+        {
+            let known = inventory
+                .targets()
+                .into_iter()
+                .map(|target| target.id)
+                .collect::<std::collections::BTreeSet<_>>();
+            if domains.keys().any(|target| !known.contains(target)) {
+                return Err(ControlError::UnknownTargetDomain);
+            }
+        }
+        *self.inner.target_sync.write().expect("target domain lock") = domains;
+        Ok(())
+    }
+
+    fn target_sync_domain(&self, target: &StableId) -> Result<Arc<dyn SyncDomain>, ControlError> {
+        self.inner
+            .target_sync
+            .read()
+            .expect("target domain lock")
+            .get(target)
+            .cloned()
+            .ok_or(ControlError::TargetDomainUnavailable)
     }
 
     pub fn targets(&self) -> Result<(Vec<TargetRecord>, Vec<StableId>), ControlError> {
@@ -1526,6 +1565,10 @@ pub enum ControlError {
     TargetsUnavailable,
     #[error(transparent)]
     TargetInventory(#[from] TargetInventoryError),
+    #[error("target domain is unavailable")]
+    TargetDomainUnavailable,
+    #[error("target domain does not belong to the inventory")]
+    UnknownTargetDomain,
     #[error(transparent)]
     Contract(#[from] commonkit_contracts::ContractError),
     #[error(transparent)]
@@ -1564,6 +1607,38 @@ async fn select_targets(
         .select_targets(request.targets)
         .map_err(ApiError::from)?;
     Ok(Json(serde_json::json!({ "selected": selected })))
+}
+
+async fn target_sync_plan(
+    State(state): State<ApiState>,
+    AxumPath(target): AxumPath<String>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    let target = StableId::parse(target).map_err(|_| ApiError::bad_request("invalid_target_id"))?;
+    let domain = state
+        .control
+        .target_sync_domain(&target)
+        .map_err(ApiError::from)?;
+    let value = safe_domain_result(domain.plan(request))?.0;
+    if value.get("targetId").and_then(Value::as_str) != Some(target.as_str()) {
+        return Err(ApiError::internal("target_plan_mismatch"));
+    }
+    Ok(Json(value))
+}
+
+async fn target_verify(
+    State(state): State<ApiState>,
+    AxumPath(target): AxumPath<String>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    assert_domain_request_safe(&request)?;
+    let target = StableId::parse(target).map_err(|_| ApiError::bad_request("invalid_target_id"))?;
+    let domain = state
+        .control
+        .target_sync_domain(&target)
+        .map_err(ApiError::from)?;
+    safe_domain_result(domain.verify(request))
 }
 
 async fn register_plan(
@@ -1709,6 +1784,10 @@ impl From<ControlError> for ApiError {
             ControlError::PlanStore(_) => Self::internal("plan_store_failed"),
             ControlError::TargetsUnavailable => Self::unavailable_code("targets_unavailable"),
             ControlError::TargetInventory(_) => Self::bad_request("invalid_target_selection"),
+            ControlError::TargetDomainUnavailable => {
+                Self::unavailable_code("target_domain_unavailable")
+            }
+            ControlError::UnknownTargetDomain => Self::bad_request("unknown_target_domain"),
         }
     }
 }
