@@ -93,6 +93,9 @@ pub fn initialize(
     validate_repository(&request.repository)?;
     let loadout = StableId::parse(&request.loadout)?;
     let target = StableId::parse(&request.target)?;
+    if loadout.as_str() == "public-base" || loadout.as_str() == "organization-policy" {
+        return Err(OnboardingError::ReservedLoadout);
+    }
     validate_absolute_destination(&request.kit_directory)?;
     validate_absolute_destination(&request.target_root)?;
     validate_absolute_destination(&request.config_directory)?;
@@ -124,16 +127,34 @@ pub fn initialize(
         ],
     )?;
 
-    let layer_path = request
-        .kit_directory
-        .join("layers")
-        .join(format!("{loadout}.json"));
+    let layer_paths = [
+        request.kit_directory.join("layers/public-base.json"),
+        request
+            .kit_directory
+            .join("layers/organization-policy.json"),
+        request
+            .kit_directory
+            .join("layers")
+            .join(format!("{loadout}.json")),
+    ];
     if request.mode == InitMode::Create {
-        write_starter_layer(&layer_path, &loadout)?;
+        write_starter_layer(
+            &layer_paths[0],
+            &StableId::parse("public-base")?,
+            "public_base",
+        )?;
+        write_starter_layer(
+            &layer_paths[1],
+            &StableId::parse("organization-policy")?,
+            "organization_policy",
+        )?;
+        write_starter_layer(&layer_paths[2], &loadout, "personal_kit")?;
         write_target_registration(request, &target)?;
         git_commit_created_kit(request, runner)?;
     } else {
-        validate_selected_layer(&layer_path, &loadout)?;
+        validate_selected_layer(&layer_paths[0], &StableId::parse("public-base")?)?;
+        validate_selected_layer(&layer_paths[1], &StableId::parse("organization-policy")?)?;
+        validate_selected_layer(&layer_paths[2], &loadout)?;
         write_target_registration(request, &target)?;
     }
 
@@ -150,7 +171,7 @@ pub fn initialize(
         .trim()
         .to_owned();
     validate_git_revision(&revision)?;
-    let headless_config = write_runtime_state(request, &layer_path, &revision, &target)?;
+    let headless_config = write_runtime_state(request, &layer_paths, &revision, &target)?;
     Ok(InitResult {
         status: "initialized",
         repository: request.repository.clone(),
@@ -198,7 +219,7 @@ fn ensure_clone_destination(path: &Path) -> Result<(), OnboardingError> {
     }
 }
 
-fn write_starter_layer(path: &Path, loadout: &StableId) -> Result<(), OnboardingError> {
+fn write_starter_layer(path: &Path, loadout: &StableId, kind: &str) -> Result<(), OnboardingError> {
     fs::create_dir_all(
         path.parent()
             .ok_or_else(|| OnboardingError::UnsafePath(path.into()))?,
@@ -206,7 +227,7 @@ fn write_starter_layer(path: &Path, loadout: &StableId) -> Result<(), Onboarding
     let document = json!({
         "schemaVersion": 1,
         "id": loadout,
-        "kind": "personal_kit",
+        "kind": kind,
         "source": {
             "path": format!("layers/{loadout}.json"),
             "revision": "0000000000000000000000000000000000000000",
@@ -265,6 +286,8 @@ fn git_commit_created_kit(
     for arguments in [
         vec![
             OsString::from("add"),
+            OsString::from("layers/public-base.json"),
+            OsString::from("layers/organization-policy.json"),
             OsString::from(format!("layers/{}.json", request.loadout)),
             OsString::from(format!("targets/{}.json", request.target)),
         ],
@@ -288,7 +311,7 @@ fn git_commit_created_kit(
 
 fn write_runtime_state(
     request: &InitRequest,
-    layer_path: &Path,
+    layer_paths: &[PathBuf],
     revision: &str,
     target: &StableId,
 ) -> Result<PathBuf, OnboardingError> {
@@ -302,7 +325,10 @@ fn write_runtime_state(
     let artifacts = request.state_directory.join("provider-artifacts");
     ensure_private_path(&artifacts, PrivatePathKind::Directory)?;
     ArtifactStore::open(&artifacts)?;
-    let layer_bytes = fs::read(layer_path)?;
+    let layer_bytes = layer_paths
+        .iter()
+        .map(fs::read)
+        .collect::<Result<Vec<_>, _>>()?;
     let layer_digest = digest_domain_json("commonkit.onboarding.loadout.v1", &layer_bytes)?;
     let inputs = ProviderInputs::new(
         StableId::parse("native")?,
@@ -317,7 +343,7 @@ fn write_runtime_state(
     write_private_json(&provider_state, &materialized)?;
 
     let config = json!({
-        "composition": { "layers": [layer_path] },
+        "composition": { "layers": layer_paths },
         "sync": {
             "targetId": target,
             "targetRoot": request.target_root,
@@ -385,6 +411,8 @@ pub enum OnboardingError {
     MissingLoadout(PathBuf),
     #[error("selected loadout ID does not match its layer document")]
     LoadoutMismatch,
+    #[error("loadout ID is reserved for a required security layer")]
+    ReservedLoadout,
     #[error("portable registration already exists; review it instead of overwriting: {0}")]
     PortableFileExists(PathBuf),
     #[error("Git returned an invalid HEAD revision")]

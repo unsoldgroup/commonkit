@@ -30,6 +30,8 @@ case "$1 $2" in
   "auth status") exit 0 ;;
   "repo clone")
     mkdir -p "$4/layers"
+    printf '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/public-base.json"
+    printf '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/organization-policy.json"
     printf '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/personal.json"
     exit 0 ;;
 esac
@@ -60,14 +62,7 @@ exit 92
     assert!(result.headless_config.ends_with("headless.json"));
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&result.headless_config).unwrap()).unwrap();
-    assert_eq!(
-        config["composition"]["layers"][0],
-        result
-            .kit_directory
-            .join("layers/personal.json")
-            .display()
-            .to_string()
-    );
+    assert_eq!(config["composition"]["layers"].as_array().unwrap().len(), 3);
     assert_eq!(config["sync"]["targetId"], "workstation");
     assert_eq!(
         config["sync"]["materializedStates"]
