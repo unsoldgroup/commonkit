@@ -1,6 +1,9 @@
+#[cfg(unix)]
 use std::sync::Arc;
 
+#[cfg(unix)]
 use commonkit_reconcile::PlanStore;
+#[cfg(unix)]
 use commonkit_service::ProductionDomainRegistry;
 
 #[cfg(unix)]

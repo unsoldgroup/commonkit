@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use cap_std::ambient_authority;
@@ -40,6 +40,34 @@ impl CredentialReference {
             _ => return Err(CredentialReferenceError::UnsupportedScheme),
         }
         Ok(Self(value))
+    }
+
+    /// Builds a canonical credential reference for an absolute local file path.
+    ///
+    /// This is the only supported conversion from a platform path to the portable
+    /// reference syntax; callers must not interpolate `Path::display()` into a URI.
+    pub fn from_file_path(path: impl AsRef<Path>) -> Result<Self, CredentialReferenceError> {
+        let path = path.as_ref();
+        if !path.is_absolute() {
+            return Err(CredentialReferenceError::InvalidReference);
+        }
+        let path = path
+            .to_str()
+            .ok_or(CredentialReferenceError::InvalidReference)?;
+
+        #[cfg(windows)]
+        let reference = {
+            let normalized = path.replace('\\', "/");
+            let bytes = normalized.as_bytes();
+            if !matches!(bytes, [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()) {
+                return Err(CredentialReferenceError::InvalidReference);
+            }
+            format!("file:///{normalized}")
+        };
+        #[cfg(not(windows))]
+        let reference = format!("file://{path}");
+
+        Self::parse(reference)
     }
 
     pub fn as_str(&self) -> &str {
@@ -142,7 +170,7 @@ impl CredentialReadinessInspector for LocalCredentialReadinessInspector {
                     CredentialReadiness::Missing
                 }
             }
-            "file" => match std::fs::symlink_metadata(reference.opaque()) {
+            "file" => match std::fs::symlink_metadata(local_file_path(reference)) {
                 Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
                     CredentialReadiness::Ready
                 }
@@ -156,6 +184,18 @@ impl CredentialReadinessInspector for LocalCredentialReadinessInspector {
             _ => CredentialReadiness::Unavailable,
         }
     }
+}
+
+fn local_file_path(reference: &CredentialReference) -> &Path {
+    let opaque = reference.opaque();
+    #[cfg(windows)]
+    {
+        let bytes = opaque.as_bytes();
+        if matches!(bytes, [b'/', drive, b':', b'/', ..] if drive.is_ascii_alphabetic()) {
+            return Path::new(&opaque[1..]);
+        }
+    }
+    Path::new(opaque)
 }
 
 /// Secret bytes have no serialization or cloning surface and redact all formatting.

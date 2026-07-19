@@ -2,9 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use commonkit_relay::{
-    EnvFileLoader, RelayServerId, RelayStorageError, RelayTool, ToolCache, ToolCacheStore,
-};
+#[cfg(unix)]
+use commonkit_relay::{EnvFileLoader, RelayStorageError};
+use commonkit_relay::{RelayServerId, RelayTool, ToolCache, ToolCacheStore};
 use serde_json::json;
 
 fn temporary_directory(label: &str) -> PathBuf {

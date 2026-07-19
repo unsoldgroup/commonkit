@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 use commonkit_cli::daemon_lifecycle::{DaemonBackend, DaemonService};

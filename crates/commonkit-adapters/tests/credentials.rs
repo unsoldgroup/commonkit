@@ -4,10 +4,12 @@ use std::fs;
 use commonkit_adapters::{
     BwsCommandError, BwsCommandRunner, BwsCredentialResolver, CredentialReadiness,
     CredentialReadinessInspector, CredentialReference, CredentialResolver, FakeCredentialResolver,
-    LocalCredentialReadinessInspector, LocalSensitiveFileStore, NormalizedManagedPath,
-    PlatformKeychain, PlatformKeychainCredentialResolver, PlatformSecretCommandError,
-    PlatformSecretCommandRunner, WindowsCredentialManagerResolver, WindowsCredentialReader,
+    LocalCredentialReadinessInspector, PlatformKeychain, PlatformKeychainCredentialResolver,
+    PlatformSecretCommandError, PlatformSecretCommandRunner, WindowsCredentialManagerResolver,
+    WindowsCredentialReader,
 };
+#[cfg(unix)]
+use commonkit_adapters::{LocalSensitiveFileStore, NormalizedManagedPath};
 
 #[test]
 fn accepts_only_strict_reference_uris_and_serializes_only_the_reference() {
@@ -286,8 +288,8 @@ fn local_readiness_uses_metadata_and_never_invokes_external_providers() {
     let existing = root.join("token");
     fs::write(&existing, b"not-read-by-inspection").unwrap();
     let inspector = LocalCredentialReadinessInspector;
-    let file = CredentialReference::parse(format!("file://{}", existing.display())).unwrap();
-    let missing = CredentialReference::parse(format!("file://{}/missing", root.display())).unwrap();
+    let file = CredentialReference::from_file_path(&existing).unwrap();
+    let missing = CredentialReference::from_file_path(root.join("missing")).unwrap();
     let bws = CredentialReference::parse("bws://opaque-id").unwrap();
 
     assert_eq!(inspector.inspect(&file), CredentialReadiness::Ready);

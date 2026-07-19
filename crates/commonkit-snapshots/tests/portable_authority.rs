@@ -6,9 +6,10 @@ use std::{
 
 use commonkit_snapshots::{
     DatabaseId, DeterministicTestCipher, PortableAuthorityFailpoint, PortableAuthorityPublisher,
-    PortableAuthorityStore, PortablePublication, ProcessGitAuthorityPublisher, PublisherFailpoint,
-    SnapshotError,
+    PortableAuthorityStore, SnapshotError,
 };
+#[cfg(unix)]
+use commonkit_snapshots::{PortablePublication, ProcessGitAuthorityPublisher, PublisherFailpoint};
 use sha2::{Digest, Sha256};
 
 fn descriptor(root: &std::path::Path, bytes: &[u8]) -> String {
