@@ -44,6 +44,9 @@ function placeholder(route: Route): string {
 }
 
 function render(): void {
+  // Live domain refreshes can arrive while a user is typing in the wizard.
+  // Preserve the visible form before replacing the DOM so no keystroke is lost.
+  captureOnboardingDraft();
   const completion = setupUnlocked ? "complete" : setupCheckFailed ? "required" : setupCompletion(snapshot?.status ?? null, targets);
   const setupComplete = completion === "complete";
   const route = routeForSetup(routeFromHash(location.hash), setupComplete);

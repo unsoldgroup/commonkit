@@ -22,6 +22,13 @@ test("first-run defaults stay native and require no webview path capability", as
   assert.match(backend, /onboarding_defaults,/);
 });
 
+test("background refresh preserves in-progress onboarding input before rerender", async () => {
+  const frontend = await readFile(new URL("../src/main.ts", root), "utf8");
+  const render = frontend.slice(frontend.indexOf("function render()"), frontend.indexOf("function bindTargetActions"));
+  assert.match(render, /captureOnboardingDraft\(\)/);
+  assert.ok(render.indexOf("captureOnboardingDraft()") < render.indexOf("app.innerHTML"));
+});
+
 test("desktop is single-window, CSP-bound, and emits updater artifacts", async () => {
   const config = JSON.parse(await readFile(new URL("tauri.conf.json", root), "utf8"));
   const source = await readFile(new URL("src/lib.rs", root), "utf8");
