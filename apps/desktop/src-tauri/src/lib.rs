@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use commonkit_platform::AppPaths;
 use serde::{Deserialize, Serialize};
+use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, WindowEvent};
@@ -1815,11 +1816,8 @@ pub fn run() {
             TrayIconBuilder::new()
                 .menu(&menu)
                 .tooltip("CommonKit")
-                .icon(
-                    app.default_window_icon()
-                        .ok_or("desktop icon unavailable")?
-                        .clone(),
-                )
+                .icon(Image::from_bytes(include_bytes!("../icons/tray-ck.png"))?)
+                .icon_as_template(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => {
                         let _ = show_main_window(app.clone());
@@ -2191,6 +2189,17 @@ mod tests {
         assert_eq!(summary.policy, "Policy: 1 violation");
         assert_eq!(summary.drift, "Last drift check: never");
     }
+
+    #[test]
+    fn tray_icon_has_a_monochrome_vector_source() {
+        let icon = include_str!("../icons/tray-ck.svg");
+
+        assert!(icon.contains("viewBox=\"0 0 24 24\""));
+        assert!(icon.contains("fill=\"#000000\""));
+        assert!(!icon.contains("<text"));
+        assert!(!icon.contains("stroke="));
+    }
+
     #[test]
     fn management_snapshot_uses_only_fixed_read_only_service_routes() {
         assert_eq!(
