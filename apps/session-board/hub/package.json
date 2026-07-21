@@ -1,0 +1,16 @@
+{
+  "name": "@commonkit/session-board-hub",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun run src/main.ts",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@commonkit/session-board-protocol": "workspace:*"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
