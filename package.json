@@ -8,11 +8,12 @@
     "commonkit": "./src/cli.mjs"
   },
   "scripts": {
-    "build": "pnpm --filter mcp-local-relay build",
-    "test": "pnpm run test:commonkit && pnpm run test:relay",
+    "build": "pnpm --filter mcp-local-relay build && pnpm --filter @commonkit/session-board-protocol build",
+    "test": "pnpm run test:commonkit && pnpm run test:relay && pnpm run test:session-board-protocol",
     "test:commonkit": "node --test test/*.test.mjs",
     "test:relay": "pnpm --filter mcp-local-relay test",
-    "typecheck": "pnpm --filter mcp-local-relay typecheck"
+    "test:session-board-protocol": "pnpm --filter @commonkit/session-board-protocol test",
+    "typecheck": "pnpm --filter mcp-local-relay typecheck && pnpm --filter @commonkit/session-board-protocol typecheck"
   },
   "engines": {
     "node": ">=24"

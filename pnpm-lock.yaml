@@ -43,6 +43,16 @@ importers:
         specifier: ^5.6.0
         version: 5.9.3
 
+  packages/session-board-protocol:
+    dependencies:
+      zod:
+        specifier: ^4.4.3
+        version: 4.4.3
+    devDependencies:
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
+
 packages:
 
   '@esbuild/aix-ppc64@0.28.1':
