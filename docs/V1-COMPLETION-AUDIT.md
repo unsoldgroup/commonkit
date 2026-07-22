@@ -1,7 +1,7 @@
 # CommonKit v1 completion audit
 
 Audit date: 2026-07-21
-Audit basis: the `main` worktree prepared for the UNS-1274 checkpoint. “Met locally” means the Rust production path, desktop contracts, and installed unsigned lifecycle pass on the macOS arm64 audit host; it does not substitute for production signing/notarization, a published updater, or hosted multi-OS evidence. GitHub Actions remains unable to produce hosted evidence because jobs are rejected by the repository billing/spend limit.
+Audit basis: `main` at `c4c5b54`. “Met locally” means the Rust production path, desktop contracts, and installed unsigned lifecycle pass on the macOS arm64 audit host; it does not substitute for production signing/notarization, a published updater, or hosted multi-OS evidence. GitHub Actions run `29894832654` rejected all 15 jobs before their first step because recent account payments failed or the spending limit must be increased.
 
 ## Core eight-flow status
 
@@ -34,7 +34,7 @@ The eight original CommonKit runtime goals are implemented and locally evidenced
 - The APM real-binary and one chezmoi real-binary test remain explicitly opt-in because they require pinned external release binaries; their hosted platform matrix is not satisfied by the ordinary workspace run.
 - `scripts/installed-lifecycle.sh <isolated-scratch> target/debug`: passed on macOS arm64, including daemon install/restart, onboarding reload, provider plan/apply/verify, credential plan/apply/verify/redaction, scheduler enable/tick/disable, snapshot create/restore, fresh-process recovery, typed remote-helper execution, and uninstall.
 - A local arm64 Tauri application bundle built successfully, passed strict ad-hoc code-signature verification after local signing, installed at `/Applications/CommonKit.app`, and remained running as a macOS accessory/status-bar process. Its application icon uses the same Ck geometry as the monochrome tray icon.
-- The isolated Hetzner VPS is reachable, but acceptance stopped before authentication because the server presented a changed ED25519 host key. The presented fingerprint is `SHA256:aANF/QC9DUw1kvu7FCFGqeKibvH8ogAiRbxkBnS3Lzw`; the independently trusted fingerprint must be confirmed before `known_hosts` is changed. No VPS state was changed.
+- The isolated Hetzner VPS is reachable, but acceptance stopped before authentication because every presented host key differs from `known_hosts`: ED25519 `SHA256:aANF/QC9DUw1kvu7FCFGqeKibvH8ogAiRbxkBnS3Lzw`, RSA `SHA256:kZZPSOaMcuolC3/uYaDq17uMPP6SOTRasAThKXgGlzU`, and ECDSA `SHA256:oKc1G2YCUdiTI1sDrL9IP+0cCLurV9Foh07Z5LVUjPY`. At least one fingerprint must be independently confirmed before `known_hosts` is changed. No VPS state was changed.
 
 Two findings from an earlier audit are now resolved: the statement that the production daemon does not construct/run a `DriftScheduler` is no longer true, and the statement that management panels are placeholders is no longer true. Their focused runtime and desktop contracts now pass, but installed-platform evidence is still outstanding.
 
