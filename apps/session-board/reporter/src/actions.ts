@@ -141,7 +141,7 @@ export class GatePoller {
     const poll = async () => {
       if (this.#stopped) return;
       try {
-        const result = await this.run(["orca", "orchestration", "gate-list", "--status", "open", "--json"]);
+        const result = await this.run(["orca", "orchestration", "gate-list", "--status", "pending", "--json"]);
         await this.onChange(normalizeOpenGates(parseCommandJson(result, "orca orchestration gate-list"), this.machineId));
       } catch (error) {
         console.warn(error instanceof Error ? error.message : error);

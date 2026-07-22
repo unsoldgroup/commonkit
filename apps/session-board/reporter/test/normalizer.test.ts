@@ -15,7 +15,7 @@ describe("Orca worktree normalizer", () => {
       machineId: "studio",
       worktreeId: "commonkit::/Users/al/code/commonkit",
       repo: "commonkit",
-      project: "github:unsold/commonkit",
+      project: "commonkit",
       agent: "codex",
       paneKey: "pane-codex",
       state: "waiting",

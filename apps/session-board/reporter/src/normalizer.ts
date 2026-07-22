@@ -38,9 +38,8 @@ export function normalizeWorktreePs(payload: unknown, machineId: string, now = n
     if (!worktree || !Array.isArray(worktree.agents)) continue;
     const worktreeId = text(worktree.worktreeId, text(worktree.worktreeInstanceId));
     if (!worktreeId) continue;
-    const nestedRepo = record(worktree.repo);
-    const repo = text(nestedRepo?.name, text(worktree.repoId, "Unknown repo"));
-    const project = text(worktree.projectId, repo);
+    const repo = text(worktree.repo, text(record(worktree.repo)?.name, text(worktree.repoId, "Unknown repo")));
+    const project = repo;
     const worktreeLastOutput = timestamp(worktree.lastOutputAt, timestamp(worktree.lastActivityAt, fallbackTime));
 
     for (const candidateAgent of worktree.agents) {
