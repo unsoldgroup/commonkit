@@ -96,6 +96,29 @@ chmod +x "$scratch/tools/git"
 cat > "$scratch/tools/git.cmd" <<'CMD'
 @node "%COMMONKIT_FIXTURE_TOOLS%\git-proxy.mjs" %*
 CMD
+cat > "$scratch/tools/bws-fixture" <<'SH'
+#!/usr/bin/env bash
+[[ "$1" == secret && "$2" == get && "$3" == installed-secret-id ]] || exit 7
+printf '%s' '{"value":"installed credential proof"}'
+SH
+chmod +x "$scratch/tools/bws-fixture"
+cat > "$scratch/tools/bws-fixture.cmd" <<'CMD'
+@if not "%1 %2 %3"=="secret get installed-secret-id" exit /b 7
+@echo {"value":"installed credential proof"}
+CMD
+bws_fixture="$scratch/tools/bws-fixture"
+if [[ "${RUNNER_OS:-}" == Windows ]]; then bws_fixture="$scratch/tools/bws-fixture.cmd"; fi
+cat > "$scratch/tools/read-control-status.mjs" <<'JS'
+import { readFileSync, writeFileSync } from "node:fs";
+const [discoveryPath, tokenPath, outputPath] = process.argv.slice(2);
+const { port } = JSON.parse(readFileSync(discoveryPath, "utf8"));
+const token = readFileSync(tokenPath, "utf8").trim();
+const response = await fetch(`http://127.0.0.1:${port}/control/v1/status`, {
+  headers: { authorization: `Bearer ${token}` },
+});
+if (!response.ok) process.exit(1);
+writeFileSync(outputPath, await response.text());
+JS
 export COMMONKIT_FIXTURE_REPO="$scratch/source"
 export COMMONKIT_FIXTURE_TOOLS="$scratch/tools"
 export COMMONKIT_REAL_GIT="$real_git"
@@ -166,11 +189,16 @@ cmp "$scratch/source/portable/editor.conf" "$scratch/target/portable/editor.conf
 # configuration without replacing either an owned or service-manager-owned process.
 # Snapshot authority bootstrap intentionally writes portable Git state, so initialize
 # it only after the provider-backed plan has completed against its pinned clean revision.
-node - "$headless" "$snapshot_root" "$database" "$key_file" "$commonkit" "$scratch/kit" <<'JS'
+node - "$headless" "$snapshot_root" "$database" "$key_file" "$commonkit" "$scratch/kit" "$scratch/credentials" "$bws_fixture" <<'JS'
 const fs = require("fs");
-const [configPath, root, database, key, executable, portableState] = process.argv.slice(2);
+const [configPath, root, database, key, executable, portableState, credentialRoot, bwsExecutable] = process.argv.slice(2);
 const config = JSON.parse(fs.readFileSync(configPath));
 const lifecycle = { executable, args: ["status"] };
+config.credentials = {
+  root: credentialRoot,
+  bwsExecutable,
+  destinations: [{ id: "api-token", reference: "bws://installed-secret-id", path: "tokens/api" }],
+};
 config.snapshots = {
   root,
   portableState,
@@ -182,6 +210,33 @@ config.snapshots = {
 fs.writeFileSync(configPath, JSON.stringify(config, null, 2));
 JS
 "$commonkit" daemon reload-domains --confirmed >/dev/null
+
+# Credential provisioning must traverse the installed CLI and daemon's redacted
+# plan/apply/verify transaction rather than writing directly to the destination.
+credential_plan_json="$scratch/credential-plan.json"
+"$commonkit" credentials plan api-token > "$credential_plan_json"
+credential_plan_id=$(node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));if(!p.planId?.startsWith("sha256:")||p.operations?.[0]?.destinationId!=="api-token"||JSON.stringify(p).includes("installed credential proof"))process.exit(1);process.stdout.write(p.planId)' "$credential_plan_json")
+"$commonkit" credentials apply --plan-id "$credential_plan_id" --confirmed > "$scratch/credential-apply.json"
+"$commonkit" credentials verify api-token > "$scratch/credential-verify.json"
+test "$(cat "$scratch/credentials/tokens/api")" = 'installed credential proof'
+node -e 'const fs=require("fs");for(const p of process.argv.slice(1)){const v=JSON.parse(fs.readFileSync(p));if(JSON.stringify(v).includes("installed credential proof"))process.exit(1)}' "$scratch/credential-plan.json" "$scratch/credential-apply.json" "$scratch/credential-verify.json"
+
+# Enabling the installed scheduler must wake the already-running daemon, perform
+# a read-only drift tick, persist its state, and stop ticking after disable.
+"$commonkit" schedule enable --interval-seconds 1 --confirmed > "$scratch/schedule-enable.json"
+for _ in $(seq 1 50); do
+  node "$scratch/tools/read-control-status.mjs" "$XDG_DATA_HOME/state/daemon.json" "$XDG_CONFIG_HOME/control.token" "$scratch/scheduled-status.json"
+  if node -e 'const s=require(process.argv[1]);process.exit(s.lastDriftCheckUnixMs == null ? 1 : 0)' "$scratch/scheduled-status.json"; then scheduled_tick=1; break; fi
+  sleep 0.1
+done
+test "${scheduled_tick:-}" = 1
+scheduled_tick_time=$(node -e 'process.stdout.write(String(require(process.argv[1]).lastDriftCheckUnixMs))' "$scratch/scheduled-status.json")
+"$commonkit" schedule disable --confirmed > "$scratch/schedule-disable.json"
+"$commonkit" schedule status | node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>{const s=JSON.parse(b);if(s.enabled)process.exit(1)})'
+sleep 1.2
+node "$scratch/tools/read-control-status.mjs" "$XDG_DATA_HOME/state/daemon.json" "$XDG_CONFIG_HOME/control.token" "$scratch/disabled-schedule-status.json"
+test "$(node -e 'process.stdout.write(String(require(process.argv[1]).lastDriftCheckUnixMs))' "$scratch/disabled-schedule-status.json")" = "$scheduled_tick_time"
+
 "$commonkit" snapshots list | node -e '
 let body="";
 process.stdin.on("data", chunk => body += chunk);

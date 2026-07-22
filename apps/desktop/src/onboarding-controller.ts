@@ -3,7 +3,7 @@ import type { OnboardingDraft } from "./onboarding-view.ts";
 type EntrySource = Iterable<[string, FormDataEntryValue | string]>;
 
 const draftKeys = new Set<keyof OnboardingDraft>([
-  "mode", "repositoryName", "repository", "kitDirectory", "loadout", "computerName",
+  "mode", "repositoryName", "repository", "kitDirectory", "loadout", "projectLoadout", "targetOverride", "computerName",
   "targetRoot", "provider", "providerExecutable", "providerVersion", "apmManifest",
   "apmLockfile", "apmPolicy", "chezmoiSource", "chezmoiConfig",
 ]);
@@ -28,6 +28,8 @@ export function onboardingRequest(draft: OnboardingDraft, githubLogin: string): 
     provider: draft.provider,
     publishRegistration: draft.publishRegistration,
   };
+  if (draft.projectLoadout.trim()) request.projectLoadout = draft.projectLoadout.trim();
+  if (draft.targetOverride.trim()) request.targetOverride = draft.targetOverride.trim();
   if (draft.provider === "apm") {
     Object.assign(request, {
       providerExecutable: draft.providerExecutable,

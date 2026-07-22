@@ -299,8 +299,17 @@ function bindManagementActions(route: Route): void {
   });
   document.querySelector("#credential-apply")?.addEventListener("click", () => {
     const id = required("Configured credential destination ID");
-    if (!id || !window.confirm(`Provision credential destination ${id}? Secret values remain hidden.`)) return;
-    void showResult(route, () => desktopApi.credentialApply([id], confirmationId("credential-apply")));
+    if (!id) return;
+    void showResult(route, async () => {
+      const plan = await desktopApi.credentialPlan([id]);
+      const operations = plan.operations
+        .map((operation) => `${operation.action} ${operation.destinationId} at ${operation.path}`)
+        .join("\n");
+      if (!window.confirm(`Review credential plan ${plan.planId}:\n\n${operations}\n\nApply this exact plan? Secret values remain hidden.`)) {
+        return { plan, applied: false };
+      }
+      return desktopApi.credentialApply(plan.planId, confirmationId("credential-apply"));
+    });
   });
   document.querySelector("#credential-verify")?.addEventListener("click", () => {
     const id = required("Configured credential destination ID to verify");

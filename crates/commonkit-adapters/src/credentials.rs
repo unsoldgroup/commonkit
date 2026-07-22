@@ -3,6 +3,7 @@ use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -574,13 +575,27 @@ struct BwsResponse {
 /// Capability-rooted storage for credential material that must exist on one target.
 pub struct LocalSensitiveFileStore {
     root: Dir,
+    root_path: PathBuf,
+    directory_sync: Arc<SensitiveDirectorySync>,
 }
+
+type SensitiveDirectorySync = dyn Fn(&Path) -> Result<(), std::io::Error> + Send + Sync;
 
 impl LocalSensitiveFileStore {
     pub fn open(root: &std::path::Path) -> Result<Self, SensitiveFileError> {
+        Self::open_with_directory_sync(root, Arc::new(sync_sensitive_directory))
+    }
+
+    /// Test seam for proving that directory-metadata durability failures are surfaced.
+    #[doc(hidden)]
+    pub fn open_with_directory_sync(
+        root: &std::path::Path,
+        directory_sync: Arc<SensitiveDirectorySync>,
+    ) -> Result<Self, SensitiveFileError> {
         if !root.is_absolute() || root.parent().is_none() {
             return Err(SensitiveFileError::UnsafePath);
         }
+        let root_path = root.to_path_buf();
         let metadata = std::fs::symlink_metadata(root).map_err(|_| SensitiveFileError::Io)?;
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(SensitiveFileError::UnsafePath);
@@ -590,7 +605,11 @@ impl LocalSensitiveFileStore {
             .map_err(|_| SensitiveFileError::Io)?;
         let root =
             Dir::open_ambient_dir(root, ambient_authority()).map_err(|_| SensitiveFileError::Io)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            root_path,
+            directory_sync,
+        })
     }
 
     pub fn write(
@@ -598,9 +617,28 @@ impl LocalSensitiveFileStore {
         path: &crate::NormalizedManagedPath,
         value: &SecretValue,
     ) -> Result<(), SensitiveFileError> {
+        self.write_bytes(path, value.expose_for_apply())
+    }
+
+    /// Restores integrity-checked recovery bytes. Unlike a provisioned credential, a valid
+    /// pre-transaction file may be empty.
+    pub fn restore_backup_bytes(
+        &self,
+        path: &crate::NormalizedManagedPath,
+        bytes: &[u8],
+    ) -> Result<(), SensitiveFileError> {
+        self.write_bytes(path, bytes)
+    }
+
+    fn write_bytes(
+        &self,
+        path: &crate::NormalizedManagedPath,
+        bytes: &[u8],
+    ) -> Result<(), SensitiveFileError> {
         let components = path.as_str().split('/').collect::<Vec<_>>();
         let mut parent = PathBuf::new();
         for component in components.iter().take(components.len().saturating_sub(1)) {
+            let containing_parent = parent.clone();
             parent.push(component);
             match self.root.symlink_metadata(&parent) {
                 Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -610,6 +648,12 @@ impl LocalSensitiveFileStore {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     self.root
                         .create_dir(&parent)
+                        .map_err(|_| SensitiveFileError::Io)?;
+                    #[cfg(unix)]
+                    self.root
+                        .set_permissions(&parent, Permissions::from_mode(0o700))
+                        .map_err(|_| SensitiveFileError::Io)?;
+                    (self.directory_sync)(&self.root_path.join(&containing_parent))
                         .map_err(|_| SensitiveFileError::Io)?;
                 }
                 Err(_) => return Err(SensitiveFileError::Io),
@@ -638,10 +682,32 @@ impl LocalSensitiveFileStore {
         #[cfg(unix)]
         file.set_permissions(Permissions::from_mode(0o600))
             .map_err(|_| SensitiveFileError::Io)?;
-        file.write_all(value.expose_for_apply())
-            .map_err(|_| SensitiveFileError::Io)?;
-        file.sync_all().map_err(|_| SensitiveFileError::Io)
+        file.write_all(bytes).map_err(|_| SensitiveFileError::Io)?;
+        file.sync_all().map_err(|_| SensitiveFileError::Io)?;
+        (self.directory_sync)(&self.root_path.join(parent)).map_err(|_| SensitiveFileError::Io)
     }
+}
+
+#[cfg(unix)]
+fn sync_sensitive_directory(path: &Path) -> Result<(), std::io::Error> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_sensitive_directory(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_sensitive_directory(path: &Path) -> Result<(), std::io::Error> {
+    std::fs::File::open(path)?.sync_all()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

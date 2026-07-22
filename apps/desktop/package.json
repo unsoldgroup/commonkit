@@ -9,6 +9,7 @@
   "scripts": {
     "build": "tsc && vite build",
     "dev": "vite",
+    "icons": "tauri icon src-tauri/icons/app-icon.svg",
     "test": "node --test --experimental-strip-types test/*.test.ts",
     "typecheck": "tsc --noEmit",
     "tauri": "tauri"

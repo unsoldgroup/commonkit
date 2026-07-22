@@ -485,6 +485,8 @@ struct OnboardingRequest {
     repository: String,
     kit_directory: PathBuf,
     loadout: String,
+    project_loadout: Option<String>,
+    target_override: Option<String>,
     target: String,
     target_root: PathBuf,
     provider: String,
@@ -568,6 +570,12 @@ fn onboarding_arguments(request: &OnboardingRequest) -> Result<Vec<String>, Desk
         return Err(DesktopError::InvalidInput);
     }
     validate_id(&request.loadout)?;
+    if let Some(project_loadout) = &request.project_loadout {
+        validate_id(project_loadout)?;
+    }
+    if let Some(target_override) = &request.target_override {
+        validate_id(target_override)?;
+    }
     validate_id(&request.target)?;
     let mut args = vec![
         "init".into(),
@@ -585,6 +593,12 @@ fn onboarding_arguments(request: &OnboardingRequest) -> Result<Vec<String>, Desk
         "--provider".into(),
         request.provider.clone(),
     ];
+    if let Some(project_loadout) = &request.project_loadout {
+        args.extend(["--project-loadout".into(), project_loadout.clone()]);
+    }
+    if let Some(target_override) = &request.target_override {
+        args.extend(["--target-override".into(), target_override.clone()]);
+    }
     match request.provider.as_str() {
         "native" if request.provider_executable.is_none() && request.provider_version.is_none() => {
         }
@@ -730,6 +744,8 @@ fn onboarding_initialize(
             repository: request.repository,
             kit_directory: request.kit_directory,
             loadout: request.loadout,
+            project_loadout: request.project_loadout,
+            target_override: request.target_override,
             target: request.target,
             target_root: request.target_root,
             config_directory: paths.config,
@@ -898,7 +914,7 @@ fn management_routes() -> [(&'static str, &'static str); 6] {
 }
 
 #[cfg(test)]
-fn operator_routes() -> [(&'static str, &'static str); 12] {
+fn operator_routes() -> [(&'static str, &'static str); 13] {
     [
         ("plan", "/targets/{target}/sync/plan"),
         ("verify", "/targets/{target}/verify"),
@@ -909,6 +925,7 @@ fn operator_routes() -> [(&'static str, &'static str); 12] {
         ("relay_reconcile", "/relay/reconcile"),
         ("relay_restart", "/relay/restart"),
         ("schedule", "/schedule"),
+        ("credential_plan", "/credentials/plan"),
         ("credential_apply", "/credentials/apply"),
         ("credential_verify", "/credentials/verify"),
         ("diagnostics", "/diagnostics"),
@@ -1322,16 +1339,31 @@ async fn credential_readiness(
 }
 
 #[tauri::command]
-async fn credential_apply(
+async fn credential_plan(
     client: tauri::State<'_, ServiceClient>,
     destination_ids: Vec<String>,
-    confirmation_id: String,
 ) -> Result<serde_json::Value, DesktopError> {
     validate_ids(&destination_ids)?;
+    client
+        .json(
+            reqwest::Method::POST,
+            "/credentials/plan",
+            Some(serde_json::json!({"destinationIds": destination_ids})),
+        )
+        .await
+}
+
+#[tauri::command]
+async fn credential_apply(
+    client: tauri::State<'_, ServiceClient>,
+    plan_id: String,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    validate_digest(&plan_id)?;
     post_confirmed(
         &client,
         "/credentials/apply",
-        serde_json::json!({"destinationIds": destination_ids}),
+        serde_json::json!({"planId": plan_id}),
         &confirmation_id,
     )
     .await
@@ -1705,6 +1737,7 @@ pub fn run() {
             relay_restart,
             schedule_configure,
             credential_readiness,
+            credential_plan,
             credential_apply,
             credential_verify,
             diagnostics_export,
@@ -2228,6 +2261,7 @@ mod tests {
                 ("relay_reconcile", "/relay/reconcile"),
                 ("relay_restart", "/relay/restart"),
                 ("schedule", "/schedule"),
+                ("credential_plan", "/credentials/plan"),
                 ("credential_apply", "/credentials/apply"),
                 ("credential_verify", "/credentials/verify"),
                 ("diagnostics", "/diagnostics"),
@@ -2290,6 +2324,8 @@ mod tests {
             repository: "owner/kit".into(),
             kit_directory: fixture_root.join("kit"),
             loadout: "personal".into(),
+            project_loadout: Some("project-web".into()),
+            target_override: Some("target-workstation".into()),
             target: "workstation".into(),
             target_root: fixture_root.join("home"),
             provider: "apm".into(),
@@ -2315,6 +2351,16 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--apm-lockfile", "apm.lock.yaml"])
         );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--project-loadout", "project-web"])
+        );
+        assert!(
+            arguments
+                .windows(2)
+                .any(|pair| pair == ["--target-override", "target-workstation"])
+        );
     }
 
     #[test]
@@ -2325,6 +2371,8 @@ mod tests {
             repository: "owner/kit".into(),
             kit_directory: fixture_root.join("kit"),
             loadout: "personal".into(),
+            project_loadout: None,
+            target_override: None,
             target: "workstation".into(),
             target_root: fixture_root.join("home"),
             provider: "chezmoi".into(),

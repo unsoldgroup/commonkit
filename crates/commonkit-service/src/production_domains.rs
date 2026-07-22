@@ -749,11 +749,17 @@ impl ProductionDomainRegistry {
                         }
                     }
                     fs::create_dir_all(&config.root)?;
-                    Ok(Arc::new(ProductionCredentialDomain {
+                    let domain = Arc::new(ProductionCredentialDomain {
                         root: config.root,
                         bws_executable: config.bws_executable,
                         destinations: unique_destinations(config.destinations)?,
-                    }))
+                        lock: Mutex::new(()),
+                        directory_sync: Arc::new(sync_directory_io),
+                    });
+                    domain
+                        .recover_unfinished()
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    Ok(domain)
                 },
             )
             .transpose()?;
@@ -897,7 +903,29 @@ fn unique_destinations(
     values: Vec<CredentialDestination>,
 ) -> Result<BTreeMap<StableId, CredentialDestination>, ProductionDomainError> {
     let mut output = BTreeMap::new();
+    let mut paths = BTreeSet::new();
     for value in values {
+        if value.path.as_str() == CREDENTIAL_STATE_DIRECTORY
+            || value
+                .path
+                .as_str()
+                .starts_with(&format!("{CREDENTIAL_STATE_DIRECTORY}/"))
+        {
+            return Err(ProductionDomainError::UnsafeConfig);
+        }
+        let path = value.path.as_str();
+        if paths.iter().any(|existing: &String| {
+            existing == path
+                || existing
+                    .strip_prefix(path)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+                || path
+                    .strip_prefix(existing)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Err(ProductionDomainError::UnsafeConfig);
+        }
+        paths.insert(path.to_owned());
         if output.insert(value.id.clone(), value).is_some() {
             return Err(ProductionDomainError::DuplicateId);
         }
@@ -1703,6 +1731,24 @@ fn collect_local_input_digests(
 fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), DomainFailure> {
     let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
     fs::create_dir_all(parent).map_err(|_| DomainFailure::OperationFailed)?;
+    write_private_atomic_prepared(path, bytes, &sync_directory_io)
+}
+
+fn write_private_atomic_with_sync(
+    path: &Path,
+    bytes: &[u8],
+    directory_sync: &CredentialDirectorySync,
+) -> Result<(), DomainFailure> {
+    ensure_private_parent_with_sync(path, directory_sync)?;
+    write_private_atomic_prepared(path, bytes, directory_sync)
+}
+
+fn write_private_atomic_prepared(
+    path: &Path,
+    bytes: &[u8],
+    directory_sync: &CredentialDirectorySync,
+) -> Result<(), DomainFailure> {
+    let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
     let temporary = path.with_extension(format!("tmp-{:032x}", rand::random::<u128>()));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -1719,20 +1765,59 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), DomainFailure> 
         return Err(DomainFailure::OperationFailed);
     }
     fs::rename(&temporary, path).map_err(|_| DomainFailure::OperationFailed)?;
-    sync_parent_directory(parent)
+    sync_parent_directory_with(parent, directory_sync)
+}
+
+fn sync_parent_directory(parent: &Path) -> Result<(), DomainFailure> {
+    sync_parent_directory_with(parent, &sync_directory_io)
+}
+
+fn sync_path_parent_with(
+    path: &Path,
+    directory_sync: &CredentialDirectorySync,
+) -> Result<(), DomainFailure> {
+    let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
+    sync_parent_directory_with(parent, directory_sync)
+}
+
+fn remove_file_with_sync(
+    path: &Path,
+    directory_sync: &CredentialDirectorySync,
+) -> Result<(), DomainFailure> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_path_parent_with(path, directory_sync),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(DomainFailure::OperationFailed),
+    }
+}
+
+fn sync_parent_directory_with(
+    parent: &Path,
+    directory_sync: &CredentialDirectorySync,
+) -> Result<(), DomainFailure> {
+    directory_sync(parent).map_err(|_| DomainFailure::OperationFailed)
 }
 
 #[cfg(unix)]
-fn sync_parent_directory(parent: &Path) -> Result<(), DomainFailure> {
-    fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|_| DomainFailure::OperationFailed)?;
-    Ok(())
+fn sync_directory_io(path: &Path) -> Result<(), std::io::Error> {
+    fs::File::open(path)?.sync_all()
 }
 
-#[cfg(not(unix))]
-fn sync_parent_directory(_parent: &Path) -> Result<(), DomainFailure> {
-    Ok(())
+#[cfg(windows)]
+fn sync_directory_io(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory_io(path: &Path) -> Result<(), std::io::Error> {
+    fs::File::open(path)?.sync_all()
 }
 
 fn relay_authority_from_states(
@@ -2119,20 +2204,480 @@ struct ProductionCredentialDomain {
     root: PathBuf,
     bws_executable: Option<PathBuf>,
     destinations: BTreeMap<StableId, CredentialDestination>,
+    lock: Mutex<()>,
+    directory_sync: Arc<CredentialDirectorySync>,
 }
+type CredentialDirectorySync = dyn Fn(&Path) -> Result<(), std::io::Error> + Send + Sync;
+const CREDENTIAL_STATE_DIRECTORY: &str = ".commonkit-credentials";
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoredCredentialPlan {
+    schema: String,
+    plan_id: Sha256Digest,
+    destinations: Vec<PlannedCredentialDestination>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PlannedCredentialDestination {
+    destination_id: StableId,
+    path: NormalizedManagedPath,
+    reference_scheme: String,
+    reference_digest: Sha256Digest,
+    observed_digest: Sha256Digest,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CredentialReceipt {
+    schema: String,
+    receipt_id: Sha256Digest,
+    plan_id: Sha256Digest,
+    status: CredentialReceiptStatus,
+    recovery_digest: Sha256Digest,
+    destinations: Vec<CredentialRecoveryDestination>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyCredentialReceipt {
+    schema: String,
+    receipt_id: Sha256Digest,
+    status: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum CredentialReceiptStatus {
+    Applying,
+    Succeeded,
+    RolledBack,
+    RecoveryRequired,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CredentialRecoveryDestination {
+    destination_id: StableId,
+    path: NormalizedManagedPath,
+    backup: DurableCredentialBackup,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum DurableCredentialBackup {
+    File { digest: Sha256Digest },
+    Absent,
+    Unchanged,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CredentialPlanRequest {
+    destination_ids: Vec<StableId>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
-struct CredentialRequest {
-    destination_ids: Vec<StableId>,
+struct CredentialApplyRequest {
+    plan_id: Sha256Digest,
     confirmed: Option<bool>,
     confirmation_id: Option<StableId>,
     idempotency_key: Option<String>,
 }
-impl CredentialRequest {
-    fn acknowledge_metadata(&self) {
-        let _ = (self.confirmed, &self.confirmation_id, &self.idempotency_key);
+impl CredentialApplyRequest {
+    fn is_confirmed(&self) -> bool {
+        self.confirmed == Some(true)
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CredentialVerifyRequest {
+    destination_ids: Vec<StableId>,
+}
+
+fn credential_observed_digest(
+    root: &Path,
+    path: &NormalizedManagedPath,
+) -> Result<Sha256Digest, DomainFailure> {
+    let path = root.join(path.as_str());
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+            digest_domain_json(
+                "commonkit.credentials.observed.file.v1",
+                &digest_bytes(&fs::read(path).map_err(|_| DomainFailure::OperationFailed)?)?,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)
+        }
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            digest_text("commonkit.credentials.observed.kind.v1", "directory")
+        }
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            digest_text("commonkit.credentials.observed.kind.v1", "symlink")
+        }
+        Ok(_) => digest_text("commonkit.credentials.observed.kind.v1", "other"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            digest_text("commonkit.credentials.observed.kind.v1", "absent")
+        }
+        Err(_) => Err(DomainFailure::OperationFailed),
+    }
+}
+
+impl ProductionCredentialDomain {
+    fn state_root(&self) -> PathBuf {
+        self.root.join(CREDENTIAL_STATE_DIRECTORY)
+    }
+
+    fn plan_path(&self, plan_id: &Sha256Digest) -> PathBuf {
+        self.state_root().join("plans").join(format!(
+            "{}.json",
+            plan_id.as_str().trim_start_matches("sha256:")
+        ))
+    }
+
+    fn receipt_path(&self, receipt_id: &Sha256Digest) -> PathBuf {
+        self.state_root().join("receipts").join(format!(
+            "{}.json",
+            receipt_id.as_str().trim_start_matches("sha256:")
+        ))
+    }
+
+    fn backup_path(&self, receipt_id: &Sha256Digest, digest: &Sha256Digest) -> PathBuf {
+        self.state_root()
+            .join("backups")
+            .join(receipt_id.as_str().trim_start_matches("sha256:"))
+            .join(digest.as_str().trim_start_matches("sha256:"))
+    }
+
+    fn write_receipt(&self, receipt: &CredentialReceipt) -> Result<(), DomainFailure> {
+        let bytes = serde_json::to_vec(receipt).map_err(|_| DomainFailure::OperationFailed)?;
+        let path = self.receipt_path(&receipt.receipt_id);
+        write_private_atomic_with_sync(&path, &bytes, self.directory_sync.as_ref())
+    }
+
+    fn cleanup_backups(&self, receipt_id: &Sha256Digest) -> Result<(), DomainFailure> {
+        let backup_root = self.state_root().join("backups");
+        let run_root = backup_root.join(receipt_id.as_str().trim_start_matches("sha256:"));
+        match fs::remove_dir_all(run_root) {
+            Ok(()) => sync_parent_directory_with(&backup_root, self.directory_sync.as_ref()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(DomainFailure::OperationFailed),
+        }
+    }
+
+    fn cleanup_orphan_backups(&self, referenced: &BTreeSet<String>) -> Result<(), DomainFailure> {
+        let root = self.state_root().join("backups");
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(DomainFailure::OperationFailed),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|_| DomainFailure::OperationFailed)?;
+            let metadata = entry
+                .file_type()
+                .map_err(|_| DomainFailure::OperationFailed)?;
+            if metadata.is_symlink() || !metadata.is_dir() {
+                return Err(DomainFailure::OperationFailed);
+            }
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| DomainFailure::OperationFailed)?;
+            if !referenced.contains(&name) {
+                fs::remove_dir_all(entry.path()).map_err(|_| DomainFailure::OperationFailed)?;
+            }
+        }
+        sync_parent_directory_with(&root, self.directory_sync.as_ref())
+    }
+
+    fn build_plan(&self, ids: Vec<StableId>) -> Result<StoredCredentialPlan, DomainFailure> {
+        if ids.is_empty() {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let mut unique = BTreeSet::new();
+        let mut destinations = Vec::new();
+        for id in ids {
+            if !unique.insert(id.clone()) {
+                return Err(DomainFailure::InvalidRequest);
+            }
+            let destination = self
+                .destinations
+                .get(&id)
+                .ok_or(DomainFailure::InvalidRequest)?;
+            destinations.push(PlannedCredentialDestination {
+                destination_id: id,
+                path: destination.path.clone(),
+                reference_scheme: destination.reference.scheme().to_owned(),
+                reference_digest: digest_text(
+                    "commonkit.credentials.reference.v1",
+                    destination.reference.as_str(),
+                )?,
+                observed_digest: credential_observed_digest(&self.root, &destination.path)?,
+            });
+        }
+        destinations.sort_by(|left, right| left.destination_id.cmp(&right.destination_id));
+        let plan_id = digest_domain_json("commonkit.credentials.plan.v1", &destinations)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(StoredCredentialPlan {
+            schema: "commonkit.credentials.plan.v1".into(),
+            plan_id,
+            destinations,
+        })
+    }
+
+    fn persist_plan(&self, plan: &StoredCredentialPlan) -> Result<(), DomainFailure> {
+        let bytes = serde_json::to_vec(plan).map_err(|_| DomainFailure::OperationFailed)?;
+        write_private_atomic_with_sync(
+            &self.plan_path(&plan.plan_id),
+            &bytes,
+            self.directory_sync.as_ref(),
+        )
+    }
+
+    fn load_plan(&self, plan_id: &Sha256Digest) -> Result<StoredCredentialPlan, DomainFailure> {
+        let bytes = fs::read(self.plan_path(plan_id)).map_err(|_| DomainFailure::StalePlan)?;
+        let plan: StoredCredentialPlan =
+            serde_json::from_slice(&bytes).map_err(|_| DomainFailure::StalePlan)?;
+        if &plan.plan_id != plan_id
+            || digest_domain_json("commonkit.credentials.plan.v1", &plan.destinations)
+                .map_err(|_| DomainFailure::OperationFailed)?
+                != *plan_id
+        {
+            return Err(DomainFailure::StalePlan);
+        }
+        Ok(plan)
+    }
+
+    fn capture_backup(
+        &self,
+        receipt_id: &Sha256Digest,
+        path: &NormalizedManagedPath,
+    ) -> Result<DurableCredentialBackup, DomainFailure> {
+        let path = self.root.join(path.as_str());
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let bytes = fs::read(path).map_err(|_| DomainFailure::OperationFailed)?;
+                let digest = digest_bytes(&bytes).map_err(|_| DomainFailure::OperationFailed)?;
+                let backup_path = self.backup_path(receipt_id, &digest);
+                if backup_path.exists() {
+                    let existing =
+                        fs::read(&backup_path).map_err(|_| DomainFailure::OperationFailed)?;
+                    if digest_bytes(&existing).map_err(|_| DomainFailure::OperationFailed)?
+                        != digest
+                    {
+                        return Err(DomainFailure::OperationFailed);
+                    }
+                } else {
+                    write_private_atomic_with_sync(
+                        &backup_path,
+                        &bytes,
+                        self.directory_sync.as_ref(),
+                    )?;
+                }
+                Ok(DurableCredentialBackup::File { digest })
+            }
+            Ok(_) => Ok(DurableCredentialBackup::Unchanged),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(DurableCredentialBackup::Absent)
+            }
+            Err(_) => Err(DomainFailure::OperationFailed),
+        }
+    }
+
+    fn load_backup(
+        &self,
+        receipt_id: &Sha256Digest,
+        backup: &DurableCredentialBackup,
+    ) -> Result<Option<Vec<u8>>, DomainFailure> {
+        let DurableCredentialBackup::File { digest } = backup else {
+            return Ok(None);
+        };
+        let bytes = fs::read(self.backup_path(receipt_id, digest))
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        if digest_bytes(&bytes).map_err(|_| DomainFailure::OperationFailed)? != *digest {
+            return Err(DomainFailure::OperationFailed);
+        }
+        Ok(Some(bytes))
+    }
+
+    fn restore_backup(
+        &self,
+        store: &LocalSensitiveFileStore,
+        receipt_id: &Sha256Digest,
+        path: &NormalizedManagedPath,
+        backup: &DurableCredentialBackup,
+    ) -> Result<(), DomainFailure> {
+        match backup {
+            DurableCredentialBackup::File { .. } => store
+                .restore_backup_bytes(
+                    path,
+                    &self
+                        .load_backup(receipt_id, backup)?
+                        .ok_or(DomainFailure::OperationFailed)?,
+                )
+                .map_err(|_| DomainFailure::OperationFailed),
+            DurableCredentialBackup::Absent => {
+                let destination = self.root.join(path.as_str());
+                remove_file_with_sync(&destination, self.directory_sync.as_ref())
+            }
+            DurableCredentialBackup::Unchanged => Ok(()),
+        }
+    }
+
+    fn recover_unfinished(&self) -> Result<(), DomainFailure> {
+        let receipts = self.state_root().join("receipts");
+        let mut paths = match fs::read_dir(receipts) {
+            Ok(entries) => entries
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| DomainFailure::OperationFailed)?
+                .into_iter()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(_) => return Err(DomainFailure::OperationFailed),
+        };
+        paths.sort();
+        let mut referenced_backups = BTreeSet::new();
+        let store = LocalSensitiveFileStore::open(&self.root)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        for path in paths {
+            let metadata =
+                fs::symlink_metadata(&path).map_err(|_| DomainFailure::OperationFailed)?;
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(DomainFailure::OperationFailed);
+            }
+            let bytes = fs::read(&path).map_err(|_| DomainFailure::OperationFailed)?;
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(|_| DomainFailure::OperationFailed)?;
+            if value.get("schema").and_then(Value::as_str)
+                == Some("commonkit.credentials.receipt.v1")
+            {
+                let legacy: LegacyCredentialReceipt =
+                    serde_json::from_value(value).map_err(|_| DomainFailure::OperationFailed)?;
+                if legacy.schema != "commonkit.credentials.receipt.v1"
+                    || !matches!(legacy.status.as_str(), "succeeded" | "rolledBack")
+                {
+                    return Err(DomainFailure::OperationFailed);
+                }
+                referenced_backups.insert(
+                    legacy
+                        .receipt_id
+                        .as_str()
+                        .trim_start_matches("sha256:")
+                        .to_owned(),
+                );
+                self.cleanup_backups(&legacy.receipt_id)?;
+                continue;
+            }
+            let mut receipt: CredentialReceipt =
+                serde_json::from_value(value).map_err(|_| DomainFailure::OperationFailed)?;
+            referenced_backups.insert(
+                receipt
+                    .receipt_id
+                    .as_str()
+                    .trim_start_matches("sha256:")
+                    .to_owned(),
+            );
+            if receipt.schema != "commonkit.credentials.receipt.v2"
+                || path.file_stem().and_then(|name| name.to_str())
+                    != Some(receipt.receipt_id.as_str().trim_start_matches("sha256:"))
+                || digest_domain_json("commonkit.credentials.recovery.v1", &receipt.destinations)
+                    .map_err(|_| DomainFailure::OperationFailed)?
+                    != receipt.recovery_digest
+            {
+                return Err(DomainFailure::OperationFailed);
+            }
+            if !matches!(
+                receipt.status,
+                CredentialReceiptStatus::Applying | CredentialReceiptStatus::RecoveryRequired
+            ) {
+                self.cleanup_backups(&receipt.receipt_id)?;
+                continue;
+            }
+            let plan = self
+                .load_plan(&receipt.plan_id)
+                .map_err(|_| DomainFailure::OperationFailed)?;
+            if plan.destinations.len() != receipt.destinations.len()
+                || plan
+                    .destinations
+                    .iter()
+                    .zip(&receipt.destinations)
+                    .any(|(planned, recovery)| {
+                        planned.destination_id != recovery.destination_id
+                            || planned.path != recovery.path
+                    })
+            {
+                return Err(DomainFailure::OperationFailed);
+            }
+            for destination in &receipt.destinations {
+                let configured = self
+                    .destinations
+                    .get(&destination.destination_id)
+                    .ok_or(DomainFailure::OperationFailed)?;
+                if configured.path != destination.path {
+                    return Err(DomainFailure::OperationFailed);
+                }
+                let _ = self.load_backup(&receipt.receipt_id, &destination.backup)?;
+            }
+            for destination in receipt.destinations.iter().rev() {
+                if self
+                    .restore_backup(
+                        &store,
+                        &receipt.receipt_id,
+                        &destination.path,
+                        &destination.backup,
+                    )
+                    .is_err()
+                {
+                    receipt.status = CredentialReceiptStatus::RecoveryRequired;
+                    let _ = self.write_receipt(&receipt);
+                    return Err(DomainFailure::OperationFailed);
+                }
+            }
+            receipt.status = CredentialReceiptStatus::RolledBack;
+            self.write_receipt(&receipt)?;
+            self.cleanup_backups(&receipt.receipt_id)?;
+        }
+        self.cleanup_orphan_backups(&referenced_backups)?;
+        Ok(())
+    }
+}
+
+fn ensure_private_parent_with_sync(
+    path: &Path,
+    directory_sync: &CredentialDirectorySync,
+) -> Result<(), DomainFailure> {
+    let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
+    let mut missing = Vec::new();
+    let mut cursor = parent;
+    loop {
+        match fs::symlink_metadata(cursor) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => break,
+            Ok(_) => return Err(DomainFailure::OperationFailed),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor.parent().ok_or(DomainFailure::OperationFailed)?;
+            }
+            Err(_) => return Err(DomainFailure::OperationFailed),
+        }
+    }
+    for directory in missing.iter().rev() {
+        fs::create_dir(directory).map_err(|_| DomainFailure::OperationFailed)?;
+        #[cfg(unix)]
+        fs::set_permissions(
+            directory,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        directory_sync(directory).map_err(|_| DomainFailure::OperationFailed)?;
+        let containing = directory.parent().ok_or(DomainFailure::OperationFailed)?;
+        directory_sync(containing).map_err(|_| DomainFailure::OperationFailed)?;
+    }
+    Ok(())
 }
 fn resolve(
     reference: &CredentialReference,
@@ -2171,32 +2716,184 @@ fn resolve(
     SecretValue::new(bytes).map_err(|_| DomainFailure::OperationFailed)
 }
 impl CredentialDomain for ProductionCredentialDomain {
-    fn apply(&self, request: Value) -> Result<Value, DomainFailure> {
-        let request: CredentialRequest =
-            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
-        request.acknowledge_metadata();
-        let store = LocalSensitiveFileStore::open(&self.root)
+    fn plan(&self, request: Value) -> Result<Value, DomainFailure> {
+        let _guard = self
+            .lock
+            .lock()
             .map_err(|_| DomainFailure::OperationFailed)?;
-        let mut applied = Vec::new();
-        for id in request.destination_ids {
+        let request: CredentialPlanRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let plan = self.build_plan(request.destination_ids)?;
+        self.persist_plan(&plan)?;
+        let operations = plan
+            .destinations
+            .iter()
+            .map(|destination| {
+                serde_json::json!({
+                    "destinationId": destination.destination_id,
+                    "path": destination.path,
+                    "action": "provision"
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({"planId": plan.plan_id, "operations": operations}))
+    }
+    fn apply(&self, request: Value) -> Result<Value, DomainFailure> {
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let request: CredentialApplyRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        if !request.is_confirmed() {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        self.recover_unfinished()?;
+        let plan_id = request.plan_id;
+        let confirmation_id = request
+            .confirmation_id
+            .clone()
+            .ok_or(DomainFailure::InvalidRequest)?;
+        let plan = self.load_plan(&plan_id)?;
+        for planned in &plan.destinations {
             let destination = self
                 .destinations
-                .get(&id)
-                .ok_or(DomainFailure::InvalidRequest)?;
-            store
-                .write(
-                    &destination.path,
-                    &resolve(&destination.reference, self.bws_executable.as_deref())?,
-                )
-                .map_err(|_| DomainFailure::OperationFailed)?;
-            applied.push(id);
+                .get(&planned.destination_id)
+                .ok_or(DomainFailure::StalePlan)?;
+            let current = self.build_plan(vec![planned.destination_id.clone()])?;
+            let current = current
+                .destinations
+                .first()
+                .ok_or(DomainFailure::StalePlan)?;
+            if current.path != planned.path
+                || current.reference_digest != planned.reference_digest
+                || current.observed_digest != planned.observed_digest
+            {
+                return Err(DomainFailure::StalePlan);
+            }
+            let _ = destination;
         }
-        Ok(serde_json::json!({"applied":applied}))
+        let store = LocalSensitiveFileStore::open(&self.root)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let receipt_id = digest_domain_json(
+            "commonkit.credentials.receipt.v1",
+            &(
+                plan_id.clone(),
+                confirmation_id,
+                request.idempotency_key.clone(),
+            ),
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        let mut resolved = Vec::new();
+        for planned in &plan.destinations {
+            let destination = self
+                .destinations
+                .get(&planned.destination_id)
+                .ok_or(DomainFailure::StalePlan)?;
+            match resolve(&destination.reference, self.bws_executable.as_deref()) {
+                Ok(secret) => resolved.push((planned, destination, secret)),
+                Err(error) => return Err(error),
+            }
+        }
+        let recovery = resolved
+            .iter()
+            .map(|(planned, _, _)| {
+                Ok(CredentialRecoveryDestination {
+                    destination_id: planned.destination_id.clone(),
+                    path: planned.path.clone(),
+                    backup: self.capture_backup(&receipt_id, &planned.path)?,
+                })
+            })
+            .collect::<Result<Vec<_>, DomainFailure>>();
+        let recovery = match recovery {
+            Ok(recovery) => recovery,
+            Err(error) => {
+                let _ = self.cleanup_backups(&receipt_id);
+                return Err(error);
+            }
+        };
+        let recovery_digest = digest_domain_json("commonkit.credentials.recovery.v1", &recovery)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let mut receipt = CredentialReceipt {
+            schema: "commonkit.credentials.receipt.v2".into(),
+            receipt_id: receipt_id.clone(),
+            plan_id,
+            status: CredentialReceiptStatus::Applying,
+            recovery_digest,
+            destinations: recovery,
+        };
+        // The applying checkpoint is durable only after every backup artifact exists.
+        self.write_receipt(&receipt)?;
+        for destination in &receipt.destinations {
+            let _ = self.load_backup(&receipt_id, &destination.backup)?;
+        }
+        let mut applied = Vec::new();
+        for (index, (planned, destination, secret)) in resolved.iter().enumerate() {
+            if store.write(&destination.path, secret).is_err() {
+                let mut rollback_succeeded = true;
+                // The failing write may have truncated or created its destination before
+                // reporting an I/O or durability error, so restore it as well as all
+                // previously completed writes.
+                for rollback_index in (0..=index).rev() {
+                    if self
+                        .restore_backup(
+                            &store,
+                            &receipt_id,
+                            &resolved[rollback_index].0.path,
+                            &receipt.destinations[rollback_index].backup,
+                        )
+                        .is_err()
+                    {
+                        rollback_succeeded = false;
+                    }
+                }
+                receipt.status = if rollback_succeeded {
+                    CredentialReceiptStatus::RolledBack
+                } else {
+                    CredentialReceiptStatus::RecoveryRequired
+                };
+                self.write_receipt(&receipt)?;
+                if receipt.status == CredentialReceiptStatus::RolledBack {
+                    self.cleanup_backups(&receipt_id)?;
+                }
+                return Err(DomainFailure::OperationFailed);
+            }
+            applied.push(planned.destination_id.clone());
+        }
+        receipt.status = CredentialReceiptStatus::Succeeded;
+        if self.write_receipt(&receipt).is_err() {
+            let mut rollback_succeeded = true;
+            for rollback_index in (0..resolved.len()).rev() {
+                if self
+                    .restore_backup(
+                        &store,
+                        &receipt_id,
+                        &resolved[rollback_index].0.path,
+                        &receipt.destinations[rollback_index].backup,
+                    )
+                    .is_err()
+                {
+                    rollback_succeeded = false;
+                }
+            }
+            receipt.status = if rollback_succeeded {
+                CredentialReceiptStatus::RolledBack
+            } else {
+                CredentialReceiptStatus::RecoveryRequired
+            };
+            let _ = self.write_receipt(&receipt);
+            return Err(DomainFailure::OperationFailed);
+        }
+        self.cleanup_backups(&receipt_id)?;
+        Ok(serde_json::json!({"applied":applied,"receiptId":receipt_id,"planId":receipt.plan_id}))
     }
     fn verify(&self, request: Value) -> Result<Value, DomainFailure> {
-        let request: CredentialRequest =
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let request: CredentialVerifyRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
-        request.acknowledge_metadata();
         let mut verified = Vec::new();
         for id in request.destination_ids {
             let destination = self
@@ -2783,6 +3480,72 @@ impl ProductionSnapshotDomain {
             writers.insert(id.clone(), writer);
         }
         Ok(writers)
+    }
+}
+
+#[cfg(test)]
+mod credential_durability_tests {
+    use super::*;
+
+    #[test]
+    fn private_atomic_write_durably_creates_every_receipt_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("credentials");
+        fs::create_dir(&root).unwrap();
+        let path = root
+            .join(CREDENTIAL_STATE_DIRECTORY)
+            .join("receipts")
+            .join("receipt.json");
+        let synced = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&synced);
+        let directory_sync = move |path: &Path| {
+            observed.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        };
+
+        write_private_atomic_with_sync(&path, b"receipt", &directory_sync).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"receipt");
+        assert_eq!(
+            *synced.lock().unwrap(),
+            vec![
+                root.join(CREDENTIAL_STATE_DIRECTORY),
+                root.clone(),
+                root.join(CREDENTIAL_STATE_DIRECTORY).join("receipts"),
+                root.join(CREDENTIAL_STATE_DIRECTORY),
+                root.join(CREDENTIAL_STATE_DIRECTORY).join("receipts"),
+            ]
+        );
+    }
+
+    #[test]
+    fn private_atomic_write_fails_closed_when_receipt_parent_sync_fails() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path().join("receipts");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("receipt.json");
+        let failing_sync = |_: &Path| Err(std::io::Error::other("injected sync failure"));
+
+        assert_eq!(
+            write_private_atomic_with_sync(&path, b"receipt", &failing_sync),
+            Err(DomainFailure::OperationFailed)
+        );
+    }
+
+    #[test]
+    fn credential_delete_fails_closed_when_destination_parent_sync_fails() {
+        let temporary = tempfile::tempdir().unwrap();
+        let parent = temporary.path().join("credentials");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("token");
+        fs::write(&path, b"secret").unwrap();
+        let failing_sync = |_: &Path| Err(std::io::Error::other("injected sync failure"));
+
+        assert_eq!(
+            remove_file_with_sync(&path, &failing_sync),
+            Err(DomainFailure::OperationFailed)
+        );
+        assert!(!path.exists());
     }
 }
 

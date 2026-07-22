@@ -26,6 +26,10 @@ test("wizard shows four steps and marks only the current step", () => {
   assert.equal((html.match(/<li/g) ?? []).length, 4);
   assert.equal((html.match(/aria-current="step"/g) ?? []).length, 1);
   assert.match(html, /Set up this computer/);
+  assert.match(html, /Project settings profile/);
+  assert.match(html, /Computer-specific override/);
+  assert.match(html, /name="projectLoadout"/);
+  assert.match(html, /name="targetOverride"/);
 });
 
 test("authenticated setup uses plain language and hides implementation details", () => {

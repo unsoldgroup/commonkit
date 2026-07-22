@@ -6,6 +6,10 @@ export type GithubAuthStatus =
   | { state: "authenticated"; login: string; method: "githubCli" }
   | { state: "signedOut" };
 export interface OnboardingDefaults { kitDirectory: string; targetRoot: string; computerName: string; }
+export interface CredentialPlan {
+  planId: string;
+  operations: Array<{ destinationId: string; path: string; action: string; credential: "<redacted>" }>;
+}
 
 export const desktopApi = {
   onboardingInitialize: (request: Record<string, unknown>) => invoke<unknown>("onboarding_initialize", { request }),
@@ -26,7 +30,8 @@ export const desktopApi = {
   relayRestart: (confirmationId: string) => invoke<unknown>("relay_restart", { confirmationId }),
   scheduleConfigure: (enabled: boolean, intervalSeconds: number, confirmationId: string) => invoke<unknown>("schedule_configure", { enabled, intervalSeconds, confirmationId }),
   credentialReadiness: (references: string[]) => invoke<unknown>("credential_readiness", { references }),
-  credentialApply: (destinationIds: string[], confirmationId: string) => invoke<unknown>("credential_apply", { destinationIds, confirmationId }),
+  credentialPlan: (destinationIds: string[]) => invoke<CredentialPlan>("credential_plan", { destinationIds }),
+  credentialApply: (planId: string, confirmationId: string) => invoke<unknown>("credential_apply", { planId, confirmationId }),
   credentialVerify: (destinationIds: string[]) => invoke<unknown>("credential_verify", { destinationIds }),
   diagnosticsExport: () => invoke<unknown>("diagnostics_export"),
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),

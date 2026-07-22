@@ -128,6 +128,13 @@ fn init_exposes_create_connect_and_rejects_malformed_repository_before_gh() {
     let help = String::from_utf8(help.stdout).expect("utf8");
     assert!(help.contains("create"));
     assert!(help.contains("connect"));
+    let create_help = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["init", "create", "--help"])
+        .output()
+        .expect("init create help");
+    let create_help = String::from_utf8(create_help.stdout).expect("utf8");
+    assert!(create_help.contains("--project-loadout"));
+    assert!(create_help.contains("--target-override"));
     let root = temporary_directory("invalid-onboarding");
     let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
         .args([

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
+use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
     BwsCommandError, BwsCommandRunner, BwsCredentialResolver, CredentialReadiness,
@@ -10,6 +12,57 @@ use commonkit_adapters::{
 };
 #[cfg(unix)]
 use commonkit_adapters::{LocalSensitiveFileStore, NormalizedManagedPath};
+
+#[cfg(unix)]
+#[test]
+fn sensitive_file_store_durably_syncs_each_created_directory_and_destination_parent() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("credentials");
+    fs::create_dir(&root).unwrap();
+    let synced = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&synced);
+    let store = LocalSensitiveFileStore::open_with_directory_sync(
+        &root,
+        Arc::new(move |path| {
+            observed.lock().unwrap().push(path.to_path_buf());
+            Ok(())
+        }),
+    )
+    .unwrap();
+    let path = NormalizedManagedPath::parse("nested/private/token").unwrap();
+    let value = commonkit_adapters::SecretValue::new(b"secret".to_vec()).unwrap();
+
+    store.write(&path, &value).unwrap();
+
+    assert_eq!(
+        *synced.lock().unwrap(),
+        vec![
+            root.clone(),
+            root.join("nested"),
+            root.join("nested/private")
+        ]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn sensitive_file_store_reports_destination_directory_sync_failure() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path().join("credentials");
+    fs::create_dir(&root).unwrap();
+    let store = LocalSensitiveFileStore::open_with_directory_sync(
+        &root,
+        Arc::new(|_| Err(std::io::Error::other("injected directory sync failure"))),
+    )
+    .unwrap();
+    let path = NormalizedManagedPath::parse("token").unwrap();
+    let value = commonkit_adapters::SecretValue::new(b"secret".to_vec()).unwrap();
+
+    assert_eq!(
+        store.write(&path, &value),
+        Err(commonkit_adapters::SensitiveFileError::Io)
+    );
+}
 
 #[test]
 fn accepts_only_strict_reference_uris_and_serializes_only_the_reference() {
@@ -260,6 +313,24 @@ fn target_local_sensitive_files_are_private_and_never_follow_symlinks() {
         .expect_err("symlink rejected");
     assert_eq!(error.to_string(), "unsafe sensitive-file path");
     assert!(!outside.join("captured").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn target_local_sensitive_store_can_restore_an_empty_backup_safely() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = temporary_directory("credentials-empty-backup");
+    let store = LocalSensitiveFileStore::open(&root).unwrap();
+    let path = NormalizedManagedPath::parse("runtime/token").unwrap();
+
+    store.restore_backup_bytes(&path, b"").unwrap();
+
+    assert_eq!(fs::read(root.join("runtime/token")).unwrap(), b"");
+    assert_eq!(
+        fs::metadata(root.join("runtime/token")).unwrap().mode() & 0o777,
+        0o600
+    );
 }
 
 struct StaticInspector;

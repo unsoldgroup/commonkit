@@ -727,8 +727,24 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
     );
 
     let credentials = registry.credentials.unwrap();
-    let applied = credentials.apply(serde_json::json!({"confirmed":true,"confirmationId":"test","destinationIds":["api-token"]})).unwrap();
-    assert_eq!(applied, serde_json::json!({"applied":["api-token"]}));
+    let credential_plan = credentials
+        .plan(serde_json::json!({"destinationIds":["api-token"]}))
+        .unwrap();
+    let applied = credentials
+        .apply(serde_json::json!({
+            "confirmed": true,
+            "confirmationId": "test",
+            "planId": credential_plan["planId"]
+        }))
+        .unwrap();
+    assert_eq!(applied["applied"], serde_json::json!(["api-token"]));
+    assert_eq!(applied["planId"], credential_plan["planId"]);
+    assert!(
+        applied["receiptId"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:")
+    );
     assert_eq!(
         std::fs::read(root.join("credentials/tokens/api")).unwrap(),
         b"never serialize me"

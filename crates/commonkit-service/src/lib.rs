@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -134,15 +134,43 @@ impl Default for SchedulerConfig {
 #[derive(Clone)]
 pub struct SchedulerStore {
     path: PathBuf,
+    updates: Arc<tokio::sync::watch::Sender<SchedulerConfig>>,
+    save_lock: Arc<std::sync::Mutex<()>>,
+    directory_sync: Arc<DirectorySync>,
 }
+
+type DirectorySync = dyn Fn(&Path) -> Result<(), std::io::Error> + Send + Sync;
+
+static SCHEDULER_TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 impl SchedulerStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, SchedulerError> {
+        Self::open_with_sync(root, Arc::new(sync_directory))
+    }
+
+    fn open_with_sync(
+        root: impl AsRef<Path>,
+        directory_sync: Arc<DirectorySync>,
+    ) -> Result<Self, SchedulerError> {
         std::fs::create_dir_all(root.as_ref())?;
         make_private_directory(root.as_ref())?;
-        Ok(Self {
+        let (updates, _) = tokio::sync::watch::channel(SchedulerConfig::default());
+        let store = Self {
             path: root.as_ref().join("scheduler.json"),
-        })
+            updates: Arc::new(updates),
+            save_lock: Arc::new(std::sync::Mutex::new(())),
+            directory_sync,
+        };
+        store.updates.send_replace(store.load()?);
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    fn open_with_directory_sync(
+        root: impl AsRef<Path>,
+        directory_sync: Arc<DirectorySync>,
+    ) -> Result<Self, SchedulerError> {
+        Self::open_with_sync(root, directory_sync)
     }
 
     fn load(&self) -> Result<SchedulerConfig, SchedulerError> {
@@ -159,29 +187,69 @@ impl SchedulerStore {
     }
 
     fn save(&self, config: SchedulerConfig) -> Result<(), SchedulerError> {
+        let _save_guard = self.save_lock.lock().expect("scheduler save lock");
         let bytes = serde_json::to_vec(&config)?;
-        let temporary = self
-            .path
-            .with_extension(format!("{}.tmp", std::process::id()));
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        let (temporary, mut file) = loop {
+            let sequence = SCHEDULER_TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let temporary =
+                self.path
+                    .with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
+            let mut options = OpenOptions::new();
+            options.create_new(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&temporary) {
+                Ok(file) => break (temporary, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
         let result = (|| {
-            let mut file = options.open(&temporary)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
             std::fs::rename(&temporary, &self.path)?;
+            let parent = self.path.parent().ok_or_else(|| {
+                std::io::Error::other("scheduler state path has no containing directory")
+            })?;
+            (self.directory_sync)(parent)?;
             Ok::<_, std::io::Error>(())
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temporary);
         }
-        result.map_err(Into::into)
+        result.map_err(SchedulerError::from)?;
+        self.updates.send_replace(config);
+        Ok(())
     }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<SchedulerConfig> {
+        self.updates.subscribe()
+    }
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
+    std::fs::File::open(path)?.sync_all()
 }
 
 #[derive(Debug, Error)]
@@ -212,18 +280,19 @@ pub struct DriftScheduler<C> {
     checker: Arc<C>,
     status: Arc<RwLock<ServiceStatus>>,
     events: EventHub,
-    configuration: std::sync::Mutex<SchedulerConfig>,
+    configuration: Arc<tokio::sync::watch::Sender<SchedulerConfig>>,
     store: Option<SchedulerStore>,
     running: AtomicBool,
 }
 
 impl<C: DriftChecker> DriftScheduler<C> {
     pub fn new(checker: Arc<C>, status: Arc<RwLock<ServiceStatus>>, events: EventHub) -> Self {
+        let (configuration, _) = tokio::sync::watch::channel(SchedulerConfig::default());
         Self {
             checker,
             status,
             events,
-            configuration: std::sync::Mutex::new(SchedulerConfig::default()),
+            configuration: Arc::new(configuration),
             store: None,
             running: AtomicBool::new(false),
         }
@@ -236,21 +305,19 @@ impl<C: DriftChecker> DriftScheduler<C> {
         store: SchedulerStore,
     ) -> Result<Self, SchedulerError> {
         let configuration = store.load()?;
+        store.updates.send_replace(configuration);
         Ok(Self {
             checker,
             status,
             events,
-            configuration: std::sync::Mutex::new(configuration),
+            configuration: store.updates.clone(),
             store: Some(store),
             running: AtomicBool::new(false),
         })
     }
 
     pub fn configuration(&self) -> SchedulerConfig {
-        *self
-            .configuration
-            .lock()
-            .expect("scheduler configuration lock")
+        *self.configuration.borrow()
     }
 
     pub fn enable(&self, interval: Duration) -> Result<(), SchedulerError> {
@@ -272,11 +339,9 @@ impl<C: DriftChecker> DriftScheduler<C> {
     fn update_configuration(&self, next: SchedulerConfig) -> Result<(), SchedulerError> {
         if let Some(store) = &self.store {
             store.save(next)?;
+        } else {
+            self.configuration.send_replace(next);
         }
-        *self
-            .configuration
-            .lock()
-            .expect("scheduler configuration lock") = next;
         Ok(())
     }
 
@@ -327,18 +392,38 @@ impl<C: DriftChecker> DriftScheduler<C> {
         Some(result)
     }
 
-    pub async fn run_until<F>(&self, interval: Duration, shutdown: F)
+    pub async fn run_until<F>(&self, _interval: Duration, shutdown: F)
     where
         F: std::future::Future<Output = ()>,
     {
-        let mut timer = tokio::time::interval(interval.max(Duration::from_secs(1)));
+        let mut configuration = if let Some(store) = &self.store {
+            store.subscribe()
+        } else {
+            self.configuration.subscribe()
+        };
         tokio::pin!(shutdown);
+        if configuration.borrow_and_update().enabled {
+            self.try_check_now().await;
+        }
         loop {
-            tokio::select! {
-                _ = timer.tick() => {
-                    if self.configuration().enabled { self.try_check_now().await; }
+            let current = *configuration.borrow_and_update();
+            if current.enabled {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(current.interval_seconds.max(1))) => {
+                        self.try_check_now().await;
+                    }
+                    changed = configuration.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    _ = &mut shutdown => break,
                 }
-                _ = &mut shutdown => break,
+            } else {
+                tokio::select! {
+                    changed = configuration.changed() => {
+                        if changed.is_err() { break; }
+                    }
+                    _ = &mut shutdown => break,
+                }
             }
         }
     }
@@ -682,6 +767,7 @@ fn router_with_control_and_relay(
             "/control/v1/credentials/readiness",
             post(credentials_readiness),
         )
+        .route("/control/v1/credentials/plan", post(credentials_plan))
         .route("/control/v1/credentials/apply", post(credentials_apply))
         .route("/control/v1/credentials/verify", post(credentials_verify))
         .route(
@@ -1620,6 +1706,7 @@ pub trait CompositionDomain: Send + Sync + 'static {
 }
 
 pub trait CredentialDomain: Send + Sync + 'static {
+    fn plan(&self, request: Value) -> Result<Value, DomainFailure>;
     fn apply(&self, request: Value) -> Result<Value, DomainFailure>;
     fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
 }
@@ -3062,6 +3149,24 @@ async fn credentials_apply(
     safe_domain_result(domain.apply(request))
 }
 
+async fn credentials_plan(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    assert_domain_request_safe(&request)?;
+    let domain = state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .credentials
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("credential_domain_unconfigured"))?;
+    safe_domain_result(domain.plan(request))
+}
+
 async fn credentials_verify(
     State(state): State<ApiState>,
     Json(request): Json<Value>,
@@ -4116,5 +4221,36 @@ mod runtime_reload_tests {
             .await
             .unwrap();
         assert_eq!(adopted.status(), StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod scheduler_store_durability_tests {
+    use super::*;
+
+    #[test]
+    fn directory_sync_failure_is_reported_before_schedule_is_published() {
+        let root = tempfile::tempdir().expect("temporary scheduler root");
+        let expected_directory = root.path().to_path_buf();
+        let store = SchedulerStore::open_with_directory_sync(
+            root.path(),
+            Arc::new(move |directory| {
+                assert_eq!(directory, expected_directory);
+                Err(std::io::Error::other("simulated directory sync failure"))
+            }),
+        )
+        .expect("scheduler store");
+        let receiver = store.subscribe();
+        let desired = SchedulerConfig {
+            enabled: true,
+            interval_seconds: 60,
+        };
+
+        let error = store
+            .save(desired)
+            .expect_err("directory sync must fail save");
+
+        assert!(matches!(error, SchedulerError::Io(_)));
+        assert_eq!(*receiver.borrow(), SchedulerConfig::default());
     }
 }

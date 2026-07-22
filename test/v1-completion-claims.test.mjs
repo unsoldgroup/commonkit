@@ -12,9 +12,11 @@ test("v1 completion claims remain tied to product-level evidence", async () => {
   for (let flow = 1; flow <= 12; flow += 1) {
     assert.match(audit, new RegExp(`\\| ${flow} \\|`), `missing flow ${flow}`);
   }
-  assert.match(audit, /Do not mark CommonKit v1 complete or release-ready/);
-  assert.match(audit, /production daemon does not construct\/run a `DriftScheduler`/);
-  assert.match(audit, /management panels are placeholders/i);
+  assert.match(audit, /Do not mark CommonKit v1 release-ready/);
+  assert.match(audit, /host-key confirmation/i);
+  assert.match(audit, /Production Apple signing\/notarization/);
+  assert.match(audit, /hosted-platform/i);
+  assert.match(audit, /first eight runtime flows.*locally implemented/i);
   assert.doesNotMatch(support, /deliberately disabled/);
   assert.match(support, /have not been demonstrated with production notarization\/signing/);
 });

@@ -40,11 +40,17 @@ fn daemon_composition_and_durable_diff_have_actionable_absent_daemon_errors() {
 
 #[test]
 fn credential_apply_requires_consent_before_contacting_daemon() {
-    let denied = command(&["credentials", "apply", "api-token"]);
+    let denied = command(&[
+        "credentials",
+        "apply",
+        "--plan-id",
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ]);
     assert!(!denied.status.success());
     assert!(String::from_utf8_lossy(&denied.stderr).contains("confirmation_required"));
 
     for arguments in [
+        vec!["credentials", "plan", "api-token"],
         vec!["credentials", "readiness", "env://COMMONKIT_TOKEN"],
         vec!["credentials", "verify", "api-token"],
     ] {

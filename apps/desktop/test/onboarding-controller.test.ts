@@ -51,3 +51,17 @@ test("provider pins are added only for the selected import", () => {
   assert.equal(onboardingRequest(draft, "astemarie").apmLockfile, "apm.lock.yaml");
   assert.equal("chezmoiConfig" in onboardingRequest(draft, "astemarie"), false);
 });
+
+test("advanced composition selectors are portable and omitted when blank", () => {
+  const draft = defaultOnboardingDraft();
+  assert.equal("projectLoadout" in onboardingRequest(draft, "astemarie"), false);
+  assert.equal("targetOverride" in onboardingRequest(draft, "astemarie"), false);
+
+  applyOnboardingValues(draft, new Map(Object.entries({
+    projectLoadout: "project-web",
+    targetOverride: "target-macbook",
+  })));
+  const request = onboardingRequest(draft, "astemarie");
+  assert.equal(request.projectLoadout, "project-web");
+  assert.equal(request.targetOverride, "target-macbook");
+});

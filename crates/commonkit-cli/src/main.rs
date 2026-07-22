@@ -190,6 +190,12 @@ struct InitArgs {
     kit_directory: PathBuf,
     #[arg(long)]
     loadout: String,
+    /// Optional project-loadout layer ID, applied after the personal kit.
+    #[arg(long)]
+    project_loadout: Option<String>,
+    /// Optional target-override layer ID, applied last.
+    #[arg(long)]
+    target_override: Option<String>,
     #[arg(long)]
     target: String,
     #[arg(long)]
@@ -229,8 +235,14 @@ enum CredentialCommand {
     Readiness {
         references: Vec<String>,
     },
-    Apply {
+    /// Build a redacted, content-addressed credential provisioning plan.
+    Plan {
         destination_ids: Vec<String>,
+    },
+    /// Apply a previously reviewed credential plan.
+    Apply {
+        #[arg(long)]
+        plan_id: String,
         #[arg(long)]
         confirmed: bool,
     },
@@ -565,6 +577,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     repository: args.repository,
                     kit_directory: args.kit_directory,
                     loadout: args.loadout,
+                    project_loadout: args.project_loadout,
+                    target_override: args.target_override,
                     target: args.target,
                     target_root: args.target_root,
                     config_directory: paths.config,
@@ -1302,6 +1316,12 @@ fn run_credentials(command: CredentialCommand) -> Result<(), Box<dyn Error>> {
             Some(json!({"references": references})),
             None,
         )?,
+        CredentialCommand::Plan { destination_ids } => daemon_control(
+            "POST",
+            "/control/v1/credentials/plan",
+            Some(json!({"destinationIds": destination_ids})),
+            None,
+        )?,
         CredentialCommand::Apply {
             confirmed: false, ..
         } => {
@@ -1310,13 +1330,13 @@ fn run_credentials(command: CredentialCommand) -> Result<(), Box<dyn Error>> {
             );
         }
         CredentialCommand::Apply {
-            destination_ids,
+            plan_id,
             confirmed: true,
         } => daemon_control(
             "POST",
             "/control/v1/credentials/apply",
             Some(json!({
-                "destinationIds": destination_ids,
+                "planId": plan_id,
                 "confirmed": true,
                 "confirmationId": "cli-credentials-apply"
             })),

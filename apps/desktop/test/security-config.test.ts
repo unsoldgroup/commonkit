@@ -109,3 +109,41 @@ test("updater commands separate inspection from explicitly confirmed installatio
   assert.doesNotMatch(lifecycle, /let _ = write_update_report/);
   assert.match(source, /expected\s*==\s*env!\("CARGO_PKG_VERSION"\)/);
 });
+
+test("credential provisioning reviews a redacted plan before applying its exact plan id", async () => {
+  const frontend = await readFile(new URL("../src/main.ts", root), "utf8");
+  const api = await readFile(new URL("../src/api.ts", root), "utf8");
+  const flow = frontend.slice(
+    frontend.indexOf('document.querySelector("#credential-apply")'),
+    frontend.indexOf('document.querySelector("#credential-verify")'),
+  );
+  const plan = flow.indexOf("credentialPlan([id])");
+  const review = flow.indexOf("window.confirm", plan);
+  const apply = flow.indexOf("credentialApply(plan.planId", review);
+  assert.ok(plan >= 0 && review > plan && apply > review);
+  assert.match(api, /credentialApply:\s*\(planId: string/);
+  assert.doesNotMatch(api, /credentialApply:\s*\(destinationIds/);
+});
+
+test("application and menu-bar icons share the same Ck monogram geometry", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", root), "utf8"));
+  const tauriConfig = JSON.parse(
+    await readFile(new URL("../src-tauri/tauri.conf.json", root), "utf8"),
+  );
+  const tray = await readFile(new URL("../src-tauri/icons/tray-ck.svg", root), "utf8");
+  const app = await readFile(new URL("../src-tauri/icons/app-icon.svg", root), "utf8");
+  const paths = [...tray.matchAll(/<path d="([^"]+)"/g)].map((match) => match[1]);
+
+  assert.equal(paths.length, 2);
+  for (const path of paths) assert.match(app, new RegExp(path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(app, /fill="#FFFFFF"/);
+  assert.match(app, /fill="#1F6F50"/);
+  assert.equal(packageJson.scripts.icons, "tauri icon src-tauri/icons/app-icon.svg");
+  assert.deepEqual(tauriConfig.bundle.icon, [
+    "icons/32x32.png",
+    "icons/128x128.png",
+    "icons/128x128@2x.png",
+    "icons/icon.icns",
+    "icons/icon.ico",
+  ]);
+});

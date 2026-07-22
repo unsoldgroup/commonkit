@@ -7,6 +7,7 @@ use commonkit_cli::onboarding::{
     CommandRunner, InitMode, InitRequest, OnboardingError, ProcessRunner, ProviderSelection,
     initialize,
 };
+use commonkit_contracts::LayerDocument;
 use std::ffi::OsString;
 use std::process::Command;
 
@@ -16,6 +17,8 @@ fn request(root: &Path, mode: InitMode, repository: &str) -> InitRequest {
         repository: repository.to_owned(),
         kit_directory: root.join("kit"),
         loadout: "personal".to_owned(),
+        project_loadout: None,
+        target_override: None,
         target: "workstation".to_owned(),
         target_root: root.join("target"),
         config_directory: root.join("config"),
@@ -23,6 +26,125 @@ fn request(root: &Path, mode: InitMode, repository: &str) -> InitRequest {
         provider: ProviderSelection::Native,
         publish_registration: true,
     }
+}
+
+#[test]
+fn connect_configures_all_five_layers_with_provenance_and_an_organization_floor() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(temporary.path().join("target")).unwrap();
+    test_support::write_tool(
+        &bin,
+        "gh",
+        r#"
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers"
+    printf '%s' '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"base"}}' > "$4/layers/public-base.json"
+    printf '%s' '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"org","securityPolicy":{"deniedPaths":["**/.env"],"requiredControls":{"secret_scan":true},"allowlists":{"git_hosts":["github.com"]},"minimums":{"backup_count":1},"maximums":{"snapshot_age_hours":24}}}}' > "$4/layers/organization-policy.json"
+    printf '%s' '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"personal"}}' > "$4/layers/personal.json"
+    printf '%s' '{"schemaVersion":1,"id":"project-web","kind":"project_loadout","source":{"path":"layers/project-web.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"project"}}' > "$4/layers/project-web.json"
+    printf '%s' '{"schemaVersion":1,"id":"target-workstation","kind":"target_overrides","source":{"path":"layers/target-workstation.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"target"}}' > "$4/layers/target-workstation.json"
+    exit 0 ;;
+esac
+exit 91
+"#,
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        "[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\nexit 0",
+    );
+    let mut request = request(temporary.path(), InitMode::Connect, "owner/five-layer-kit");
+    request.project_loadout = Some("project-web".to_owned());
+    request.target_override = Some("target-workstation".to_owned());
+
+    let result = initialize(&request, &ProcessRunner::new(&bin)).unwrap();
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&result.headless_config).unwrap()).unwrap();
+    assert_eq!(config["composition"]["layers"].as_array().unwrap().len(), 5);
+
+    let plans = std::sync::Arc::new(
+        commonkit_reconcile::PlanStore::open(temporary.path().join("state/plans")).unwrap(),
+    );
+    let registry = commonkit_service::ProductionDomainRegistry::load(
+        &result.headless_config,
+        plans,
+        temporary.path().join("receipts"),
+    )
+    .unwrap();
+    let composition = registry.composition.unwrap();
+    assert_eq!(composition.compose().unwrap()["spec"]["theme"], "target");
+    let theme = composition.explain("/theme").unwrap();
+    assert_eq!(theme["winner"]["layerId"], "target-workstation");
+    assert_eq!(theme["contributions"].as_array().unwrap().len(), 5);
+    assert_eq!(
+        composition.explain("/securityPolicy/deniedPaths").unwrap()["governingRules"],
+        serde_json::json!([
+            "schema:/securityPolicy/deniedPaths:set_union",
+            "organization-security-floor:non-overridable"
+        ])
+    );
+}
+
+#[test]
+fn connect_rejects_a_weakened_organization_floor_before_registration_or_plan_mutation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let log = temporary.path().join("commands.log");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(temporary.path().join("target")).unwrap();
+    test_support::write_tool(
+        &bin,
+        "gh",
+        &format!(
+            r#"
+printf 'gh %s\n' "$*" >> '{}'
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers"
+    printf '%s' '{{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{}}}}' > "$4/layers/public-base.json"
+    printf '%s' '{{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{"securityPolicy":{{"deniedPaths":["**/.env"],"requiredControls":{{"secret_scan":true}},"allowlists":{{"git_hosts":["github.com"]}},"minimums":{{"backup_count":1}},"maximums":{{"snapshot_age_hours":24}}}}}}}}' > "$4/layers/organization-policy.json"
+    printf '%s' '{{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{}}}}' > "$4/layers/personal.json"
+    printf '%s' '{{"schemaVersion":1,"id":"project-web","kind":"project_loadout","source":{{"path":"layers/project-web.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{}}}}' > "$4/layers/project-web.json"
+    printf '%s' '{{"schemaVersion":1,"id":"target-workstation","kind":"target_overrides","source":{{"path":"layers/target-workstation.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{"securityPolicy":{{"deniedPaths":["**/.env"],"requiredControls":{{"secret_scan":true}},"allowlists":{{"git_hosts":["github.com","evil.example"]}},"minimums":{{"backup_count":1}},"maximums":{{"snapshot_age_hours":24}}}}}}}}' > "$4/layers/target-workstation.json"
+    exit 0 ;;
+esac
+exit 91
+"#,
+            log.display()
+        ),
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        &format!(
+            "printf 'git %s\\n' \"$*\" >> '{}'\n[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\nexit 0",
+            log.display()
+        ),
+    );
+    let mut request = request(temporary.path(), InitMode::Connect, "owner/unsafe-kit");
+    request.project_loadout = Some("project-web".to_owned());
+    request.target_override = Some("target-workstation".to_owned());
+
+    let error = initialize(&request, &ProcessRunner::new(&bin)).unwrap_err();
+
+    assert!(error.to_string().contains("allowlist"));
+    assert!(
+        !request
+            .kit_directory
+            .join("targets/workstation.json")
+            .exists()
+    );
+    assert!(!request.state_directory.join("plans").exists());
+    assert!(!request.config_directory.join("headless.json").exists());
+    let commands = std::fs::read_to_string(log).unwrap();
+    assert!(!commands.contains("git add"));
+    assert!(!commands.contains("git commit"));
+    assert!(!commands.contains("git push"));
 }
 
 #[test]
@@ -100,6 +222,10 @@ fn connect_uses_existing_gh_credentials_and_writes_first_run_state() {
     let bin = temporary.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(temporary.path().join("target")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("config")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("state")).unwrap();
+    std::fs::write(temporary.path().join("config/daemon-token"), b"keep-config").unwrap();
+    std::fs::write(temporary.path().join("state/service-state"), b"keep-state").unwrap();
     std::fs::set_permissions(
         temporary.path().join("target"),
         std::fs::Permissions::from_mode(0o755),
@@ -185,6 +311,14 @@ exit 0
             & 0o777,
         0o755
     );
+    assert_eq!(
+        std::fs::read(temporary.path().join("config/daemon-token")).unwrap(),
+        b"keep-config"
+    );
+    assert_eq!(
+        std::fs::read(temporary.path().join("state/service-state")).unwrap(),
+        b"keep-state"
+    );
 }
 
 #[test]
@@ -207,12 +341,62 @@ fn create_provisions_a_private_repository_and_pushes_only_portable_files() {
             .join("targets/workstation.json")
             .is_file()
     );
+    let registration: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.kit_directory.join("targets/workstation.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !registration
+            .as_object()
+            .unwrap()
+            .contains_key("projectLoadout")
+    );
+    assert!(
+        !registration
+            .as_object()
+            .unwrap()
+            .contains_key("targetOverride")
+    );
     let commands = std::fs::read_to_string(log).unwrap();
     assert!(commands.contains("gh repo create owner/new-kit --private"));
     assert!(commands.contains("gh repo clone owner/new-kit"));
     assert!(commands.contains("git -C"));
     assert!(commands.contains("push --set-upstream origin HEAD"));
     assert!(!commands.to_ascii_lowercase().contains("token"));
+}
+
+#[test]
+fn create_writes_selected_project_and_target_layers_into_the_portable_registration() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    test_support::write_logging_tools(&bin, &temporary.path().join("commands.log"));
+    let mut request = request(temporary.path(), InitMode::Create, "owner/five-layer-kit");
+    request.project_loadout = Some("project-web".to_owned());
+    request.target_override = Some("target-workstation".to_owned());
+
+    let result = initialize(&request, &ProcessRunner::new(&bin)).unwrap();
+
+    let project: LayerDocument = serde_json::from_slice(
+        &std::fs::read(result.kit_directory.join("layers/project-web.json")).unwrap(),
+    )
+    .unwrap();
+    let target: LayerDocument = serde_json::from_slice(
+        &std::fs::read(result.kit_directory.join("layers/target-workstation.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(project.kind, commonkit_contracts::LayerKind::ProjectLoadout);
+    assert_eq!(target.kind, commonkit_contracts::LayerKind::TargetOverrides);
+    let registration: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(result.kit_directory.join("targets/workstation.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(registration["loadout"], "personal");
+    assert_eq!(registration["projectLoadout"], "project-web");
+    assert_eq!(registration["targetOverride"], "target-workstation");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(result.headless_config).unwrap()).unwrap();
+    assert_eq!(config["composition"]["layers"].as_array().unwrap().len(), 5);
 }
 
 #[test]
@@ -505,6 +689,37 @@ fn create_removes_the_local_checkout_when_provider_validation_fails() {
 }
 
 #[test]
+fn create_push_failure_leaves_no_local_runtime_referencing_the_removed_checkout() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let log = temporary.path().join("commands");
+    std::fs::create_dir_all(&bin).unwrap();
+    test_support::write_logging_tools(&bin, &log);
+    test_support::write_tool(
+        &bin,
+        "git",
+        &format!(
+            r#"
+printf 'git %s\n' "$*" >> '{}'
+if [ "$3" = "rev-parse" ]; then printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'; exit 0; fi
+if [ "$3" = "push" ]; then exit 42; fi
+exit 0
+"#,
+            log.display()
+        ),
+    );
+    let init = request(temporary.path(), InitMode::Create, "owner/push-fails");
+
+    let error = initialize(&init, &ProcessRunner::new(&bin)).unwrap_err();
+
+    assert!(error.to_string().contains("status Some(42)"), "{error}");
+    assert!(!init.kit_directory.exists());
+    assert!(!init.config_directory.exists());
+    assert!(!init.state_directory.exists());
+    assert!(!init.target_root.exists());
+}
+
+#[test]
 fn connect_rejects_native_sources_that_escape_the_git_checkout() {
     let temporary = tempfile::tempdir().unwrap();
     let bin = temporary.path().join("bin");
@@ -539,6 +754,273 @@ exit 91
     )
     .unwrap_err();
     assert!(error.to_string().contains("regular non-symlink file"));
+}
+
+#[test]
+fn connect_provider_failure_does_not_publish_registration_or_local_runtime() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let log = temporary.path().join("commands");
+    std::fs::create_dir_all(&bin).unwrap();
+    test_support::write_tool(
+        &bin,
+        "gh",
+        &format!(
+            r#"
+printf 'gh %s\n' "$*" >> '{}'
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers"
+    printf '{{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{}}}}' > "$4/layers/public-base.json"
+    printf '{{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{}}}}' > "$4/layers/organization-policy.json"
+    printf '{{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{"files":[{{"path":"portable/missing","source":"portable/missing"}}]}}}}' > "$4/layers/personal.json"
+    exit 0 ;;
+esac
+exit 91
+"#,
+            log.display()
+        ),
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        &format!(
+            "printf 'git %s\\n' \"$*\" >> '{}'\n[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\nexit 0",
+            log.display()
+        ),
+    );
+    let init = request(temporary.path(), InitMode::Connect, "owner/provider-fails");
+
+    let error = initialize(&init, &ProcessRunner::new(&bin)).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("native provider source is missing")
+    );
+    let commands = std::fs::read_to_string(&log).unwrap();
+    assert!(!commands.contains("git add"));
+    assert!(!commands.contains("git commit"));
+    assert!(!commands.contains("git push"));
+    assert!(!init.kit_directory.join("targets/workstation.json").exists());
+    assert!(!init.config_directory.exists());
+    assert!(!init.state_directory.exists());
+}
+
+#[test]
+fn connect_runtime_failure_after_commit_rolls_back_registration_and_preserves_local_runtime() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let log = temporary.path().join("commands");
+    let committed = temporary.path().join("committed");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(temporary.path().join("config")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("state")).unwrap();
+    std::fs::write(temporary.path().join("config/daemon-token"), b"keep-config").unwrap();
+    std::fs::write(temporary.path().join("state/service-state"), b"keep-state").unwrap();
+    test_support::write_tool(
+        &bin,
+        "gh",
+        &format!(
+            r#"
+printf 'gh %s\n' "$*" >> '{}'
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers" "$4/portable"
+    printf 'managed\n' > "$4/portable/editor.conf"
+    printf '{{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{}}}}' > "$4/layers/public-base.json"
+    printf '{{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{}}}}' > "$4/layers/organization-policy.json"
+    printf '{{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"}},"spec":{{"files":[{{"path":"portable/editor.conf","source":"portable/editor.conf"}}]}}}}' > "$4/layers/personal.json"
+    exit 0 ;;
+esac
+exit 91
+"#,
+            log.display()
+        ),
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        &format!(
+            r#"
+printf 'git %s\n' "$*" >> '{}'
+if [ "$3" = rev-parse ]; then
+  if [ -f '{}' ]; then printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'; else printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'; fi
+  exit 0
+fi
+if [ "$3" = commit ]; then touch '{}'; rm -f '{}'; exit 0; fi
+exit 0
+"#,
+            log.display(),
+            committed.display(),
+            committed.display(),
+            temporary.path().join("kit/portable/editor.conf").display()
+        ),
+    );
+    let init = request(temporary.path(), InitMode::Connect, "owner/runtime-fails");
+
+    let error = initialize(&init, &ProcessRunner::new(&bin)).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("native provider source is missing")
+    );
+    let commands = std::fs::read_to_string(&log).unwrap();
+    assert!(commands.contains("git -C"));
+    assert!(commands.contains("reset --hard aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert!(!commands.contains("git -C") || !commands.contains(" push origin HEAD"));
+    assert!(!init.kit_directory.join("targets/workstation.json").exists());
+    assert_eq!(
+        std::fs::read(temporary.path().join("config/daemon-token")).unwrap(),
+        b"keep-config"
+    );
+    assert_eq!(
+        std::fs::read(temporary.path().join("state/service-state")).unwrap(),
+        b"keep-state"
+    );
+    assert!(!init.config_directory.join("headless.json").exists());
+    assert!(!init.state_directory.join("plans").exists());
+}
+
+#[test]
+fn connect_push_failure_restores_registration_and_leaves_existing_runtime_unchanged() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let log = temporary.path().join("commands");
+    let committed = temporary.path().join("committed");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(temporary.path().join("config")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("state/plans")).unwrap();
+    std::fs::write(temporary.path().join("config/headless.json"), b"old-config").unwrap();
+    std::fs::write(temporary.path().join("state/plans/old-plan"), b"old-plan").unwrap();
+    test_support::write_tool(
+        &bin,
+        "gh",
+        r#"
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers"
+    printf '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/public-base.json"
+    printf '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/organization-policy.json"
+    printf '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/personal.json"
+    exit 0 ;;
+esac
+exit 91
+"#,
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        &format!(
+            r#"
+printf 'git %s\n' "$*" >> '{}'
+if [ "$3" = rev-parse ]; then
+  if [ -f '{}' ]; then printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'; else printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'; fi
+  exit 0
+fi
+if [ "$3" = commit ]; then touch '{}'; exit 0; fi
+if [ "$3" = push ]; then exit 42; fi
+exit 0
+"#,
+            log.display(),
+            committed.display(),
+            committed.display()
+        ),
+    );
+    let init = request(temporary.path(), InitMode::Connect, "owner/push-fails");
+
+    let error = initialize(&init, &ProcessRunner::new(&bin)).unwrap_err();
+
+    assert!(error.to_string().contains("status Some(42)"), "{error}");
+    let commands = std::fs::read_to_string(&log).unwrap();
+    assert!(commands.contains("push origin HEAD"));
+    assert!(commands.contains("reset --hard aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert!(!init.kit_directory.join("targets/workstation.json").exists());
+    assert_eq!(
+        std::fs::read(temporary.path().join("config/headless.json")).unwrap(),
+        b"old-config"
+    );
+    assert_eq!(
+        std::fs::read(temporary.path().join("state/plans/old-plan")).unwrap(),
+        b"old-plan"
+    );
+}
+
+#[test]
+fn connect_runtime_publication_failure_happens_before_push_and_rolls_back_local_changes() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    let log = temporary.path().join("commands");
+    let committed = temporary.path().join("committed");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(temporary.path().join("config")).unwrap();
+    std::fs::create_dir_all(temporary.path().join("state")).unwrap();
+    std::fs::write(temporary.path().join("config/daemon-token"), b"keep-config").unwrap();
+    std::fs::write(temporary.path().join("state/providers"), b"blocking-file").unwrap();
+    test_support::write_tool(
+        &bin,
+        "gh",
+        r#"
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers"
+    printf '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/public-base.json"
+    printf '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/organization-policy.json"
+    printf '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/personal.json"
+    exit 0 ;;
+esac
+exit 91
+"#,
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        &format!(
+            r#"
+printf 'git %s\n' "$*" >> '{}'
+if [ "$3" = rev-parse ]; then
+  if [ -f '{}' ]; then printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'; else printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'; fi
+  exit 0
+fi
+if [ "$3" = commit ]; then touch '{}'; exit 0; fi
+exit 0
+"#,
+            log.display(),
+            committed.display(),
+            committed.display()
+        ),
+    );
+    let init = request(
+        temporary.path(),
+        InitMode::Connect,
+        "owner/publication-fails",
+    );
+
+    let error = initialize(&init, &ProcessRunner::new(&bin)).unwrap_err();
+
+    assert!(
+        error.to_string().contains("unsafe onboarding path"),
+        "{error}"
+    );
+    let commands = std::fs::read_to_string(&log).unwrap();
+    assert!(!commands.contains("push origin HEAD"));
+    assert!(commands.contains("reset --hard aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+    assert!(!init.kit_directory.join("targets/workstation.json").exists());
+    assert_eq!(
+        std::fs::read(temporary.path().join("config/daemon-token")).unwrap(),
+        b"keep-config"
+    );
+    assert_eq!(
+        std::fs::read(temporary.path().join("state/providers")).unwrap(),
+        b"blocking-file"
+    );
+    assert!(!init.config_directory.join("headless.json").exists());
+    assert!(!init.target_root.exists());
 }
 
 #[test]

@@ -15,6 +15,8 @@ export interface OnboardingDraft {
   repository: string;
   kitDirectory: string;
   loadout: string;
+  projectLoadout: string;
+  targetOverride: string;
   computerName: string;
   targetRoot: string;
   provider: OnboardingProvider;
@@ -43,6 +45,8 @@ export function defaultOnboardingDraft(): OnboardingDraft {
     repository: "",
     kitDirectory: "",
     loadout: "personal",
+    projectLoadout: "",
+    targetOverride: "",
     computerName: "workstation",
     targetRoot: "",
     provider: "native",
@@ -102,6 +106,8 @@ function computerStep({ draft }: OnboardingViewState): string {
     <details class="advanced"><summary>Advanced local settings</summary>
       ${field("kitDirectory", "Local setup folder", draft.kitDirectory, "Where CommonKit keeps its private Git checkout on this computer.", true)}
       ${field("loadout", "Settings profile ID", draft.loadout, "The portable profile selected for this computer.")}
+      ${optionalField("projectLoadout", "Project settings profile", draft.projectLoadout, "Optional project-specific layer applied after your personal profile.")}
+      ${optionalField("targetOverride", "Computer-specific override", draft.targetOverride, "Optional final layer for this computer only.")}
     </details>
     ${actions(true, "Continue")}
   </form>`;
@@ -127,7 +133,7 @@ function reviewStep({ auth, draft, submitting }: OnboardingViewState): string {
   const imported = draft.provider === "native" ? "Start with an empty CommonKit setup" : draft.provider === "apm" ? "Import APM settings" : "Import chezmoi settings";
   return `<form id="onboarding-form" class="setup-step" data-step="4">
     <h2 id="setup-heading" tabindex="-1">Review before creating</h2>
-    <dl class="review-list"><dt>Private repository</dt><dd>${escapeHtml(repository)}</dd><dt>Local folder</dt><dd>${escapeHtml(draft.kitDirectory)}</dd><dt>Computer</dt><dd>${escapeHtml(draft.computerName)}</dd><dt>Folder to manage</dt><dd>${escapeHtml(draft.targetRoot)}</dd><dt>Existing settings</dt><dd>${escapeHtml(imported)}</dd></dl>
+    <dl class="review-list"><dt>Private repository</dt><dd>${escapeHtml(repository)}</dd><dt>Local folder</dt><dd>${escapeHtml(draft.kitDirectory)}</dd><dt>Computer</dt><dd>${escapeHtml(draft.computerName)}</dd><dt>Folder to manage</dt><dd>${escapeHtml(draft.targetRoot)}</dd><dt>Personal profile</dt><dd>${escapeHtml(draft.loadout)}</dd>${draft.projectLoadout ? `<dt>Project profile</dt><dd>${escapeHtml(draft.projectLoadout)}</dd>` : ""}${draft.targetOverride ? `<dt>Computer override</dt><dd>${escapeHtml(draft.targetOverride)}</dd>` : ""}<dt>Existing settings</dt><dd>${escapeHtml(imported)}</dd></dl>
     <div class="safety-note"><strong>Nothing on this computer changes yet.</strong><p>CommonKit will prepare a preview for you to review first.</p></div>
     <label class="consent"><input name="publishRegistration" type="checkbox" value="true" ${draft.publishRegistration ? "checked" : ""} required> <span><strong>Save this computer to the private repository</strong><small>This lets your other computers discover it. CommonKit will create and push a registration commit.</small></span></label>
     ${actions(true, submitting ? "Preparing preview…" : "Prepare setup preview", submitting)}
@@ -156,6 +162,11 @@ function choice(name: string, value: string, title: string, detail: string, chec
 function field(name: string, label: string, value: string, help: string, picker = false): string {
   const id = `onboarding-${name}`;
   return `<label class="setup-field" for="${id}"><span>${label}</span><input id="${id}" name="${name}" value="${escapeHtml(value)}" required aria-describedby="${id}-help">${picker ? `<button type="button" class="secondary picker" data-pick${name === "targetRoot" || name === "kitDirectory" ? "-directory" : ""}="${name}" aria-label="Choose ${escapeHtml(label)}">Choose</button>` : ""}<small id="${id}-help">${help}</small></label>`;
+}
+
+function optionalField(name: string, label: string, value: string, help: string): string {
+  const id = `onboarding-${name}`;
+  return `<label class="setup-field" for="${id}"><span>${label} <small>(optional)</small></span><input id="${id}" name="${name}" value="${escapeHtml(value)}" aria-describedby="${id}-help"><small id="${id}-help">${help}</small></label>`;
 }
 
 function actions(back: boolean, next: string, disabled = false): string {

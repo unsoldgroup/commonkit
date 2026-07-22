@@ -109,6 +109,9 @@ impl SyncDomain for EchoDomains {
     }
 }
 impl CredentialDomain for EchoDomains {
+    fn plan(&self, _: Value) -> Result<Value, DomainFailure> {
+        Ok(serde_json::json!({"domain":"credentials","action":"plan"}))
+    }
     fn apply(&self, _: Value) -> Result<Value, DomainFailure> {
         Ok(serde_json::json!({"domain":"credentials","action":"apply"}))
     }
@@ -150,6 +153,17 @@ async fn configured_domains_receive_authenticated_consent_checked_requests() {
         control,
     );
     let consent = serde_json::json!({"confirmed":true,"confirmationId":"test-consent"});
+    assert_eq!(
+        call(
+            app.clone(),
+            &token,
+            "POST",
+            "/control/v1/credentials/plan",
+            serde_json::json!({"destinationIds":["api-token"]}),
+        )
+        .await["action"],
+        "plan"
+    );
     for (method, path, expected) in [
         ("POST", "/control/v1/sync/plan", "sync"),
         ("POST", "/control/v1/rollback", "sync"),
