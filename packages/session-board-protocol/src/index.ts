@@ -183,12 +183,18 @@ export const actionClosedMessageSchema = z
   .strict();
 export type ActionClosedMessage = z.infer<typeof actionClosedMessageSchema>;
 
+export const tailResponseMessageSchema = z
+  .object({ type: z.literal("tailResponse"), requestId: idSchema, lines: z.array(z.string()) })
+  .strict();
+export type TailResponseMessage = z.infer<typeof tailResponseMessageSchema>;
+
 export const reporterToHubMessageSchema = z.discriminatedUnion("type", [
   helloMessageSchema,
   stateSnapshotMessageSchema,
   stateDeltaMessageSchema,
   actionOpenedMessageSchema,
   actionClosedMessageSchema,
+  tailResponseMessageSchema,
 ]);
 export type ReporterToHubMessage = z.infer<typeof reporterToHubMessageSchema>;
 
@@ -197,7 +203,12 @@ export const decisionMessageSchema = z
   .strict();
 export type DecisionMessage = z.infer<typeof decisionMessageSchema>;
 
-export const hubToReporterMessageSchema = decisionMessageSchema;
+export const tailRequestMessageSchema = z
+  .object({ type: z.literal("tailRequest"), requestId: idSchema, sessionRef: sessionRefSchema })
+  .strict();
+export type TailRequestMessage = z.infer<typeof tailRequestMessageSchema>;
+
+export const hubToReporterMessageSchema = z.discriminatedUnion("type", [decisionMessageSchema, tailRequestMessageSchema]);
 export type HubToReporterMessage = z.infer<typeof hubToReporterMessageSchema>;
 
 export const decisionRequestSchema = z.object({ verdict: verdictSchema }).strict();

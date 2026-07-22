@@ -18,6 +18,7 @@ export interface HubClientOptions {
   reconnectMaxMs?: number;
   now?: () => Date;
   onDecision: (decision: Decision) => void | Promise<void>;
+  onTailRequest?: (session: Pick<Session, "machineId" | "worktreeId" | "paneKey">) => Promise<string[]>;
   webSocketFactory?: (url: string, options?: { headers: Record<string, string> }) => WebSocket;
 }
 
@@ -80,8 +81,15 @@ export class HubClient {
     this.#socket = socket;
     socket.addEventListener("open", () => { this.#attempt = 0; this.#send({ type: "hello", machineToken: this.options.machineToken }); this.#sendSnapshot(); });
     socket.addEventListener("message", async (event) => {
-      try { await this.options.onDecision(hubToReporterMessageSchema.parse(JSON.parse(String(event.data))).decision); }
-      catch (error) { console.error("Hub decision failed", error); }
+      try {
+        const message = hubToReporterMessageSchema.parse(JSON.parse(String(event.data)));
+        if (message.type === "decision") await this.options.onDecision(message.decision);
+        else {
+          const lines = this.options.onTailRequest ? await this.options.onTailRequest(message.sessionRef) : [];
+          this.#send({ type: "tailResponse", requestId: message.requestId, lines });
+        }
+      }
+      catch (error) { console.error("Hub message failed", error); }
     });
     socket.addEventListener("close", () => {
       if (this.#stopped || socket !== this.#socket) return;

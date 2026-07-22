@@ -49,6 +49,16 @@ importers:
         specifier: ^5.9.0
         version: 5.9.3
 
+  apps/session-board/web:
+    dependencies:
+      '@commonkit/session-board-protocol':
+        specifier: workspace:*
+        version: link:../../../packages/session-board-protocol
+    devDependencies:
+      typescript:
+        specifier: ^5.9.0
+        version: 5.9.3
+
   packages/mcp-local-relay:
     dependencies:
       '@modelcontextprotocol/sdk':

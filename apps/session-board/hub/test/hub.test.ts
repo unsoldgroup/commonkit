@@ -250,6 +250,28 @@ describe("board hub", () => {
     reporter.close();
   });
 
+  test("proxies a session tail request to its Target reporter", async () => {
+    hub = startHub({ reporterTokens: { studio: "studio-secret" }, actionToken: "board-secret" });
+    const reporter = await openReporter();
+    reporter.send(JSON.stringify({ type: "stateSnapshot", machine, sessions: [session], pendingActions: [] }));
+    await eventually(() => expect(hub!.latestEventId).toBe(1));
+
+    const sessionId = encodeURIComponent(JSON.stringify([session.machineId, session.worktreeId, session.paneKey]));
+    const request = fetch(`${hub.url}/sessions/${sessionId}/tail`);
+    const message = await nextMessage(reporter) as { requestId: string };
+    expect(message).toEqual({
+      type: "tailRequest",
+      requestId: expect.any(String),
+      sessionRef: { machineId: session.machineId, worktreeId: session.worktreeId, paneKey: session.paneKey },
+    });
+    reporter.send(JSON.stringify({ type: "tailResponse", requestId: message.requestId, lines: ["running tests", "done"] }));
+
+    const response = await request;
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ lines: ["running tests", "done"] });
+    reporter.close();
+  });
+
   test("does not let one Target take over another Target's action id", async () => {
     hub = startHub({
       reporterTokens: { studio: "studio-secret", laptop: "laptop-secret" },

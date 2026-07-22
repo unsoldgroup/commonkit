@@ -83,6 +83,7 @@ describe("session board protocol fixtures", () => {
       { type: "actionOpened", action: codexAction },
       { type: "actionOpened", action: gateAction },
       { type: "actionClosed", actionId: action.id },
+      { type: "tailResponse", requestId: "tail-1", lines: ["one", "two"] },
     ] as const;
 
     for (const fixture of fixtures) expectRoundTrip(reporterToHubMessageSchema, fixture);
@@ -90,6 +91,11 @@ describe("session board protocol fixtures", () => {
 
   test("round-trips hub decisions", () => {
     expectRoundTrip(hubToReporterMessageSchema, { type: "decision", decision });
+    expectRoundTrip(hubToReporterMessageSchema, {
+      type: "tailRequest",
+      requestId: "tail-1",
+      sessionRef: action.sessionRef,
+    });
   });
 
   test("round-trips REST and SSE payloads", () => {

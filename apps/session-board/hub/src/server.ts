@@ -72,6 +72,7 @@ export function startHub(options: HubOptions): HubServer {
   const reporters = new Map<string, Socket>();
   const subscribers = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const eventBuffer: BufferedEvent[] = [];
+  const tailRequests = new Map<string, { machineId: string; resolve: (lines: string[]) => void; timer: ReturnType<typeof setTimeout> }>();
   const encoder = new TextEncoder();
   let latestEventId = 0;
 
@@ -116,6 +117,15 @@ export function startHub(options: HubOptions): HubServer {
   const handleReporterMessage = (socket: Socket, raw: string | Buffer) => {
     const message = reporterToHubMessageSchema.parse(JSON.parse(raw.toString()));
     if (message.type === "hello") return;
+    if (message.type === "tailResponse") {
+      const pending = tailRequests.get(message.requestId);
+      if (pending?.machineId === socket.data.machineId) {
+        clearTimeout(pending.timer);
+        tailRequests.delete(message.requestId);
+        pending.resolve(message.lines);
+      }
+      return;
+    }
     assertMachineOwnership(message, socket.data.machineId);
 
     if (message.type === "stateSnapshot") {
@@ -257,6 +267,32 @@ export function startHub(options: HubOptions): HubServer {
         return json({ decision });
       }
 
+      const tailMatch = /^\/sessions\/([^/]+)\/tail$/.exec(url.pathname);
+      if (tailMatch && request.method === "GET") {
+        let ref: Pick<Session, "machineId" | "worktreeId" | "paneKey">;
+        try {
+          const value = JSON.parse(decodeURIComponent(tailMatch[1]));
+          if (!Array.isArray(value) || value.length !== 3 || value.some((item) => typeof item !== "string")) throw new Error();
+          ref = { machineId: value[0], worktreeId: value[1], paneKey: value[2] };
+        } catch {
+          return json({ error: "invalid session id" }, 400);
+        }
+        if (!sessions.has(sessionKey(ref))) return json({ error: "session not found" }, 404);
+        const reporter = reporters.get(ref.machineId);
+        if (!reporter) return json({ error: "Target offline" }, 410);
+        const requestId = crypto.randomUUID();
+        const lines = await new Promise<string[] | undefined>((resolve) => {
+          const timer = setTimeout(() => { tailRequests.delete(requestId); resolve(undefined); }, 5_000);
+          tailRequests.set(requestId, { machineId: ref.machineId, resolve, timer });
+          if (reporter.send(JSON.stringify({ type: "tailRequest", requestId, sessionRef: ref })) <= 0) {
+            clearTimeout(timer);
+            tailRequests.delete(requestId);
+            resolve(undefined);
+          }
+        });
+        return lines ? json({ lines }) : json({ error: "tail request timed out" }, 504);
+      }
+
       if (url.pathname === "/layout" && request.method === "GET") {
         const file = Bun.file(layoutPath);
         if (!(await file.exists())) return json({ groups: [] });
@@ -325,6 +361,8 @@ export function startHub(options: HubOptions): HubServer {
       return latestEventId;
     },
     async stop() {
+      for (const pending of tailRequests.values()) { clearTimeout(pending.timer); pending.resolve([]); }
+      tailRequests.clear();
       for (const subscriber of subscribers) subscriber.close();
       subscribers.clear();
       await server.stop(true);
