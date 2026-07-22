@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>cloud.unsold.session-board-reporter</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@BUN_BIN@@</string>
+    <string>run</string>
+    <string>apps/session-board/reporter/src/main.ts</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>@@REPO_DIR@@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SESSION_BOARD_CONFIG</key>
+    <string>@@CONFIG_FILE@@</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>@@LOG_DIR@@/session-board-reporter.log</string>
+  <key>StandardErrorPath</key>
+  <string>@@LOG_DIR@@/session-board-reporter.error.log</string>
+</dict>
+</plist>
