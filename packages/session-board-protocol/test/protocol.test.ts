@@ -82,7 +82,7 @@ describe("session board protocol fixtures", () => {
       { type: "actionOpened", action },
       { type: "actionOpened", action: codexAction },
       { type: "actionOpened", action: gateAction },
-      { type: "actionClosed", actionId: action.id },
+      { type: "actionClosed", actionId: action.id, outcome: "allowed" },
       { type: "tailResponse", requestId: "tail-1", lines: ["one", "two"] },
     ] as const;
 
@@ -104,6 +104,7 @@ describe("session board protocol fixtures", () => {
     expectRoundTrip(decisionRequestSchema, { verdict: "allow" });
     expectRoundTrip(decisionRequestSchema, { verdict: "option:2" });
     expectRoundTrip(sseEventSchema, { type: "snapshot", data: snapshot });
+    expectRoundTrip(sseEventSchema, { type: "actionClosed", data: { actionId: action.id, outcome: "allowed" } });
   });
 
   test("rejects invalid action details and option verdicts", () => {

@@ -50,16 +50,64 @@ export interface CodexKeystrokeExecutor {
   execute(action: PendingAction, verdict: Verdict): Promise<void>;
 }
 
-export class UnsupportedCodexKeystrokeExecutor implements CodexKeystrokeExecutor {
-  async execute(): Promise<void> {
-    throw new Error("Codex keystroke decisions are deferred to UNS-1305");
+type CodexOutcome = { actionId: string; outcome: "allowed" | "denied" | "stale" | "failed" };
+
+const CODEX_PROMPT = /Allow Codex to run|Yes,\s*proceed|don['’]t ask again for/i;
+
+export function isCodexApprovalPrompt(text: string) {
+  return CODEX_PROMPT.test(text) && !(/Goal blocked \(\/goal resume\)/i.test(text) && !/Allow Codex to run|Yes,\s*proceed/i.test(text));
+}
+
+function terminal(payload: unknown) {
+  return asRecord(asRecord(asRecord(payload)?.result)?.terminal);
+}
+
+function readFrame(result: Awaited<ReturnType<RunCommand>>, label: string) {
+  const value = terminal(parseCommandJson(result, label));
+  const tail = Array.isArray(value?.tail) ? value.tail.filter((line): line is string => typeof line === "string") : [];
+  return { text: tail.join("\n"), cursor: value?.nextCursor };
+}
+
+export class CodexTerminalExecutor implements CodexKeystrokeExecutor {
+  constructor(
+    private readonly run: RunCommand = runCommand,
+    private readonly onClosed: (outcome: CodexOutcome) => void | Promise<void> = () => {},
+  ) {}
+
+  async execute(action: PendingAction, verdict: Verdict): Promise<void> {
+    if (action.kind !== "codex-prompt") throw new Error("Codex executor requires a Codex prompt action");
+    const terminalHandle = action.sessionRef.paneKey;
+    let outcome: CodexOutcome["outcome"] = "failed";
+    try {
+      parseCommandJson(await this.run(["orca", "terminal", "wait", "--terminal", terminalHandle, "--for", "tui-idle", "--timeout-ms", "5000", "--json"]), "orca terminal wait");
+      const before = readFrame(await this.run(["orca", "terminal", "read", "--terminal", terminalHandle, "--json"]), "orca terminal read");
+      if (!isCodexApprovalPrompt(before.text) || !before.text.includes(action.detail.prompt)) {
+        outcome = "stale";
+        throw new Error("Codex approval prompt is no longer present");
+      }
+      const option = verdict.startsWith("option:") ? Number(verdict.slice(7)) : action.detail.options.findIndex((label) => verdict === "allow" ? /^yes\b/i.test(label) : /^no\b/i.test(label)) + 1;
+      const label = action.detail.options[option - 1];
+      if (!label || !new RegExp(`(?:^|\\n)\\s*${option}\\.\\s*${label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "i").test(before.text)) {
+        outcome = "stale";
+        throw new Error("Codex approval option no longer matches the expected prompt");
+      }
+      parseCommandJson(await this.run(["orca", "terminal", "send", "--terminal", terminalHandle, "--text", String(option), "--enter", "--json"]), "orca terminal send");
+      const afterArgs = ["orca", "terminal", "read", "--terminal", terminalHandle];
+      if (typeof before.cursor === "number" || typeof before.cursor === "string") afterArgs.push("--cursor", String(before.cursor));
+      afterArgs.push("--json");
+      const after = readFrame(await this.run(afterArgs), "orca terminal read confirmation");
+      if (isCodexApprovalPrompt(after.text)) throw new Error("Codex approval prompt was not consumed");
+      outcome = verdict === "deny" || (verdict.startsWith("option:") && /^no\b/i.test(label)) ? "denied" : "allowed";
+    } finally {
+      await this.onClosed({ actionId: action.id, outcome });
+    }
   }
 }
 
 export class DecisionExecutor {
   constructor(
     private readonly actions: () => ReadonlyMap<string, PendingAction>,
-    private readonly codex: CodexKeystrokeExecutor = new UnsupportedCodexKeystrokeExecutor(),
+    private readonly codex: CodexKeystrokeExecutor = new CodexTerminalExecutor(),
     private readonly run: RunCommand = runCommand,
   ) {}
 

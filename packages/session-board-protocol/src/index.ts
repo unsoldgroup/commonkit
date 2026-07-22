@@ -73,6 +73,20 @@ export const claudePermissionActionSchema = z
   .strict();
 export type ClaudePermissionAction = z.infer<typeof claudePermissionActionSchema>;
 
+export const claudeHookRequestSchema = z.object({
+  tool: z.string().min(1),
+  input: z.unknown(),
+  session: z.object({
+    id: idSchema,
+    cwd: z.string().min(1),
+    transcriptPath: z.string().optional(),
+  }).strict(),
+}).strict();
+export type ClaudeHookRequest = z.infer<typeof claudeHookRequestSchema>;
+
+export const claudeHookResponseSchema = z.object({ decision: z.enum(["allow", "deny"]) }).strict();
+export type ClaudeHookResponse = z.infer<typeof claudeHookResponseSchema>;
+
 export const codexPromptActionSchema = z
   .object({
     ...pendingActionBase,
@@ -179,7 +193,11 @@ export const actionOpenedMessageSchema = z
 export type ActionOpenedMessage = z.infer<typeof actionOpenedMessageSchema>;
 
 export const actionClosedMessageSchema = z
-  .object({ type: z.literal("actionClosed"), actionId: idSchema })
+  .object({
+    type: z.literal("actionClosed"),
+    actionId: idSchema,
+    outcome: z.enum(["allowed", "denied", "stale", "failed"]).optional(),
+  })
   .strict();
 export type ActionClosedMessage = z.infer<typeof actionClosedMessageSchema>;
 
@@ -222,7 +240,13 @@ export const sseEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("machine"), data: machineSchema }).strict(),
   z.object({ type: z.literal("session"), data: sessionSchema }).strict(),
   z.object({ type: z.literal("actionOpened"), data: pendingActionSchema }).strict(),
-  z.object({ type: z.literal("actionClosed"), data: z.object({ actionId: idSchema }).strict() }).strict(),
+  z.object({
+    type: z.literal("actionClosed"),
+    data: z.object({
+      actionId: idSchema,
+      outcome: z.enum(["allowed", "denied", "stale", "failed"]).optional(),
+    }).strict(),
+  }).strict(),
   z.object({ type: z.literal("decision"), data: decisionSchema }).strict(),
 ]);
 export type SseEvent = z.infer<typeof sseEventSchema>;

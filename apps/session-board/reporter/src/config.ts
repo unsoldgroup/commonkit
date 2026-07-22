@@ -7,6 +7,7 @@ interface FileConfig {
   machineToken?: string;
   machineId?: string;
   machineName?: string;
+  hookPort?: number;
 }
 
 export interface ReporterConfig {
@@ -14,6 +15,7 @@ export interface ReporterConfig {
   machineToken: string;
   machineId: string;
   machineName: string;
+  hookPort: number;
 }
 
 export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<ReporterConfig> {
@@ -31,5 +33,6 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     machineToken,
     machineId: env.SESSION_BOARD_MACHINE_ID ?? file.machineId ?? hostname(),
     machineName: env.SESSION_BOARD_MACHINE_NAME ?? file.machineName ?? hostname(),
+    hookPort: Number(env.SESSION_BOARD_HOOK_PORT ?? file.hookPort ?? 47821),
   };
 }

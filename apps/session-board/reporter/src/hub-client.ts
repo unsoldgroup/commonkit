@@ -37,6 +37,16 @@ export class HubClient {
 
   get actions(): ReadonlyMap<string, PendingAction> { return this.#actions; }
 
+  openAction(action: PendingAction) {
+    this.#actions.set(action.id, action);
+    if (this.#connected()) this.#send({ type: "actionOpened", action });
+  }
+
+  closeAction(actionId: string, outcome?: "allowed" | "denied" | "stale" | "failed") {
+    this.#actions.delete(actionId);
+    if (this.#connected()) this.#send({ type: "actionClosed", actionId, outcome });
+  }
+
   setSessions(sessions: Session[]) {
     const previous = this.#sessions;
     this.#sessions = new Map(sessions.map((session) => [key(session), session]));
@@ -47,11 +57,12 @@ export class HubClient {
   }
 
   setActions(actions: PendingAction[]) {
-    const previous = this.#actions;
-    this.#actions = new Map(actions.map((action) => [action.id, action]));
+    const previous = new Map(this.#actions);
+    for (const [id, action] of this.#actions) if (action.kind === "orca-gate" && !actions.some((candidate) => candidate.id === id)) this.#actions.delete(id);
+    for (const action of actions) this.#actions.set(action.id, action);
     if (!this.#connected()) return;
     for (const action of actions) if (JSON.stringify(previous.get(action.id)) !== JSON.stringify(action)) this.#send({ type: "actionOpened", action });
-    for (const id of previous.keys()) if (!this.#actions.has(id)) this.#send({ type: "actionClosed", actionId: id });
+    for (const [id, action] of previous) if (action.kind === "orca-gate" && !this.#actions.has(id)) this.#send({ type: "actionClosed", actionId: id });
   }
 
   start() { this.#connect(); }

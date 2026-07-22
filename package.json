@@ -9,12 +9,13 @@
   },
   "scripts": {
     "build": "pnpm --filter mcp-local-relay build && pnpm --filter @commonkit/session-board-protocol build",
-    "test": "pnpm run test:commonkit && pnpm run test:relay && pnpm run test:session-board-protocol && pnpm run test:session-board-hub && pnpm run test:session-board-reporter && pnpm run test:session-board-web",
+    "test": "pnpm run test:commonkit && pnpm run test:relay && pnpm run test:session-board-protocol && pnpm run test:session-board-hub && pnpm run test:session-board-reporter && pnpm run test:session-board-hook && pnpm run test:session-board-web",
     "test:commonkit": "node --test test/*.test.mjs",
     "test:relay": "pnpm --filter mcp-local-relay test",
     "test:session-board-protocol": "pnpm --filter @commonkit/session-board-protocol test",
     "test:session-board-hub": "pnpm --filter @commonkit/session-board-hub test",
     "test:session-board-reporter": "pnpm --filter @commonkit/session-board-reporter test",
+    "test:session-board-hook": "pnpm --filter @commonkit/session-board-hook test",
     "test:session-board-web": "pnpm --filter @commonkit/session-board-web test",
     "typecheck": "pnpm --filter mcp-local-relay typecheck && pnpm --filter @commonkit/session-board-protocol typecheck && pnpm --filter @commonkit/session-board-reporter typecheck && pnpm --filter @commonkit/session-board-web typecheck"
   },

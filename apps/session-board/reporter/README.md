@@ -1,6 +1,6 @@
 # Session Board Mac reporter
 
-The reporter runs on a Mac Target. It reads Orca session state, normalizes it to the shared board protocol, and dials outbound to the hub. It never opens an inbound listener.
+The reporter runs on a Mac Target. It reads Orca session state, normalizes it to the shared board protocol, and dials outbound to the hub. Its only inbound listener is the Claude hook endpoint bound to `127.0.0.1:47821`; no reporter port is exposed off-Target.
 
 ## Configure and run
 
@@ -11,6 +11,7 @@ export SESSION_BOARD_HUB_URL=https://board.unsold.cloud
 export SESSION_BOARD_MACHINE_TOKEN='<machine token>'
 export SESSION_BOARD_MACHINE_ID=studio
 export SESSION_BOARD_MACHINE_NAME='Studio Mac'
+export SESSION_BOARD_HOOK_PORT=47821
 pnpm --filter @commonkit/session-board-reporter start
 ```
 
@@ -18,7 +19,7 @@ Alternatively, set `SESSION_BOARD_CONFIG` to a JSON file containing `hubUrl`, `m
 
 The primary source reads `~/Library/Application Support/Orca/orca-runtime.json`, connects to its WebSocket endpoint with the runtime token, and probes the JSON-RPC command framing. If the runtime rejects that framing, is unreachable, or times out, the reporter automatically falls back to `orca worktree ps --json` every two seconds. Every hub reconnect sends a full snapshot before subsequent deltas.
 
-Open orchestration gates are polled with `orca orchestration gate-list`. A gate is resolved only after the hub sends a decision originating from a human board tap. Codex keystroke execution is an explicit unsupported stub pending UNS-1305. Nothing auto-approves. Claude permission handling belongs to the separate fail-open hook: timeout or hub failure must return control to the normal TUI prompt.
+Open orchestration gates are polled with `orca orchestration gate-list`. A gate is resolved only after the hub sends a decision originating from a human board tap. Codex decisions use a wait/read/verify/send/re-read loop and refuse stale or mismatched prompts. Nothing auto-approves. Claude permission handling uses the localhost hook endpoint; timeout or hub failure returns control to the normal TUI prompt.
 
 ## Refresh the captured fixture
 

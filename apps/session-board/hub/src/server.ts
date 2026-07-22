@@ -176,7 +176,7 @@ export function startHub(options: HubOptions): HubServer {
     const action = actions.get(message.actionId);
     if (action?.sessionRef.machineId === socket.data.machineId) {
       actions.delete(message.actionId);
-      publish({ type: "actionClosed", data: { actionId: message.actionId } });
+      publish({ type: "actionClosed", data: { actionId: message.actionId, outcome: message.outcome } });
     }
   };
 
