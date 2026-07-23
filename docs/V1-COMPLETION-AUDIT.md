@@ -1,7 +1,7 @@
 # CommonKit v1 completion audit
 
-Audit date: 2026-07-21
-Audit basis: the current `main` policy checkpoint. “Met locally” means the Rust production path, desktop contracts, and installed unsigned lifecycle pass on the macOS arm64 audit host; it does not substitute for production signing/notarization, a published updater, or manually recorded native multi-OS evidence. CommonKit does not use GitHub Actions, and GitHub-hosted status is not a completion or release gate.
+Audit date: 2026-07-23
+Audit basis: implementation commit `e25785d021a469f555c51258df9f51889372cbd8` on `main`. “Met locally” means the Rust production path, desktop contracts, and installed unsigned lifecycle pass on the macOS arm64 audit host; it does not substitute for production signing/notarization, a published updater, or manually recorded native multi-OS evidence. CommonKit does not use GitHub Actions, and GitHub-hosted status is not a completion or release gate.
 
 ## Core eight-flow status
 
@@ -29,10 +29,11 @@ The eight original CommonKit runtime goals are implemented and locally evidenced
 - `cargo test --workspace --all-features --locked`: passed, including provider isolation with temporary loopback access enabled for the test harness.
 - `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`: passed.
 - `pnpm test`: passed (25 CommonKit contracts and 15 relay contracts).
-- `pnpm --dir apps/desktop test`: 43 tests passed.
+- `pnpm --dir apps/desktop test`: 44 tests passed.
 - `pnpm --dir apps/desktop typecheck`: passed.
 - The APM real-binary and one chezmoi real-binary test remain explicitly opt-in because they require pinned external release binaries; their native platform matrix is not satisfied by the ordinary workspace run.
 - `scripts/installed-lifecycle.sh <isolated-scratch> target/debug`: passed on macOS arm64, including daemon install/restart, onboarding reload, provider plan/apply/verify, credential plan/apply/verify/redaction, scheduler enable/tick/disable, snapshot create/restore, fresh-process recovery, typed remote-helper execution, and uninstall.
+- `docs/evidence/eight-flow-macos-arm64-e25785d.json` binds that successful lifecycle to the exact implementation commit, platform, architecture, Node version, and SHA-256 digests of the four installed binaries. Future native runs use `scripts/qualify-eight-flows.sh` to emit the same secret-free format.
 - A local arm64 Tauri application bundle built successfully, passed strict ad-hoc code-signature verification after local signing, installed at `/Applications/CommonKit.app`, and remained running as a macOS accessory/status-bar process. Its application icon uses the same Ck geometry as the monochrome tray icon.
 - The isolated VPS acceptance run did not proceed: the previous VPS was decommissioned (its IP now presents unrelated host keys), so no VPS state was changed. Rerun against the current Hostinger VPS.
 

@@ -150,6 +150,41 @@ test("manual harness exercises an unsigned installed CLI and daemon lifecycle", 
   }
 });
 
+test("eight-flow qualification binds native evidence to commit and binary digests", async () => {
+  const qualifier = await read("scripts/qualify-eight-flows.sh");
+
+  assert.match(qualifier, /installed-lifecycle\.sh/);
+  assert.match(qualifier, /COMMONKIT_QUALIFICATION_COMMIT/);
+  assert.match(qualifier, /createHash\("sha256"\)/);
+  assert.match(qualifier, /process\.platform/);
+  assert.match(qualifier, /process\.arch/);
+  assert.match(qualifier, /result.*passed/s);
+  assert.doesNotMatch(qualifier, /set -x/);
+});
+
+test("committed macOS eight-flow evidence is complete and content-addressed", async () => {
+  const evidence = JSON.parse(
+    await read("docs/evidence/eight-flow-macos-arm64-e25785d.json"),
+  );
+
+  assert.match(evidence.commit, /^[0-9a-f]{40}$/);
+  assert.equal(evidence.platform, "darwin");
+  assert.equal(evidence.architecture, "arm64");
+  assert.equal(evidence.result, "passed");
+  assert.deepEqual(
+    Object.keys(evidence.binaries).sort(),
+    [
+      "commonkit",
+      "commonkit-snapshot-recovery-fixture",
+      "commonkit-target-helper",
+      "commonkitd",
+    ],
+  );
+  for (const digest of Object.values(evidence.binaries)) {
+    assert.match(digest, /^sha256:[0-9a-f]{64}$/);
+  }
+});
+
 test("release artifacts include and verify the target helper on every platform", async () => {
   const [builder, verifier, desktop] = await Promise.all([
     read("scripts/build-release-cli.sh"),

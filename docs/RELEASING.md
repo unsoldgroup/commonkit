@@ -37,8 +37,12 @@ injected only into the release command; they are never committed or logged.
    updater manifest with `scripts/assemble-updater-manifest.mjs`, and validate
    the complete set with `scripts/verify-release-assets.mjs`.
 8. Publish the two versioned release candidates to the chosen artifact store.
-9. Run `scripts/installed-lifecycle.sh` plus the signed two-version updater
-   lifecycle manually on macOS, Linux, and Windows.
+9. Set `COMMONKIT_QUALIFICATION_COMMIT` to the exact source commit and run
+   `scripts/qualify-eight-flows.sh <evidence-root> <installed-bin>` on macOS,
+   Linux, and Windows. It executes `scripts/installed-lifecycle.sh` in an
+   isolated scratch directory and records the native platform, architecture,
+   commit, result, and binary SHA-256 digests. Then run the signed two-version
+   updater lifecycle on each platform.
 10. Record the platform, architecture, artifact digests, commands, and results
     in the release evidence.
 
