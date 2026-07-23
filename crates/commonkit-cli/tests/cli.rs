@@ -1,7 +1,11 @@
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::process::Command;
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use commonkit_service::{ControlToken, DaemonDiscovery};
 use serde_json::{Value, json};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -49,6 +53,66 @@ fn reports_versioned_machine_readable_status() {
     assert_eq!(status["contractVersion"], "1.0");
     assert_eq!(status["schemaVersion"], 1);
     assert!(status["stateDirectory"].as_str().is_some());
+}
+
+#[test]
+fn sync_help_exposes_explicit_fetch_before_plan() {
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["sync", "--help"])
+        .output()
+        .expect("sync help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--fetch"), "{stdout}");
+}
+
+#[test]
+fn sync_fetch_sends_one_fetch_bound_plan_request_and_never_applies() {
+    let root = tempfile::tempdir().unwrap();
+    let mut status = Command::new(env!("CARGO_BIN_EXE_commonkit"));
+    isolate_app_paths(&mut status, root.path());
+    let status: Value = serde_json::from_slice(&status.arg("status").output().unwrap().stdout)
+        .expect("status JSON");
+    let config = std::path::PathBuf::from(status["configDirectory"].as_str().unwrap());
+    let state = std::path::PathBuf::from(status["stateDirectory"].as_str().unwrap());
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+    let token = ControlToken::load_or_create(&config.join("control.token")).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    DaemonDiscovery::new(port, None, &token)
+        .unwrap()
+        .persist(&state.join("daemon.json"))
+        .unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 8192];
+        let length = stream.read(&mut request).unwrap();
+        let request = String::from_utf8_lossy(&request[..length]);
+        assert!(request.starts_with("POST /control/v1/sync/plan "));
+        assert!(request.contains(r#""fetch":true"#), "{request}");
+        assert!(!request.contains("/apply"));
+        let body = r#"{"planId":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_commonkit"));
+    isolate_app_paths(&mut command, root.path());
+    let output = command
+        .args(["sync", "--fetch", "--confirmed"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
 }
 
 #[test]

@@ -31,17 +31,49 @@ export COMMONKIT_SERVICE_ROOT="$scratch/service"
 export COMMONKIT_RELAY_PORT=0
 mkdir -p "$HOME"
 
-zero_digest=sha256:0000000000000000000000000000000000000000000000000000000000000000
-cat > "$scratch/source/layers/public-base.json" <<JSON
-{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"$zero_digest"},"spec":{}}
-JSON
-cat > "$scratch/source/layers/organization-policy.json" <<JSON
-{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"$zero_digest"},"spec":{}}
-JSON
 printf 'installed lifecycle fixture\n' > "$scratch/source/portable/editor.conf"
-cat > "$scratch/source/layers/personal.json" <<JSON
-{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"$zero_digest"},"spec":{"files":[{"path":"portable/editor.conf","source":"portable/editor.conf"}]}}
-JSON
+node - "$scratch/source/layers" <<'JS'
+const { createHash } = require("node:crypto");
+const { writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+
+const layersRoot = process.argv[2];
+const canonical = (value) => {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object") {
+    const entries = Object.keys(value).sort().map(
+      (key) => `${JSON.stringify(key)}:${canonical(value[key])}`,
+    );
+    return `{${entries.join(",")}}`;
+  }
+  return JSON.stringify(value);
+};
+const writeLayer = (name, kind, spec) => {
+  const layer = {
+    schemaVersion: 1,
+    id: name,
+    kind,
+    source: {
+      path: `layers/${name}.json`,
+      revision: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    },
+    spec,
+  };
+  const digest = createHash("sha256")
+    .update("commonkit.layer-content.v1")
+    .update(Buffer.from([0]))
+    .update(canonical(layer))
+    .digest("hex");
+  layer.source.contentDigest = `sha256:${digest}`;
+  writeFileSync(join(layersRoot, `${name}.json`), `${JSON.stringify(layer)}\n`);
+};
+
+writeLayer("public-base", "public_base", {});
+writeLayer("organization-policy", "organization_policy", {});
+writeLayer("personal", "personal_kit", {
+  files: [{ path: "portable/editor.conf", source: "portable/editor.conf" }],
+});
+JS
 git -C "$scratch/source" init --quiet
 git -C "$scratch/source" config user.email commonkit-ci@example.invalid
 git -C "$scratch/source" config user.name CommonKit-CI
@@ -178,12 +210,24 @@ plan_json="$scratch/plan.json"
 plan_id=$(node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(p.planId ?? p.id)' "$plan_json")
 "$commonkit" diff "$plan_id" >/dev/null
 "$commonkit" apply "$plan_id" --confirmed > "$scratch/apply.json"
+apply_run_id=$(node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));if(!p.runId)process.exit(1);process.stdout.write(p.runId)' "$scratch/apply.json")
 for _ in $(seq 1 150); do
-  if "$commonkit" verify >/dev/null 2>&1; then verified=1; break; fi
+  if "$commonkit" verify >/dev/null 2>&1 &&
+    cmp -s "$scratch/source/portable/editor.conf" "$scratch/target/portable/editor.conf"; then
+    verified=1
+    break
+  fi
   sleep 0.1
 done
 test "${verified:-}" = 1
 cmp "$scratch/source/portable/editor.conf" "$scratch/target/portable/editor.conf"
+
+# Exercise explicit receipt-bound rollback through the installed CLI and daemon
+# and prove the exact absent preimage was restored. A rolled-back plan remains
+# idempotently bound to its original confirmation and is not silently re-run.
+"$commonkit" rollback "$apply_run_id" --confirmed > "$scratch/rollback.json"
+node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));if(p.outcome!=="rolledback"||p.runId!==process.argv[2])process.exit(1)' "$scratch/rollback.json" "$apply_run_id"
+test ! -e "$scratch/target/portable/editor.conf"
 
 # The same authenticated atomic reload used by Desktop must adopt mutable-state
 # configuration without replacing either an owned or service-manager-owned process.

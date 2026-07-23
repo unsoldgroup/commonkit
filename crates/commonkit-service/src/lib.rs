@@ -122,6 +122,57 @@ pub struct SchedulerConfig {
     pub interval_seconds: u64,
 }
 
+pub const MIN_SCHEDULE_INTERVAL_SECONDS: u64 = 1;
+pub const MAX_SCHEDULE_INTERVAL_SECONDS: u64 = 86_400;
+pub const DEFAULT_DRIFT_CHECK_TIMEOUT_SECONDS: u64 = 30;
+
+fn validate_scheduler_interval(interval_seconds: u64) -> Result<(), SchedulerError> {
+    if interval_seconds < MIN_SCHEDULE_INTERVAL_SECONDS {
+        return Err(SchedulerError::IntervalTooShort);
+    }
+    if interval_seconds > MAX_SCHEDULE_INTERVAL_SECONDS {
+        return Err(SchedulerError::IntervalTooLong);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CompletedDriftCheck {
+    checked_at_unix_ms: u128,
+    state: OverallState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SchedulerState {
+    enabled: bool,
+    interval_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_completed_check: Option<CompletedDriftCheck>,
+}
+
+impl SchedulerState {
+    fn config(&self) -> SchedulerConfig {
+        SchedulerConfig {
+            enabled: self.enabled,
+            interval_seconds: self.interval_seconds,
+        }
+    }
+}
+
+impl From<SchedulerConfig> for SchedulerState {
+    fn from(config: SchedulerConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            interval_seconds: config.interval_seconds,
+            last_completed_check: None,
+        }
+    }
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
@@ -174,13 +225,19 @@ impl SchedulerStore {
     }
 
     fn load(&self) -> Result<SchedulerConfig, SchedulerError> {
+        let config = self.load_state()?.config();
+        validate_scheduler_interval(config.interval_seconds)?;
+        Ok(config)
+    }
+
+    fn load_state(&self) -> Result<SchedulerState, SchedulerError> {
         match std::fs::symlink_metadata(&self.path) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
                 Err(SchedulerError::UnsafeState)
             }
             Ok(_) => Ok(serde_json::from_slice(&std::fs::read(&self.path)?)?),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(SchedulerConfig::default())
+                Ok(SchedulerConfig::default().into())
             }
             Err(error) => Err(error.into()),
         }
@@ -188,7 +245,23 @@ impl SchedulerStore {
 
     fn save(&self, config: SchedulerConfig) -> Result<(), SchedulerError> {
         let _save_guard = self.save_lock.lock().expect("scheduler save lock");
-        let bytes = serde_json::to_vec(&config)?;
+        let mut state = self.load_state()?;
+        state.enabled = config.enabled;
+        state.interval_seconds = config.interval_seconds;
+        self.persist_state(&state)?;
+        self.updates.send_replace(config);
+        Ok(())
+    }
+
+    fn save_completed_check(&self, check: CompletedDriftCheck) -> Result<(), SchedulerError> {
+        let _save_guard = self.save_lock.lock().expect("scheduler save lock");
+        let mut state = self.load_state()?;
+        state.last_completed_check = Some(check);
+        self.persist_state(&state)
+    }
+
+    fn persist_state(&self, state: &SchedulerState) -> Result<(), SchedulerError> {
+        let bytes = serde_json::to_vec(state)?;
         let (temporary, mut file) = loop {
             let sequence = SCHEDULER_TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let temporary =
@@ -221,7 +294,6 @@ impl SchedulerStore {
             let _ = std::fs::remove_file(&temporary);
         }
         result.map_err(SchedulerError::from)?;
-        self.updates.send_replace(config);
         Ok(())
     }
 
@@ -256,8 +328,14 @@ fn sync_directory(path: &Path) -> Result<(), std::io::Error> {
 pub enum SchedulerError {
     #[error("scheduler state is not a regular file")]
     UnsafeState,
-    #[error("scheduler interval must be at least one second")]
-    InvalidInterval,
+    #[error("scheduler interval must be at least {MIN_SCHEDULE_INTERVAL_SECONDS} second")]
+    IntervalTooShort,
+    #[error("scheduler interval must not exceed {MAX_SCHEDULE_INTERVAL_SECONDS} seconds")]
+    IntervalTooLong,
+    #[error("scheduler status is busy during durable-state restoration")]
+    StatusUnavailable,
+    #[error("scheduler drift-check timeout must be positive")]
+    InvalidCheckTimeout,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -283,6 +361,8 @@ pub struct DriftScheduler<C> {
     configuration: Arc<tokio::sync::watch::Sender<SchedulerConfig>>,
     store: Option<SchedulerStore>,
     running: AtomicBool,
+    worker_running: Arc<AtomicBool>,
+    check_timeout: Duration,
 }
 
 impl<C: DriftChecker> DriftScheduler<C> {
@@ -295,6 +375,8 @@ impl<C: DriftChecker> DriftScheduler<C> {
             configuration: Arc::new(configuration),
             store: None,
             running: AtomicBool::new(false),
+            worker_running: Arc::new(AtomicBool::new(false)),
+            check_timeout: Duration::from_secs(DEFAULT_DRIFT_CHECK_TIMEOUT_SECONDS),
         }
     }
 
@@ -304,8 +386,18 @@ impl<C: DriftChecker> DriftScheduler<C> {
         events: EventHub,
         store: SchedulerStore,
     ) -> Result<Self, SchedulerError> {
-        let configuration = store.load()?;
+        let persisted = store.load_state()?;
+        let configuration = persisted.config();
+        validate_scheduler_interval(configuration.interval_seconds)?;
         store.updates.send_replace(configuration);
+        if let Some(check) = persisted.last_completed_check {
+            let mut restored = status
+                .try_write()
+                .map_err(|_| SchedulerError::StatusUnavailable)?;
+            restored.state = check.state;
+            restored.last_drift_check_unix_ms = Some(check.checked_at_unix_ms);
+            restored.last_drift_error_code = check.code;
+        }
         Ok(Self {
             checker,
             status,
@@ -313,7 +405,17 @@ impl<C: DriftChecker> DriftScheduler<C> {
             configuration: store.updates.clone(),
             store: Some(store),
             running: AtomicBool::new(false),
+            worker_running: Arc::new(AtomicBool::new(false)),
+            check_timeout: Duration::from_secs(DEFAULT_DRIFT_CHECK_TIMEOUT_SECONDS),
         })
+    }
+
+    pub fn with_check_timeout(mut self, timeout: Duration) -> Result<Self, SchedulerError> {
+        if timeout.is_zero() {
+            return Err(SchedulerError::InvalidCheckTimeout);
+        }
+        self.check_timeout = timeout;
+        Ok(self)
     }
 
     pub fn configuration(&self) -> SchedulerConfig {
@@ -321,9 +423,7 @@ impl<C: DriftChecker> DriftScheduler<C> {
     }
 
     pub fn enable(&self, interval: Duration) -> Result<(), SchedulerError> {
-        if interval.as_secs() == 0 {
-            return Err(SchedulerError::InvalidInterval);
-        }
+        validate_scheduler_interval(interval.as_secs())?;
         self.update_configuration(SchedulerConfig {
             enabled: true,
             interval_seconds: interval.as_secs(),
@@ -371,10 +471,61 @@ impl<C: DriftChecker> DriftScheduler<C> {
             }
         }
         let _reset = Reset(&self.running);
-        let result = self.checker.check();
+        let mut result = if self
+            .worker_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            DriftResult {
+                state: OverallState::Degraded,
+                code: Some("drift_check_worker_still_running".into()),
+            }
+        } else {
+            let checker = self.checker.clone();
+            let worker_running = self.worker_running.clone();
+            match tokio::time::timeout(
+                self.check_timeout,
+                tokio::task::spawn_blocking(move || {
+                    struct ResetWorker(Arc<AtomicBool>);
+                    impl Drop for ResetWorker {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::Release);
+                        }
+                    }
+                    let _reset = ResetWorker(worker_running);
+                    checker.check()
+                }),
+            )
+            .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(_)) => DriftResult {
+                    state: OverallState::Degraded,
+                    code: Some("drift_check_failed".into()),
+                },
+                Err(_) => DriftResult {
+                    state: OverallState::Degraded,
+                    code: Some("drift_check_timeout".into()),
+                },
+            }
+        };
         let checked_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |duration| duration.as_millis());
+        if self.store.as_ref().is_some_and(|store| {
+            store
+                .save_completed_check(CompletedDriftCheck {
+                    checked_at_unix_ms: checked_at,
+                    state: result.state,
+                    code: result.code.clone(),
+                })
+                .is_err()
+        }) {
+            result = DriftResult {
+                state: OverallState::Degraded,
+                code: Some("scheduler_state_persist_failed".into()),
+            };
+        }
         {
             let mut status = self.status.write().await;
             status.state = result.state;
@@ -961,6 +1112,7 @@ pub enum ApplyStatus {
 pub struct ApplyOperation {
     pub id: Sha256Digest,
     pub plan_id: Sha256Digest,
+    pub run_id: StableId,
     pub status: ApplyStatus,
     pub failure_code: Option<StableId>,
 }
@@ -1942,9 +2094,7 @@ impl ControlPlane {
         &self,
         config: SchedulerConfig,
     ) -> Result<SchedulerConfig, SchedulerError> {
-        if config.enabled && config.interval_seconds == 0 {
-            return Err(SchedulerError::InvalidInterval);
-        }
+        validate_scheduler_interval(config.interval_seconds)?;
         if let Some(store) = self
             .inner
             .scheduler_store
@@ -2031,6 +2181,7 @@ impl ControlPlane {
                 "idempotencyKey": idempotency_key,
             }),
         )?;
+        let run_id = durable_run_id(&plan.id, confirmation_id)?;
 
         {
             let mut keys = self.inner.idempotency.lock().expect("idempotency lock");
@@ -2046,6 +2197,7 @@ impl ControlPlane {
             let running = ApplyOperation {
                 id: operation_id.clone(),
                 plan_id: plan_id.clone(),
+                run_id,
                 status: ApplyStatus::Running,
                 failure_code: None,
             };
@@ -2177,6 +2329,8 @@ impl ControlPlane {
             executor.execute_bound(&job.plan, &job.confirmation_id, &job.idempotency_key);
         let completed = ApplyOperation {
             id: job.operation_id.clone(),
+            run_id: durable_run_id(&job.plan.id, &job.confirmation_id)
+                .expect("validated plan and confirmation produce a durable run ID"),
             plan_id: job.plan.id,
             status: execution.status,
             failure_code: execution.failure_code,
@@ -3079,9 +3233,18 @@ fn domain_error(error: DomainFailure) -> ApiError {
 
 async fn sync_plan(
     State(state): State<ApiState>,
-    Json(request): Json<Value>,
+    Json(mut request): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     require_consent(&request)?;
+    let fetch = match request.get("fetch") {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| ApiError::bad_request("invalid_fetch"))?,
+        None => false,
+    };
+    if let Some(object) = request.as_object_mut() {
+        object.remove("fetch");
+    }
     let domain = state
         .control
         .inner
@@ -3092,6 +3255,18 @@ async fn sync_plan(
         .sync
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
+    if fetch {
+        let git = domain.git_sync(true).map_err(domain_error)?;
+        assert_no_embedded_secrets(&git)
+            .map_err(|_| ApiError::internal("unsafe_domain_response"))?;
+        match git.get("state").and_then(Value::as_str) {
+            Some("clean" | "ahead") => {}
+            Some("dirty" | "behind" | "diverged") => {
+                return Err(ApiError::conflict("git_sync_not_plannable"));
+            }
+            _ => return Err(ApiError::internal("invalid_git_sync_response")),
+        }
+    }
     safe_domain_result(domain.plan(request))
 }
 
@@ -3315,7 +3490,10 @@ async fn update_schedule(
         .update_scheduler(config)
         .map(Json)
         .map_err(|error| match error {
-            SchedulerError::InvalidInterval => ApiError::bad_request("invalid_schedule_interval"),
+            SchedulerError::IntervalTooShort => {
+                ApiError::bad_request("schedule_interval_too_short")
+            }
+            SchedulerError::IntervalTooLong => ApiError::bad_request("schedule_interval_too_long"),
             _ => ApiError::internal("scheduler_state_invalid"),
         })
 }

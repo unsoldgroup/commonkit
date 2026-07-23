@@ -11,7 +11,9 @@ use commonkit_adapters::{
     NormalizedManagedPath, NormalizedResource, OwnershipRules, ProviderContext, ProviderInputs,
     ProviderPlanRequest, ProviderWorkspace, ResourceProvenance, build_provider_plan,
 };
-use commonkit_config::{LayerSet, compose_layers, v1_merge_rules};
+use commonkit_config::{
+    LayerSet, compose_layers, layer_content_digest, v1_merge_rules, validate_layer_content_digest,
+};
 use commonkit_contracts::{
     LayerDocument, LayerKind, SecurityPolicy, Sha256Digest, StableId, assert_no_embedded_secrets,
     digest_domain_json,
@@ -1337,17 +1339,18 @@ fn write_starter_layer(
         path.parent()
             .ok_or_else(|| OnboardingError::UnsafePath(path.into()))?,
     )?;
-    let document = json!({
+    let mut document: LayerDocument = serde_json::from_value(json!({
         "schemaVersion": 1,
         "id": loadout,
         "kind": kind,
         "source": {
             "path": format!("layers/{loadout}.json"),
             "revision": "0000000000000000000000000000000000000000",
-            "contentDigest": digest_domain_json("commonkit.onboarding.layer.v1", &json!({}))?,
+            "contentDigest": format!("sha256:{}", "0".repeat(64)),
         },
         "spec": {},
-    });
+    }))?;
+    document.source.content_digest = layer_content_digest(&document)?;
     write_new_json(path, &document)
 }
 
@@ -1365,6 +1368,7 @@ fn validate_selected_layer(
     if &document.id != loadout || document.kind != kind {
         return Err(OnboardingError::LoadoutMismatch);
     }
+    validate_layer_content_digest(&document)?;
     Ok(())
 }
 
@@ -1373,7 +1377,9 @@ fn validate_selected_composition(layer_paths: &[PathBuf]) -> Result<(), Onboardi
     for path in layer_paths {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
         assert_no_embedded_secrets(&value)?;
-        documents.push(serde_json::from_value::<LayerDocument>(value)?);
+        let document = serde_json::from_value::<LayerDocument>(value)?;
+        validate_layer_content_digest(&document)?;
+        documents.push(document);
     }
     let layers = LayerSet::new(documents)?;
     let composition = compose_layers(&layers, &v1_merge_rules())?;
@@ -2166,6 +2172,8 @@ pub enum OnboardingError {
     LayerSet(#[from] commonkit_config::LayerSetError),
     #[error(transparent)]
     Composition(#[from] commonkit_config::ComposeError),
+    #[error(transparent)]
+    LayerIntegrity(#[from] commonkit_config::LayerIntegrityError),
     #[error(transparent)]
     Policy(#[from] commonkit_core::PolicyViolation),
     #[error(transparent)]

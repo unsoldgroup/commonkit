@@ -55,7 +55,8 @@ test("review explains safety and escapes every user-controlled value", () => {
   draft.repositoryName = `<script>alert(1)</script>`;
   draft.computerName = `mac"><img src=x>`;
   const html = onboardingPanel(state({ step: 4, auth: { state: "authenticated", login: "astemarie" }, draft }));
-  assert.match(html, /Nothing on this computer changes yet/);
+  assert.match(html, /Managed settings are not applied yet/);
+  assert.match(html, /save this setup locally/i);
   assert.match(html, /Prepare setup preview/);
   assert.doesNotMatch(html, /<script>|<img/);
 });

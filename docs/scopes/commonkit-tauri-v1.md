@@ -131,6 +131,14 @@ Organization security constraints are stored separately from ordinary desired va
 
 Composition emits a clean normalized document plus a sidecar trace and lockfile. `commonkit explain <json-pointer>` reports the winning value, every contributing layer, merge operation, source revision, and governing policy.
 
+The v1 layer `spec` is a closed CommonKit-owned envelope. Its top-level
+vocabulary is published in `schemas/layer.schema.json` and includes
+provider-backed `capabilities` such as `capabilities.agentContext`. Unknown
+top-level fields fail closed. Provider- or adapter-owned payloads remain nested
+inside their named capability, adapter, hook, or plugin envelope and are
+validated by that provider's version-pinned contract rather than by a second
+CommonKit package-policy language.
+
 ## Runtime architecture
 
 ```text
@@ -467,13 +475,16 @@ Exit: all 12 v1 flows pass on the declared platform matrix; release artifacts in
 
 These do not block Phase 0 contract work but must be resolved before their owning phase:
 
-1. GitHub authentication: GitHub CLI first, or GitHub App/device flow in v1.
-2. Snapshot backend: Cloudflare R2 as the default S3-compatible provider, or provider-neutral setup only.
-3. External secret manager included in v1.
-4. Relay authority: CommonKit-owned subset with explicit prune is recommended.
-5. Relay upstream validation: strict for changed endpoints/auth, deferred option for offline targets.
-6. Remote Windows transport: OpenSSH, WinRM, both, or local-only v1.
-7. Initial Linux packaging/support matrix beyond AppImage and Debian-family packages.
+GitHub authentication is resolved for v1: CommonKit uses the installed GitHub
+CLI as its credential broker and repository-provisioning client. CommonKit does
+not store GitHub OAuth credentials in portable state.
+
+1. Snapshot backend: Cloudflare R2 as the default S3-compatible provider, or provider-neutral setup only.
+2. External secret manager included in v1.
+3. Relay authority: CommonKit-owned subset with explicit prune is recommended.
+4. Relay upstream validation: strict for changed endpoints/auth, deferred option for offline targets.
+5. Remote Windows transport: OpenSSH, WinRM, both, or local-only v1.
+6. Initial Linux packaging/support matrix beyond AppImage and Debian-family packages.
 
 ## Implementation start gate
 

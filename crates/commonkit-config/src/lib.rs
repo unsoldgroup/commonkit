@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use commonkit_contracts::{
     CommonKitLock, ContractError, Contribution, LayerDocument, LayerKind, LockedLayer,
-    MergeOperation, ProvenanceTrace, SCHEMA_VERSION, SchemaVersion, Sha256Digest, TraceEntry,
-    canonical_json, digest_json,
+    MergeOperation, ProvenanceTrace, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
+    TraceEntry, V1_LAYER_SPEC_FIELDS, canonical_json, digest_domain_json, digest_json,
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -18,6 +18,7 @@ impl LayerSet {
     pub fn new(mut layers: Vec<LayerDocument>) -> Result<Self, LayerSetError> {
         let mut seen = BTreeSet::new();
         for layer in &layers {
+            validate_v1_spec(&layer.spec)?;
             if !seen.insert(layer.kind) {
                 return Err(LayerSetError::DuplicateKind(layer.kind));
             }
@@ -36,11 +37,115 @@ impl LayerSet {
     }
 }
 
+fn validate_v1_spec(spec: &Value) -> Result<(), LayerSetError> {
+    let object = spec.as_object().ok_or(LayerSetError::SpecMustBeObject)?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !V1_LAYER_SPEC_FIELDS.contains(&field.as_str()))
+    {
+        return Err(LayerSetError::UnknownSpecField {
+            field: field.clone(),
+        });
+    }
+    for field in ["arguments", "requirements", "denials", "files"] {
+        if object.get(field).is_some_and(|value| !value.is_array()) {
+            return Err(LayerSetError::InvalidSpecFieldType {
+                field: field.into(),
+                expected: "array",
+            });
+        }
+    }
+    if object
+        .get("securityPolicy")
+        .is_some_and(|value| !value.is_object())
+    {
+        return Err(LayerSetError::InvalidSpecFieldType {
+            field: "securityPolicy".into(),
+            expected: "object",
+        });
+    }
+    for field in ["capabilities", "relay", "settings"] {
+        if object.get(field).is_some_and(|value| !value.is_object()) {
+            return Err(LayerSetError::InvalidSpecFieldType {
+                field: field.into(),
+                expected: "object",
+            });
+        }
+    }
+    if object.get("theme").is_some_and(|value| !value.is_string()) {
+        return Err(LayerSetError::InvalidSpecFieldType {
+            field: "theme".into(),
+            expected: "string",
+        });
+    }
+    for field in ["adapters", "hooks", "plugins", "targets"] {
+        let Some(value) = object.get(field) else {
+            continue;
+        };
+        let items = value
+            .as_array()
+            .ok_or_else(|| LayerSetError::InvalidSpecFieldType {
+                field: field.into(),
+                expected: "array",
+            })?;
+        let mut ids = BTreeSet::new();
+        for item in items {
+            let id = item
+                .as_object()
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| LayerSetError::MissingSpecItemId {
+                    field: field.into(),
+                })?;
+            StableId::parse(id).map_err(|_| LayerSetError::InvalidSpecItemId {
+                field: field.into(),
+                id: id.into(),
+            })?;
+            if !ids.insert(id) {
+                return Err(LayerSetError::DuplicateSpecItemId {
+                    field: field.into(),
+                    id: id.into(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 pub struct CompositionResult {
     pub spec: Value,
     pub spec_digest: Sha256Digest,
     pub trace: ProvenanceTrace,
     pub lock: CommonKitLock,
+}
+
+/// Computes the canonical digest of a layer without including the digest field
+/// itself. Formatting differences in the source file do not change this value;
+/// every typed semantic field, including source path and revision, does.
+pub fn layer_content_digest(layer: &LayerDocument) -> Result<Sha256Digest, ContractError> {
+    let mut value = serde_json::to_value(layer).map_err(|_| ContractError::Canonicalization)?;
+    value
+        .get_mut("source")
+        .and_then(Value::as_object_mut)
+        .and_then(|source| source.remove("contentDigest"))
+        .ok_or(ContractError::Canonicalization)?;
+    digest_domain_json("commonkit.layer-content.v1", &value)
+}
+
+pub fn validate_layer_content_digest(layer: &LayerDocument) -> Result<(), LayerIntegrityError> {
+    let actual = layer_content_digest(layer)?;
+    if actual != layer.source.content_digest {
+        return Err(LayerIntegrityError::ContentDigestMismatch);
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+pub enum LayerIntegrityError {
+    #[error("layer content digest does not match canonical content")]
+    ContentDigestMismatch,
+    #[error(transparent)]
+    Contract(#[from] ContractError),
 }
 
 pub fn compose_layers(
@@ -169,6 +274,21 @@ pub enum LayerSetError {
     MissingRequired(LayerKind),
     #[error("layer kind appears more than once: {0:?}")]
     DuplicateKind(LayerKind),
+    #[error("layer spec must be an object")]
+    SpecMustBeObject,
+    #[error("unknown CommonKit v1 spec field: {field}")]
+    UnknownSpecField { field: String },
+    #[error("CommonKit v1 spec field {field} must be {expected}")]
+    InvalidSpecFieldType {
+        field: String,
+        expected: &'static str,
+    },
+    #[error("CommonKit v1 spec collection {field} requires an ID on every item")]
+    MissingSpecItemId { field: String },
+    #[error("CommonKit v1 spec collection {field} contains invalid ID {id}")]
+    InvalidSpecItemId { field: String, id: String },
+    #[error("CommonKit v1 spec collection {field} contains duplicate ID {id}")]
+    DuplicateSpecItemId { field: String, id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,10 +402,16 @@ fn merge_value(
         MergeStrategy::Replace => Ok(Some(overlay.clone())),
         MergeStrategy::RecursiveMap => {
             let Some(base) = base.as_object() else {
-                return Ok(Some(overlay.clone()));
+                return Err(MergeError::StrategyTypeMismatch {
+                    pointer: pointer.into(),
+                    expected: "object",
+                });
             };
             let Some(overlay) = overlay.as_object() else {
-                return Ok(Some(Value::Object(base.clone())));
+                return Err(MergeError::StrategyTypeMismatch {
+                    pointer: pointer.into(),
+                    expected: "object",
+                });
             };
             let mut merged = base.clone();
             for (key, value) in overlay {
@@ -343,10 +469,23 @@ fn merge_by_id(
     let mut result = base.clone();
     let mut positions = BTreeMap::new();
     for (index, value) in result.iter().enumerate() {
-        positions.insert(item_id(value, pointer, id_key)?, index);
+        let id = item_id(value, pointer, id_key)?;
+        if positions.insert(id.clone(), index).is_some() {
+            return Err(MergeError::DuplicateItemId {
+                pointer: pointer.into(),
+                id,
+            });
+        }
     }
+    let mut overlay_ids = BTreeSet::new();
     for value in overlay {
         let id = item_id(value, pointer, id_key)?;
+        if !overlay_ids.insert(id.clone()) {
+            return Err(MergeError::DuplicateItemId {
+                pointer: pointer.into(),
+                id,
+            });
+        }
         if let Some(index) = positions.get(&id).copied() {
             let item_pointer = format!("{pointer}/{id}");
             result[index] =
@@ -396,6 +535,8 @@ pub enum MergeError {
     },
     #[error("merge-by-ID at {pointer} requires string key {id_key}")]
     MissingItemId { pointer: String, id_key: String },
+    #[error("merge-by-ID at {pointer} contains duplicate ID {id}")]
+    DuplicateItemId { pointer: String, id: String },
     #[error("canonicalization failed during set union")]
     Canonicalization,
 }
@@ -405,7 +546,8 @@ impl MergeError {
         match self {
             Self::DeleteNotAllowed { pointer }
             | Self::StrategyTypeMismatch { pointer, .. }
-            | Self::MissingItemId { pointer, .. } => pointer,
+            | Self::MissingItemId { pointer, .. }
+            | Self::DuplicateItemId { pointer, .. } => pointer,
             Self::Canonicalization => "",
         }
     }

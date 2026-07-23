@@ -127,6 +127,70 @@ fn production_registry_resolves_bws_only_during_confirmed_apply_without_leaking_
 
 #[cfg(unix)]
 #[test]
+fn credential_verify_uses_the_applied_receipt_without_resolving_the_provider_again() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let runner = root.join("bws-fixture");
+    std::fs::write(
+        &runner,
+        "#!/bin/sh\nprintf '%s' '{\"value\":\"verify-without-provider\"}'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&runner, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config_path = root.join("headless.json");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec(&serde_json::json!({
+            "credentials": {
+                "root": root.join("credentials"),
+                "bwsExecutable": runner,
+                "destinations": [{
+                    "id":"api-token",
+                    "reference":"bws://secret-id",
+                    "path":"tokens/api"
+                }]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let registry = ProductionDomainRegistry::load(
+        &config_path,
+        Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap();
+    let domain = registry.credentials.unwrap();
+    let plan = domain
+        .plan(serde_json::json!({"destinationIds":["api-token"]}))
+        .unwrap();
+    domain
+        .apply(serde_json::json!({
+            "planId":plan["planId"],
+            "confirmed":true,
+            "confirmationId":"credential-verify-test"
+        }))
+        .unwrap();
+
+    std::fs::remove_file(&runner).unwrap();
+    assert_eq!(
+        domain
+            .verify(serde_json::json!({"destinationIds":["api-token"]}))
+            .unwrap()["verified"],
+        serde_json::json!(["api-token"])
+    );
+
+    std::fs::write(root.join("credentials/tokens/api"), b"changed-after-apply").unwrap();
+    assert_eq!(
+        domain.verify(serde_json::json!({"destinationIds":["api-token"]})),
+        Err(DomainFailure::VerificationFailed)
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn credential_apply_rejects_a_plan_when_the_reviewed_destination_changes() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();

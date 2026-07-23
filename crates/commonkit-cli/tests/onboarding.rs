@@ -76,7 +76,25 @@ exit 91
     )
     .unwrap();
     let composition = registry.composition.unwrap();
-    assert_eq!(composition.compose().unwrap()["spec"]["theme"], "target");
+    let composed = composition.compose().unwrap();
+    assert_eq!(composed["spec"]["theme"], "target");
+    for (index, path) in config["composition"]["layers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let document: LayerDocument =
+            serde_json::from_slice(&std::fs::read(path.as_str().unwrap()).unwrap()).unwrap();
+        assert_eq!(
+            composed["lock"]["layers"][index]["contentDigest"],
+            serde_json::json!(
+                commonkit_config::layer_content_digest(&document)
+                    .unwrap()
+                    .to_string()
+            )
+        );
+    }
     let theme = composition.explain("/theme").unwrap();
     assert_eq!(theme["winner"]["layerId"], "target-workstation");
     assert_eq!(theme["contributions"].as_array().unwrap().len(), 5);
@@ -87,6 +105,50 @@ exit 91
             "organization-security-floor:non-overridable"
         ])
     );
+}
+
+#[test]
+fn connect_rejects_a_layer_with_mismatched_canonical_content_before_registration() {
+    let temporary = tempfile::tempdir().unwrap();
+    let bin = temporary.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(temporary.path().join("target")).unwrap();
+    test_support::write_raw_tool(
+        &bin,
+        "gh",
+        r#"
+case "$1 $2" in
+  "auth status") exit 0 ;;
+  "repo clone")
+    mkdir -p "$4/layers"
+    printf '%s' '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/public-base.json"
+    printf '%s' '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/organization-policy.json"
+    printf '%s' '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"tampered":true}}' > "$4/layers/personal.json"
+    exit 0 ;;
+esac
+exit 91
+"#,
+    );
+    test_support::write_tool(
+        &bin,
+        "git",
+        "[ \"$3\" = rev-parse ] && printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\nexit 0",
+    );
+    let request = request(temporary.path(), InitMode::Connect, "owner/tampered-kit");
+
+    let error = initialize(&request, &ProcessRunner::new(&bin)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("layer content digest does not match canonical content")
+    );
+    assert!(
+        !request
+            .kit_directory
+            .join("targets/workstation.json")
+            .exists()
+    );
+    assert!(!request.config_directory.join("headless.json").exists());
 }
 
 #[test]
@@ -1070,8 +1132,47 @@ mod test_support {
     use std::path::Path;
 
     pub fn write_tool(bin: &Path, name: &str, body: &str) {
+        write_tool_inner(bin, name, body, true);
+    }
+
+    pub fn write_raw_tool(bin: &Path, name: &str, body: &str) {
+        write_tool_inner(bin, name, body, false);
+    }
+
+    fn write_tool_inner(bin: &Path, name: &str, body: &str, seal: bool) {
         let path = bin.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        let seal_layers = if seal && name == "gh" {
+            r#"
+status=$?
+if [ "$1 $2" = "repo clone" ] && [ "$status" -eq 0 ] && [ -d "$4/layers" ]; then
+  node - "$4/layers" <<'NODE'
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const canonical = (value) => Array.isArray(value)
+  ? `[${value.map(canonical).join(",")}]`
+  : value && typeof value === "object"
+    ? `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonical(value[key])}`).join(",")}}`
+    : JSON.stringify(value);
+for (const name of fs.readdirSync(process.argv[2])) {
+  if (!name.endsWith(".json")) continue;
+  const file = path.join(process.argv[2], name);
+  const document = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete document.source.contentDigest;
+  const digest = crypto.createHash("sha256")
+    .update("commonkit.layer-content.v1").update(Buffer.from([0]))
+    .update(canonical(document)).digest("hex");
+  document.source.contentDigest = `sha256:${digest}`;
+  fs.writeFileSync(file, JSON.stringify(document));
+}
+NODE
+fi
+exit "$status"
+"#
+        } else {
+            ""
+        };
+        std::fs::write(&path, format!("#!/bin/sh\n(\n{body}\n)\n{seal_layers}")).unwrap();
         #[cfg(unix)]
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }

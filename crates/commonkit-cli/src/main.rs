@@ -55,6 +55,9 @@ enum Command {
     },
     /// Plan synchronization through the local CommonKit daemon.
     Sync {
+        /// Fetch and validate the trusted Git remote before creating the plan.
+        #[arg(long)]
+        fetch: bool,
         #[arg(long)]
         confirmed: bool,
     },
@@ -723,16 +726,21 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         | Command::Rollback {
             confirmed: false, ..
         }
-        | Command::Sync { confirmed: false } => {
+        | Command::Sync {
+            confirmed: false, ..
+        } => {
             return Err(
                 "confirmation_required: pass --confirmed after reviewing the operation".into(),
             );
         }
-        Command::Sync { confirmed: true } => print_daemon(daemon_control(
+        Command::Sync {
+            fetch,
+            confirmed: true,
+        } => print_daemon(daemon_control(
             "POST",
             "/control/v1/sync/plan",
             Some(
-                json!({"confirmed":true,"confirmationId":"cli-sync","idempotencyKey":nonce("sync")}),
+                json!({"confirmed":true,"confirmationId":"cli-sync","idempotencyKey":nonce("sync"),"fetch":fetch}),
             ),
             None,
         )?)?,

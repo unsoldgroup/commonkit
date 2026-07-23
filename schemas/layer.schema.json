@@ -55,7 +55,30 @@
     "source": {
       "$ref": "#/$defs/SourceMetadata"
     },
-    "spec": true
+    "spec": {
+      "additionalProperties": false,
+      "properties": {
+        "adapters": true,
+        "arguments": true,
+        "capabilities": true,
+        "credentials": true,
+        "databases": true,
+        "denials": true,
+        "files": true,
+        "hooks": true,
+        "plugins": true,
+        "relay": true,
+        "requirements": true,
+        "schedules": true,
+        "securityPolicy": true,
+        "services": true,
+        "settings": true,
+        "snapshots": true,
+        "targets": true,
+        "theme": true
+      },
+      "type": "object"
+    }
   },
   "required": [
     "schemaVersion",

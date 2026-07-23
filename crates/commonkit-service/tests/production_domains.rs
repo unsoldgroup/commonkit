@@ -1490,6 +1490,9 @@ fn configured_git_provider_pipeline_materializes_native_state_before_local_plann
     )
     .unwrap();
     let sync = registry.sync.unwrap();
+    let fetched = sync.git_sync(true).unwrap();
+    assert_eq!(fetched["state"], "clean");
+    assert_eq!(fetched["fetched"], true);
     let plan = sync
         .plan(serde_json::json!({"confirmed":true,"confirmationId":"provider-plan"}))
         .unwrap();

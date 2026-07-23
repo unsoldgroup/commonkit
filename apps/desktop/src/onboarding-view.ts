@@ -74,7 +74,7 @@ export function onboardingPanel(state: OnboardingViewState): string {
     : `<p class="onboarding-result" role="status" aria-live="polite"></p>`;
   return `<section class="panel onboarding-panel" aria-busy="${state.submitting}">
     <p class="eyebrow">Get started</p><h1>Welcome to CommonKit</h1>
-    <p class="setup-intro">Set up this computer in a few guided steps. You will review a preview before CommonKit changes anything.</p>
+    <p class="setup-intro">Set up this computer in a few guided steps. CommonKit saves the setup locally, then shows a preview before applying managed settings.</p>
     ${progress}${content}${message}</section>`;
 }
 
@@ -134,7 +134,7 @@ function reviewStep({ auth, draft, submitting }: OnboardingViewState): string {
   return `<form id="onboarding-form" class="setup-step" data-step="4">
     <h2 id="setup-heading" tabindex="-1">Review before creating</h2>
     <dl class="review-list"><dt>Private repository</dt><dd>${escapeHtml(repository)}</dd><dt>Local folder</dt><dd>${escapeHtml(draft.kitDirectory)}</dd><dt>Computer</dt><dd>${escapeHtml(draft.computerName)}</dd><dt>Folder to manage</dt><dd>${escapeHtml(draft.targetRoot)}</dd><dt>Personal profile</dt><dd>${escapeHtml(draft.loadout)}</dd>${draft.projectLoadout ? `<dt>Project profile</dt><dd>${escapeHtml(draft.projectLoadout)}</dd>` : ""}${draft.targetOverride ? `<dt>Computer override</dt><dd>${escapeHtml(draft.targetOverride)}</dd>` : ""}<dt>Existing settings</dt><dd>${escapeHtml(imported)}</dd></dl>
-    <div class="safety-note"><strong>Nothing on this computer changes yet.</strong><p>CommonKit will prepare a preview for you to review first.</p></div>
+    <div class="safety-note"><strong>Managed settings are not applied yet.</strong><p>CommonKit will save this setup locally and prepare a preview for you to review first.</p></div>
     <label class="consent"><input name="publishRegistration" type="checkbox" value="true" ${draft.publishRegistration ? "checked" : ""} required> <span><strong>Save this computer to the private repository</strong><small>This lets your other computers discover it. CommonKit will create and push a registration commit.</small></span></label>
     ${actions(true, submitting ? "Preparing preview…" : "Prepare setup preview", submitting)}
   </form>`;

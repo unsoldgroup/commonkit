@@ -1,24 +1,75 @@
+use commonkit_config::layer_content_digest;
+use commonkit_contracts::LayerDocument;
 use commonkit_reconcile::PlanStore;
 use commonkit_service::ProductionDomainRegistry;
 use serde_json::json;
+
+fn layer_document(id: &str, kind: &str, spec: serde_json::Value) -> serde_json::Value {
+    let mut document: LayerDocument = serde_json::from_value(json!({
+        "schemaVersion": 1,
+        "id": id,
+        "kind": kind,
+        "source": {
+            "path": format!("layers/{id}.json"),
+            "revision": "57a085e7d0b558e71c8d2255b7e60e6c677dee76",
+            "contentDigest": format!("sha256:{}", "0".repeat(64))
+        },
+        "spec": spec
+    }))
+    .unwrap();
+    document.source.content_digest = layer_content_digest(&document).unwrap();
+    serde_json::to_value(document).unwrap()
+}
+
+#[test]
+fn production_registry_rejects_layer_bytes_that_do_not_match_the_declared_digest() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let layers = [
+        ("public-base", "public_base"),
+        ("organization-policy", "organization_policy"),
+    ]
+    .map(|(id, kind)| {
+        let path = root.join(format!("{id}.json"));
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!({
+                "schemaVersion": 1,
+                "id": id,
+                "kind": kind,
+                "source": {
+                    "path": format!("layers/{id}.json"),
+                    "revision": "57a085e7d0b558e71c8d2255b7e60e6c677dee76",
+                    "contentDigest": format!("sha256:{}", "0".repeat(64))
+                },
+                "spec": {"tampered": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        path
+    });
+    let config = root.join("headless.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&json!({"composition":{"layers":layers}})).unwrap(),
+    )
+    .unwrap();
+
+    assert!(
+        ProductionDomainRegistry::load(
+            &config,
+            std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+            root.join("receipts"),
+        )
+        .is_err()
+    );
+}
 
 #[test]
 fn production_registry_composes_only_configured_layer_files() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    let layer_document = |id: &str, kind: &str, spec: serde_json::Value| {
-        json!({
-            "schemaVersion": 1,
-            "id": id,
-            "kind": kind,
-            "source": {
-                "path": format!("layers/{id}.json"),
-                "revision": "57a085e7d0b558e71c8d2255b7e60e6c677dee76",
-                "contentDigest": format!("sha256:{}", "0".repeat(64))
-            },
-            "spec": spec
-        })
-    };
     let layers = [
         ("public-base", "public_base", json!({})),
         ("organization-policy", "organization_policy", json!({})),
@@ -57,19 +108,6 @@ fn production_registry_composes_only_configured_layer_files() {
 fn production_registry_rejects_a_later_layer_that_weakens_the_organization_floor() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    let layer_document = |id: &str, kind: &str, spec: serde_json::Value| {
-        json!({
-            "schemaVersion": 1,
-            "id": id,
-            "kind": kind,
-            "source": {
-                "path": format!("layers/{id}.json"),
-                "revision": "57a085e7d0b558e71c8d2255b7e60e6c677dee76",
-                "contentDigest": format!("sha256:{}", "0".repeat(64))
-            },
-            "spec": spec
-        })
-    };
     let policy = |allowed: &[&str]| {
         json!({
             "deniedPaths": ["**/.env"],
@@ -121,19 +159,6 @@ fn production_registry_rejects_a_later_layer_that_weakens_the_organization_floor
 fn production_registry_uses_schema_merge_rules_and_reports_the_governing_rule() {
     let temporary = tempfile::tempdir().unwrap();
     let root = temporary.path();
-    let layer_document = |id: &str, kind: &str, spec: serde_json::Value| {
-        json!({
-            "schemaVersion": 1,
-            "id": id,
-            "kind": kind,
-            "source": {
-                "path": format!("layers/{id}.json"),
-                "revision": "57a085e7d0b558e71c8d2255b7e60e6c677dee76",
-                "contentDigest": format!("sha256:{}", "0".repeat(64))
-            },
-            "spec": spec
-        })
-    };
     let policy = |allowed: &[&str], minimum: i64| {
         json!({
             "deniedPaths": ["**/.env"],

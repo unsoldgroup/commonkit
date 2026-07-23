@@ -10,14 +10,58 @@ function label(value: unknown): string { return String(value ?? "unknown").repla
 function empty(message: string): string { return `<p class="empty">${escapeHtml(message)}</p>`; }
 function error(value: RecordValue): string | null { return typeof value.error === "string" ? `<p class="domain-error" role="alert">${escapeHtml(value.error)}</p>` : null; }
 
+const riskRank = new Map([
+  ["read_only", 0],
+  ["low", 1],
+  ["medium", 2],
+  ["high", 3],
+  ["destructive", 4],
+]);
+
+function planRisk(plan: RecordValue, operations: unknown[]): string {
+  if (typeof plan.risk === "string") return plan.risk;
+  return operations.reduce<string>((highest, item) => {
+    const candidate = String(record(item).risk ?? "read_only");
+    return (riskRank.get(candidate) ?? 0) > (riskRank.get(highest) ?? 0) ? candidate : highest;
+  }, "read_only");
+}
+
+function operationResource(operation: RecordValue): string {
+  if (typeof operation.path === "string") return operation.path;
+  if (typeof operation.resource === "string") return operation.resource;
+  const resource = record(operation.resource);
+  return String(
+    resource.managedPath
+      ?? resource.resourceId
+      ?? operation.id
+      ?? "Managed resource",
+  );
+}
+
+function operationSource(operation: RecordValue): string {
+  const provenance = record(operation.provenance);
+  return String(
+    provenance.layer
+      ?? provenance.source
+      ?? operation.source
+      ?? operation.adapterId
+      ?? "composed loadout",
+  );
+}
+
 function plansPanel(value: RecordValue): string {
   const plan = record(value.plan ?? value.currentPlan ?? value);
   const operations = list(plan.operations);
+  const risk = planRisk(plan, operations);
   const operation = record(value.operation ?? value.applyOperation);
   const progress = operation.totalOperations
     ? `<p class="progress"><strong>${escapeHtml(operation.state ?? "Applying")}</strong> · ${escapeHtml(operation.completedOperations ?? 0)} of ${escapeHtml(operation.totalOperations)} operations</p>` : "";
-  const rows = operations.map((item) => { const op = record(item); const provenance = record(op.provenance); return `<li><strong>${escapeHtml(label(op.kind))}</strong><span>${escapeHtml(op.path ?? op.resource ?? op.id ?? "Managed resource")}</span><small>From ${escapeHtml(provenance.layer ?? provenance.source ?? op.source ?? "composed loadout")}</small></li>`; }).join("");
-  return `${progress}<div class="summary-card"><span class="risk risk-${escapeHtml(plan.risk)}">${escapeHtml(label(plan.risk))} risk</span><h2>${operations.length} planned operation${operations.length === 1 ? "" : "s"}</h2><p>Plan ${escapeHtml(plan.id ?? "not yet created")}</p></div>${rows ? `<ol class="inventory">${rows}</ol>` : empty("Create a plan to review provenance and risk.")}<label>Reviewed plan<select name="plan-id">${plan.id ? `<option value="${escapeHtml(plan.id)}">${escapeHtml(plan.id)}</option>` : ""}</select></label>`;
+  const rows = operations.map((item) => {
+    const op = record(item);
+    const summary = typeof op.summary === "string" ? op.summary : label(op.kind);
+    return `<li><strong>${escapeHtml(summary)}</strong><span>${escapeHtml(operationResource(op))}</span><small>${escapeHtml(label(op.risk))} risk · From ${escapeHtml(operationSource(op))}</small></li>`;
+  }).join("");
+  return `${progress}<div class="summary-card"><span class="risk risk-${escapeHtml(risk)}">${escapeHtml(label(risk))} risk</span><h2>${operations.length} planned operation${operations.length === 1 ? "" : "s"}</h2><p>Plan ${escapeHtml(plan.id ?? "not yet created")}</p></div>${rows ? `<ol class="inventory">${rows}</ol>` : empty("Create a plan to review provenance and risk.")}<label>Reviewed plan<select name="plan-id">${plan.id ? `<option value="${escapeHtml(plan.id)}">${escapeHtml(plan.id)}</option>` : ""}</select></label>`;
 }
 
 function snapshotsPanel(value: RecordValue): string {

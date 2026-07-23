@@ -131,6 +131,12 @@ test("manual harness exercises an unsigned installed CLI and daemon lifecycle", 
   assert.match(harness, /"\$commonkit" sync --confirmed/);
   assert.match(harness, /"\$commonkit" apply/);
   assert.match(harness, /"\$commonkit" verify/);
+  assert.match(harness, /apply_run_id=.*runId/);
+  assert.match(harness, /"\$commonkit" rollback "\$apply_run_id" --confirmed/);
+  assert.match(harness, /commonkit\.layer-content\.v1/);
+  assert.doesNotMatch(harness, /zero_digest/);
+  assert.match(harness, /test ! -e "\$scratch\/target\/portable\/editor\.conf"/);
+  assert.doesNotMatch(harness, /reapply_plan_id/);
   assert.match(harness, /"\$commonkit" snapshots create/);
   assert.match(harness, /"\$commonkit" snapshots restore/);
   assert.match(harness, /"\$recovery_fixture" interrupt/);

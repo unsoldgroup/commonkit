@@ -17,7 +17,7 @@ use commonkit_adapters::{
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
     materialize_mcp_client_state, validate_ownership,
 };
-use commonkit_config::{LayerSet, compose_layers, v1_merge_rules};
+use commonkit_config::{LayerSet, compose_layers, v1_merge_rules, validate_layer_content_digest};
 use commonkit_contracts::{
     LayerDocument, LayerKind, Plan, ReceiptState, SecurityPolicy, Sha256Digest, StableId,
     assert_no_embedded_secrets, digest_domain_json,
@@ -999,10 +999,10 @@ impl ProductionCompositionDomain {
             )
             .map_err(|_| DomainFailure::OperationFailed)?;
             assert_no_embedded_secrets(&value).map_err(|_| DomainFailure::OperationFailed)?;
-            layers.push(
-                serde_json::from_value::<LayerDocument>(value)
-                    .map_err(|_| DomainFailure::OperationFailed)?,
-            );
+            let layer = serde_json::from_value::<LayerDocument>(value)
+                .map_err(|_| DomainFailure::OperationFailed)?;
+            validate_layer_content_digest(&layer).map_err(|_| DomainFailure::OperationFailed)?;
+            layers.push(layer);
         }
         let layers = LayerSet::new(layers).map_err(|_| DomainFailure::OperationFailed)?;
         let result = compose_layers(&layers, &v1_merge_rules())
@@ -1693,6 +1693,23 @@ fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, DomainFailure> {
         .map_err(|_| DomainFailure::OperationFailed)
 }
 
+fn hmac_sha256(key: &[u8; 32], message: &[u8]) -> String {
+    let mut inner_pad = [0x36_u8; 64];
+    let mut outer_pad = [0x5c_u8; 64];
+    for (index, byte) in key.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(message);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    format!("{:x}", outer.finalize())
+}
+
 fn collect_local_input_digests(
     repository: &Path,
     path: &Path,
@@ -2262,6 +2279,8 @@ struct CredentialRecoveryDestination {
     destination_id: StableId,
     path: NormalizedManagedPath,
     backup: DurableCredentialBackup,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verification_tag: Option<Sha256Digest>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2343,6 +2362,60 @@ impl ProductionCredentialDomain {
             "{}.json",
             receipt_id.as_str().trim_start_matches("sha256:")
         ))
+    }
+
+    fn verification_key_path(&self) -> PathBuf {
+        self.state_root().join("verification.key")
+    }
+
+    fn load_or_create_verification_key(&self) -> Result<[u8; 32], DomainFailure> {
+        let path = self.verification_key_path();
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                let bytes = fs::read(path).map_err(|_| DomainFailure::OperationFailed)?;
+                bytes.try_into().map_err(|_| DomainFailure::OperationFailed)
+            }
+            Ok(_) => Err(DomainFailure::OperationFailed),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut key = [0_u8; 32];
+                rand::rng().fill_bytes(&mut key);
+                write_private_atomic_with_sync(&path, &key, self.directory_sync.as_ref())?;
+                Ok(key)
+            }
+            Err(_) => Err(DomainFailure::OperationFailed),
+        }
+    }
+
+    fn load_verification_key(&self) -> Result<[u8; 32], DomainFailure> {
+        let path = self.verification_key_path();
+        let metadata =
+            fs::symlink_metadata(&path).map_err(|_| DomainFailure::VerificationFailed)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(DomainFailure::VerificationFailed);
+        }
+        fs::read(path)
+            .map_err(|_| DomainFailure::VerificationFailed)?
+            .try_into()
+            .map_err(|_| DomainFailure::VerificationFailed)
+    }
+
+    fn verification_tag(
+        key: &[u8; 32],
+        destination: &StableId,
+        path: &NormalizedManagedPath,
+        reference_digest: &Sha256Digest,
+        bytes: &[u8],
+    ) -> Result<Sha256Digest, DomainFailure> {
+        let mut message = Vec::new();
+        message.extend_from_slice(destination.as_str().as_bytes());
+        message.push(0);
+        message.extend_from_slice(path.as_str().as_bytes());
+        message.push(0);
+        message.extend_from_slice(reference_digest.as_str().as_bytes());
+        message.push(0);
+        message.extend_from_slice(bytes);
+        Sha256Digest::parse(format!("sha256:{}", hmac_sha256(key, &message)))
+            .map_err(|_| DomainFailure::OperationFailed)
     }
 
     fn backup_path(&self, receipt_id: &Sha256Digest, digest: &Sha256Digest) -> PathBuf {
@@ -2802,6 +2875,7 @@ impl CredentialDomain for ProductionCredentialDomain {
                     destination_id: planned.destination_id.clone(),
                     path: planned.path.clone(),
                     backup: self.capture_backup(&receipt_id, &planned.path)?,
+                    verification_tag: None,
                 })
             })
             .collect::<Result<Vec<_>, DomainFailure>>();
@@ -2828,6 +2902,7 @@ impl CredentialDomain for ProductionCredentialDomain {
             let _ = self.load_backup(&receipt_id, &destination.backup)?;
         }
         let mut applied = Vec::new();
+        let verification_key = self.load_or_create_verification_key()?;
         for (index, (planned, destination, secret)) in resolved.iter().enumerate() {
             if store.write(&destination.path, secret).is_err() {
                 let mut rollback_succeeded = true;
@@ -2856,6 +2931,39 @@ impl CredentialDomain for ProductionCredentialDomain {
                 if receipt.status == CredentialReceiptStatus::RolledBack {
                     self.cleanup_backups(&receipt_id)?;
                 }
+                return Err(DomainFailure::OperationFailed);
+            }
+            receipt.destinations[index].verification_tag = Some(Self::verification_tag(
+                &verification_key,
+                &planned.destination_id,
+                &planned.path,
+                &planned.reference_digest,
+                secret.expose_for_apply(),
+            )?);
+            receipt.recovery_digest =
+                digest_domain_json("commonkit.credentials.recovery.v1", &receipt.destinations)
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+            if self.write_receipt(&receipt).is_err() {
+                let mut rollback_succeeded = true;
+                for rollback_index in (0..=index).rev() {
+                    if self
+                        .restore_backup(
+                            &store,
+                            &receipt_id,
+                            &resolved[rollback_index].0.path,
+                            &receipt.destinations[rollback_index].backup,
+                        )
+                        .is_err()
+                    {
+                        rollback_succeeded = false;
+                    }
+                }
+                receipt.status = if rollback_succeeded {
+                    CredentialReceiptStatus::RolledBack
+                } else {
+                    CredentialReceiptStatus::RecoveryRequired
+                };
+                let _ = self.write_receipt(&receipt);
                 return Err(DomainFailure::OperationFailed);
             }
             applied.push(planned.destination_id.clone());
@@ -2894,21 +3002,62 @@ impl CredentialDomain for ProductionCredentialDomain {
             .map_err(|_| DomainFailure::OperationFailed)?;
         let request: CredentialVerifyRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let verification_key = self.load_verification_key()?;
+        let receipt_root = self.state_root().join("receipts");
+        let receipt_paths = fs::read_dir(receipt_root)
+            .map_err(|_| DomainFailure::VerificationFailed)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| DomainFailure::VerificationFailed)?;
         let mut verified = Vec::new();
         for id in request.destination_ids {
             let destination = self
                 .destinations
                 .get(&id)
                 .ok_or(DomainFailure::InvalidRequest)?;
-            let expected = resolve(&destination.reference, self.bws_executable.as_deref())?;
             let path = self.root.join(destination.path.as_str());
             let metadata =
                 fs::symlink_metadata(&path).map_err(|_| DomainFailure::VerificationFailed)?;
-            if !metadata.is_file()
-                || metadata.file_type().is_symlink()
-                || fs::read(path).map_err(|_| DomainFailure::VerificationFailed)?
-                    != expected.expose_for_apply()
-            {
+            if !metadata.is_file() || metadata.file_type().is_symlink() {
+                return Err(DomainFailure::VerificationFailed);
+            }
+            let bytes = fs::read(path).map_err(|_| DomainFailure::VerificationFailed)?;
+            let reference_digest = digest_text(
+                "commonkit.credentials.reference.v1",
+                destination.reference.as_str(),
+            )
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+            let observed = Self::verification_tag(
+                &verification_key,
+                &id,
+                &destination.path,
+                &reference_digest,
+                &bytes,
+            )
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+            let mut matched = false;
+            for entry in &receipt_paths {
+                let receipt: CredentialReceipt = serde_json::from_slice(
+                    &fs::read(entry.path()).map_err(|_| DomainFailure::VerificationFailed)?,
+                )
+                .map_err(|_| DomainFailure::VerificationFailed)?;
+                if receipt.status == CredentialReceiptStatus::Succeeded
+                    && digest_domain_json(
+                        "commonkit.credentials.recovery.v1",
+                        &receipt.destinations,
+                    )
+                    .map_err(|_| DomainFailure::VerificationFailed)?
+                        == receipt.recovery_digest
+                    && receipt.destinations.iter().any(|record| {
+                        record.destination_id == id
+                            && record.path == destination.path
+                            && record.verification_tag.as_ref() == Some(&observed)
+                    })
+                {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
                 return Err(DomainFailure::VerificationFailed);
             }
             verified.push(id);

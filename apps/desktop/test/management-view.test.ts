@@ -47,6 +47,38 @@ test("plan review is human-readable and selects a bound digest without raw JSON"
   assert.doesNotMatch(html, /<pre>/);
 });
 
+test("plan review renders the production Rust plan contract faithfully", () => {
+  const digest = `sha256:${"a".repeat(64)}`;
+  const html = managementPanel("plans", { plans: {
+    schemaVersion: 1,
+    contractVersion: "1.0.0",
+    id: digest,
+    targetId: "workstation",
+    operations: [{
+      id: digest,
+      adapterId: "filesystem",
+      kind: "update",
+      resource: {
+        resourceType: "file",
+        resourceId: "editor-config",
+        managedPath: ".config/editor.json",
+      },
+      risk: "high",
+      requiresConfirmation: true,
+      dependsOn: [],
+      payloadDigest: digest,
+      summary: "Update editor configuration",
+    }],
+  } });
+
+  assert.match(html, /High risk/i);
+  assert.match(html, /Update editor configuration/);
+  assert.match(html, /\.config\/editor\.json/);
+  assert.match(html, /filesystem/);
+  assert.doesNotMatch(html, /\[object Object\]/);
+  assert.doesNotMatch(html, /Unknown risk/i);
+});
+
 test("snapshot, relay, and diagnostics panels expose typed inventory controls", () => {
   const snapshots = managementPanel("snapshots", { snapshots: {
     authoritativeWriter: { databaseId: "catalog", targetId: "macbook" },

@@ -113,10 +113,10 @@ _Avoid_: Worker box
 - "Profile" described a selected subset; resolved: use **Loadout** unless later user research favors a more conventional term.
 - "Agent package manager" overlapped with CommonKit's initial adapter scope; resolved: package management belongs to the selected **Agent-context provider**, with APM preferred, while CommonKit orchestrates the complete developer environment.
 - APM MCP translation was initially open; resolved: CommonKit reads only APM's documented `dependencies.mcp` manifest shape and isolated staged `.mcp.json`, requires the two representations to agree, normalizes declarations with manifest/lock provenance, rejects ambiguous ownership or unsupported transports, and sends the resulting relay desired state and stable loopback client configuration through CommonKit's confirmation-bound plan. It does not import APM internals or invoke provider-native live apply.
+- GitHub authentication was initially open; resolved for v1: the installed GitHub CLI is the credential broker and repository-provisioning client. OAuth credentials remain outside CommonKit and the kit. A first-party GitHub App/device flow may replace this boundary later without changing portable state.
 
 ## Open — not yet resolved
 
-- Which GitHub authentication and repository-provisioning flow CommonKit supports in version 1.
 - Which S3-compatible object-store provider is the default for encrypted snapshots.
 
 ## Version 1 contract

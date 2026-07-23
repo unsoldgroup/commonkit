@@ -478,6 +478,16 @@ async fn apply_endpoint_requires_explicit_confirmation_and_idempotency() {
         .await
         .expect("response");
     assert_eq!(confirmed.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(confirmed.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let operation: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(
+        operation["runId"]
+            .as_str()
+            .is_some_and(|run_id| !run_id.is_empty()),
+        "apply must return the durable run ID required by the rollback command"
+    );
 }
 
 #[tokio::test]

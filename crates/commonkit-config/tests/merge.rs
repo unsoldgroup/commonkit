@@ -56,3 +56,38 @@ fn rejects_deletion_on_paths_not_enabled_by_the_schema() {
 
     assert_eq!(error.pointer(), "/protected");
 }
+
+#[test]
+fn rejects_type_changes_selected_for_recursive_merge() {
+    let error = merge_specs(
+        &serde_json::json!({"settings": {"enabled": true}}),
+        &serde_json::json!({"settings": "replace-the-map"}),
+        &MergeRules::new().with_strategy("/settings", MergeStrategy::RecursiveMap),
+    )
+    .expect_err("a recursive map cannot change resource type");
+
+    assert_eq!(error.pointer(), "/settings");
+}
+
+#[test]
+fn rejects_duplicate_ids_within_a_merge_by_id_layer() {
+    let rules = MergeRules::new().with_strategy(
+        "/adapters",
+        MergeStrategy::MergeById {
+            id_key: "id".into(),
+        },
+    );
+    let error = merge_specs(
+        &serde_json::json!({"adapters": []}),
+        &serde_json::json!({
+            "adapters": [
+                {"id": "codex", "enabled": true},
+                {"id": "codex", "enabled": false}
+            ]
+        }),
+        &rules,
+    )
+    .expect_err("one layer cannot ambiguously declare the same stable ID twice");
+
+    assert_eq!(error.pointer(), "/adapters");
+}

@@ -6,8 +6,8 @@ use axum::http::{Request, StatusCode, header};
 use commonkit_contracts::{Plan, StableId};
 use commonkit_service::{
     ApplyStatus, ControlPlane, ControlToken, DriftChecker, DriftResult, DriftScheduler, EventHub,
-    ExecutionResult, OverallState, PlanExecutor, SchedulerConfig, SchedulerStore, ServiceStatus,
-    router_with_control,
+    ExecutionResult, MAX_SCHEDULE_INTERVAL_SECONDS, OverallState, PlanExecutor, SchedulerConfig,
+    SchedulerStore, ServiceStatus, router_with_control,
 };
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -59,6 +59,53 @@ async fn scheduler_enable_disable_and_startup_restore_are_persistent() {
     restored.disable().unwrap();
     assert!(!restored.configuration().enabled);
     let _ = std::fs::remove_dir_all(temp);
+}
+
+#[tokio::test]
+async fn completed_drift_result_is_restored_into_service_status_after_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let first_status = Arc::new(RwLock::new(ServiceStatus::default()));
+    let scheduler = DriftScheduler::with_store(
+        Arc::new(ReadOnlyCheck {
+            calls: AtomicUsize::new(0),
+            result: DriftResult {
+                state: OverallState::Degraded,
+                code: Some("remote_unavailable".into()),
+            },
+        }),
+        first_status.clone(),
+        EventHub::new(4),
+        SchedulerStore::open(temp.path()).unwrap(),
+    )
+    .unwrap();
+    scheduler.check_now().await;
+    let checked_at = first_status
+        .read()
+        .await
+        .last_drift_check_unix_ms
+        .expect("completed check timestamp");
+
+    let restored_status = Arc::new(RwLock::new(ServiceStatus::default()));
+    let _restored = DriftScheduler::with_store(
+        Arc::new(ReadOnlyCheck {
+            calls: AtomicUsize::new(0),
+            result: DriftResult {
+                state: OverallState::Healthy,
+                code: None,
+            },
+        }),
+        restored_status.clone(),
+        EventHub::new(4),
+        SchedulerStore::open(temp.path()).unwrap(),
+    )
+    .unwrap();
+    let restored = restored_status.read().await;
+    assert_eq!(restored.state, OverallState::Degraded);
+    assert_eq!(restored.last_drift_check_unix_ms, Some(checked_at));
+    assert_eq!(
+        restored.last_drift_error_code.as_deref(),
+        Some("remote_unavailable")
+    );
 }
 
 #[tokio::test]
@@ -169,6 +216,62 @@ async fn control_api_configuration_change_wakes_the_production_wired_scheduler()
     task.await.unwrap();
 }
 
+#[tokio::test]
+async fn public_schedule_api_rejects_intervals_outside_the_supported_bounds() {
+    let temp = tempfile::tempdir().unwrap();
+    let control = ControlPlane::new(Arc::new(UnusedExecutor));
+    control.set_scheduler_store(Arc::new(SchedulerStore::open(temp.path()).unwrap()));
+    let token = ControlToken::generate();
+    let app = router_with_control(
+        token.clone(),
+        Arc::new(RwLock::new(ServiceStatus::default())),
+        "127.0.0.1:3764",
+        EventHub::new(4),
+        control,
+    );
+
+    for (interval, code) in [
+        (0, "schedule_interval_too_short"),
+        (
+            MAX_SCHEDULE_INTERVAL_SECONDS + 1,
+            "schedule_interval_too_long",
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/control/v1/schedule")
+                    .header(header::HOST, "127.0.0.1:3764")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", token.expose_for_client()),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "enabled": true,
+                            "intervalSeconds": interval,
+                            "confirmed": true,
+                            "confirmationId": "scheduler-bounds"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains(code),
+            "expected stable error {code}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
 #[test]
 fn cloned_scheduler_stores_can_save_concurrently() {
     let temp = tempfile::tempdir().unwrap();
@@ -264,6 +367,64 @@ async fn overlapping_manual_checks_are_suppressed() {
     assert_eq!(checker.calls.load(Ordering::SeqCst), 1);
     release_tx.send(()).unwrap();
     assert!(first.await.unwrap().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timed_out_blocking_check_degrades_and_does_not_halt_later_scheduler_progress() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    struct HungCheck {
+        calls: Arc<AtomicUsize>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl DriftChecker for HungCheck {
+        fn check(&self) -> DriftResult {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.release.lock().unwrap().recv().unwrap();
+            DriftResult {
+                state: OverallState::Healthy,
+                code: None,
+            }
+        }
+    }
+    let status = Arc::new(RwLock::new(ServiceStatus::default()));
+    let scheduler = DriftScheduler::new(
+        Arc::new(HungCheck {
+            calls: calls.clone(),
+            release: std::sync::Mutex::new(release_rx),
+        }),
+        status.clone(),
+        EventHub::new(4),
+    )
+    .with_check_timeout(std::time::Duration::from_millis(20))
+    .unwrap();
+
+    let timed_out =
+        tokio::time::timeout(std::time::Duration::from_millis(250), scheduler.check_now())
+            .await
+            .expect("blocking target check must not hang scheduler progress");
+    assert_eq!(timed_out.state, OverallState::Degraded);
+    assert_eq!(timed_out.code.as_deref(), Some("drift_check_timeout"));
+
+    let later_tick =
+        tokio::time::timeout(std::time::Duration::from_millis(250), scheduler.check_now())
+            .await
+            .expect("later scheduler ticks must remain responsive");
+    assert_eq!(later_tick.state, OverallState::Degraded);
+    assert_eq!(
+        later_tick.code.as_deref(),
+        Some("drift_check_worker_still_running")
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "timed-out workers remain overlap-suppressed"
+    );
+    assert_eq!(
+        status.read().await.last_drift_error_code.as_deref(),
+        Some("drift_check_worker_still_running")
+    );
+    release_tx.send(()).unwrap();
 }
 
 impl DriftChecker for ReadOnlyCheck {

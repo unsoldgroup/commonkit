@@ -6,7 +6,7 @@ use std::{fmt, sync::OnceLock};
 use regex::Regex;
 use schemars::{JsonSchema, schema_for};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -706,6 +706,29 @@ pub struct LayerDocument {
     pub spec: Value,
 }
 
+/// Closed top-level vocabulary for a CommonKit v1 layer. Provider-specific
+/// payloads remain nested below these owned capability and adapter envelopes.
+pub const V1_LAYER_SPEC_FIELDS: &[&str] = &[
+    "adapters",
+    "arguments",
+    "capabilities",
+    "credentials",
+    "databases",
+    "denials",
+    "files",
+    "hooks",
+    "plugins",
+    "relay",
+    "requirements",
+    "schedules",
+    "securityPolicy",
+    "services",
+    "settings",
+    "snapshots",
+    "targets",
+    "theme",
+];
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SecurityPolicy {
@@ -1281,6 +1304,17 @@ pub fn layer_schema() -> Result<Value, ContractError> {
         "$id".into(),
         Value::String("https://schemas.commonkit.dev/v1/layer.schema.json".into()),
     );
+    let spec = schema
+        .pointer_mut("/properties/spec")
+        .ok_or(ContractError::SchemaGeneration)?;
+    *spec = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": V1_LAYER_SPEC_FIELDS
+            .iter()
+            .map(|field| ((*field).to_owned(), Value::Bool(true)))
+            .collect::<Map<String, Value>>()
+    });
     for (path, pattern) in [
         ("/properties/id", r"^[a-z][a-z0-9_-]{0,62}$"),
         (
