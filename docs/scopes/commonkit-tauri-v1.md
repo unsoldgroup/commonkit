@@ -70,7 +70,7 @@ CommonKit must provide a safe, explainable, cross-platform way to answer:
 - Reapplying an unchanged loadout is a no-op.
 - A failed apply restores the previous managed state or produces an explicit recoverable receipt.
 - All current CommonKit safety tests and relay behavior tests have Rust equivalents before the Node implementations are retired.
-- Installers and updates are signed; CI builds and tests macOS, Linux, and Windows release artifacts.
+- Installers and updates are signed; native manual validation builds and tests macOS, Linux, and Windows release artifacts.
 
 ## Product boundary
 
@@ -87,7 +87,7 @@ CommonKit must provide a safe, explainable, cross-platform way to answer:
 9. Integrated MCP relay desired state, lifecycle, and runtime health.
 10. Versioned coding-agent adapters.
 11. Redacted diagnostic exports.
-12. Open-source onboarding, schemas, threat model, CI, packaging, and releases.
+12. Open-source onboarding, schemas, threat model, manual validation, packaging, and releases.
 13. macOS, Linux, and Windows desktop and headless operation.
 14. GitHub-backed portable state and encrypted S3-compatible database snapshots.
 
@@ -422,7 +422,7 @@ Exit: desktop acceptance suite passes on macOS, Linux, and Windows.
 
 ### Phase 7 — Release readiness
 
-- Complete threat model, support matrix, migration guide, OSS onboarding, packaging, signing, update channels, CI, and release automation.
+- Complete threat model, support matrix, migration guide, OSS onboarding, packaging, signing, update channels, manual platform validation, and release tooling.
 
 Exit: all 12 v1 flows pass on the declared platform matrix; release artifacts install, update, and uninstall cleanly.
 
@@ -482,5 +482,5 @@ Before feature implementation begins:
 - Convert Phase 0 into Linear sub-issues with acceptance criteria and dependency links.
 - Create failing contract fixtures for every current Node behavior that must survive.
 - Approve the versioned normalized schema, adapter contract, receipt format, and threat-model skeleton.
-- Establish macOS, Linux, and Windows CI runners and artifact signing strategy.
+- Establish macOS, Linux, and Windows manually invoked validation runners and an artifact signing strategy.
 - Make no production mutation path available until redaction, plan binding, transaction receipts, and rollback primitives exist.

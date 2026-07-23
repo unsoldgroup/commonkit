@@ -15,7 +15,8 @@ test("v1 completion claims remain tied to product-level evidence", async () => {
   assert.match(audit, /Do not mark CommonKit v1 release-ready/);
   assert.match(audit, /host-key confirmation/i);
   assert.match(audit, /Production Apple signing\/notarization/);
-  assert.match(audit, /hosted-platform/i);
+  assert.match(audit, /native-platform/i);
+  assert.match(audit, /does not use GitHub Actions/i);
   assert.match(audit, /first eight runtime flows.*locally implemented/i);
   assert.doesNotMatch(support, /deliberately disabled/);
   assert.match(support, /have not been demonstrated with production notarization\/signing/);

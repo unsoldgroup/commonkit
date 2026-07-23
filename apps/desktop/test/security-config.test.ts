@@ -48,12 +48,12 @@ test("desktop is single-window, CSP-bound, and emits updater artifacts", async (
   ]);
 });
 
-test("published installer lifecycle launches the installed desktop and waits for daemon health", async () => {
-  const workflow = await readFile(new URL("../../../.github/workflows/release-lifecycle.yml", import.meta.url), "utf8");
-  assert.match(workflow, /COMMONKIT_DESKTOP_SMOKE_REPORT/);
-  assert.match(workflow, /Applications\/CommonKit\.app\/Contents\/MacOS\/commonkit-desktop/);
-  assert.match(workflow, /commonkit-desktop-smoke\.json/);
-  assert.match(workflow, /serviceState/);
+test("manual release policy requires native desktop and daemon lifecycle evidence", async () => {
+  const release = await readFile(new URL("../../../docs/RELEASING.md", import.meta.url), "utf8");
+  assert.match(release, /trusted release workstation/i);
+  assert.match(release, /manually invoked platform runner/i);
+  assert.match(release, /install → reconcile → verify → snapshot\/restore → recover → update →\s+uninstall/);
+  assert.match(release, /scripts\/installed-lifecycle\.sh/);
 });
 
 test("installed lifecycle atomically reloads an already-running daemon after onboarding", async () => {
@@ -79,12 +79,12 @@ test("desktop preflights and reloads through the authenticated daemon API regard
   assert.doesNotMatch(onboarding, /reload_owned_after_onboarding|ExternalServiceReloadRequired/);
 });
 
-test("release builds bundle target-matched CLI and daemon before Tauri packaging", async () => {
-  const workflow = await readFile(new URL("../../../.github/workflows/release.yml", import.meta.url), "utf8");
-  const bundle = workflow.indexOf("Stage desktop sidecars");
-  const tauri = workflow.indexOf("Build signed and notarized desktop bundles");
+test("manual release builds bundle target-matched sidecars before Tauri packaging", async () => {
+  const release = await readFile(new URL("../../../docs/RELEASING.md", import.meta.url), "utf8");
+  const bundle = release.indexOf("scripts/stage-desktop-sidecars.sh");
+  const tauri = release.indexOf("Tauri build command");
   assert.ok(bundle >= 0 && tauri > bundle, "sidecars must be staged before the installer is built");
-  assert.match(workflow, /scripts\/stage-desktop-sidecars\.sh/);
+  assert.match(release, /does not use GitHub Actions/i);
 });
 
 test("updater commands separate inspection from explicitly confirmed installation", async () => {

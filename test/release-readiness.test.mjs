@@ -11,16 +11,13 @@ const execFileAsync = promisify(execFile);
 
 const read = (path) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
 
-test("release workflow covers signed desktop and standalone CLI artifacts", async () => {
-  const workflow = await read(".github/workflows/release.yml");
-
+test("manual release policy covers signed desktop and standalone CLI artifacts", async () => {
+  const release = await read("docs/RELEASING.md");
   for (const value of [
-    "universal-apple-darwin",
-    "x86_64-pc-windows-msvc",
-    "x86_64-unknown-linux-gnu",
+    "universal macOS",
+    "Windows NSIS",
+    "Linux AppImage",
     "AppImage",
-    "deb",
-    "nsis",
     "APPLE_CERTIFICATE",
     "APPLE_SIGNING_IDENTITY",
     "APPLE_ID",
@@ -30,31 +27,22 @@ test("release workflow covers signed desktop and standalone CLI artifacts", asyn
     "WINDOWS_CERTIFICATE_PASSWORD",
     "TAURI_SIGNING_PRIVATE_KEY",
     "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
-    "syft",
-    "cosign sign-blob",
-    "SHA256SUMS",
-    "latest.json",
+    "SPDX SBOM",
   ]) {
-    assert.match(workflow, new RegExp(value.replaceAll("-", "\\-")), value);
+    assert.match(release, new RegExp(value.replaceAll("-", "\\-"), "i"), value);
   }
-
-  assert.doesNotMatch(workflow, /if:\s*\$\{\{\s*false\s*\}\}/);
-  assert.doesNotMatch(workflow, /Disabled contract/);
-  assert.match(workflow, /tauri-apps\/tauri-action/);
-  assert.match(workflow, /build-release-cli\.sh/);
-  assert.match(workflow, /upload-artifact/);
-  assert.match(workflow, /libwebkit2gtk-4\.1-dev/);
-  assert.match(workflow, /Import-PfxCertificate/);
-  assert.match(workflow, /WINDOWS_CERTIFICATE_THUMBPRINT/);
-  assert.match(workflow, /tauri-apps\/tauri-action@v1/);
+  assert.match(release, /scripts\/build-release-cli\.sh/);
+  assert.match(release, /scripts\/verify-release-assets\.mjs/);
+  assert.match(release, /fails? closed/i);
+  assert.match(release, /does not use GitHub Actions/i);
 });
 
 test("release inputs are validated before packaging", async () => {
-  const workflow = await read(".github/workflows/release.yml");
+  const release = await read("docs/RELEASING.md");
   const validator = await read("scripts/prepare-release-config.mjs");
 
-  assert.match(workflow, /prepare-release-config\.mjs/);
-  assert.match(workflow, /verify-release-assets\.mjs/);
+  assert.match(release, /prepare-release-config\.mjs/);
+  assert.match(release, /verify-release-assets\.mjs/);
   assert.match(validator, /TAURI_UPDATER_PUBLIC_KEY/);
   assert.match(validator, /COMMONKIT_UPDATE_ENDPOINT/);
   assert.match(validator, /process\.exitCode = 1/);
@@ -62,13 +50,13 @@ test("release inputs are validated before packaging", async () => {
 });
 
 test("release download URLs are bound to the repository and exact release tag", async () => {
-  const workflow = await read(".github/workflows/release.yml");
-
-  assert.match(
-    workflow,
-    /COMMONKIT_RELEASE_DOWNLOAD_BASE: https:\/\/github\.com\/\$\{\{ github\.repository \}\}\/releases\/download\/\$\{\{ inputs\.tag \|\| github\.ref_name \}\}/,
-  );
-  assert.doesNotMatch(workflow, /vars\.COMMONKIT_RELEASE_DOWNLOAD_BASE/);
+  const [release, updater] = await Promise.all([
+    read("docs/RELEASING.md"),
+    read("scripts/assemble-updater-manifest.mjs"),
+  ]);
+  assert.match(release, /exact version and artifact digests/i);
+  assert.match(updater, /COMMONKIT_RELEASE_DOWNLOAD_BASE/);
+  assert.match(updater, /must be HTTPS/);
 });
 
 test("release automation performs real assembly and fails closed", async () => {
@@ -126,54 +114,19 @@ test("updater manifest uses Tauri platform keys and signed payloads", async () =
   }
 });
 
-test("release lifecycle matrix exercises install update and uninstall", async () => {
-  const workflow = await read(".github/workflows/release-lifecycle.yml");
-
-  assert.match(workflow, /macos-latest/);
-  assert.match(workflow, /ubuntu-latest/);
-  assert.match(workflow, /windows-latest/);
-  assert.match(workflow, /install/);
-  assert.match(workflow, /update/);
-  assert.match(workflow, /uninstall/);
-  assert.doesNotMatch(workflow, /if:\s*\$\{\{\s*false\s*\}\}/);
-  assert.doesNotMatch(workflow, /run:\s*echo/);
-  assert.match(workflow, /gh release download/);
-  assert.match(workflow, /hdiutil attach/);
-  assert.match(workflow, /dpkg -i/);
-  assert.match(workflow, /Start-Process.*\/S/);
-  assert.match(workflow, /commonkitd-macos-universal/);
-  assert.match(workflow, /commonkitd-linux-x86_64/);
-  assert.match(workflow, /commonkitd-windows-x86_64\.exe/);
-  assert.match(workflow, /installed-lifecycle\.sh/);
-  assert.match(workflow, /COMMONKIT_DESKTOP_UPDATE_REPORT/);
-  assert.match(workflow, /COMMONKIT_DESKTOP_UPDATE_EXPECTED_VERSION/);
-  assert.match(workflow, /updatedByTauri/);
-  assert.match(workflow, /updaterExitPrepared/);
-  assert.match(workflow, /Wait for the Windows updater to replace the installed executable/);
-  assert.match(workflow, /desktopVersion/);
-  assert.match(workflow, /desktopExecutable/);
-  assert.match(workflow, /previous_hash/);
-  assert.match(workflow, /updated_hash/);
-  assert.match(workflow, /CommonKit\.AppImage[\s\S]*COMMONKIT_DESKTOP_SMOKE_REPORT/);
-  assert.doesNotMatch(workflow, /installedVersion/);
-  assert.doesNotMatch(workflow, /dpkg -L[^\n]*commonkit-desktop/);
-  assert.doesNotMatch(workflow, /Update macOS by installing current signed release/);
-  assert.doesNotMatch(workflow, /Update Linux by installing current signed Debian release/);
-  assert.doesNotMatch(workflow, /Update Windows by installing current signed NSIS release/);
+test("manual release policy requires native install update and uninstall evidence", async () => {
+  const release = await read("docs/RELEASING.md");
+  for (const value of ["macOS", "Linux", "Windows", "install", "update", "uninstall"]) {
+    assert.match(release, new RegExp(value, "i"));
+  }
+  assert.match(release, /two published versions/i);
+  assert.match(release, /artifact digests, commands, and results/i);
+  assert.match(release, /scripts\/installed-lifecycle\.sh/);
 });
 
-test("CI exercises an unsigned installed CLI and daemon lifecycle on every OS", async () => {
-  const workflow = await read(".github/workflows/ci.yml");
+test("manual harness exercises an unsigned installed CLI and daemon lifecycle", async () => {
   const harness = await read("scripts/installed-lifecycle.sh");
 
-  assert.match(workflow, /unsigned-installed-lifecycle/);
-  assert.match(workflow, /cargo install --locked --path crates\/commonkit-cli/);
-  assert.match(workflow, /cargo install --locked --path crates\/commonkit-service/);
-  assert.match(workflow, /commonkit-target-helper/);
-  assert.match(workflow, /commonkitd/);
-  assert.match(workflow, /installed-lifecycle\.sh/);
-  assert.match(workflow, /commonkit-snapshot-recovery-fixture/);
-  assert.doesNotMatch(workflow, /commonkit-snapshots --test durable_restore/);
   assert.match(harness, /"\$commonkit" init connect/);
   assert.match(harness, /"\$commonkit" sync --confirmed/);
   assert.match(harness, /"\$commonkit" apply/);
@@ -189,7 +142,6 @@ test("CI exercises an unsigned installed CLI and daemon lifecycle on every OS", 
   for (const command of ["install", "start", "status", "restart", "uninstall"]) {
     assert.match(harness, new RegExp(`"\\$commonkit" daemon ${command}`));
   }
-  assert.match(workflow, /test:compatibility/);
 });
 
 test("release artifacts include and verify the target helper on every platform", async () => {
@@ -206,35 +158,25 @@ test("release artifacts include and verify the target helper on every platform",
   }
 });
 
-test("CI isolates the real APM integration behind a checksum-verified provider gate", async () => {
-  const [workflow, integration] = await Promise.all([
-    read(".github/workflows/ci.yml"),
+test("manual provider validation is bound to checksum-verified releases", async () => {
+  const [providerLock, integration] = await Promise.all([
+    read("providers/provider-release-lock.json"),
     read("crates/commonkit-adapters/tests/apm_real_provider.rs"),
   ]);
   const exactTest = "checksum_pinned_apm_release_materializes_without_touching_live_target";
 
-  // The ordinary workspace matrix must remain runnable without downloading a
-  // provider, while the real integration remains an explicit required CI test.
   assert.match(integration, /#\[ignore\s*=\s*"requires checksum-verified APM 0\.25\.0 binary"\]/);
   assert.match(integration, /COMMONKIT_APM_025_BIN/);
-
-  for (const job of ["providers-unix:", "providers-windows:"]) {
-    const start = workflow.indexOf(job);
-    assert.notEqual(start, -1, `${job} missing`);
-    const remainder = workflow.slice(start + job.length);
-    const nextJobMatch = /\n  [a-z][a-z0-9-]+:\n/.exec(remainder);
-    const nextJob = nextJobMatch
-      ? start + job.length + nextJobMatch.index
-      : -1;
-    const body = workflow.slice(start, nextJob === -1 ? undefined : nextJob);
-    const checksum = body.search(/shasum -a 256 --check|Get-FileHash/);
-    const env = body.indexOf("COMMONKIT_APM_025_BIN");
-    const exact = body.indexOf(
-      `apm_real_provider ${exactTest} -- --ignored --exact`,
-    );
-    assert.ok(checksum >= 0, `${job} must verify the downloaded archive`);
-    assert.ok(env > checksum, `${job} must export only the verified executable`);
-    assert.ok(exact > env, `${job} must run the exact ignored integration after verification`);
+  assert.match(integration, new RegExp(exactTest));
+  const lock = JSON.parse(providerLock);
+  assert.equal(lock.apm.version, "0.25.0");
+  assert.equal(lock.chezmoi.version, "2.70.4");
+  for (const provider of Object.values(lock)) {
+    for (const [platform, entry] of Object.entries(provider)) {
+      if (platform === "version") continue;
+      assert.match(entry.sha256, /^[a-f0-9]{64}$/);
+      assert.ok(entry.asset.length > 0);
+    }
   }
 });
 
@@ -247,7 +189,7 @@ test("release and third-party notice policies are explicit", async () => {
   ]);
 
   assert.match(release, /signed and notarized universal macOS/i);
-  assert.match(release, /fail closed/i);
+  assert.match(release, /fails? closed/i);
   assert.match(notices, /chezmoi/i);
   assert.match(notices, /not redistributed/i);
   assert.match(migration, /update channel/i);

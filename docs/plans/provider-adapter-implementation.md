@@ -193,7 +193,7 @@ If CommonKit redistributes chezmoi, its complete MIT notice must ship in `THIRD_
 
 ## APM convergence
 
-APM 0.25.0 uses the same inputs, materialized sets, ownership, bindings, artifacts, and adapters. Frozen install, compile, and CI audit occur in a disposable workspace. See the detailed APM plan for fixed commands, policy bypass denial, MCP limitations, and its vertical acceptance slices.
+APM 0.25.0 uses the same inputs, materialized sets, ownership, bindings, artifacts, and adapters. Frozen install, compile, and manually invoked provider audit occur in a disposable workspace. See the detailed APM plan for fixed commands, policy bypass denial, MCP limitations, and its vertical acceptance slices.
 
 ## SSH target staging
 

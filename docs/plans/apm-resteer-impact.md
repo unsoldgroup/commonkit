@@ -19,7 +19,7 @@ Observed behavior relevant to the adapter:
 - Frozen install reads the committed lockfile from the disposable project.
 - Compilation may emit Codex context as root `AGENTS.md`; Claude instructions
   may remain under `.claude/rules/` without a duplicate root `CLAUDE.md`.
-- CI audit performs a cache-only install replay. Its temporary directory must
+- The provider audit performs a cache-only install replay. Its temporary directory must
   be outside the project tree; APM refuses an in-tree `TMPDIR`.
 - The `.apm/` project tree is a provider input. CommonKit stages it, rejects
   symlinks, and binds its deterministic tree digest into provider inputs.
@@ -221,7 +221,7 @@ All commands except `--version` run with `cwd` set to the disposable staging wor
 
 `apm --version` must contain exact semver `0.25.0` after the literal ` version ` marker. A release build may append a short commit identifier; prerelease, `unknown`, missing, or mismatched versions fail with remediation.
 
-`install --frozen` is lockfile-only but is not a complete content-integrity or offline guarantee. A cold machine may still require package material. The CI audit is mandatory and exit code `0` is the only passing result.
+`install --frozen` is lockfile-only but is not a complete content-integrity or offline guarantee. A cold machine may still require package material. The manually invoked provider audit is mandatory and exit code `0` is the only passing result.
 
 The runner forbids arbitrary provider arguments and scrubs APM bypass environment variables. In particular it never permits `--no-policy`, `--force`, `--trust-transitive-mcp`, `--allow-insecure`, `--allow-insecure-host`, `--no-audit`, `--audit off`, `--no-drift`, `--strip`, `--skip-verify`, `APM_POLICY_DISABLE`, or `APM_ALLOW_PROTOCOL_FALLBACK`.
 
@@ -340,7 +340,7 @@ Do not rewrite the v1 scope. Add a short “ADR 0005 provider amendment” that:
 - [Installation](https://github.com/microsoft/apm/blob/v0.25.0/docs/src/content/docs/getting-started/installation.md)
 - [`install` command and `--root`/`--frozen`](https://github.com/microsoft/apm/blob/v0.25.0/docs/src/content/docs/reference/cli/install.md)
 - [`compile` command](https://github.com/microsoft/apm/blob/v0.25.0/docs/src/content/docs/reference/cli/compile.md)
-- [`audit` command and CI exit semantics](https://github.com/microsoft/apm/blob/v0.25.0/docs/src/content/docs/reference/cli/audit.md)
+- [`audit` command and non-interactive exit semantics](https://github.com/microsoft/apm/blob/v0.25.0/docs/src/content/docs/reference/cli/audit.md)
 - [Manifest schema](https://github.com/microsoft/apm/blob/v0.25.0/docs/src/content/docs/reference/manifest-schema.md)
 - [Lockfile specification](https://github.com/microsoft/apm/blob/v0.25.0/docs/src/content/docs/reference/lockfile-spec.md)
 - [Governance and bypass contract](https://github.com/microsoft/apm/blob/v0.25.0/docs/src/content/docs/enterprise/governance-guide.md)

@@ -137,11 +137,12 @@ pnpm typecheck
 pnpm test
 ```
 
-CI runs the Rust workspace, Node package, desktop, provider isolation gates, and
-an unsigned installed CLI/daemon lifecycle on macOS, Linux, and Windows. Signed
-release workflows additionally require Apple notarization, Windows signing,
-Tauri updater signing, and the configured HTTPS update channel; they fail closed
-when those external credentials are absent.
+CommonKit does not use GitHub Actions. Validation is run locally and manually on
+the named macOS, Linux, or Windows machine or an explicitly selected
+non-GitHub runner. Signed releases require Apple notarization, Windows signing,
+Tauri updater signing, the configured HTTPS update channel, and recorded native
+lifecycle evidence; release scripts fail closed when those inputs are absent.
 
 See [CONTEXT.md](CONTEXT.md), [ADR 0005](docs/adr/0005-use-apm-for-agent-context.md),
-and [the v1 scope](docs/scopes/commonkit-tauri-v1.md) for the product contract.
+[the v1 scope](docs/scopes/commonkit-tauri-v1.md), and
+[the release policy](docs/RELEASING.md) for the product contract.
