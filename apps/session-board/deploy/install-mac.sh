@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly REPO_DIR="${SESSION_BOARD_REPO_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
+readonly REPO_DIR="${SESSION_BOARD_REPO_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 readonly TEMPLATE="$REPO_DIR/apps/session-board/deploy/templates/cloud.unsold.session-board-reporter.plist"
 readonly CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/commonkit"
 readonly CONFIG_FILE="$CONFIG_DIR/session-board-reporter.json"

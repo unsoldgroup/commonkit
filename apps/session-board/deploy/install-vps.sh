@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly DOMAIN="${SESSION_BOARD_DOMAIN:-board.unsold.cloud}"
 readonly HUB_PORT="${SESSION_BOARD_PORT:-8787}"
-readonly REPO_DIR="${SESSION_BOARD_REPO_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../../.." && pwd)}"
+readonly REPO_DIR="${SESSION_BOARD_REPO_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 readonly TEMPLATE_DIR="$REPO_DIR/apps/session-board/deploy/templates"
 readonly CONFIG_DIR="$HOME/.config/commonkit/session-board"
 readonly SYSTEMD_DIR="$HOME/.config/systemd/user"
