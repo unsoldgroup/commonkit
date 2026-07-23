@@ -1,0 +1,44 @@
+{
+  "id": "local",
+  "ok": true,
+  "result": {
+    "worktrees": [
+      {
+        "worktreeId": "commonkit::/Users/al/code/commonkit",
+        "worktreeInstanceId": "wt-1303",
+        "repoId": "repo-commonkit",
+        "projectId": "github:unsold/commonkit",
+        "hostId": "host-studio",
+        "repo": { "name": "commonkit" },
+        "path": "/Users/al/code/commonkit",
+        "branch": "uns-1303-session-board-reporter",
+        "displayName": "Session Board reporter",
+        "status": "permission",
+        "lastActivityAt": 1784664000000,
+        "lastOutputAt": 1784664001000,
+        "agents": [
+          {
+            "paneKey": "pane-codex",
+            "agentType": "codex",
+            "state": "waiting",
+            "stateStartedAt": 1784663999000,
+            "updatedAt": 1784664001000,
+            "taskTitle": "Build Mac reporter",
+            "displayName": "Codex",
+            "lastAssistantMessage": "Waiting for approval"
+          },
+          {
+            "paneKey": "pane-other",
+            "agentType": "future-agent",
+            "state": "unknown-state",
+            "updatedAt": "2026-07-21T20:00:02.000Z",
+            "displayName": "Future agent"
+          }
+        ]
+      }
+    ],
+    "totalCount": 1,
+    "truncated": false
+  },
+  "_meta": { "runtimeId": "runtime-captured" }
+}
