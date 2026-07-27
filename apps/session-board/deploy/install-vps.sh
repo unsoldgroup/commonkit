@@ -57,7 +57,7 @@ readonly ACME_SH="${ACME_SH:-$HOME/.acme.sh/acme.sh}"
 }
 : "${SESSION_BOARD_REPORTER_TOKENS:?Set SESSION_BOARD_REPORTER_TOKENS to a JSON object of Target ids to tokens}"
 : "${SESSION_BOARD_ACTION_TOKEN:?Set SESSION_BOARD_ACTION_TOKEN}"
-: "${HOSTINGER_API_TOKEN:?Set HOSTINGER_API_TOKEN for the acme.sh Hostinger DNS challenge}"
+: "${CF_Token:?Set CF_Token for the acme.sh Cloudflare DNS challenge (Cloudflare is authoritative for unsold.cloud)}"
 
 mkdir -p "$CONFIG_DIR" "$SYSTEMD_DIR" "$REPO_DIR/apps/session-board/hub/data"
 umask 077
@@ -75,8 +75,8 @@ chmod 644 "$UNIT_FILE"
 pnpm --dir "$REPO_DIR" install --frozen-lockfile
 pnpm --dir "$REPO_DIR" --filter @commonkit/session-board-web build
 
-export HOSTINGER_API_TOKEN
-"$ACME_SH" --issue --dns dns_hostinger --keylength ec-256 -d "$DOMAIN"
+export CF_Token
+"$ACME_SH" --issue --dns dns_cf --keylength ec-256 -d "$DOMAIN"
 CERT_STAGE="$(mktemp -d)"
 readonly CERT_STAGE
 trap 'rm -rf -- "$CERT_STAGE"' EXIT

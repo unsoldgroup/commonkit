@@ -14,7 +14,7 @@ On the VPS Target, install:
 
 - Bun, pnpm, Caddy, and a running system Caddy service.
 - acme.sh at `~/.acme.sh/acme.sh` for the service user.
-- A Hostinger API token with DNS access for the `unsold.cloud` zone.
+- A Cloudflare API token with DNS edit access for the `unsold.cloud` zone (Cloudflare is the authoritative DNS; the Hostinger zone copy is not served).
 - `sudo` access for installing the Caddy certificate and site snippet and reloading Caddy.
 
 The main `/etc/caddy/Caddyfile` must import the snippets directory once:
@@ -33,13 +33,13 @@ On each Mac Target, install Bun, pnpm, Orca, and Tailscale. Confirm the Mac can 
 
 ## DNS
 
-Create this record manually in the Hostinger `unsold.cloud` DNS zone:
+Create this record in the Cloudflare `unsold.cloud` zone:
 
 | Type | Name | Value | Proxy |
 | --- | --- | --- | --- |
 | A | `board` | VPS tailnet IPv4 address | DNS only |
 
-The address must be the VPS Tailscale address, not its public address. Access therefore requires the client to be on the tailnet. Do not expose the hub port or this hostname through a public reverse proxy. The installer does not create or change this record. The Hostinger API token passed to acme.sh is used only for the temporary DNS-01 validation record.
+The address must be the VPS Tailscale address, not its public address. Access therefore requires the client to be on the tailnet. Do not expose the hub port or this hostname through a public reverse proxy. The installer does not create or change this record. The Cloudflare token passed to acme.sh is used only for the temporary DNS-01 validation record.
 
 ## Install the VPS hub
 
@@ -50,9 +50,9 @@ From the repository root on the VPS:
 ```sh
 export SESSION_BOARD_REPORTER_TOKENS='{"studio":"replace-with-random-token"}'
 export SESSION_BOARD_ACTION_TOKEN='replace-with-a-different-random-token'
-export HOSTINGER_API_TOKEN='hostinger-api-token'
+export CF_Token='cloudflare-dns-edit-token'
 apps/session-board/deploy/install-vps.sh
-unset SESSION_BOARD_REPORTER_TOKENS SESSION_BOARD_ACTION_TOKEN HOSTINGER_API_TOKEN
+unset SESSION_BOARD_REPORTER_TOKENS SESSION_BOARD_ACTION_TOKEN CF_Token
 ```
 
 The script installs dependencies, builds the web app, writes the hub environment file with mode `0600`, installs and starts `board-hub.service`, explicitly runs the acme.sh DNS-01 challenge, installs the certificate for Caddy, validates the Caddy configuration, and reloads Caddy. It does not create the permanent DNS record.
@@ -110,7 +110,7 @@ tail -n 100 "$HOME/Library/Logs/CommonKit/session-board-reporter.error.log"
 ## Add another machine
 
 1. Generate a new reporter token. Never reuse another Target's token.
-2. Add `"target-id":"new-token"` to `SESSION_BOARD_REPORTER_TOKENS` and rerun `install-vps.sh` with the complete token map, action token, and the Hostinger API token. This refreshes the certificate as well as the service configuration.
+2. Add `"target-id":"new-token"` to `SESSION_BOARD_REPORTER_TOKENS` and rerun `install-vps.sh` with the complete token map, action token, and CF_Token. This refreshes the certificate as well as the service configuration.
 3. On the new Mac, run `install-mac.sh` with the same Target id and token and a useful Target display name.
 4. Open the board from a tailnet client and confirm the Target appears online. Stop the reporter and confirm it becomes offline before relying on the deployment.
 
@@ -125,4 +125,4 @@ Reporter tokens are rotated one Target at a time:
 
 To rotate the board action token, rerun `install-vps.sh` with the unchanged reporter map and a new `SESSION_BOARD_ACTION_TOKEN`, then replace the token used by the trusted board client. Existing board clients stop being able to submit decisions immediately. A failed or missing decision never becomes an approval; Claude returns to its normal TUI prompt on hook timeout or reporter failure.
 
-Certificate renewal uses the same DNS-01 flow. Rerun `install-vps.sh` with `HOSTINGER_API_TOKEN` before expiry, or configure a reviewed local renewal job that runs `acme.sh --renew`, installs the renewed files at `/etc/caddy/certs/session-board/`, and reloads Caddy. Do not place the Hostinger API token in the hub environment file.
+Certificate renewal uses the same DNS-01 flow. Rerun `install-vps.sh` with `CF_Token` before expiry, or configure a reviewed local renewal job that runs `acme.sh --renew`, installs the renewed files at `/etc/caddy/certs/session-board/`, and reloads Caddy. Do not place the Cloudflare token in the hub environment file.
