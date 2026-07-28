@@ -67,6 +67,7 @@ chmod 600 "$PLIST"
 plutil -lint "$PLIST"
 
 pnpm --dir "$REPO_DIR" install --frozen-lockfile
+pnpm --dir "$REPO_DIR" --filter @commonkit/session-board-protocol build
 launchctl bootout "$SERVICE_TARGET" >/dev/null 2>&1 || true
 launchctl bootstrap "$DOMAIN_TARGET" "$PLIST"
 launchctl enable "$SERVICE_TARGET"
