@@ -137,3 +137,16 @@ Version 1 is complete only when it supports all of these flows:
 12. Provide open-source onboarding, schema, threat model, and CI.
 
 Version 1 supports macOS, Linux, and Windows as first-class managed targets. Every platform must support headless CLI/service operation; the desktop status application is an additional interface, not a runtime requirement.
+
+## Session Board
+
+The Session Board is CommonKit's glanceable approval surface: a hub on the always-on VPS (`board.unsold.cloud`, tailnet-only) fed by per-machine reporters, showing every Claude/Codex/Orca session and the decisions they are waiting on.
+
+**Glossary**
+- **Pending action**: a decision a human owes a session — a Claude permission prompt, a Codex numbered option prompt, or an Orca gate.
+- **Approval card**: the board's rendering of one pending action. A card answers who ([project] + agent), what (verb + relative path or command), why (**intent** — the agent's last transcript message before asking), and shows the exact payload (diff, content, or command).
+- **Verbs**: Allow (once), Always (persist a project-local allowlist rule — ADR 0009), Deny with an optional steer message. Codex cards keep their numbered options.
+- **Intent**: transcript-derived context on a card; read from the session's JSONL transcript at prompt time, never stored beyond the action.
+- **Stale**: an action whose 55s window lapsed; the terminal prompt took over (fail-open, ADR 0008) and the card must show that outcome rather than live buttons.
+- **Decision log**: the recent history of human decisions, kept by the hub for glanceable audit (7-day retention).
+- **Push opt-in**: per-device web-push subscription so a new pending action reaches the iPad when the board is closed; notification delivery never affects the decision path.
