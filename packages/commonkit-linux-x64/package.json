@@ -1,0 +1,27 @@
+{
+  "name": "commonkit-linux-x64",
+  "version": "0.1.0",
+  "description": "CommonKit native Rust runtime for Linux x64",
+  "license": "MIT",
+  "author": "Unsold Group (https://unsold.group)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unsoldgroup/commonkit.git",
+    "directory": "packages/commonkit-linux-x64"
+  },
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "bin",
+    "checksums.json",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

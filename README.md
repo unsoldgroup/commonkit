@@ -44,6 +44,22 @@ Requirements are Rust 1.85+, Node.js 24+, pnpm 10.28.2, Git, and SSH. APM and
 chezmoi are optional until a loadout selects them; CommonKit validates their
 exact configured versions before use.
 
+For a normal CLI and daemon installation, use the public npm package:
+
+```sh
+npm install --global commonkit
+commonkit --version
+commonkit daemon install
+commonkit daemon start
+```
+
+The npm launcher selects the matching native Rust package for the current OS
+and architecture, verifies its executables by SHA-256, and exposes
+`commonkit`, `commonkitd`, and `commonkit-target-helper`. The signed desktop
+application remains a separate native download.
+
+To build CommonKit from source instead:
+
 ```sh
 git clone https://github.com/unsoldgroup/commonkit.git
 cd commonkit

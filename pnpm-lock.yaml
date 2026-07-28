@@ -65,6 +65,19 @@ importers:
         specifier: ^5.9.0
         version: 5.9.3
 
+  packages/commonkit-darwin-arm64: {}
+
+  packages/commonkit-linux-x64: {}
+
+  packages/commonkit-npm:
+    optionalDependencies:
+      commonkit-darwin-arm64:
+        specifier: workspace:0.1.0
+        version: link:../commonkit-darwin-arm64
+      commonkit-linux-x64:
+        specifier: workspace:0.1.0
+        version: link:../commonkit-linux-x64
+
   packages/mcp-local-relay:
     dependencies:
       '@modelcontextprotocol/sdk':
