@@ -162,26 +162,28 @@ test("eight-flow qualification binds native evidence to commit and binary digest
   assert.doesNotMatch(qualifier, /set -x/);
 });
 
-test("committed macOS eight-flow evidence is complete and content-addressed", async () => {
-  const evidence = JSON.parse(
-    await read("docs/evidence/eight-flow-macos-arm64-e25785d.json"),
-  );
-
-  assert.match(evidence.commit, /^[0-9a-f]{40}$/);
-  assert.equal(evidence.platform, "darwin");
-  assert.equal(evidence.architecture, "arm64");
-  assert.equal(evidence.result, "passed");
-  assert.deepEqual(
-    Object.keys(evidence.binaries).sort(),
-    [
-      "commonkit",
-      "commonkit-snapshot-recovery-fixture",
-      "commonkit-target-helper",
-      "commonkitd",
-    ],
-  );
-  for (const digest of Object.values(evidence.binaries)) {
-    assert.match(digest, /^sha256:[0-9a-f]{64}$/);
+test("committed native eight-flow evidence is complete and content-addressed", async () => {
+  for (const [path, platform, architecture] of [
+    ["docs/evidence/eight-flow-macos-arm64-e25785d.json", "darwin", "arm64"],
+    ["docs/evidence/eight-flow-linux-x64-e98dee5.json", "linux", "x64"],
+  ]) {
+    const evidence = JSON.parse(await read(path));
+    assert.match(evidence.commit, /^[0-9a-f]{40}$/);
+    assert.equal(evidence.platform, platform);
+    assert.equal(evidence.architecture, architecture);
+    assert.equal(evidence.result, "passed");
+    assert.deepEqual(
+      Object.keys(evidence.binaries).sort(),
+      [
+        "commonkit",
+        "commonkit-snapshot-recovery-fixture",
+        "commonkit-target-helper",
+        "commonkitd",
+      ],
+    );
+    for (const digest of Object.values(evidence.binaries)) {
+      assert.match(digest, /^sha256:[0-9a-f]{64}$/);
+    }
   }
 });
 
