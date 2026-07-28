@@ -1,15 +1,23 @@
 # CommonKit v1 completion audit
 
 Audit date: 2026-07-23
-Audit basis: implementation commit `e25785d021a469f555c51258df9f51889372cbd8` on `main`. “Met locally” means the Rust production path, desktop contracts, and installed unsigned lifecycle pass on the macOS arm64 audit host; it does not substitute for production signing/notarization, a published updater, or manually recorded native multi-OS evidence. CommonKit does not use GitHub Actions, and GitHub-hosted status is not a completion or release gate.
+Audit basis: source and macOS evidence at implementation commit `e25785d021a469f555c51258df9f51889372cbd8`, plus a separately recorded Linux lifecycle at commit `e98dee5620eb34025366128339f5a1dbaf0c66ea`. This is **commit-bound historical evidence**. It does not establish the state of current HEAD or any later release candidate; each candidate must rerun the qualifier and bind its own binary digests. “Met locally” in this dated audit means that the named production-path contracts and unsigned installed lifecycle passed at the named commit. It does not substitute for production signing/notarization, a published updater, Windows evidence, native credential-store execution, or real-SSH evidence. CommonKit does not use GitHub Actions, and GitHub-hosted status is not a completion or release gate.
 
 ## Core eight-flow status
 
-The eight original CommonKit runtime goals are implemented and locally evidenced: target initialization; drift preview; safe reconciliation; parity verification; independent credential-reference provisioning; recovery and rollback; multiple targets with five-layer composition; and scheduled read-only drift checks. These are necessary but not sufficient for v1 release readiness. The complete v1 contract also includes relay management, coding-agent providers and SkillOpt, redacted diagnostics, cross-platform desktop/headless delivery, Git-backed portable state, encrypted snapshots, and the release lifecycle.
+The first eight runtime flows were locally implemented and exercised at the recorded commits: target initialization; drift preview; safe reconciliation;
+parity verification; independent credential-reference provisioning; recovery
+and rollback; multiple targets with five-layer composition; and scheduled
+read-only drift checks. Their evidence remains useful but is not current-head
+qualification. These flows are necessary but not sufficient for v1 release
+readiness. The complete v1 contract also includes relay management, coding-agent
+providers and SkillOpt, redacted diagnostics, cross-platform desktop/headless
+delivery, Git-backed portable state, encrypted snapshots, and the release
+lifecycle.
 
 ## Twelve-flow matrix
 
-| # | Flow | Implementation status | Current evidence | Remaining gate |
+| # | Flow | Implementation status at audit basis | Commit-bound evidence | Remaining gate |
 | --- | --- | --- | --- | --- |
 | 1 | Initialize a target | Met on macOS and Linux | `commonkit init create|connect` creates or clones a kit, writes the composition layers and target registration, establishes private runtime roots, validates pinned native/APM/chezmoi inputs, materializes an initial provider plan, and writes `headless.json`. Publication is protected by a private fsynced transaction journal: restart recovery finalizes an observed pushed revision, rolls back an unpushed transaction, and fails closed on ambiguous remote advancement or tampered artifacts. Desktop onboarding uses the same bounded provider choices. Content-addressed installed lifecycles passed on macOS arm64 and Ubuntu Linux x86_64. | Installed first-run evidence on Windows. |
 | 2 | Preview drift | Met on macOS and Linux | Git-backed provider materialization, composition/explanation, live observation, durable plan retrieval, deterministic diff, stale-input rejection, and local/typed-SSH planning are implemented. Both installed lifecycles produced and inspected a bound plan before mutation. Provider-pipeline, service, CLI, and SSH contracts are green on the audited commit. | Native Windows and declared remote support-matrix evidence. |
@@ -33,7 +41,7 @@ The eight original CommonKit runtime goals are implemented and locally evidenced
 - `pnpm --dir apps/desktop typecheck`: passed.
 - The APM real-binary and one chezmoi real-binary test remain explicitly opt-in because they require pinned external release binaries; their native platform matrix is not satisfied by the ordinary workspace run.
 - `scripts/installed-lifecycle.sh <isolated-scratch> target/debug`: passed on macOS arm64, including daemon install/restart, onboarding reload, provider plan/apply/verify, credential plan/apply/verify/redaction, scheduler enable/tick/disable, snapshot create/restore, fresh-process recovery, typed remote-helper execution, and uninstall.
-- `docs/evidence/eight-flow-macos-arm64-e25785d.json` and `docs/evidence/eight-flow-linux-x64-e98dee5.json` bind successful macOS arm64 and Ubuntu Linux x86_64 lifecycles to exact commits, platforms, architectures, Node versions, and SHA-256 digests of the four installed binaries. The Linux run used an isolated temporary source tree, Rust toolchain, runtime root, and loopback ports on the current Hostinger VPS; the complete temporary directory was removed after retrieving evidence. Future native runs use `scripts/qualify-eight-flows.sh` to emit the same secret-free format.
+- `docs/evidence/eight-flow-macos-arm64-e25785d.json` and `docs/evidence/eight-flow-linux-x64-e98dee5.json` bind successful macOS arm64 and Ubuntu Linux x86_64 lifecycles to exact commits, platforms, architectures, Node versions, and SHA-256 digests of the four installed binaries. They do not establish a pass for current HEAD. The Linux run used an isolated temporary source tree, Rust toolchain, runtime root, and loopback ports on the Hostinger VPS; the complete temporary directory was removed after retrieving evidence. Future native runs use `scripts/qualify-eight-flows.sh` to emit the same secret-free format.
 - A local arm64 Tauri application bundle built successfully, passed strict ad-hoc code-signature verification after local signing, installed at `/Applications/CommonKit.app`, and remained running as a macOS accessory/status-bar process. Its application icon uses the same Ck geometry as the monochrome tray icon.
 - The isolated VPS acceptance run passed on the current Hostinger VPS. It used only an approved private `/tmp` root, a temporary Rust toolchain, process-fallback services, and ephemeral loopback ports; the source, toolchain, binaries, and runtime state were deleted after the evidence JSON was retrieved.
 
@@ -59,7 +67,7 @@ Locally implemented and evidenced on the committed audit basis: bounded onboardi
 
 Implementation evidence still required before external release qualification:
 
-1. Complete the optional real-SSH transport smoke on a disposable Linux host. The current Hostinger VPS now has isolated Linux lifecycle evidence, but the qualification intentionally did not create a system account or start a second sshd.
+1. Complete the real-SSH transport smoke on a disposable Linux host. The Hostinger VPS has isolated local-target Linux lifecycle evidence, but the qualification intentionally did not create a system account or start a second sshd. Host-key confirmation was not performed or recorded, so the typed helper and simulated transport contracts are not remote-target qualification.
 
 External or native-platform evidence still required:
 
@@ -70,4 +78,11 @@ External or native-platform evidence still required:
 
 ## Conclusion
 
-Do not mark CommonKit v1 release-ready. The first eight runtime flows are now installed and evidenced on macOS arm64 and Ubuntu Linux x86_64, and flows 9–11 remain covered by production-path contracts. Flow 12 remains partial because Windows qualification, external signing, publication, updater, provider, and full remote-target evidence are still outstanding. No P0 finding was identified in this audit.
+Do not mark CommonKit v1 release-ready. The first eight runtime flows were
+installed and evidenced on macOS arm64 and Ubuntu Linux x86_64 at the exact
+commits recorded above; this dated evidence does not qualify current HEAD.
+Flows 9–11 had production-path contract coverage at the audit basis. Flow 12
+remains partial because current-candidate native qualification, Windows
+qualification, external signing, publication, updater, native credential-store,
+provider, and full remote-target evidence are still outstanding. No P0 finding
+was identified in this dated audit.

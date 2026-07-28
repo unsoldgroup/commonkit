@@ -142,6 +142,7 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
             before_digest,
             after_digest,
             payload_digest,
+            provenance: Some(resource.provenance.clone()),
             summary: format!("materialize {path} over SSH"),
         })?;
         self.write_record(

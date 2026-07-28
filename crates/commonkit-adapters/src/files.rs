@@ -17,7 +17,9 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{ArtifactStore, ContentReference, ContentSensitivity};
-use crate::{FileMode, FilesystemIntent, NormalizedManagedPath, SafeSymlinkTarget};
+use crate::{
+    FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, SafeSymlinkTarget,
+};
 
 static REPLACEMENT_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -165,10 +167,10 @@ impl FileAdapter {
         let mut observed = Vec::new();
         for intent in intents {
             validate_semantic_intent(intent)?;
-            observed.push((
-                intent.path().as_str().to_owned(),
-                inspect_resource(&self.target, &self.artifacts, intent.path().as_str())?,
-            ));
+            let mut preimage =
+                inspect_resource(&self.target, &self.artifacts, intent.path().as_str())?;
+            project_preimage_for_intent(intent, &mut preimage);
+            observed.push((intent.path().as_str().to_owned(), preimage));
         }
         observed.sort_by(|left, right| left.0.cmp(&right.0));
         observed.dedup_by(|left, right| left.0 == right.0);
@@ -235,6 +237,7 @@ impl FileAdapter {
             before_digest,
             after_digest: Some(after_digest),
             payload_digest,
+            provenance: None,
             summary: format!("materialize {}", intent.path.portable()),
         })?;
         let record = ManagedFileRecord {
@@ -307,9 +310,19 @@ impl FileAdapter {
         id: StableId,
         intent: FilesystemIntent,
     ) -> Result<Operation, FileAdapterError> {
+        self.register_resource_with_provenance(id, intent, None)
+    }
+
+    fn register_resource_with_provenance(
+        &mut self,
+        id: StableId,
+        intent: FilesystemIntent,
+        provenance: Option<commonkit_contracts::OperationProvenance>,
+    ) -> Result<Operation, FileAdapterError> {
         validate_semantic_intent(&intent)?;
         self.validate_target_binding()?;
-        let observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())?;
+        let mut observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())?;
+        project_preimage_for_intent(&intent, &mut observed);
         let before_digest = semantic_digest(&observed)?;
         let expected = match &intent {
             FilesystemIntent::Symlink {
@@ -363,6 +376,7 @@ impl FileAdapter {
             before_digest,
             after_digest,
             payload_digest,
+            provenance,
             summary: format!("materialize {path}"),
         })?;
         write_record(
@@ -389,7 +403,21 @@ impl FileAdapter {
             let bytes = provider_artifacts.load(content)?;
             *content = self.artifacts.put(&bytes, content.sensitivity)?;
         }
-        self.register_resource(id, intent)
+        self.register_resource_with_provenance(id, intent, None)
+    }
+
+    pub fn register_materialized_provider_resource(
+        &mut self,
+        id: StableId,
+        resource: &NormalizedResource,
+        provider_artifacts: &ArtifactStore,
+    ) -> Result<Operation, FileAdapterError> {
+        let mut intent = resource.intent.clone();
+        if let FilesystemIntent::File { content, .. } = &mut intent {
+            let bytes = provider_artifacts.load(content)?;
+            *content = self.artifacts.put(&bytes, content.sensitivity)?;
+        }
+        self.register_resource_with_provenance(id, intent, Some(resource.provenance.clone()))
     }
 
     fn semantic(&mut self, operation: &Operation) -> Result<FilesystemIntent, AdapterFailure> {
@@ -458,7 +486,9 @@ impl FileAdapter {
             .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
         let observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
             .map_err(|_| failure("unsafe_path", "managed resource path is unsafe"))?;
-        let digest = semantic_digest(&observed)
+        let mut projected = observed.clone();
+        project_preimage_for_intent(&intent, &mut projected);
+        let digest = semantic_digest(&projected)
             .map_err(|_| failure("digest_failed", "could not digest managed resource"))?;
         if digest != operation.before_digest {
             return Err(failure(
@@ -484,8 +514,9 @@ impl FileAdapter {
         let intent = self.semantic(operation)?;
         self.validate_target_binding()
             .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
-        let observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
+        let mut observed = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
             .map_err(|_| failure("unsafe_path", "managed resource path is unsafe"))?;
+        project_preimage_for_intent(&intent, &mut observed);
         let observed_digest = semantic_digest(&observed)
             .map_err(|_| failure("preimage_changed", "managed resource cannot be digested"))?;
         if observed_digest != operation.before_digest {
@@ -519,18 +550,7 @@ impl FileAdapter {
             .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
         let mut actual = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
             .map_err(|_| failure("unsafe_path", "managed resource path is unsafe"))?;
-        if matches!(
-            &intent,
-            FilesystemIntent::File { mode: None, .. }
-                | FilesystemIntent::Directory { mode: None, .. }
-        ) {
-            match &mut actual {
-                ResourcePreimage::File { mode, .. } | ResourcePreimage::Directory { mode } => {
-                    *mode = None;
-                }
-                _ => {}
-            }
-        }
+        project_preimage_for_intent(&intent, &mut actual);
         let digest = semantic_digest(&actual)
             .map_err(|_| failure("verify_failed", "could not digest managed resource"))?;
         if digest == operation.after_digest {
@@ -561,7 +581,9 @@ impl FileAdapter {
                 "resource backup artifact is invalid",
             )
         })?;
-        if semantic_digest(&preimage).map_err(|_| {
+        let mut projected_preimage = preimage.clone();
+        project_preimage_for_intent(&intent, &mut projected_preimage);
+        if semantic_digest(&projected_preimage).map_err(|_| {
             failure(
                 "rollback_backup_mismatch",
                 "resource backup cannot be digested",
@@ -577,18 +599,7 @@ impl FileAdapter {
             .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
         let mut current = inspect_resource(&self.target, &self.artifacts, intent.path().as_str())
             .map_err(|_| failure("unsafe_path", "managed rollback path is unsafe"))?;
-        if matches!(
-            &intent,
-            FilesystemIntent::File { mode: None, .. }
-                | FilesystemIntent::Directory { mode: None, .. }
-        ) {
-            match &mut current {
-                ResourcePreimage::File { mode, .. } | ResourcePreimage::Directory { mode } => {
-                    *mode = None;
-                }
-                _ => {}
-            }
-        }
+        project_preimage_for_intent(&intent, &mut current);
         let current_digest = semantic_digest(&current).map_err(|_| {
             failure(
                 "rollback_preimage_changed",
@@ -814,6 +825,20 @@ fn validate_semantic_intent(intent: &FilesystemIntent) -> Result<(), FileAdapter
         SafeSymlinkTarget::parse(&path, target.as_str().to_owned())?;
     }
     Ok(())
+}
+
+fn project_preimage_for_intent(intent: &FilesystemIntent, preimage: &mut ResourcePreimage) {
+    if matches!(
+        intent,
+        FilesystemIntent::File { mode: None, .. } | FilesystemIntent::Directory { mode: None, .. }
+    ) {
+        match preimage {
+            ResourcePreimage::File { mode, .. } | ResourcePreimage::Directory { mode } => {
+                *mode = None;
+            }
+            ResourcePreimage::Absent | ResourcePreimage::Symlink { .. } => {}
+        }
+    }
 }
 
 fn desired_preimage(intent: &FilesystemIntent) -> ResourcePreimage {

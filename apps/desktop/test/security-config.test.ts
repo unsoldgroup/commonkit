@@ -48,6 +48,74 @@ test("desktop is single-window, CSP-bound, and emits updater artifacts", async (
   ]);
 });
 
+test("macOS shows the Dock icon only while the main window is open", async () => {
+  const source = await readFile(new URL("src/lib.rs", root), "utf8");
+  const showWindow = source.slice(
+    source.indexOf("fn show_main_window"),
+    source.indexOf("fn show_route"),
+  );
+  const hideWindow = source.slice(
+    source.indexOf("fn hide_main_window"),
+    source.indexOf("fn show_route"),
+  );
+  const windowEvents = source.slice(source.indexOf(".on_window_event"));
+  const setup = source.slice(
+    source.indexOf(".setup(move |app|"),
+    source.indexOf(".on_window_event"),
+  );
+
+  assert.match(
+    showWindow,
+    /set_activation_policy\(tauri::ActivationPolicy::Regular\)/,
+  );
+  assert.ok(
+    showWindow.indexOf("ActivationPolicy::Regular") <
+      showWindow.indexOf("window.show()"),
+    "the Dock icon must be restored before showing the window",
+  );
+  assert.match(
+    hideWindow,
+    /set_activation_policy\(tauri::ActivationPolicy::Accessory\)/,
+  );
+  assert.ok(
+    hideWindow.indexOf("window.hide()") <
+      hideWindow.indexOf("ActivationPolicy::Accessory"),
+    "closing the window must hide it before returning to menu-bar-only mode",
+  );
+  assert.match(windowEvents, /hide_main_window\(window\)/);
+  assert.doesNotMatch(windowEvents, /let _ = window\.hide\(\)/);
+  assert.doesNotMatch(
+    windowEvents,
+    /let _ = window[\s\S]*?set_activation_policy/,
+  );
+  assert.match(setup, /arg == "--minimized"/);
+  assert.match(
+    setup,
+    /if !start_minimized \{[\s\S]*?show_main_window/,
+  );
+  assert.match(
+    windowEvents,
+    /RunEvent::Reopen[\s\S]*?show_main_window/,
+    "reopening a tray-only app must restore its hidden window as well as its Dock icon",
+  );
+});
+
+test("macOS Dock lifecycle smoke verifies open, close, and reopen against OS state", async () => {
+  const smoke = await readFile(
+    new URL("../../../scripts/macos-dock-lifecycle-smoke.sh", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(smoke, /NSRunningApplication/);
+  assert.match(smoke, /activationPolicy/);
+  assert.match(smoke, /process "Dock"/);
+  assert.match(smoke, /process "CommonKit"/);
+  assert.match(smoke, /open -a CommonKit/);
+  assert.match(smoke, /Open CommonKit/);
+  assert.match(smoke, /expected Regular/);
+  assert.match(smoke, /expected Accessory/);
+});
+
 test("manual release policy requires native desktop and daemon lifecycle evidence", async () => {
   const release = await readFile(new URL("../../../docs/RELEASING.md", import.meta.url), "utf8");
   assert.match(release, /trusted release workstation/i);

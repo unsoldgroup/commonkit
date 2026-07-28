@@ -23,6 +23,7 @@ pub struct OperationDraft {
     pub before_digest: Option<Sha256Digest>,
     pub after_digest: Option<Sha256Digest>,
     pub payload_digest: Sha256Digest,
+    pub provenance: Option<OperationProvenance>,
     pub summary: String,
 }
 
@@ -38,6 +39,8 @@ struct OperationSemantic<'a> {
     before_digest: &'a Option<Sha256Digest>,
     after_digest: &'a Option<Sha256Digest>,
     payload_digest: &'a Sha256Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<&'a OperationProvenance>,
 }
 
 pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, ContractError> {
@@ -57,6 +60,7 @@ pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, Contra
             before_digest: &draft.before_digest,
             after_digest: &draft.after_digest,
             payload_digest: &draft.payload_digest,
+            provenance: draft.provenance.as_ref(),
         },
     )?;
     Ok(Operation {
@@ -70,6 +74,7 @@ pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, Contra
         before_digest: draft.before_digest,
         after_digest: draft.after_digest,
         payload_digest: draft.payload_digest,
+        provenance: draft.provenance,
         summary: draft.summary,
     })
 }
@@ -141,6 +146,7 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
             before_digest: operation.before_digest.clone(),
             after_digest: operation.after_digest.clone(),
             payload_digest: operation.payload_digest.clone(),
+            provenance: operation.provenance.clone(),
             summary: operation.summary.clone(),
         })?;
         if recomputed.id != operation.id {

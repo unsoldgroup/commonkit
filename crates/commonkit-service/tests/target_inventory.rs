@@ -293,7 +293,33 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
         serde_json::from_slice(&to_bytes(plan.into_body(), 4096).await.unwrap()).unwrap();
     assert_eq!(body["targetId"], "remote");
 
+    let unconfirmed_fetch = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/control/v1/targets/remote/git")
+                .header(header::HOST, "127.0.0.1:3764")
+                .header(
+                    header::AUTHORIZATION,
+                    format!("Bearer {}", token.expose_for_client()),
+                )
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"confirmed":false,"confirmationId":"target-fetch"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unconfirmed_fetch.status(), StatusCode::CONFLICT);
+
     for (method, fetched) in [("GET", false), ("POST", true)] {
+        let request_body = if fetched {
+            r#"{"confirmed":true,"confirmationId":"target-fetch"}"#
+        } else {
+            "{}"
+        };
         let response = app
             .clone()
             .oneshot(
@@ -306,7 +332,7 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
                         format!("Bearer {}", token.expose_for_client()),
                     )
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from("{}"))
+                    .body(Body::from(request_body))
                     .unwrap(),
             )
             .await

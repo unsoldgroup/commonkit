@@ -2438,7 +2438,7 @@ async fn target_sync_plan(
     AxumPath(target): AxumPath<String>,
     Json(request): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    require_consent(&request)?;
+    assert_domain_request_safe(&request)?;
     let target = StableId::parse(target).map_err(|_| ApiError::bad_request("invalid_target_id"))?;
     let domain = state
         .control
@@ -2475,7 +2475,9 @@ async fn target_git_inspect(
 async fn target_git_fetch(
     State(state): State<ApiState>,
     AxumPath(target): AxumPath<String>,
+    Json(request): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
     target_git(state, target, true).await
 }
 
@@ -3235,13 +3237,17 @@ async fn sync_plan(
     State(state): State<ApiState>,
     Json(mut request): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    require_consent(&request)?;
     let fetch = match request.get("fetch") {
         Some(value) => value
             .as_bool()
             .ok_or_else(|| ApiError::bad_request("invalid_fetch"))?,
         None => false,
     };
+    if fetch {
+        require_consent(&request)?;
+    } else {
+        assert_domain_request_safe(&request)?;
+    }
     if let Some(object) = request.as_object_mut() {
         object.remove("fetch");
     }

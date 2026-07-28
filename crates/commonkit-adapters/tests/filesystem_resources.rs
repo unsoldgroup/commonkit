@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_adapters::{
-    ArtifactStore, ContentSensitivity, FileAdapter, FileMode, FilesystemIntent,
+    ArtifactStore, ContentSensitivity, FileAdapter, FileAdapterError, FileMode, FilesystemIntent,
     NormalizedManagedPath, SafeSymlinkTarget,
 };
 use commonkit_contracts::StableId;
@@ -46,6 +46,190 @@ fn file_operation(
             &provider,
         )
         .expect("file operation")
+}
+
+#[test]
+fn unspecified_file_mode_does_not_create_perpetual_drift() {
+    let root = temporary_directory("unspecified-file-mode-no-drift");
+    let target = root.join("target");
+    let state = root.join("state");
+    fs::create_dir_all(target.join("home")).expect("target");
+    fs::write(target.join("home/config.txt"), b"managed\n").expect("managed file");
+
+    let provider = ArtifactStore::open(root.join("provider-artifacts")).expect("provider store");
+    let content = provider
+        .put(b"managed\n", ContentSensitivity::Portable)
+        .expect("provider content");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+
+    assert!(matches!(
+        adapter.register_materialized_resource(
+            id("managed-file"),
+            FilesystemIntent::File {
+                path: NormalizedManagedPath::parse("home/config.txt").expect("path"),
+                content,
+                mode: None,
+                expected_before: None,
+            },
+            &provider,
+        ),
+        Err(FileAdapterError::NoChange)
+    ));
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn unspecified_file_mode_updates_and_rolls_back_without_changing_the_original_mode() {
+    let root = temporary_directory("unspecified-file-mode-lifecycle");
+    let target = root.join("target");
+    let state = root.join("state");
+    fs::create_dir_all(target.join("home")).expect("target");
+    let managed_path = target.join("home/config.txt");
+    fs::write(&managed_path, b"original\n").expect("original file");
+    fs::set_permissions(&managed_path, fs::Permissions::from_mode(0o640)).expect("original mode");
+
+    let provider = ArtifactStore::open(root.join("provider-artifacts")).expect("provider store");
+    let content = provider
+        .put(b"managed\n", ContentSensitivity::Portable)
+        .expect("provider content");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register_materialized_resource(
+            id("managed-file"),
+            FilesystemIntent::File {
+                path: NormalizedManagedPath::parse("home/config.txt").expect("path"),
+                content,
+                mode: None,
+                expected_before: None,
+            },
+            &provider,
+        )
+        .expect("file update");
+
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("apply");
+    adapter.verify(&operation).expect("verify");
+    assert_eq!(
+        fs::read(&managed_path).expect("managed bytes"),
+        b"managed\n"
+    );
+
+    drop(adapter);
+    let mut adapter = FileAdapter::open(&target, &state).expect("fresh rollback adapter");
+    adapter.rollback(&operation).expect("rollback");
+    assert_eq!(
+        fs::read(&managed_path).expect("restored bytes"),
+        b"original\n"
+    );
+    assert_eq!(
+        fs::metadata(&managed_path)
+            .expect("restored metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn unspecified_directory_mode_updates_and_rolls_back_an_existing_file_with_its_mode() {
+    let root = temporary_directory("unspecified-directory-mode-lifecycle");
+    let target = root.join("target");
+    let state = root.join("state");
+    fs::create_dir_all(&target).expect("target");
+    let managed_path = target.join("config");
+    fs::write(&managed_path, b"original file\n").expect("original file");
+    fs::set_permissions(&managed_path, fs::Permissions::from_mode(0o640)).expect("original mode");
+
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register_resource(
+            id("managed-directory"),
+            FilesystemIntent::Directory {
+                path: NormalizedManagedPath::parse("config").expect("path"),
+                mode: None,
+                exact: false,
+            },
+        )
+        .expect("directory update");
+
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("apply");
+    adapter.verify(&operation).expect("verify");
+    assert!(managed_path.is_dir());
+
+    drop(adapter);
+    let mut adapter = FileAdapter::open(&target, &state).expect("fresh rollback adapter");
+    adapter.rollback(&operation).expect("rollback");
+    assert_eq!(
+        fs::read(&managed_path).expect("restored bytes"),
+        b"original file\n"
+    );
+    assert_eq!(
+        fs::metadata(&managed_path)
+            .expect("restored metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn unspecified_file_mode_updates_and_rolls_back_an_existing_directory_with_its_mode() {
+    let root = temporary_directory("unspecified-mode-directory-preimage");
+    let target = root.join("target");
+    let state = root.join("state");
+    let managed_path = target.join("config");
+    fs::create_dir_all(&managed_path).expect("original directory");
+    fs::set_permissions(&managed_path, fs::Permissions::from_mode(0o750))
+        .expect("original directory mode");
+
+    let provider = ArtifactStore::open(root.join("provider-artifacts")).expect("provider store");
+    let content = provider
+        .put(b"managed file\n", ContentSensitivity::Portable)
+        .expect("provider content");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register_materialized_resource(
+            id("managed-file"),
+            FilesystemIntent::File {
+                path: NormalizedManagedPath::parse("config").expect("path"),
+                content,
+                mode: None,
+                expected_before: None,
+            },
+            &provider,
+        )
+        .expect("file update");
+
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("apply");
+    adapter.verify(&operation).expect("verify");
+    assert_eq!(
+        fs::read(&managed_path).expect("managed bytes"),
+        b"managed file\n"
+    );
+
+    drop(adapter);
+    let mut adapter = FileAdapter::open(&target, &state).expect("fresh rollback adapter");
+    adapter.rollback(&operation).expect("rollback");
+    assert!(managed_path.is_dir());
+    assert_eq!(
+        fs::metadata(&managed_path)
+            .expect("restored metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o750
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
 }
 
 fn assert_adapter_did_not_read(state: &std::path::Path, forbidden: &[u8]) {

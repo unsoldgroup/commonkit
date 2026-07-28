@@ -58,7 +58,9 @@ enum Command {
         /// Fetch and validate the trusted Git remote before creating the plan.
         #[arg(long)]
         fetch: bool,
-        #[arg(long)]
+        // Accepted for compatibility with older automation. Preview is read-only
+        // and no longer asks the operator for mutation confirmation.
+        #[arg(long, hide = true)]
         confirmed: bool,
     },
     /// Show the deterministic changes in a synchronization plan.
@@ -725,22 +727,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         | Command::Rollback {
             confirmed: false, ..
-        }
-        | Command::Sync {
-            confirmed: false, ..
         } => {
             return Err(
                 "confirmation_required: pass --confirmed after reviewing the operation".into(),
             );
         }
-        Command::Sync {
-            fetch,
-            confirmed: true,
-        } => print_daemon(daemon_control(
+        Command::Sync { fetch, confirmed } => print_daemon(daemon_control(
             "POST",
             "/control/v1/sync/plan",
             Some(
-                json!({"confirmed":true,"confirmationId":"cli-sync","idempotencyKey":nonce("sync"),"fetch":fetch}),
+                json!({"confirmed":confirmed || fetch,"confirmationId":"cli-sync","idempotencyKey":nonce("sync"),"fetch":fetch}),
             ),
             None,
         )?)?,

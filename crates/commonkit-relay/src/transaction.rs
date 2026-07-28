@@ -235,6 +235,7 @@ pub fn plan_relay_operation(
         before_digest: before,
         after_digest: Some(after),
         payload_digest,
+        provenance: None,
         summary: "reconcile persistent MCP relay configuration".into(),
     })?;
     write_immutable(

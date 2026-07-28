@@ -33,6 +33,16 @@
         "payloadDigest": {
           "type": "string"
         },
+        "provenance": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperationProvenance"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "requiresConfirmation": {
           "type": "boolean"
         },
@@ -72,6 +82,30 @@
         "restore"
       ],
       "type": "string"
+    },
+    "OperationProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "inputDigest": {
+          "type": "string"
+        },
+        "providerId": {
+          "type": "string"
+        },
+        "providerVersion": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "providerId",
+        "providerVersion",
+        "inputDigest",
+        "source"
+      ],
+      "type": "object"
     },
     "PlanBindings": {
       "additionalProperties": false,

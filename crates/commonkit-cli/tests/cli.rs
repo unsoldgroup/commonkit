@@ -64,6 +64,7 @@ fn sync_help_exposes_explicit_fetch_before_plan() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--fetch"), "{stdout}");
+    assert!(!stdout.contains("--confirmed"), "{stdout}");
 }
 
 #[test]
@@ -91,6 +92,10 @@ fn sync_fetch_sends_one_fetch_bound_plan_request_and_never_applies() {
         let request = String::from_utf8_lossy(&request[..length]);
         assert!(request.starts_with("POST /control/v1/sync/plan "));
         assert!(request.contains(r#""fetch":true"#), "{request}");
+        assert!(
+            request.contains(r#""confirmed":true"#),
+            "the explicit --fetch option is the operator's consent to update Git tracking refs: {request}"
+        );
         assert!(!request.contains("/apply"));
         let body = r#"{"planId":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}"#;
         write!(
@@ -103,10 +108,7 @@ fn sync_fetch_sends_one_fetch_bound_plan_request_and_never_applies() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_commonkit"));
     isolate_app_paths(&mut command, root.path());
-    let output = command
-        .args(["sync", "--fetch", "--confirmed"])
-        .output()
-        .unwrap();
+    let output = command.args(["sync", "--fetch"]).output().unwrap();
     assert!(
         output.status.success(),
         "{}",
@@ -365,19 +367,37 @@ fn headless_commands_contact_the_daemon_and_fail_actionably_when_it_is_absent() 
 
 #[test]
 fn mutations_require_an_explicit_confirmation_flag() {
-    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
-        .args([
+    for arguments in [
+        vec![
             "apply",
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        ])
-        .output()
-        .expect("apply");
+        ],
+        vec!["rollback", "run-reviewed"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+            .args(arguments)
+            .output()
+            .expect("mutation");
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("confirmation_required")
+        );
+    }
+}
+
+#[test]
+fn read_only_sync_preview_does_not_require_confirmation() {
+    let directory = temporary_directory("cli-sync-preview-no-daemon");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_commonkit"));
+    isolate_app_paths(&mut command, &directory);
+    let output = command.arg("sync").output().expect("sync preview");
+
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8(output.stderr)
-            .unwrap()
-            .contains("confirmation_required")
-    );
+    let error = String::from_utf8(output.stderr).expect("UTF-8");
+    assert!(error.contains("daemon_unavailable"), "{error}");
+    assert!(!error.contains("confirmation_required"), "{error}");
 }
 
 #[test]

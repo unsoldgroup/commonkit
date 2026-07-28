@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use commonkit_contracts::{ContractError, Sha256Digest, StableId, digest_domain_json};
+use commonkit_contracts::{ContractError, Sha256Digest, digest_domain_json};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -163,14 +163,7 @@ impl From<SafeSymlinkTarget> for String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ResourceProvenance {
-    pub provider_id: StableId,
-    pub provider_version: String,
-    pub input_digest: Sha256Digest,
-    pub source: String,
-}
+pub type ResourceProvenance = commonkit_contracts::OperationProvenance;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]

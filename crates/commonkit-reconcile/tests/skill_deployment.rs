@@ -41,6 +41,7 @@ fn operation() -> Operation {
         before_digest: Some(digest('1')),
         after_digest: Some(digest('2')),
         payload_digest: digest('3'),
+        provenance: None,
         summary: "Install accepted skill into the canary loadout".into(),
     })
     .expect("operation")

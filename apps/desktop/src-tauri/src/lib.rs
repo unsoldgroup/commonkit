@@ -1562,11 +1562,30 @@ async fn run_automated_update_lifecycle(app: tauri::AppHandle, report: PathBuf, 
 
 #[tauri::command]
 fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Regular)
+        .map_err(|error| error.to_string())?;
     let window = app
         .get_webview_window("main")
         .ok_or("main window unavailable")?;
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
+}
+
+fn hide_main_window(window: &tauri::Window) -> Result<(), String> {
+    window.hide().map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    window
+        .app_handle()
+        .set_activation_policy(tauri::ActivationPolicy::Accessory)
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn report_window_lifecycle_error(action: &str, result: Result<(), String>) {
+    if let Err(error) = result {
+        eprintln!("CommonKit could not {action}: {error}");
+    }
 }
 
 fn show_route(app: tauri::AppHandle, route: &str) -> Result<(), String> {
@@ -1709,7 +1728,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(client.clone())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            let _ = show_main_window(app.clone());
+            report_window_lifecycle_error("show the main window", show_main_window(app.clone()));
         }))
         .plugin(
             tauri_plugin_autostart::Builder::new()
@@ -1853,7 +1872,10 @@ pub fn run() {
                 .icon_as_template(true)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => {
-                        let _ = show_main_window(app.clone());
+                        report_window_lifecycle_error(
+                            "show the main window",
+                            show_main_window(app.clone()),
+                        );
                     }
                     "refresh" => {
                         tauri::async_runtime::spawn(refresh_tray(app.clone()));
@@ -1886,6 +1908,10 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+            let start_minimized = std::env::args().any(|arg| arg == "--minimized");
+            if !start_minimized {
+                show_main_window(app.handle().clone()).map_err(std::io::Error::other)?;
+            }
             let app_handle = app.handle().clone();
             if let (Some(report), Ok(expected)) = (
                 std::env::var_os("COMMONKIT_DESKTOP_UPDATE_REPORT"),
@@ -1915,11 +1941,19 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                report_window_lifecycle_error("hide the main window", hide_main_window(window));
             }
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run CommonKit desktop");
+        .build(tauri::generate_context!())
+        .expect("failed to build CommonKit desktop")
+        .run(|app, event| {
+            if let tauri::RunEvent::Reopen { .. } = event {
+                report_window_lifecycle_error(
+                    "reopen the main window",
+                    show_main_window(app.clone()),
+                );
+            }
+        });
 }
 
 #[cfg(test)]

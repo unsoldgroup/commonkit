@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describePermission } from "../src/claude-hook-server.js";
 
 describe("describePermission", () => {
@@ -27,9 +30,23 @@ import { lastAssistantText } from "../src/claude-hook-server.js";
 
 describe("lastAssistantText", () => {
   test("extracts the latest assistant text from a transcript", async () => {
-    const path = "/tmp/sb-transcript-test.jsonl";
-    expect(await lastAssistantText(path)).toBe("Recording the ADR for import budgeting before wiring the distiller.");
-    expect(await lastAssistantText("/tmp/does-not-exist.jsonl")).toBeUndefined();
-    expect(await lastAssistantText(undefined)).toBeUndefined();
+    const root = await mkdtemp(join(tmpdir(), "commonkit-session-board-transcript-"));
+    const path = join(root, "transcript.jsonl");
+    try {
+      await writeFile(path, [
+        JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "Earlier status." }] } }),
+        JSON.stringify({
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text: "Recording the ADR for import budgeting before wiring the distiller." }],
+          },
+        }),
+      ].join("\n"));
+      expect(await lastAssistantText(path)).toBe("Recording the ADR for import budgeting before wiring the distiller.");
+      expect(await lastAssistantText(join(root, "does-not-exist.jsonl"))).toBeUndefined();
+      expect(await lastAssistantText(undefined)).toBeUndefined();
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

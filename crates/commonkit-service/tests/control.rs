@@ -64,6 +64,7 @@ fn plan() -> commonkit_contracts::Plan {
         before_digest: None,
         after_digest: Some(digest('d')),
         payload_digest: digest('e'),
+        provenance: None,
         summary: "create config".into(),
     })
     .expect("operation");

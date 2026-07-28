@@ -29,7 +29,7 @@ impl ProviderResourcePlanner for FileAdapter {
         resource: &NormalizedResource,
         provider_artifacts: &ArtifactStore,
     ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
-        match self.register_materialized_resource(id, resource.intent.clone(), provider_artifacts) {
+        match self.register_materialized_provider_resource(id, resource, provider_artifacts) {
             Ok(operation) => Ok(Some(operation)),
             Err(FileAdapterError::NoChange) => Ok(None),
             Err(error) => Err(error.into()),

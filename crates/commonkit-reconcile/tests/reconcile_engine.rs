@@ -49,6 +49,7 @@ fn operation(adapter: &str, resource: &str) -> Operation {
         before_digest: Some(digest('1')),
         after_digest: Some(digest('2')),
         payload_digest: digest('3'),
+        provenance: None,
         summary: resource.into(),
     })
     .expect("operation")

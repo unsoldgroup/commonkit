@@ -214,6 +214,7 @@ impl<B: ServiceBackend> ServiceAdapter<B> {
             before_digest: Some(before_digest),
             after_digest: Some(after_digest),
             payload_digest,
+            provenance: None,
             summary: format!("reconcile service {}", spec.name),
         })?;
         self.intents.insert(

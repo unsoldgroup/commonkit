@@ -1,6 +1,6 @@
 use commonkit_core::{
     OperationDraft, OperationKind, PlanBindings, PlanBuildError, PlanDraft, ResourceRef, Risk,
-    Sha256Digest, StableId, build_plan, finalize_operation,
+    Sha256Digest, StableId, build_plan, digest_domain_json, finalize_operation,
 };
 
 fn id(value: &str) -> StableId {
@@ -26,6 +26,7 @@ fn operation(adapter: &str, resource: &str, summary: &str) -> OperationDraft {
         before_digest: Some(digest('1')),
         after_digest: Some(digest('2')),
         payload_digest: digest('3'),
+        provenance: None,
         summary: summary.into(),
     }
 }
@@ -46,6 +47,32 @@ fn operation_id_excludes_display_summary() {
     let right =
         finalize_operation(operation("codex", "settings", "Localized summary")).expect("op");
     assert_eq!(left.id, right.id);
+}
+
+#[test]
+fn operation_without_provenance_retains_the_legacy_v1_identity() {
+    let draft = operation("codex", "settings", "Update settings");
+    let legacy = digest_domain_json(
+        "commonkit.operation.v1",
+        &serde_json::json!({
+            "adapterId": draft.adapter_id,
+            "kind": draft.kind,
+            "resource": draft.resource,
+            "risk": draft.risk,
+            "requiresConfirmation": draft.requires_confirmation,
+            "dependsOn": draft.depends_on,
+            "beforeDigest": draft.before_digest,
+            "afterDigest": draft.after_digest,
+            "payloadDigest": draft.payload_digest,
+        }),
+    )
+    .expect("legacy identity");
+
+    assert_eq!(
+        finalize_operation(draft).expect("operation").id,
+        legacy,
+        "optional provenance must not invalidate durable pre-provenance v1 plans"
+    );
 }
 
 #[test]

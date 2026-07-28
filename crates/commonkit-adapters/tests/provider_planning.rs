@@ -112,6 +112,19 @@ fn verified_provider_states_build_a_durable_mutation_free_bound_plan() {
             .iter()
             .all(|operation| operation.adapter_id.as_str() == "files")
     );
+    let apm_operation = plan
+        .operations
+        .iter()
+        .find(|operation| operation.resource.managed_path.as_deref() == Some("agents/apm.txt"))
+        .expect("APM operation");
+    let provenance = apm_operation
+        .provenance
+        .as_ref()
+        .expect("provider resource provenance");
+    assert_eq!(provenance.provider_id.as_str(), "apm");
+    assert_eq!(provenance.provider_version, "0.25.0");
+    assert_eq!(provenance.source, "fixture:agents/apm.txt");
+    assert_eq!(provenance.input_digest, apm.inputs.digest().clone());
     for operation in &plan.operations {
         adapter.prepare(operation).unwrap();
         adapter.apply(operation).unwrap();

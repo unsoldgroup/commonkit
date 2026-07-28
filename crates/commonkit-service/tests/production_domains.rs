@@ -633,6 +633,32 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         std::fs::read(target.join("home/config.txt")).unwrap(),
         b"managed\n"
     );
+    let verified = sync
+        .verify(serde_json::json!({"planId": plan_contract.id}))
+        .unwrap();
+    assert_eq!(verified["verified"], true);
+
+    let converged_plan: commonkit_contracts::Plan = serde_json::from_value(
+        sync.plan(serde_json::json!({
+            "confirmed": true,
+            "confirmationId": "converged-production-plan"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        converged_plan.operations.is_empty(),
+        "applying the desired state must make the next production plan a no-op"
+    );
+
+    std::fs::write(target.join("home/config.txt"), b"hand edit").unwrap();
+    assert_eq!(
+        sync.verify(serde_json::json!({"planId": plan_contract.id})),
+        Err(commonkit_service::DomainFailure::VerificationFailed),
+        "verification must report an explicit parity failure after a managed-file hand edit"
+    );
+    std::fs::write(target.join("home/config.txt"), b"managed\n").unwrap();
+
     let rolled_back = sync
         .rollback(serde_json::json!({"confirmed":true,"confirmationId":"test","runId":run_id}))
         .unwrap();

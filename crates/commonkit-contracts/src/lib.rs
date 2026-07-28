@@ -914,6 +914,15 @@ pub struct ResourceRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationProvenance {
+    pub provider_id: StableId,
+    pub provider_version: String,
+    pub input_digest: Sha256Digest,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Operation {
     pub id: Sha256Digest,
     pub adapter_id: StableId,
@@ -927,6 +936,8 @@ pub struct Operation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_digest: Option<Sha256Digest>,
     pub payload_digest: Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<OperationProvenance>,
     pub summary: String,
 }
 
