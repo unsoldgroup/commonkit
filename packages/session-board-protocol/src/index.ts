@@ -67,6 +67,7 @@ export const claudePermissionActionSchema = z
       .object({
         tool: z.string().min(1),
         input: z.unknown(),
+        intent: z.string().optional(),
       })
       .strict(),
   })

@@ -5,6 +5,7 @@ import {
   type Decision,
 } from "@commonkit/session-board-protocol";
 import { createServer, type Server } from "node:http";
+import { open } from "node:fs/promises";
 
 export interface ClaudeHookServerOptions {
   machineId: string;
@@ -21,14 +22,41 @@ export function describePermission(tool: string, input: unknown, cwd: string): s
   const record = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
   const text = (key: string) => (typeof record[key] === "string" && record[key] ? (record[key] as string) : undefined);
   const project = cwd.split("/").filter(Boolean).pop() ?? cwd;
+  const relative = (path: string) => (path.startsWith(`${cwd}/`) ? path.slice(cwd.length + 1) : path);
   const body =
     tool === "Bash" ? (text("description") ? `${text("description")} — ${text("command") ?? ""}` : text("command")) :
-    tool === "Edit" || tool === "Write" || tool === "NotebookEdit" ? `${tool} ${text("file_path") ?? "file"}` :
+    tool === "Edit" || tool === "Write" || tool === "NotebookEdit" ? `${tool} ${relative(text("file_path") ?? text("notebook_path") ?? "file")}` :
     tool === "WebFetch" ? `Fetch ${text("url") ?? "URL"}` :
     tool === "WebSearch" ? `Search "${text("query") ?? ""}"` :
     tool === "Task" ? `Agent: ${text("description") ?? text("prompt") ?? "subagent"}` :
     undefined;
   return truncate(body ? `[${project}] ${body}` : `[${project}] Allow ${tool}`);
+}
+
+export async function lastAssistantText(transcriptPath: string | undefined, maxBytes = 131_072): Promise<string | undefined> {
+  if (!transcriptPath) return undefined;
+  try {
+    const handle = await open(transcriptPath, "r");
+    try {
+      const { size } = await handle.stat();
+      const start = Math.max(0, size - maxBytes);
+      const buffer = Buffer.alloc(size - start);
+      await handle.read(buffer, 0, buffer.length, start);
+      const lines = buffer.toString("utf8").split("\n");
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        try {
+          const entry = JSON.parse(lines[index]!);
+          if (entry?.type !== "assistant") continue;
+          const content = entry?.message?.content;
+          const blocks = Array.isArray(content) ? content : [];
+          const text = blocks.filter((block: { type?: string; text?: string }) => block?.type === "text" && typeof block.text === "string")
+            .map((block: { text: string }) => block.text).join(" ").trim();
+          if (text) return truncate(text.replaceAll(/\s+/g, " "), 280);
+        } catch { /* partial or non-JSON line */ }
+      }
+      return undefined;
+    } finally { await handle.close(); }
+  } catch { return undefined; }
 }
 
 export class ClaudeHookServer {
@@ -82,7 +110,11 @@ export class ClaudeHookServer {
       kind: "claude-permission",
       sessionRef: { machineId: this.options.machineId, worktreeId: payload.session.cwd, paneKey: payload.session.id },
       summary: describePermission(payload.tool, payload.input, payload.session.cwd),
-      detail: { tool: payload.tool, input: payload.input },
+      detail: {
+        tool: payload.tool,
+        input: payload.input,
+        ...(await lastAssistantText(payload.session.transcriptPath).then((intent) => (intent ? { intent } : {}))),
+      },
       createdAt: now().toISOString(),
       expiresAt: new Date(now().getTime() + timeoutMs).toISOString(),
     };
