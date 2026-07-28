@@ -68,6 +68,7 @@ export const claudePermissionActionSchema = z
         tool: z.string().min(1),
         input: z.unknown(),
         intent: z.string().optional(),
+        ruleSuggestion: z.string().optional(),
       })
       .strict(),
   })
@@ -85,7 +86,22 @@ export const claudeHookRequestSchema = z.object({
 }).strict();
 export type ClaudeHookRequest = z.infer<typeof claudeHookRequestSchema>;
 
-export const claudeHookResponseSchema = z.object({ decision: z.enum(["allow", "deny"]) }).strict();
+export const claudeHookResponseSchema = z
+  .object({
+    decision: z.enum(["allow", "deny"]),
+    updatedPermissions: z
+      .array(
+        z
+          .object({
+            rule: z.string().min(1),
+            destination: z.literal("localSettings"),
+          })
+          .strict(),
+      )
+      .min(1)
+      .optional(),
+  })
+  .strict();
 export type ClaudeHookResponse = z.infer<typeof claudeHookResponseSchema>;
 
 export const codexPromptActionSchema = z
@@ -124,7 +140,7 @@ export const pendingActionSchema = z.discriminatedUnion("kind", [
 export type PendingAction = z.infer<typeof pendingActionSchema>;
 
 export const verdictSchema = z.union([
-  z.enum(["allow", "deny"]),
+  z.enum(["allow", "always", "deny"]),
   z.string().regex(/^option:[1-9]\d*$/),
 ]);
 export type Verdict = z.infer<typeof verdictSchema>;
@@ -133,6 +149,7 @@ export const decisionSchema = z
   .object({
     actionId: idSchema,
     verdict: verdictSchema,
+    steer: z.string().max(280).optional(),
     decidedAt: timestampSchema,
   })
   .strict();
@@ -230,11 +247,33 @@ export type TailRequestMessage = z.infer<typeof tailRequestMessageSchema>;
 export const hubToReporterMessageSchema = z.discriminatedUnion("type", [decisionMessageSchema, tailRequestMessageSchema]);
 export type HubToReporterMessage = z.infer<typeof hubToReporterMessageSchema>;
 
-export const decisionRequestSchema = z.object({ verdict: verdictSchema }).strict();
+export const decisionRequestSchema = z
+  .object({ verdict: verdictSchema, steer: z.string().max(280).optional() })
+  .strict();
 export type DecisionRequest = z.infer<typeof decisionRequestSchema>;
+
+export function decisionValidForAction(action: PendingAction, decision: DecisionRequest): boolean {
+  return action.kind === "claude-permission" || (decision.verdict !== "always" && decision.steer === undefined);
+}
 
 export const decisionResponseSchema = z.object({ decision: decisionSchema }).strict();
 export type DecisionResponse = z.infer<typeof decisionResponseSchema>;
+
+export const decisionRecordSchema = z
+  .object({
+    id: idSchema,
+    actionId: idSchema,
+    summary: z.string().min(1),
+    verdict: verdictSchema,
+    steer: z.string().max(280).optional(),
+    machineId: idSchema,
+    decidedAt: timestampSchema,
+  })
+  .strict();
+export type DecisionRecord = z.infer<typeof decisionRecordSchema>;
+
+export const decisionsResponseSchema = z.object({ records: z.array(decisionRecordSchema) }).strict();
+export type DecisionsResponse = z.infer<typeof decisionsResponseSchema>;
 
 export const sseEventSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("snapshot"), data: boardSnapshotSchema }).strict(),
