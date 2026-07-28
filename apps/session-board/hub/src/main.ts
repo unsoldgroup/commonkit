@@ -1,4 +1,5 @@
 import { startHub } from "./server.js";
+import { createPushSender } from "./push.js";
 
 function required(name: string) {
   const value = process.env[name];
@@ -19,11 +20,20 @@ function reporterTokens() {
   return value as Record<string, string>;
 }
 
+function pushOptions() {
+  const publicKey = process.env.SESSION_BOARD_VAPID_PUBLIC;
+  const privateKey = process.env.SESSION_BOARD_VAPID_PRIVATE;
+  const subject = process.env.SESSION_BOARD_VAPID_SUBJECT;
+  if (!publicKey || !privateKey || !subject) return undefined;
+  return { publicKey, sender: createPushSender(subject, publicKey, privateKey) };
+}
+
 const hub = startHub({
   reporterTokens: reporterTokens(),
   actionToken: required("SESSION_BOARD_ACTION_TOKEN"),
   hostname: process.env.SESSION_BOARD_HOST ?? "127.0.0.1",
   port: Number(process.env.SESSION_BOARD_PORT ?? 8787),
+  push: pushOptions(),
 });
 
 console.log(`Session Board hub listening on ${hub.url}`);

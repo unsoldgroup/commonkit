@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -247,6 +247,221 @@ describe("board hub", () => {
       body: JSON.stringify({ verdict: "deny" }),
     });
     expect(repeated.status).toBe(410);
+    reporter.close();
+  });
+
+  test("persists decisions and prunes records older than seven days", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "session-board-data-"));
+    await Bun.write(join(dataDir, "decisions.json"), JSON.stringify({
+      records: [
+        {
+          id: "old-record",
+          actionId: "old-action",
+          summary: "Old decision",
+          verdict: "deny",
+          machineId: machine.id,
+          decidedAt: "2026-07-20T11:59:59.000Z",
+        },
+      ],
+    }));
+    hub = startHub({
+      reporterTokens: { studio: "studio-secret" },
+      actionToken: "board-secret",
+      dataDir,
+      now: () => new Date("2026-07-27T12:00:00.000Z"),
+    });
+    const reporter = await openReporter();
+    reporter.send(JSON.stringify({ type: "actionOpened", action }));
+    await eventually(() => expect(hub!.latestEventId).toBe(1));
+
+    const response = await fetch(`${hub.url}/actions/${action.id}/decision`, {
+      method: "POST",
+      headers: { Authorization: "Bearer board-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ verdict: "deny", steer: "Use the safer path." }),
+    });
+
+    expect(response.status).toBe(200);
+    const decisions = await fetch(`${hub.url}/decisions`).then((item) => item.json());
+    expect(decisions.records).toEqual([
+      {
+        id: expect.any(String),
+        actionId: action.id,
+        summary: action.summary,
+        verdict: "deny",
+        steer: "Use the safer path.",
+        machineId: machine.id,
+        decidedAt: "2026-07-27T12:00:00.000Z",
+      },
+    ]);
+    expect(JSON.parse(await readFile(join(dataDir, "decisions.json"), "utf8"))).toEqual(decisions);
+    reporter.close();
+  });
+
+  test("broadcasts the outcome when the board applies a decision", async () => {
+    hub = startHub({ reporterTokens: { studio: "studio-secret" }, actionToken: "board-secret" });
+    const reporter = await openReporter();
+    reporter.send(JSON.stringify({ type: "actionOpened", action }));
+    await eventually(() => expect(hub!.latestEventId).toBe(1));
+
+    const response = await fetch(`${hub.url}/actions/${action.id}/decision`, {
+      method: "POST",
+      headers: { Authorization: "Bearer board-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ verdict: "allow" }),
+    });
+    expect(response.status).toBe(200);
+
+    const events = await fetch(`${hub.url}/events`, { headers: { "Last-Event-ID": "1" } });
+    const reader = events.body!.getReader();
+    const decoder = new TextDecoder();
+    let replay = "";
+    while (!replay.includes('"type":"actionClosed"')) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      replay += decoder.decode(value, { stream: true });
+    }
+    await reader.cancel();
+    expect(replay).toContain('"type":"decision"');
+    expect(replay).toContain(`"type":"actionClosed","data":{"actionId":"${action.id}","outcome":"allowed"}`);
+    reporter.close();
+  });
+
+  test("broadcasts stale or failed reporter outcomes after state removal", async () => {
+    hub = startHub({ reporterTokens: { studio: "studio-secret" }, actionToken: "board-secret" });
+    const reporter = await openReporter();
+    reporter.send(JSON.stringify({ type: "actionOpened", action }));
+    await eventually(() => expect(hub!.latestEventId).toBe(1));
+    reporter.send(JSON.stringify({
+      type: "stateDelta",
+      machine,
+      sessions: { upsert: [], remove: [] },
+      pendingActions: { upsert: [], remove: [action.id] },
+    }));
+    await eventually(() => expect(hub!.latestEventId).toBe(2));
+    reporter.send(JSON.stringify({ type: "actionClosed", actionId: action.id, outcome: "failed" }));
+    await eventually(() => expect(hub!.latestEventId).toBe(3));
+
+    const events = await fetch(`${hub.url}/events`, { headers: { "Last-Event-ID": "2" } });
+    const reader = events.body!.getReader();
+    const { value } = await reader.read();
+    await reader.cancel();
+    expect(new TextDecoder().decode(value))
+      .toContain(`"type":"actionClosed","data":{"actionId":"${action.id}","outcome":"failed"}`);
+    reporter.close();
+  });
+
+  test("rejects always and steer for non-Claude actions", async () => {
+    hub = startHub({ reporterTokens: { studio: "studio-secret" }, actionToken: "board-secret" });
+    const reporter = await openReporter();
+    const codexAction = {
+      ...action,
+      kind: "codex-prompt",
+      detail: { prompt: "Choose", options: ["Continue"] },
+    } as const;
+    reporter.send(JSON.stringify({ type: "actionOpened", action: codexAction }));
+    await eventually(() => expect(hub!.latestEventId).toBe(1));
+
+    for (const body of [{ verdict: "always" }, { verdict: "option:1", steer: "Try another way." }]) {
+      const response = await fetch(`${hub.url}/actions/${action.id}/decision`, {
+        method: "POST",
+        headers: { Authorization: "Bearer board-secret", "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(response.status).toBe(400);
+    }
+    expect((await fetch(`${hub.url}/state`).then((item) => item.json())).pendingActions).toEqual([codexAction]);
+    reporter.close();
+  });
+
+  test("stores push subscriptions by endpoint and serves the VAPID public key", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "session-board-push-"));
+    hub = startHub({
+      reporterTokens: { studio: "studio-secret" },
+      actionToken: "board-secret",
+      dataDir,
+      push: { publicKey: "public-key", sender: { async send() {} } },
+    });
+    const subscription = {
+      endpoint: "https://push.example/device-1",
+      expirationTime: null,
+      keys: { p256dh: "device-key", auth: "device-auth" },
+    };
+
+    expect(await fetch(`${hub.url}/push/vapid-public-key`).then((response) => response.json()))
+      .toEqual({ publicKey: "public-key" });
+    expect((await fetch(`${hub.url}/push/subscriptions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(subscription),
+    })).status).toBe(401);
+    expect((await fetch(`${hub.url}/push/subscriptions`, {
+      method: "POST",
+      headers: { Authorization: "Bearer board-secret", "Content-Type": "application/json" },
+      body: JSON.stringify(subscription),
+    })).status).toBe(201);
+    const updated = { ...subscription, keys: { ...subscription.keys, auth: "updated-auth" } };
+    expect((await fetch(`${hub.url}/push/subscriptions`, {
+      method: "POST",
+      headers: { Authorization: "Bearer board-secret", "Content-Type": "application/json" },
+      body: JSON.stringify(updated),
+    })).status).toBe(201);
+    expect(JSON.parse(await readFile(join(dataDir, "push-subscriptions.json"), "utf8"))).toEqual({
+      [subscription.endpoint]: updated,
+    });
+  });
+
+  test("pushes each newly-seen pending action once across reporter reconnect state", async () => {
+    const dataDir = await mkdtemp(join(tmpdir(), "session-board-push-"));
+    const sent: Array<{ endpoint: string; payload: string }> = [];
+    hub = startHub({
+      reporterTokens: { studio: "studio-secret" },
+      actionToken: "board-secret",
+      dataDir,
+      push: {
+        publicKey: "public-key",
+        sender: {
+          async send(subscription, payload) {
+            sent.push({ endpoint: subscription.endpoint, payload });
+          },
+        },
+      },
+    });
+    const subscription = {
+      endpoint: "https://push.example/device-1",
+      keys: { p256dh: "device-key", auth: "device-auth" },
+    };
+    await fetch(`${hub.url}/push/subscriptions`, {
+      method: "POST",
+      headers: { Authorization: "Bearer board-secret", "Content-Type": "application/json" },
+      body: JSON.stringify(subscription),
+    });
+    const reporter = await openReporter();
+
+    reporter.send(JSON.stringify({ type: "stateSnapshot", machine, sessions: [], pendingActions: [action] }));
+    await eventually(() => expect(sent).toHaveLength(1));
+    reporter.send(JSON.stringify({ type: "stateSnapshot", machine, sessions: [], pendingActions: [action] }));
+    await Bun.sleep(20);
+    expect(sent).toHaveLength(1);
+
+    const secondAction = { ...action, id: "action-2", summary: "Allow Edit" };
+    reporter.send(JSON.stringify({
+      type: "stateDelta",
+      machine,
+      sessions: { upsert: [], remove: [] },
+      pendingActions: { upsert: [secondAction], remove: [] },
+    }));
+    await eventually(() => expect(sent).toHaveLength(2));
+    expect(sent.map((item) => JSON.parse(item.payload))).toEqual([
+      {
+        title: "Session Board approval needed",
+        body: action.summary,
+        actionId: action.id,
+      },
+      {
+        title: "Session Board approval needed",
+        body: secondAction.summary,
+        actionId: secondAction.id,
+      },
+    ]);
     reporter.close();
   });
 
