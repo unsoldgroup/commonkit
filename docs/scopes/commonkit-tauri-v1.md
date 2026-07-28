@@ -277,6 +277,20 @@ The Tauri 2 application replaces the macOS-only SwiftUI relay status app. It is 
 - Adapter diagnostics and redacted export.
 - Scheduling and update settings.
 
+### Onboarding entry points
+
+- GUI, solo CLI, and agent-assisted onboarding call the same validated Rust
+  initialization core and produce the same portable kit, runtime domains, and
+  first content-addressed plan.
+- Safe defaults keep the Git checkout, CommonKit private config/state, and
+  managed target root non-overlapping.
+- The CLI returns machine-readable JSON on success and actionable validation
+  errors on failure.
+- An assisting agent may inspect and prepare onboarding, but must stop before
+  adding `--publish-registration`; repository creation and registration pushes
+  require explicit user approval.
+- Onboarding never implies approval to apply the resulting first plan.
+
 ### Desktop lifecycle
 
 - Single-instance behavior.

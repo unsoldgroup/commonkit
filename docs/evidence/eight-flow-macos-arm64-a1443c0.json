@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "commit": "a1443c0d237658088706bb20e1dc136118576b4c",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "kernel": "Darwin Alexs-MacBook-Air.local 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:27:52 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T8112 arm64",
+  "nodeVersion": "v25.5.0",
+  "result": "passed",
+  "command": "scripts/installed-lifecycle.sh <isolated-scratch> <installed-bin>",
+  "binaries": {
+    "commonkit": "sha256:51efc04bc91fdfca78d95c81776402c2a6a8f642540710300d6eedae91d11735",
+    "commonkitd": "sha256:5a40f7a3038f8af696ef69478d84d3d07de40f9441b8b53e7c4fe4df7c1c7f5b",
+    "commonkit-target-helper": "sha256:607f41730d62804379b1541d58886ef2ec06ed39fdcda54a687777932564e281",
+    "commonkit-snapshot-recovery-fixture": "sha256:cf2434aa02f866e4631aca300e3bd93f3d5ac05d45bf7f9f8d8d6ea607d97f35"
+  }
+}

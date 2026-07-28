@@ -2,14 +2,14 @@
 
 This matrix is a release gate, not a claim that unchecked rows are production-ready.
 
-The committed eight-flow lifecycle records are **commit-bound historical evidence**, not evidence for an arbitrary later checkout: macOS arm64 passed at `e25785d`, and Ubuntu Linux x86_64 passed at `e98dee5`. A current release
+The committed eight-flow lifecycle records are **commit-bound historical evidence**, not evidence for an arbitrary later checkout: the latest macOS arm64 candidate passed at `a1443c0` (superseding the earlier `e25785d` record), and Ubuntu Linux x86_64 passed at `e98dee5`. A current release
 candidate must rerun the qualifier and record new binary digests. The table
 distinguishes implemented contracts from those native release-candidate runs.
 
 | Capability | macOS | Linux | Windows | Remote macOS/Linux |
 | --- | --- | --- | --- | --- |
-| Composition, policy, plans, receipts | Implemented; commit-bound lifecycle at `e25785d` | Implemented; commit-bound lifecycle at `e98dee5` | Implemented contracts; native manual validation required | Transport-neutral contracts |
-| Local filesystem reconciliation | Implemented; commit-bound lifecycle at `e25785d` | Implemented; commit-bound lifecycle at `e98dee5` | Implemented contracts; native ACL/reparse validation required | Typed SSH boundary; real-SSH lifecycle not performed or recorded |
+| Composition, policy, plans, receipts | Implemented; latest commit-bound lifecycle at `a1443c0` | Implemented; commit-bound lifecycle at `e98dee5` | Implemented contracts; native manual validation required | Transport-neutral contracts |
+| Local filesystem reconciliation | Implemented; latest commit-bound lifecycle at `a1443c0` | Implemented; commit-bound lifecycle at `e98dee5` | Implemented contracts; native ACL/reparse validation required | Typed SSH boundary; real-SSH lifecycle not performed or recorded |
 | APM 0.25.0 Claude + Codex | Fails closed; native fallback only until a privileged helper or VM boundary exists | Contract implemented; release binaries gated | Contract implemented; x86_64 gated, arm64 unavailable upstream | Controller-isolated materialization for SSH targets; verified portable artifacts staged through the typed helper |
 | chezmoi 2.70.4 safe subset | Fails closed; native fallback only until a privileged helper or VM boundary exists | Isolation contract | Isolation contract | Controller-isolated materialization only when controller and target platform/architecture match; otherwise fail closed and use native resources |
 | Credentials | env/file/BWS/keychain implemented; lifecycle used a fixture provider, so native Keychain execution remains unrecorded | env/file/BWS/keychain implemented; lifecycle used a fixture provider, so native Secret Service execution remains unrecorded | env/file/BWS and native Credential Manager API implemented; native Windows validation required | Target-local only |

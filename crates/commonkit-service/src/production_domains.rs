@@ -1156,7 +1156,6 @@ impl ProductionSyncDomain {
                 "composedLoadoutDigest":self.config.composed_loadout_digest,
                 "policyDigest":self.config.policy_digest,
                 "relayClientRoot":self.config.relay_client_root,
-                "relayEndpoint":self.config.relay_endpoint,
                 "sourceRevision":self.config.provider_pipeline.as_ref().map(|pipeline| &pipeline.source.revision),
                 "providers":providers,
             }),
@@ -1215,10 +1214,15 @@ impl ProductionSyncDomain {
         plan: &Plan,
         states: &[MaterializedState],
     ) -> Result<(), DomainFailure> {
+        let relay_endpoint = states
+            .iter()
+            .any(|state| !state.capabilities.is_empty())
+            .then(|| self.config.relay_endpoint.clone())
+            .flatten();
         let record = ProviderAuthorityRecord {
             plan: plan.clone(),
             states: states.to_vec(),
-            relay_endpoint: self.config.relay_endpoint.clone(),
+            relay_endpoint,
             executable_digests: self.executable_digests()?,
             external_state_digests: self.external_state_digests()?,
             provider_input_digests: self.provider_input_digests()?,
@@ -1345,9 +1349,10 @@ impl ProductionSyncDomain {
             config.source.trusted_remote_url.clone(),
             "origin",
         );
-        let status = repository
-            .inspect(true)
-            .map_err(|_| DomainFailure::OperationFailed)?;
+        let status = repository.inspect(false).map_err(|error| {
+            eprintln!("commonkitd: local provider repository inspection failed: {error}");
+            DomainFailure::OperationFailed
+        })?;
         if status.revision.as_str() != config.source.revision
             || matches!(
                 status.disposition,
@@ -1397,7 +1402,10 @@ impl ProductionSyncDomain {
         pipeline
             .materialize_all(&references, &context)
             .map(|result| result.states)
-            .map_err(|_| DomainFailure::OperationFailed)
+            .map_err(|error| {
+                eprintln!("commonkitd: provider materialization failed: {error}");
+                DomainFailure::OperationFailed
+            })
     }
 
     fn configured_provider(
@@ -1408,9 +1416,6 @@ impl ProductionSyncDomain {
     ) -> Result<Box<dyn DesiredStateProvider>, DomainFailure> {
         match config {
             ConfiguredProvider::Native { version, files } => {
-                if files.is_empty() {
-                    return Err(DomainFailure::OperationFailed);
-                }
                 let mut input_digests = BTreeMap::from([(
                     "repositoryRevision".into(),
                     digest_text(
@@ -1546,22 +1551,34 @@ impl ProductionSyncDomain {
     }
 
     fn build(&self) -> Result<Plan, DomainFailure> {
-        fs::create_dir_all(&self.config.adapter_state)
-            .map_err(|_| DomainFailure::OperationFailed)?;
-        let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
-            .map_err(|_| DomainFailure::OperationFailed)?;
+        fs::create_dir_all(&self.config.adapter_state).map_err(|error| {
+            eprintln!("commonkitd: adapter state preparation failed: {error}");
+            DomainFailure::OperationFailed
+        })?;
+        let artifacts = ArtifactStore::open(&self.config.provider_artifacts).map_err(|error| {
+            eprintln!("commonkitd: provider artifact store failed: {error}");
+            DomainFailure::OperationFailed
+        })?;
         let rules = OwnershipRules::new(
             self.config.case_sensitive,
             self.config.declared_roots.clone(),
             self.config.protected_roots.clone(),
         )
-        .map_err(|_| DomainFailure::OperationFailed)?;
-        let states = self.states_for_plan(&artifacts)?;
+        .map_err(|error| {
+            eprintln!("commonkitd: ownership policy preparation failed: {error}");
+            DomainFailure::OperationFailed
+        })?;
+        let states = self.states_for_plan(&artifacts).inspect_err(|error| {
+            eprintln!("commonkitd: desired-state preparation failed: {error:?}");
+        })?;
         let resources = states
             .iter()
             .flat_map(|state| state.resources.iter().cloned())
             .collect::<Vec<_>>();
-        validate_ownership(&resources, &rules).map_err(|_| DomainFailure::OperationFailed)?;
+        validate_ownership(&resources, &rules).map_err(|error| {
+            eprintln!("commonkitd: ownership validation failed: {error}");
+            DomainFailure::OperationFailed
+        })?;
         let intents = || {
             states
                 .iter()
@@ -1576,10 +1593,14 @@ impl ProductionSyncDomain {
             SyncTargetTransport::Local => {
                 let mut files =
                     FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
-                        .map_err(|_| DomainFailure::OperationFailed)?;
-                let observed = files
-                    .observed_state_digest(intents())
-                    .map_err(|_| DomainFailure::OperationFailed)?;
+                        .map_err(|error| {
+                            eprintln!("commonkitd: filesystem adapter preparation failed: {error}");
+                            DomainFailure::OperationFailed
+                        })?;
+                let observed = files.observed_state_digest(intents()).map_err(|error| {
+                    eprintln!("commonkitd: observed-state inspection failed: {error}");
+                    DomainFailure::OperationFailed
+                })?;
                 self.finish_plan(&states, &artifacts, &rules, observed, &mut files)?
             }
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
@@ -1606,10 +1627,14 @@ impl ProductionSyncDomain {
                 self.finish_plan(&states, &artifacts, &rules, observed, &mut files)?
             }
         };
-        self.seal_execution_authority(&plan, &states)?;
-        self.plan_store
-            .persist(&plan)
-            .map_err(|_| DomainFailure::OperationFailed)?;
+        self.seal_execution_authority(&plan, &states)
+            .inspect_err(|error| {
+                eprintln!("commonkitd: plan authority sealing failed: {error:?}");
+            })?;
+        self.plan_store.persist(&plan).map_err(|error| {
+            eprintln!("commonkitd: plan persistence failed: {error}");
+            DomainFailure::OperationFailed
+        })?;
         Ok(plan)
     }
 
@@ -1983,7 +2008,13 @@ impl SyncDomain for ProductionSyncDomain {
         let artifacts = ArtifactStore::open_existing(&self.config.provider_artifacts)
             .map_err(|_| DomainFailure::OperationFailed)?;
         let record = self.load_execution_authority(approved)?;
-        if record.relay_endpoint != self.config.relay_endpoint
+        let expected_relay_endpoint = record
+            .states
+            .iter()
+            .any(|state| !state.capabilities.is_empty())
+            .then(|| self.config.relay_endpoint.clone())
+            .flatten();
+        if record.relay_endpoint != expected_relay_endpoint
             || record.executable_digests != self.executable_digests()?
             || record.external_state_digests != self.external_state_digests()?
             || record.provider_input_digests != self.provider_input_digests()?

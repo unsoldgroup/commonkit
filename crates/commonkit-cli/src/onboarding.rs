@@ -127,7 +127,7 @@ pub fn initialize(
     runner: &dyn CommandRunner,
 ) -> Result<InitResult, OnboardingError> {
     validate_repository(&request.repository)?;
-    if request.mode == InitMode::Connect && !request.publish_registration {
+    if !request.publish_registration {
         return Err(OnboardingError::RegistrationConsentRequired);
     }
     let loadout = StableId::parse(&request.loadout)?;
@@ -153,7 +153,6 @@ pub fn initialize(
     if let Some(recovered) = recover_incomplete_onboarding(request, runner)? {
         return Ok(recovered);
     }
-    ensure_clone_destination(&request.kit_directory)?;
     if request.mode == InitMode::Create {
         validate_create_provider_inputs(&request.provider)?;
     }
@@ -162,6 +161,7 @@ pub fn initialize(
         "gh",
         &os_args(["auth", "status", "--hostname", "github.com"]),
     )?;
+    let checkout = checkout_disposition(request, runner)?;
 
     if request.mode == InitMode::Create {
         runner.run(
@@ -174,15 +174,17 @@ pub fn initialize(
             ],
         )?;
     }
-    runner.run(
-        "gh",
-        &[
-            OsString::from("repo"),
-            OsString::from("clone"),
-            OsString::from(&request.repository),
-            request.kit_directory.as_os_str().to_owned(),
-        ],
-    )?;
+    if checkout == CheckoutDisposition::Clone {
+        runner.run(
+            "gh",
+            &[
+                OsString::from("repo"),
+                OsString::from("clone"),
+                OsString::from(&request.repository),
+                request.kit_directory.as_os_str().to_owned(),
+            ],
+        )?;
+    }
     let mut checkout_cleanup = (request.mode == InitMode::Create)
         .then(|| CreatedCheckoutCleanup::new(request.kit_directory.clone()));
     let provider = if request.mode == InitMode::Create {
@@ -242,6 +244,7 @@ pub fn initialize(
         connect_base_revision.clone(),
         (request.mode == InitMode::Create).then(|| revision.clone()),
     )?;
+    let mut connect_registration_created = false;
     if request.mode == InitMode::Connect {
         // Fully exercise provider materialization and runtime planning before the portable
         // registration is committed. This staged preflight is never made visible locally.
@@ -256,19 +259,20 @@ pub fn initialize(
                 &target,
             )?;
         }
-        write_target_registration(request, &target)?;
-        if let Err(error) = git_commit_registration(request, runner) {
-            rollback_registration(request, runner, &revision);
-            return Err(error);
-        }
-        let committed_revision = match git_head_revision(request, runner) {
-            Ok(revision) => revision,
-            Err(error) => {
+        connect_registration_created = write_target_registration(request, &target)?;
+        if connect_registration_created {
+            if let Err(error) = git_commit_registration(request, runner) {
                 rollback_registration(request, runner, &revision);
                 return Err(error);
             }
-        };
-        revision = committed_revision;
+            revision = match git_head_revision(request, runner) {
+                Ok(revision) => revision,
+                Err(error) => {
+                    rollback_registration(request, runner, &revision);
+                    return Err(error);
+                }
+            };
+        }
         transaction.set_intended_revision(revision.clone())?;
     }
 
@@ -329,8 +333,10 @@ pub fn initialize(
     }
     let push_result = if request.mode == InitMode::Create {
         git_push_created_kit(request, runner)
-    } else {
+    } else if connect_registration_created {
         git_push_registration(request, runner)
+    } else {
+        Ok(())
     };
     if let Err(error) = push_result {
         let rollback = runtime.rollback();
@@ -1318,16 +1324,85 @@ fn validate_absolute_destination(path: &Path) -> Result<(), OnboardingError> {
     }
 }
 
-fn ensure_clone_destination(path: &Path) -> Result<(), OnboardingError> {
-    match fs::symlink_metadata(path) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckoutDisposition {
+    Clone,
+    Reuse,
+}
+
+fn checkout_disposition(
+    request: &InitRequest,
+    runner: &dyn CommandRunner,
+) -> Result<CheckoutDisposition, OnboardingError> {
+    match fs::symlink_metadata(&request.kit_directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(CheckoutDisposition::Clone)
+        }
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            Err(OnboardingError::UnsafePath(path.to_path_buf()))
+            Err(OnboardingError::UnsafePath(request.kit_directory.clone()))
         }
-        Ok(_) if fs::read_dir(path)?.next().is_some() => {
-            Err(OnboardingError::DestinationNotEmpty(path.to_path_buf()))
+        Ok(_) if fs::read_dir(&request.kit_directory)?.next().is_none() => {
+            Ok(CheckoutDisposition::Clone)
         }
-        _ => Ok(()),
+        Ok(_) if request.mode == InitMode::Create => Err(OnboardingError::DestinationNotEmpty(
+            request.kit_directory.clone(),
+        )),
+        Ok(_) => {
+            let git_metadata = fs::symlink_metadata(request.kit_directory.join(".git"))
+                .map_err(|_| OnboardingError::DestinationNotEmpty(request.kit_directory.clone()))?;
+            if git_metadata.file_type().is_symlink() || !git_metadata.is_dir() {
+                return Err(OnboardingError::UnsafePath(
+                    request.kit_directory.join(".git"),
+                ));
+            }
+            let origin = runner.run(
+                "git",
+                &[
+                    OsString::from("-C"),
+                    request.kit_directory.as_os_str().to_owned(),
+                    OsString::from("remote"),
+                    OsString::from("get-url"),
+                    OsString::from("origin"),
+                ],
+            )?;
+            if github_repository_from_remote(&origin).as_deref()
+                != Some(request.repository.as_str())
+            {
+                return Err(OnboardingError::ExistingCheckoutRepositoryMismatch {
+                    path: request.kit_directory.clone(),
+                    expected: request.repository.clone(),
+                });
+            }
+            let status = runner.run(
+                "git",
+                &[
+                    OsString::from("-C"),
+                    request.kit_directory.as_os_str().to_owned(),
+                    OsString::from("status"),
+                    OsString::from("--porcelain"),
+                ],
+            )?;
+            if !status.trim().is_empty() {
+                return Err(OnboardingError::ExistingCheckoutDirty(
+                    request.kit_directory.clone(),
+                ));
+            }
+            Ok(CheckoutDisposition::Reuse)
+        }
+        Err(error) => Err(error.into()),
     }
+}
+
+fn github_repository_from_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim().trim_end_matches('/');
+    let repository = remote
+        .strip_prefix("https://github.com/")
+        .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| remote.strip_prefix("git@github.com:"))?
+        .trim_end_matches(".git");
+    validate_repository(repository)
+        .is_ok()
+        .then(|| repository.to_owned())
 }
 
 fn write_starter_layer(
@@ -1403,7 +1478,7 @@ fn validate_selected_composition(layer_paths: &[PathBuf]) -> Result<(), Onboardi
 fn write_target_registration(
     request: &InitRequest,
     target: &StableId,
-) -> Result<(), OnboardingError> {
+) -> Result<bool, OnboardingError> {
     let path = request
         .kit_directory
         .join("targets")
@@ -1428,7 +1503,19 @@ fn write_target_registration(
     if let Some(target_override) = &request.target_override {
         fields.insert("targetOverride".into(), json!(target_override));
     }
-    write_new_json(&path, &registration)
+    if path.exists() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(OnboardingError::PortableFileExists(path));
+        }
+        let existing: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        if existing == registration {
+            return Ok(false);
+        }
+        return Err(OnboardingError::PortableFileExists(path));
+    }
+    write_new_json(&path, &registration)?;
+    Ok(true)
 }
 
 fn git_commit_created_kit(
@@ -1725,6 +1812,10 @@ fn write_runtime_state(
     });
     let path = request.config_directory.join("headless.json");
     write_private_json(&path, &config)?;
+    write_private_json(
+        &request.config_directory.join("headless.targets.json"),
+        &json!({ "selected": [target] }),
+    )?;
     Ok((path, first_plan.id))
 }
 
@@ -2100,6 +2191,14 @@ pub enum OnboardingError {
     UnsafePath(PathBuf),
     #[error("clone destination must be absent or empty: {0}")]
     DestinationNotEmpty(PathBuf),
+    #[error(
+        "existing kit checkout at {path} does not match GitHub repository {expected}; choose the matching repository or another folder"
+    )]
+    ExistingCheckoutRepositoryMismatch { path: PathBuf, expected: String },
+    #[error(
+        "existing kit checkout has uncommitted changes: {0}; commit or preserve them before retrying"
+    )]
+    ExistingCheckoutDirty(PathBuf),
     #[error("kit, configuration, state, and target roots must not overlap")]
     OverlappingRoots,
     #[error("selected loadout does not exist as a regular layer file: {0}")]
@@ -2137,7 +2236,7 @@ pub enum OnboardingError {
     #[error("provider input must not be empty: {0}")]
     EmptyProviderInput(PathBuf),
     #[error(
-        "connecting a target requires explicit --publish-registration consent before CommonKit commits and pushes the portable registration"
+        "onboarding requires explicit --publish-registration consent before CommonKit creates or updates a repository and pushes the portable registration"
     )]
     RegistrationConsentRequired,
     #[error("provider inputs for init create must be absolute import paths: {0}")]
@@ -2194,6 +2293,109 @@ pub enum OnboardingError {
     PlanStore(#[from] commonkit_reconcile::PlanStoreError),
     #[error(transparent)]
     Platform(#[from] commonkit_platform::PlatformError),
+}
+
+#[cfg(test)]
+mod registration_retry_tests {
+    use super::*;
+
+    struct ExistingCheckoutRunner {
+        origin: String,
+        status: String,
+    }
+
+    impl CommandRunner for ExistingCheckoutRunner {
+        fn run(&self, program: &str, arguments: &[OsString]) -> Result<String, OnboardingError> {
+            assert_eq!(program, "git");
+            match arguments.last().and_then(|argument| argument.to_str()) {
+                Some("origin") => Ok(self.origin.clone()),
+                Some("--porcelain") => Ok(self.status.clone()),
+                other => panic!("unexpected git arguments: {arguments:?} ({other:?})"),
+            }
+        }
+    }
+
+    #[test]
+    fn clean_matching_checkout_is_reused_but_dirty_or_foreign_checkout_fails_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let kit = temporary.path().join("kit");
+        fs::create_dir_all(kit.join(".git")).unwrap();
+        let request = InitRequest {
+            mode: InitMode::Connect,
+            repository: "owner/kit".into(),
+            kit_directory: kit,
+            loadout: "personal".into(),
+            project_loadout: None,
+            target_override: None,
+            target: "workstation".into(),
+            target_root: temporary.path().join("target"),
+            config_directory: temporary.path().join("config"),
+            state_directory: temporary.path().join("state"),
+            provider: ProviderSelection::Native,
+            publish_registration: true,
+        };
+
+        assert_eq!(
+            checkout_disposition(
+                &request,
+                &ExistingCheckoutRunner {
+                    origin: "https://github.com/owner/kit.git\n".into(),
+                    status: String::new(),
+                },
+            )
+            .unwrap(),
+            CheckoutDisposition::Reuse
+        );
+        assert!(matches!(
+            checkout_disposition(
+                &request,
+                &ExistingCheckoutRunner {
+                    origin: "git@github.com:someone-else/kit.git\n".into(),
+                    status: String::new(),
+                },
+            ),
+            Err(OnboardingError::ExistingCheckoutRepositoryMismatch { .. })
+        ));
+        assert!(matches!(
+            checkout_disposition(
+                &request,
+                &ExistingCheckoutRunner {
+                    origin: "git@github.com:owner/kit.git\n".into(),
+                    status: " M layers/personal.json\n".into(),
+                },
+            ),
+            Err(OnboardingError::ExistingCheckoutDirty(_))
+        ));
+    }
+
+    #[test]
+    fn identical_registration_is_idempotent_but_a_conflict_still_fails_closed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut request = InitRequest {
+            mode: InitMode::Connect,
+            repository: "owner/kit".into(),
+            kit_directory: temporary.path().join("kit"),
+            loadout: "personal".into(),
+            project_loadout: None,
+            target_override: None,
+            target: "workstation".into(),
+            target_root: temporary.path().join("target"),
+            config_directory: temporary.path().join("config"),
+            state_directory: temporary.path().join("state"),
+            provider: ProviderSelection::Native,
+            publish_registration: true,
+        };
+        let target = StableId::parse("workstation").unwrap();
+
+        assert!(write_target_registration(&request, &target).unwrap());
+        assert!(!write_target_registration(&request, &target).unwrap());
+
+        request.loadout = "different".into();
+        assert!(matches!(
+            write_target_registration(&request, &target),
+            Err(OnboardingError::PortableFileExists(_))
+        ));
+    }
 }
 
 #[cfg(test)]

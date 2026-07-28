@@ -1,7 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { refreshDesktopState } from "../src/live-refresh.ts";
+import { refreshDesktopState, shouldRunLiveRefresh } from "../src/live-refresh.ts";
+
+test("background refresh retries readiness but pauses during active onboarding", () => {
+  assert.equal(shouldRunLiveRefresh(false, "checking"), true);
+  assert.equal(shouldRunLiveRefresh(false, "required"), false);
+  assert.equal(shouldRunLiveRefresh(true, "required"), true);
+  assert.equal(shouldRunLiveRefresh(false, "complete"), true);
+});
 
 test("one live refresh atomically obtains status, management, and target domains", async () => {
   const calls: string[] = [];

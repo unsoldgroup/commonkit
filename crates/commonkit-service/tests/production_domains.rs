@@ -1548,6 +1548,94 @@ fn configured_git_provider_pipeline_materializes_native_state_before_local_plann
     );
 }
 
+#[test]
+fn configured_empty_native_provider_produces_a_repeatable_no_op_plan() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let remote = root.join("remote.git");
+    let seed = root.join("seed");
+    let checkout = root.join("checkout");
+    git(root, &["init", "--bare", remote.to_str().unwrap()]);
+    git(root, &["init", seed.to_str().unwrap()]);
+    git(&seed, &["config", "user.email", "test@example.com"]);
+    git(&seed, &["config", "user.name", "CommonKit Test"]);
+    std::fs::write(seed.join("README.md"), b"empty native setup\n").unwrap();
+    git(&seed, &["add", "README.md"]);
+    git(&seed, &["commit", "-m", "fixture"]);
+    git(&seed, &["branch", "-M", "main"]);
+    git(
+        &seed,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    git(&seed, &["push", "-u", "origin", "main"]);
+    git(
+        root,
+        &[
+            "clone",
+            remote.to_str().unwrap(),
+            checkout.to_str().unwrap(),
+        ],
+    );
+    git(&checkout, &["checkout", "main"]);
+    let revision = git_output(&checkout, &["rev-parse", "HEAD"]);
+    let target = root.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    let config_path = root.join("headless-provider.json");
+    write_json(
+        &config_path,
+        &serde_json::json!({
+          "sync": {
+            "targetId": "local", "targetRoot": target,
+            "adapterState": root.join("adapter"),
+            "providerArtifacts": root.join("artifacts"),
+            "providerPipeline": {
+              "root": root.join("pipeline"),
+              "source": {
+                "repository": checkout,
+                "trustedRemoteUrl": remote.to_str().unwrap(),
+                "revision": revision
+              },
+              "providers": [{"provider":"native", "version":"1.0.0", "files":[]}]
+            },
+            "declaredRoots": ["home"], "protectedRoots": [], "caseSensitive": true,
+            "targetIdentityDigest": digest_domain_json("test", &"target").unwrap(),
+            "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
+            "policyDigest": digest_domain_json("test", &"policy").unwrap()
+          }
+        }),
+    );
+    let registry = ProductionDomainRegistry::load_optional_with_relay_endpoint(
+        &config_path,
+        std::sync::Arc::new(PlanStore::open(root.join("plans-pipeline")).unwrap()),
+        root.join("receipts-pipeline"),
+        "127.0.0.1:37641".parse().unwrap(),
+    )
+    .unwrap();
+    let sync = registry.sync.unwrap();
+    std::fs::rename(&remote, root.join("remote-unavailable.git")).unwrap();
+
+    let first = sync
+        .plan(serde_json::json!({"confirmed":true,"confirmationId":"empty-native-first"}))
+        .expect("local planning does not contact the remote without an explicit fetch");
+    drop(sync);
+    let restarted = ProductionDomainRegistry::load_optional_with_relay_endpoint(
+        &config_path,
+        std::sync::Arc::new(PlanStore::open(root.join("plans-pipeline")).unwrap()),
+        root.join("receipts-pipeline"),
+        "127.0.0.1:37642".parse().unwrap(),
+    )
+    .unwrap();
+    let repeated = restarted
+        .sync
+        .unwrap()
+        .plan(serde_json::json!({"confirmed":true,"confirmationId":"empty-native-repeat"}))
+        .expect("a relay-port change does not invalidate a plan with no MCP resources");
+
+    assert!(first["operations"].as_array().unwrap().is_empty());
+    assert_eq!(repeated["planDigest"], first["planDigest"]);
+    assert_eq!(repeated["operations"], first["operations"]);
+}
+
 fn git(directory: &std::path::Path, arguments: &[&str]) {
     let output = std::process::Command::new("git")
         .arg("-C")

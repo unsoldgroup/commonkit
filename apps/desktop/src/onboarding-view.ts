@@ -1,4 +1,5 @@
 import { escapeHtml } from "./html.ts";
+import { stableComputerId } from "./onboarding-controller.ts";
 
 export type OnboardingProvider = "native" | "apm" | "chezmoi";
 export type OnboardingStep = 1 | 2 | 3 | 4;
@@ -97,10 +98,11 @@ function githubStep({ auth, draft }: OnboardingViewState): string {
 }
 
 function computerStep({ draft }: OnboardingViewState): string {
+  const computerId = stableComputerId(draft.computerName);
   return `<form id="onboarding-form" class="setup-step" data-step="2">
     <h2 id="setup-heading" tabindex="-1">Set up this computer</h2>
     <p>Give this computer a recognizable name and choose where to try CommonKit.</p>
-    ${field("computerName", "Computer name", draft.computerName, "For example, al-macbook. You can change the display name later.")}
+    ${field("computerName", "Computer name", draft.computerName, `CommonKit will save this machine as “${computerId}”.`)}
     ${field("targetRoot", "Folder to manage", draft.targetRoot, "For a safe first test, choose an empty folder. CommonKit previews every change before applying it.", true)}
     <label class="safe-choice"><input type="checkbox" id="safe-test-folder" ${draft.targetRoot.endsWith("/CommonKitManaged") ? "checked" : ""}> Use a safe test folder first</label>
     <details class="advanced"><summary>Advanced local settings</summary>
@@ -133,7 +135,7 @@ function reviewStep({ auth, draft, submitting }: OnboardingViewState): string {
   const imported = draft.provider === "native" ? "Start with an empty CommonKit setup" : draft.provider === "apm" ? "Import APM settings" : "Import chezmoi settings";
   return `<form id="onboarding-form" class="setup-step" data-step="4">
     <h2 id="setup-heading" tabindex="-1">Review before creating</h2>
-    <dl class="review-list"><dt>Private repository</dt><dd>${escapeHtml(repository)}</dd><dt>Local folder</dt><dd>${escapeHtml(draft.kitDirectory)}</dd><dt>Computer</dt><dd>${escapeHtml(draft.computerName)}</dd><dt>Folder to manage</dt><dd>${escapeHtml(draft.targetRoot)}</dd><dt>Personal profile</dt><dd>${escapeHtml(draft.loadout)}</dd>${draft.projectLoadout ? `<dt>Project profile</dt><dd>${escapeHtml(draft.projectLoadout)}</dd>` : ""}${draft.targetOverride ? `<dt>Computer override</dt><dd>${escapeHtml(draft.targetOverride)}</dd>` : ""}<dt>Existing settings</dt><dd>${escapeHtml(imported)}</dd></dl>
+    <dl class="review-list"><dt>Private repository</dt><dd>${escapeHtml(repository)}</dd><dt>Local folder</dt><dd>${escapeHtml(draft.kitDirectory)}</dd><dt>Computer ID</dt><dd>${escapeHtml(stableComputerId(draft.computerName))}</dd><dt>Folder to manage</dt><dd>${escapeHtml(draft.targetRoot)}</dd><dt>Personal profile</dt><dd>${escapeHtml(draft.loadout)}</dd>${draft.projectLoadout ? `<dt>Project profile</dt><dd>${escapeHtml(draft.projectLoadout)}</dd>` : ""}${draft.targetOverride ? `<dt>Computer override</dt><dd>${escapeHtml(draft.targetOverride)}</dd>` : ""}<dt>Existing settings</dt><dd>${escapeHtml(imported)}</dd></dl>
     <div class="safety-note"><strong>Managed settings are not applied yet.</strong><p>CommonKit will save this setup locally and prepare a preview for you to review first.</p></div>
     <label class="consent"><input name="publishRegistration" type="checkbox" value="true" ${draft.publishRegistration ? "checked" : ""} required> <span><strong>Save this computer to the private repository</strong><small>This lets your other computers discover it. CommonKit will create and push a registration commit.</small></span></label>
     ${actions(true, submitting ? "Preparing preview…" : "Prepare setup preview", submitting)}

@@ -75,7 +75,15 @@ For unattended operation, run `commonkit daemon install` and `commonkit daemon s
 [the service guide](docs/DAEMON-SERVICE.md). SSH targets use the separately packaged helper in
 [the target-helper guide](docs/TARGET-HELPER.md).
 
-### Desktop first run
+## Onboarding
+
+GUI, solo CLI, and agent-assisted setup all use the same onboarding core. It
+validates repository ownership, non-overlapping private and managed roots,
+layer IDs, provider pins and inputs, and publication consent before making an
+external change. Successful onboarding always produces a first plan for review;
+it does not apply that plan.
+
+### GUI onboarding
 
 Open CommonKit from the menu bar and choose **Get started**. The four-step setup connects your
 GitHub account, creates or connects a private setup repository, names this computer, and starts
@@ -88,6 +96,8 @@ signed in with `gh`, CommonKit detects that account. Otherwise **Sign in with Gi
 browser flow and copies its one-time code for you to paste. Tokens remain in GitHub CLI's native
 credential storage and are never returned to the desktop webview.
 
+### Solo CLI onboarding
+
 The daemon creates private, platform-native config and state roots plus a
 0600/ACL-protected control token. In a second terminal, create or connect a kit:
 
@@ -97,7 +107,8 @@ commonkit init create \
   --kit-directory "$HOME/.config/my-commonkit" \
   --loadout personal \
   --target local \
-  --target-root "$HOME"
+  --target-root "$HOME/CommonKitManaged" \
+  --publish-registration
 
 commonkit status
 commonkit sync
@@ -108,7 +119,20 @@ commonkit verify
 
 `init connect` uses the same arguments for an existing repository. `sync`
 creates a plan; it does not mutate the target. Review `diff` before applying.
-Mutating CLI commands require explicit confirmation.
+On success, initialization prints machine-readable JSON. Repository creation
+or registration requires `--publish-registration`; later mutating CLI commands
+require their own explicit confirmation.
+
+### Agent-assisted onboarding
+
+An agent may inspect `commonkit init create --help`, check `gh auth status`,
+confirm that the proposed kit and target roots do not overlap, and prepare the
+exact CLI command. It should explain the repository, local roots, provider, and
+portable registration before asking for approval. The agent must not add
+`--publish-registration` until the user explicitly approves that repository
+creation or registration push. After initialization, it should show the
+machine-readable JSON result and the read-only first plan, then stop again
+before any `commonkit apply ... --confirmed`.
 
 ## Transactions and rollback
 

@@ -18,10 +18,11 @@ struct Args {
 }
 
 fn default_relay_port() -> u16 {
-    std::env::var("COMMONKIT_RELAY_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(commonkit_relay::DEFAULT_PORT)
+    relay_port_from_env(std::env::var("COMMONKIT_RELAY_PORT").ok().as_deref())
+}
+
+fn relay_port_from_env(value: Option<&str>) -> u16 {
+    value.and_then(|value| value.parse().ok()).unwrap_or(0)
 }
 
 #[tokio::main]
@@ -57,4 +58,17 @@ async fn run(args: Args) -> Result<(), Box<dyn Error>> {
         })
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::relay_port_from_env;
+
+    #[test]
+    fn unattended_daemon_uses_a_collision_safe_relay_port_unless_explicitly_configured() {
+        assert_eq!(relay_port_from_env(None), 0);
+        assert_eq!(relay_port_from_env(Some("")), 0);
+        assert_eq!(relay_port_from_env(Some("not-a-port")), 0);
+        assert_eq!(relay_port_from_env(Some("3764")), 3764);
+    }
 }

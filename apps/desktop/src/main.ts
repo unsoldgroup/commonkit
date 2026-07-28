@@ -9,7 +9,7 @@ import { defaultOnboardingDraft, onboardingPanel, type OnboardingViewState } fro
 import { applyOnboardingValues, onboardingRequest } from "./onboarding-controller.ts";
 import { open } from "@tauri-apps/plugin-dialog";
 import { assertPlanTarget, convergenceTarget } from "./target-selection.ts";
-import { refreshDesktopState } from "./live-refresh.ts";
+import { refreshDesktopState, shouldRunLiveRefresh } from "./live-refresh.ts";
 import { setupCompletion } from "./setup-gate.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
@@ -357,6 +357,8 @@ void initializeSetupGate();
 let refreshRunning = false;
 async function refreshLiveState(): Promise<void> {
   if (refreshRunning) return;
+  const completion = setupUnlocked ? "complete" : setupCompletion(snapshot?.status ?? null, targets);
+  if (!shouldRunLiveRefresh(setupUnlocked, completion)) return;
   refreshRunning = true;
   try {
     const state = await refreshDesktopState(desktopApi, {
@@ -365,6 +367,10 @@ async function refreshLiveState(): Promise<void> {
     snapshot = state.snapshot;
     management = state.management;
     targets = state.targets;
+    setupCheckFailed = false;
+    if (onboardingState.message.startsWith("The CommonKit background service is unavailable.")) {
+      onboardingState.message = "";
+    }
     const operation = [...snapshot.events].reverse().find((event) => event.event === "operation.updated")?.data;
     if (operation && management) {
       management.plans = { ...(typeof management.plans === "object" && management.plans ? management.plans : {}), operation };

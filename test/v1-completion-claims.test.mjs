@@ -16,14 +16,14 @@ test("v1 completion claims remain tied to product-level evidence", async () => {
   assert.match(audit, /Do not mark CommonKit v1 release-ready/);
   assert.match(audit, /host-key confirmation.*not (?:performed|recorded)/i);
   assert.match(audit, /commit-bound historical evidence/i);
-  assert.match(audit, /does not establish.*current HEAD/i);
+  assert.match(audit, /does not establish.*later HEAD/i);
   assert.match(audit, /Production Apple signing\/notarization/);
   assert.match(audit, /native-platform/i);
   assert.match(audit, /does not use GitHub Actions/i);
   assert.match(audit, /first eight runtime flows.*locally implemented/i);
   assert.doesNotMatch(support, /deliberately disabled/);
   assert.match(support, /have not been demonstrated with production notarization\/signing/);
-  assert.match(support, /commit-bound.*e25785d/i);
+  assert.match(support, /commit-bound.*a1443c0/i);
   assert.match(support, /commit-bound.*e98dee5/i);
   assert.match(support, /real-SSH.*not (?:performed|recorded)/i);
   for (const scheme of ["env://", "file://", "bws://", "keychain://"]) {

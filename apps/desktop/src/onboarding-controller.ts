@@ -16,6 +16,18 @@ export function applyOnboardingValues(draft: OnboardingDraft, values: EntrySourc
   return draft;
 }
 
+export function stableComputerId(name: string): string {
+  let id = name
+    .normalize("NFKD")
+    .replace(/\p{Mark}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^[-_]+|[-_]+$/g, "");
+  if (!id) return "workstation";
+  if (!/^[a-z]/.test(id)) id = `machine-${id}`;
+  return id.slice(0, 63).replace(/[-_]+$/g, "") || "workstation";
+}
+
 export function onboardingRequest(draft: OnboardingDraft, githubLogin: string): Record<string, unknown> {
   const repository = draft.mode === "create" ? `${githubLogin}/${draft.repositoryName}` : draft.repository;
   const request: Record<string, unknown> = {
@@ -23,7 +35,7 @@ export function onboardingRequest(draft: OnboardingDraft, githubLogin: string): 
     repository,
     kitDirectory: draft.kitDirectory,
     loadout: draft.loadout,
-    target: draft.computerName,
+    target: stableComputerId(draft.computerName),
     targetRoot: draft.targetRoot,
     provider: draft.provider,
     publishRegistration: draft.publishRegistration,

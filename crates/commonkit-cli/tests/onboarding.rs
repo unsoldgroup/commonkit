@@ -300,6 +300,8 @@ fn connect_uses_existing_gh_credentials_and_writes_first_run_state() {
 case "$1 $2" in
   "auth status") exit 0 ;;
   "repo clone")
+    [ -e "$4" ] && exit 92
+    mkdir -p "$4/.git"
     mkdir -p "$4/layers"
     printf '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/public-base.json"
     printf '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{}}' > "$4/layers/organization-policy.json"
@@ -317,6 +319,8 @@ exit 91
         r#"
 case "$3" in
   rev-parse) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'; exit 0 ;;
+  remote) printf 'https://github.com/unsoldgroup/commonkit-config.git\n'; exit 0 ;;
+  status) exit 0 ;;
 esac
 exit 0
 "#,
@@ -381,6 +385,18 @@ exit 0
         std::fs::read(temporary.path().join("state/service-state")).unwrap(),
         b"keep-state"
     );
+
+    let retry = initialize(
+        &request(
+            temporary.path(),
+            InitMode::Connect,
+            "unsoldgroup/commonkit-config",
+        ),
+        &ProcessRunner::new(&bin),
+    )
+    .unwrap();
+    assert_eq!(retry.repository_revision, result.repository_revision);
+    assert_eq!(retry.first_plan_id, result.first_plan_id);
 }
 
 #[test]
@@ -403,6 +419,11 @@ fn create_provisions_a_private_repository_and_pushes_only_portable_files() {
             .join("targets/workstation.json")
             .is_file()
     );
+    let selection: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(temporary.path().join("config/headless.targets.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(selection["selected"], serde_json::json!(["workstation"]));
     let registration: serde_json::Value = serde_json::from_slice(
         &std::fs::read(result.kit_directory.join("targets/workstation.json")).unwrap(),
     )
@@ -1120,6 +1141,16 @@ fn permits_platform_state_directory_nested_under_private_config_root() {
 fn connect_requires_publish_consent_before_clone_or_registration_writes() {
     let temporary = tempfile::tempdir().unwrap();
     let mut request = request(temporary.path(), InitMode::Connect, "owner/kit");
+    request.publish_registration = false;
+    let error = initialize(&request, &ProcessRunner::new(temporary.path())).unwrap_err();
+    assert!(error.to_string().contains("--publish-registration"));
+    assert!(!request.kit_directory.exists());
+}
+
+#[test]
+fn create_requires_publish_consent_before_repository_creation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let mut request = request(temporary.path(), InitMode::Create, "owner/kit");
     request.publish_registration = false;
     let error = initialize(&request, &ProcessRunner::new(temporary.path())).unwrap_err();
     assert!(error.to_string().contains("--publish-registration"));

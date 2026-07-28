@@ -134,6 +134,19 @@ test("manual harness exercises an unsigned installed CLI and daemon lifecycle", 
   assert.match(harness, /apply_run_id=.*runId/);
   assert.match(harness, /"\$commonkit" rollback "\$apply_run_id" --confirmed/);
   assert.match(harness, /commonkit\.layer-content\.v1/);
+  for (const layer of [
+    "public-base",
+    "organization-policy",
+    "personal",
+    "project-web",
+    "target-local",
+  ]) {
+    assert.match(harness, new RegExp(`writeLayer\\("${layer}"`));
+  }
+  assert.match(harness, /--project-loadout project-web/);
+  assert.match(harness, /--target-override target-local/);
+  assert.match(harness, /"\$commonkit" targets plan local secondary --confirmed/);
+  assert.match(harness, /"\$commonkit" targets verify local secondary/);
   assert.doesNotMatch(harness, /zero_digest/);
   assert.match(harness, /test ! -e "\$scratch\/target\/portable\/editor\.conf"/);
   assert.doesNotMatch(harness, /reapply_plan_id/);
@@ -142,6 +155,8 @@ test("manual harness exercises an unsigned installed CLI and daemon lifecycle", 
   assert.match(harness, /"\$recovery_fixture" interrupt/);
   assert.match(harness, /"\$recovery_fixture" recover/);
   assert.match(harness, /"\$commonkit" relay status/);
+  assert.match(harness, /selected_target_drifted/);
+  assert.match(harness, /scheduled_target_digest/);
   assert.match(harness, /ssh/);
   assert.match(harness, /"\$target_helper" --stdio-v1/);
   assert.doesNotMatch(harness, /target-helper.*\.mjs/);

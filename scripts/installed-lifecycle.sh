@@ -6,7 +6,8 @@ scratch=${1:?usage: installed-lifecycle.sh SCRATCH}
 installed_bin=${2:?usage: installed-lifecycle.sh SCRATCH INSTALLED_BIN}
 installed_bin=$(cd "$installed_bin" && pwd -P)
 real_git=$(command -v git)
-mkdir -p "$scratch/source/layers" "$scratch/source/portable" "$scratch/tools" "$scratch/target"
+mkdir -p "$scratch/source/layers" "$scratch/source/portable" "$scratch/source/targets" \
+  "$scratch/tools" "$scratch/target" "$scratch/secondary-target"
 
 commonkit="$installed_bin/commonkit"
 commonkitd="$installed_bin/commonkitd"
@@ -73,7 +74,15 @@ writeLayer("organization-policy", "organization_policy", {});
 writeLayer("personal", "personal_kit", {
   files: [{ path: "portable/editor.conf", source: "portable/editor.conf" }],
 });
+writeLayer("project-web", "project_loadout", {
+  settings: { projectProof: "installed-five-layer-proof" },
+});
+writeLayer("target-local", "target_overrides", {
+  settings: { targetProof: "installed-local-override" },
+});
 JS
+printf '%s\n' '{"schemaVersion":1,"id":"secondary","loadout":"personal","projectLoadout":"project-web","targetOverride":"target-local","transport":"local","managedBy":"commonkit"}' \
+  > "$scratch/source/targets/secondary.json"
 git -C "$scratch/source" init --quiet
 git -C "$scratch/source" config user.email commonkit-ci@example.invalid
 git -C "$scratch/source" config user.name CommonKit-CI
@@ -188,10 +197,31 @@ init_json="$scratch/init.json"
   --repository owner/installed-fixture \
   --kit-directory "$scratch/kit" \
   --loadout personal \
+  --project-loadout project-web \
+  --target-override target-local \
   --target local \
   --publish-registration \
   --target-root "$scratch/target" > "$init_json"
 headless=$(node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1])).headlessConfig)' "$init_json")
+
+# Add a second target-specific runtime domain from the same portable five-layer
+# loadout. The provider still computes desired state; each filesystem adapter
+# owns only its declared live target root.
+node - "$headless" "$scratch/secondary-target" "$scratch" <<'JS'
+const { createHash } = require("node:crypto");
+const fs = require("node:fs");
+const [configPath, secondaryRoot, scratch] = process.argv.slice(2);
+const config = JSON.parse(fs.readFileSync(configPath));
+const secondary = structuredClone(config.sync);
+secondary.targetId = "secondary";
+secondary.targetRoot = secondaryRoot;
+secondary.adapterState = `${scratch}/secondary-state/filesystem`;
+secondary.providerArtifacts = `${scratch}/secondary-state/provider-artifacts`;
+secondary.providerPipeline.root = `${scratch}/secondary-state/provider-pipeline`;
+secondary.targetIdentityDigest = `sha256:${createHash("sha256").update("installed-secondary-target").digest("hex")}`;
+config.syncTargets = [secondary];
+fs.writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`);
+JS
 
 snapshot_root="$scratch/snapshots"
 database="$snapshot_root/database.bin"
@@ -204,7 +234,10 @@ node -e 'require("fs").writeFileSync(process.argv[1], Buffer.alloc(32,47))' "$ke
 "$commonkit" daemon reload-domains --confirmed >/dev/null
 
 "$commonkit" status >/dev/null
-"$commonkit" compose >/dev/null
+"$commonkit" compose > "$scratch/composition.json"
+node -e 'const c=require(process.argv[1]);if(c.lock.layers.length!==5||c.spec.settings.projectProof!=="installed-five-layer-proof"||c.spec.settings.targetProof!=="installed-local-override")process.exit(1)' "$scratch/composition.json"
+"$commonkit" targets select local secondary --confirmed > "$scratch/target-selection.json"
+"$commonkit" targets list | node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>{const s=JSON.parse(b);if(s.targets.length!==2||s.selected.length!==2)process.exit(1)})'
 plan_json="$scratch/plan.json"
 "$commonkit" sync --confirmed > "$plan_json"
 plan_id=$(node -e 'const fs=require("fs");const p=JSON.parse(fs.readFileSync(process.argv[1]));process.stdout.write(p.planId ?? p.id)' "$plan_json")
@@ -221,6 +254,15 @@ for _ in $(seq 1 150); do
 done
 test "${verified:-}" = 1
 cmp "$scratch/source/portable/editor.conf" "$scratch/target/portable/editor.conf"
+
+# Plan, apply, and verify both independently addressed target domains through
+# the installed multi-target CLI surface.
+"$commonkit" targets plan local secondary --confirmed > "$scratch/target-plans.json"
+secondary_plan_id=$(node -e 'const p=require(process.argv[1]);if(p.length!==2||p.some(x=>!x.planId?.startsWith("sha256:")))process.exit(1);process.stdout.write(p[1].planId)' "$scratch/target-plans.json")
+"$commonkit" targets apply secondary "$secondary_plan_id" --confirmed > "$scratch/secondary-apply.json"
+"$commonkit" targets verify local secondary > "$scratch/target-verification.json"
+cmp "$scratch/source/portable/editor.conf" "$scratch/secondary-target/portable/editor.conf"
+"$commonkit" targets select secondary --confirmed > "$scratch/scheduler-target-selection.json"
 
 # Exercise explicit receipt-bound rollback through the installed CLI and daemon
 # and prove the exact absent preimage was restored. A rolled-back plan remains
@@ -267,13 +309,16 @@ node -e 'const fs=require("fs");for(const p of process.argv.slice(1)){const v=JS
 
 # Enabling the installed scheduler must wake the already-running daemon, perform
 # a read-only drift tick, persist its state, and stop ticking after disable.
+printf 'external scheduled drift\n' > "$scratch/secondary-target/portable/editor.conf"
+scheduled_target_digest=$(node -e 'const fs=require("fs"),c=require("crypto");process.stdout.write(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$scratch/secondary-target/portable/editor.conf")
 "$commonkit" schedule enable --interval-seconds 1 --confirmed > "$scratch/schedule-enable.json"
 for _ in $(seq 1 50); do
   node "$scratch/tools/read-control-status.mjs" "$XDG_DATA_HOME/state/daemon.json" "$XDG_CONFIG_HOME/control.token" "$scratch/scheduled-status.json"
-  if node -e 'const s=require(process.argv[1]);process.exit(s.lastDriftCheckUnixMs == null ? 1 : 0)' "$scratch/scheduled-status.json"; then scheduled_tick=1; break; fi
+  if node -e 'const s=require(process.argv[1]);process.exit(s.lastDriftCheckUnixMs == null||s.lastDriftErrorCode!=="selected_target_drifted" ? 1 : 0)' "$scratch/scheduled-status.json"; then scheduled_tick=1; break; fi
   sleep 0.1
 done
 test "${scheduled_tick:-}" = 1
+test "$(node -e 'const fs=require("fs"),c=require("crypto");process.stdout.write(c.createHash("sha256").update(fs.readFileSync(process.argv[1])).digest("hex"))' "$scratch/secondary-target/portable/editor.conf")" = "$scheduled_target_digest"
 scheduled_tick_time=$(node -e 'process.stdout.write(String(require(process.argv[1]).lastDriftCheckUnixMs))' "$scratch/scheduled-status.json")
 "$commonkit" schedule disable --confirmed > "$scratch/schedule-disable.json"
 "$commonkit" schedule status | node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>{const s=JSON.parse(b);if(s.enabled)process.exit(1)})'

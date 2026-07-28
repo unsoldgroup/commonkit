@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { defaultOnboardingDraft } from "../src/onboarding-view.ts";
-import { applyOnboardingValues, onboardingRequest } from "../src/onboarding-controller.ts";
+import {
+  applyOnboardingValues,
+  onboardingRequest,
+  stableComputerId,
+} from "../src/onboarding-controller.ts";
 
 test("wizard values survive navigation and provider rerenders", () => {
   const draft = defaultOnboardingDraft();
@@ -36,6 +40,17 @@ test("final guided request derives the authenticated repository owner", () => {
     provider: "native",
     publishRegistration: true,
   });
+});
+
+test("human computer names become valid stable target identifiers", () => {
+  assert.equal(stableComputerId("Al-macbook"), "al-macbook");
+  assert.equal(stableComputerId("  Élodies MacBook Pro  "), "elodies-macbook-pro");
+  assert.equal(stableComputerId("2026 workstation"), "machine-2026-workstation");
+  assert.equal(stableComputerId("___"), "workstation");
+
+  const draft = defaultOnboardingDraft();
+  draft.computerName = "Al-macbook";
+  assert.equal(onboardingRequest(draft, "astemarie").target, "al-macbook");
 });
 
 test("provider pins are added only for the selected import", () => {

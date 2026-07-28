@@ -523,7 +523,9 @@ fn onboarding_defaults_from(
         "workstation".to_owned()
     };
     Ok(OnboardingDefaults {
-        kit_directory: paths.config.join("setup"),
+        kit_directory: home
+            .map(|path| path.join(".commonkit-kit"))
+            .unwrap_or_else(|| paths.config.with_extension("kit")),
         target_root,
         computer_name,
     })
@@ -531,7 +533,11 @@ fn onboarding_defaults_from(
 
 #[tauri::command]
 fn onboarding_defaults() -> Result<OnboardingDefaults, DesktopError> {
-    let paths = AppPaths::discover().map_err(|_| DesktopError::OnboardingFailed)?;
+    let paths = AppPaths::discover().map_err(|_| {
+        DesktopError::OnboardingFailed(
+            "CommonKit could not resolve safe local application folders".into(),
+        )
+    })?;
     let home =
         std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from);
     let computer_name = std::env::var("COMPUTERNAME")
@@ -708,7 +714,11 @@ fn onboarding_initialize(
     // Fail before cloning, committing, or publishing anything when the
     // attached daemon cannot atomically adopt the resulting domains.
     tauri::async_runtime::block_on(client.json(reqwest::Method::GET, "/domains/reload", None))?;
-    let paths = AppPaths::discover().map_err(|_| DesktopError::OnboardingFailed)?;
+    let paths = AppPaths::discover().map_err(|_| {
+        DesktopError::OnboardingFailed(
+            "CommonKit could not resolve safe local application folders".into(),
+        )
+    })?;
     let provider = match request.provider.as_str() {
         "native" => ProviderSelection::Native,
         "apm" => ProviderSelection::Apm {
@@ -727,12 +737,6 @@ fn onboarding_initialize(
             config: request.chezmoi_config.ok_or(DesktopError::InvalidInput)?,
         },
         _ => return Err(DesktopError::InvalidInput),
-    };
-    let headless_config = paths.config.join("headless.json");
-    let previous_config = match std::fs::read(&headless_config) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error.into()),
     };
     let result = initialize(
         &InitRequest {
@@ -755,7 +759,7 @@ fn onboarding_initialize(
         },
         &ProcessRunner::from_path(),
     )
-    .map_err(|_| DesktopError::OnboardingFailed)?;
+    .map_err(|error| DesktopError::OnboardingFailed(error.to_string()))?;
     if tauri::async_runtime::block_on(client.json(
         reqwest::Method::POST,
         "/domains/reload",
@@ -763,46 +767,9 @@ fn onboarding_initialize(
     ))
     .is_err()
     {
-        restore_headless_config(&headless_config, previous_config.as_deref())?;
-        // The old runtime remains active if validation failed. Re-adopt the
-        // restored file so durable and in-memory state agree before returning.
-        let _ = tauri::async_runtime::block_on(client.json(
-            reqwest::Method::POST,
-            "/domains/reload",
-            Some(serde_json::json!({"confirmed": true})),
-        ));
         return Err(DesktopError::ServiceReloadFailed);
     }
     serde_json::to_value(result).map_err(Into::into)
-}
-
-fn restore_headless_config(path: &Path, previous: Option<&[u8]>) -> Result<(), DesktopError> {
-    match previous {
-        Some(bytes) => {
-            let temporary = path.with_extension(format!("rollback-{}.tmp", std::process::id()));
-            let mut options = std::fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            use std::io::Write;
-            let mut file = options.open(&temporary)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            drop(file);
-            #[cfg(windows)]
-            std::fs::remove_file(path)?;
-            std::fs::rename(temporary, path)?;
-        }
-        None => match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        },
-    }
-    Ok(())
 }
 
 impl ServiceClient {
@@ -980,10 +947,8 @@ enum DesktopError {
     GithubCliUnavailable,
     #[error("GitHub authentication failed; retry sign-in from CommonKit")]
     GithubAuthenticationFailed,
-    #[error(
-        "CommonKit onboarding failed; review the selected provider inputs and local CLI diagnostics"
-    )]
-    OnboardingFailed,
+    #[error("CommonKit onboarding failed: {0}")]
+    OnboardingFailed(String),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -2072,13 +2037,24 @@ mod tests {
 
         assert_eq!(
             defaults.kit_directory,
-            PathBuf::from("/private/config/setup")
+            PathBuf::from("/Users/al/.commonkit-kit")
         );
         assert_eq!(
             defaults.target_root,
             PathBuf::from("/Users/al/CommonKitManaged")
         );
         assert_eq!(defaults.computer_name, "al-macbook");
+    }
+
+    #[test]
+    fn onboarding_validation_errors_remain_actionable_in_the_gui() {
+        let error = DesktopError::OnboardingFailed(
+            "kit, configuration, state, and target roots must not overlap".into(),
+        );
+        assert_eq!(
+            error.to_string(),
+            "CommonKit onboarding failed: kit, configuration, state, and target roots must not overlap"
+        );
     }
 
     #[test]
