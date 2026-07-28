@@ -59,7 +59,8 @@ readonly ACME_SH="${ACME_SH:-$HOME/.acme.sh/acme.sh}"
 : "${SESSION_BOARD_ACTION_TOKEN:?Set SESSION_BOARD_ACTION_TOKEN}"
 : "${CF_Token:?Set CF_Token for the acme.sh Cloudflare DNS challenge (Cloudflare is authoritative for unsold.cloud)}"
 
-mkdir -p "$CONFIG_DIR" "$SYSTEMD_DIR" "$REPO_DIR/apps/session-board/hub/data"
+mkdir -p "$CONFIG_DIR" "$SYSTEMD_DIR" "$REPO_DIR/apps/session-board/hub/data" \
+  "$HOME/.local/share/commonkit/session-board"
 umask 077
 {
   printf 'SESSION_BOARD_REPORTER_TOKENS=%s\n' "$(systemd_quote "$SESSION_BOARD_REPORTER_TOKENS")"
@@ -73,6 +74,7 @@ render_template "$TEMPLATE_DIR/board-hub.service" "$UNIT_FILE"
 chmod 644 "$UNIT_FILE"
 
 pnpm --dir "$REPO_DIR" install --frozen-lockfile
+pnpm --dir "$REPO_DIR" --filter @commonkit/session-board-protocol build
 pnpm --dir "$REPO_DIR" --filter @commonkit/session-board-web build
 
 export CF_Token
