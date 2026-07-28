@@ -74,6 +74,30 @@ _Avoid_: Loadout
 A managed **Target** advertising durable-execution readiness, capacity, and an exact Loadout digest.
 _Avoid_: Worker box
 
+**Context budget**:
+The per-**Loadout** accounting of agent context a target pays for on every turn, split into always-on text and router text.
+_Avoid_: Token limit, context window
+
+**Always-on text**:
+Agent instruction content injected on every turn regardless of task, such as compiled `AGENTS.md`, `CLAUDE.md`, and hook prose. Reducible only by lossy rewriting.
+_Avoid_: System prompt, preamble
+
+**Router text**:
+The single description line each skill contributes so an agent can decide whether to load it. Reducible only by admitting fewer skills.
+_Avoid_: Skill metadata, frontmatter
+
+**Distillation**:
+A lossy rewrite of an imported source into the minimal form that preserves its behavior, producing a distilled artifact and a **Retention map**.
+_Avoid_: Summarization, compression
+
+**Retention map**:
+The provenance record binding each digested section of an imported upstream source to whether distillation kept or dropped it, and where kept content landed.
+_Avoid_: Source map, diff
+
+**Material change**:
+An upstream revision that touches or removes a section the **Retention map** marks kept, or adds a section matching no known digest or heading. Only a material change warrants re-distillation.
+_Avoid_: Upstream drift, breaking change
+
 ## Relationships
 
 - A **CommonKit** defines one or more **Loadouts**.
@@ -89,6 +113,11 @@ _Avoid_: Worker box
 - An **Operation adapter** is the only component allowed to mutate, verify, or roll back a target.
 - APM is CommonKit's preferred **Agent-context provider**; CommonKit does not compete with APM's package resolution, distribution, compilation, or package-audit responsibilities.
 - Chezmoi is CommonKit's preferred home-configuration provider for the subset of semantics proven equivalent under isolated materialization; unsupported destination-dependent or executable features fail closed.
+- A **Loadout** has exactly one **Context budget**; admitting an import that exceeds it forces an explicit eviction choice rather than silent growth.
+- **Distillation** never mutates a live target. It computes a distilled artifact and **Retention map** in isolated staging, a human promotes them into canonical Git source, and CommonKit **Reconciliation** applies the result.
+- An imported skill retains its upstream reference and revision as provenance. The upstream reference is decoupled from the distilled form; re-pulling upstream is a three-way merge against the distilled fork, not a replacement.
+- Scheduled read-only upstream checks classify revisions against the **Retention map**. Non-material changes advance the recorded upstream revision silently; only a **Material change** notifies a human and queues re-distillation.
+- Imported skills are admitted by human review against the **Context budget**, not by automated evaluation. An admitted skill may afterward enter the SkillOpt evaluation and promotion path unchanged.
 - SkillOpt is an exact-version external candidate-computation provider, not a target mutator. CommonKit independently evaluates held-out evidence and policy, requires human promotion into canonical Git source, then uses APM and CommonKit reconciliation for compilation and named-canary deployment.
 - Native providers remain available for migration, fallback, and capabilities not safely delegated upstream.
 - CommonKit stages provider output and applies it through CommonKit **Reconciliation** so target mutation remains plan-bound, receipted, verifiable, and recoverable.

@@ -102,6 +102,20 @@ impl ArtifactStore {
         Ok(bytes)
     }
 
+    /// Loads an artifact known only by digest, rejecting content that does not
+    /// hash back to it.
+    ///
+    /// Plans reference their content by digest alone, so a reader working from
+    /// a durable plan has no `ContentReference` to present. Integrity is still
+    /// enforced: the digest is the only thing being trusted, and it is checked.
+    pub fn load_by_digest(&self, digest: &Sha256Digest) -> Result<Vec<u8>, ArtifactError> {
+        let bytes = self.load_unbounded(digest)?;
+        if digest_bytes(&bytes)? != *digest {
+            return Err(ArtifactError::DigestMismatch);
+        }
+        Ok(bytes)
+    }
+
     pub fn verify_digest(&self, digest: &Sha256Digest) -> Result<(), ArtifactError> {
         let bytes = self.load_unbounded(digest)?;
         if digest_bytes(&bytes)? == *digest {

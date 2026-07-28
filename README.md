@@ -158,6 +158,24 @@ Snapshot restore similarly stages and authenticates the snapshot and target
 preimage, coordinates configured service stop/start commands, and resumes or
 rolls back an interrupted transaction on daemon restart.
 
+## Session Board
+
+The Session Board is CommonKit's glanceable approval surface: a hub on the
+always-on VPS serves `https://board.unsold.cloud` (tailnet-only) while
+per-machine reporters dial out over WebSocket, streaming every Claude, Codex,
+and Orca session plus the decisions they are waiting on. Approval cards answer
+who/what/why (project, operation, agent intent from the transcript) with the
+exact payload, and offer Allow, Always (persists a previewed project-local
+permission rule through Claude Code's own `updatedPermissions` mechanism), and
+Deny with an optional steer message delivered to the owning Orca terminal.
+Every decision is a human tap and every failure path fails open to the normal
+terminal prompt (`docs/adr/0008`, `docs/adr/0009`). Code lives in
+[`apps/session-board`](apps/session-board) and
+[`packages/session-board-protocol`](packages/session-board-protocol); the
+operations runbook, including deploy scripts, web push, and token rotation, is
+[`docs/session-board.md`](docs/session-board.md), and the domain glossary is in
+`CONTEXT.md`.
+
 ## Persistent MCP relay
 
 The Rust daemon owns a loopback-only, bearer-authenticated MCP endpoint at
