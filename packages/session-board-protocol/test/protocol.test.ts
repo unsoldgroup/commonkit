@@ -2,6 +2,11 @@ import { describe, expect, test } from "bun:test";
 
 import {
   boardSnapshotSchema,
+  claudeHookResponseSchema,
+  decisionRecordSchema,
+  decisionValidForAction,
+  decisionSchema,
+  decisionsResponseSchema,
   decisionRequestSchema,
   hubToReporterMessageSchema,
   reporterToHubMessageSchema,
@@ -103,6 +108,8 @@ describe("session board protocol fixtures", () => {
     expectRoundTrip(boardSnapshotSchema, snapshot);
     expectRoundTrip(decisionRequestSchema, { verdict: "allow" });
     expectRoundTrip(decisionRequestSchema, { verdict: "option:2" });
+    expectRoundTrip(decisionRequestSchema, { verdict: "always", steer: "Keep this project-local." });
+    expectRoundTrip(decisionSchema, { ...decision, verdict: "deny", steer: "Use the read-only command." });
     expectRoundTrip(sseEventSchema, { type: "snapshot", data: snapshot });
     expectRoundTrip(sseEventSchema, { type: "actionClosed", data: { actionId: action.id, outcome: "allowed" } });
   });
@@ -115,5 +122,54 @@ describe("session board protocol fixtures", () => {
       }),
     ).toThrow();
     expect(() => decisionRequestSchema.parse({ verdict: "option:0" })).toThrow();
+    expect(() => decisionRequestSchema.parse({ verdict: "deny", steer: "x".repeat(281) })).toThrow();
+  });
+
+  test("round-trips a Claude permission rule suggestion", () => {
+    expectRoundTrip(reporterToHubMessageSchema, {
+      type: "actionOpened",
+      action: {
+        ...action,
+        detail: { ...action.detail, ruleSuggestion: "Bash(pnpm test:*)" },
+      },
+    });
+  });
+
+  test("restricts always and steer to Claude permission actions", () => {
+    expect(decisionValidForAction(action, { verdict: "always" })).toBe(true);
+    expect(decisionValidForAction(action, { verdict: "deny", steer: "Use a safer command." })).toBe(true);
+    expect(decisionValidForAction(codexAction, { verdict: "always" })).toBe(false);
+    expect(decisionValidForAction(codexAction, { verdict: "option:1", steer: "Retry later." })).toBe(false);
+    expect(decisionValidForAction(gateAction, { verdict: "always" })).toBe(false);
+    expect(decisionValidForAction(gateAction, { verdict: "option:1" })).toBe(true);
+  });
+
+  test("round-trips Claude hook permission updates", () => {
+    expectRoundTrip(claudeHookResponseSchema, {
+      decision: "allow",
+      updatedPermissions: [{ rule: "Bash(git push:*)", destination: "localSettings" }],
+    });
+    expectRoundTrip(claudeHookResponseSchema, { decision: "deny" });
+    expect(() =>
+      claudeHookResponseSchema.parse({
+        decision: "allow",
+        updatedPermissions: [{ rule: "Bash(git push:*)", destination: "userSettings" }],
+      }),
+    ).toThrow();
+  });
+
+  test("round-trips decision log records and REST payloads", () => {
+    const record = {
+      id: "decision-1",
+      actionId: action.id,
+      summary: action.summary,
+      verdict: "deny",
+      steer: "Use a read-only command.",
+      machineId: machine.id,
+      decidedAt: decision.decidedAt,
+    } as const;
+
+    expectRoundTrip(decisionRecordSchema, record);
+    expectRoundTrip(decisionsResponseSchema, { records: [record] });
   });
 });

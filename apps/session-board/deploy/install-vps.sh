@@ -65,6 +65,9 @@ umask 077
 {
   printf 'SESSION_BOARD_REPORTER_TOKENS=%s\n' "$(systemd_quote "$SESSION_BOARD_REPORTER_TOKENS")"
   printf 'SESSION_BOARD_ACTION_TOKEN=%s\n' "$(systemd_quote "$SESSION_BOARD_ACTION_TOKEN")"
+  [[ -z ${SESSION_BOARD_VAPID_PUBLIC:-} ]] || printf 'SESSION_BOARD_VAPID_PUBLIC=%s\n' "$(systemd_quote "$SESSION_BOARD_VAPID_PUBLIC")"
+  [[ -z ${SESSION_BOARD_VAPID_PRIVATE:-} ]] || printf 'SESSION_BOARD_VAPID_PRIVATE=%s\n' "$(systemd_quote "$SESSION_BOARD_VAPID_PRIVATE")"
+  [[ -z ${SESSION_BOARD_VAPID_SUBJECT:-} ]] || printf 'SESSION_BOARD_VAPID_SUBJECT=%s\n' "$(systemd_quote "$SESSION_BOARD_VAPID_SUBJECT")"
   printf 'SESSION_BOARD_HOST=%s\n' "$(systemd_quote '127.0.0.1')"
   printf 'SESSION_BOARD_PORT=%s\n' "$(systemd_quote "$HUB_PORT")"
 } >"$ENV_FILE"

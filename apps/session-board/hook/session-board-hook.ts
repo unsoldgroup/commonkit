@@ -39,11 +39,14 @@ export async function runHook(rawInput: string, fetcher: typeof fetch = fetch): 
       signal: AbortSignal.timeout(Math.min(55_000, Math.max(1, timeoutMs))),
     });
     if (!response.ok || response.status === 204) return;
-    const { decision } = claudeHookResponseSchema.parse(await response.json());
+    const { decision, updatedPermissions } = claudeHookResponseSchema.parse(await response.json());
     return JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PermissionRequest",
-        decision: { behavior: decision },
+        decision: {
+          behavior: decision,
+          ...(updatedPermissions ? { updatedPermissions } : {}),
+        },
       },
     });
   } catch {

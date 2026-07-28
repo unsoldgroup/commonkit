@@ -1,4 +1,4 @@
-import type { BoardSnapshot, PendingAction, Session } from "@commonkit/session-board-protocol";
+import type { BoardSnapshot, DecisionRecord, PendingAction, Session } from "@commonkit/session-board-protocol";
 
 export type LayoutGroup = { id: string; name: string; sessionIds: string[] };
 export type BoardGroup = LayoutGroup & { sessions: Session[] };
@@ -36,6 +36,29 @@ export function groupBoard(snapshot: BoardSnapshot, layout: Layout): BoardGroup[
 
 export const pendingOldestFirst = (snapshot: BoardSnapshot) =>
   [...snapshot.pendingActions].sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt));
+
+export const decisionsNewestFirst = (records: DecisionRecord[]) =>
+  [...records].sort((a, b) => Date.parse(b.decidedAt) - Date.parse(a.decidedAt));
+
+export function actionPayload(action: PendingAction) {
+  if (action.kind !== "claude-permission") return undefined;
+  const input = (action.detail.input && typeof action.detail.input === "object" ? action.detail.input : {}) as Record<string, unknown>;
+  const str = (key: string) => typeof input[key] === "string" && input[key] ? input[key] as string : undefined;
+  const tool = action.detail.tool;
+  if (tool === "Bash") return str("command");
+  if (tool === "Write") return str("content");
+  if (tool === "Edit") return str("old_string") || str("new_string")
+    ? `${(str("old_string") ?? "").split("\n").map((line) => `- ${line}`).join("\n")}\n${(str("new_string") ?? "").split("\n").map((line) => `+ ${line}`).join("\n")}`
+    : undefined;
+  if (tool === "NotebookEdit") return str("new_source");
+  if (tool === "WebFetch") return [str("url"), str("prompt")].filter(Boolean).join("\n");
+  if (tool === "WebSearch") return str("query");
+  if (tool === "Task") return str("prompt");
+  return str("command") ?? str("content") ?? str("prompt");
+}
+
+export const outcomeText = (outcome: "allowed" | "denied" | "stale" | "failed") =>
+  outcome === "allowed" ? "Allowed" : outcome === "denied" ? "Denied" : "Expired · answered in terminal";
 
 export function moveSession(layout: Layout, groups: BoardGroup[], id: string, targetId: string): Layout {
   return { groups: groups.map((group) => ({
