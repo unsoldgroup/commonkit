@@ -50,12 +50,23 @@ From the repository root on the VPS:
 ```sh
 export SESSION_BOARD_REPORTER_TOKENS='{"studio":"replace-with-random-token"}'
 export SESSION_BOARD_ACTION_TOKEN='replace-with-a-different-random-token'
+export SESSION_BOARD_VAPID_PUBLIC='replace-with-vapid-public-key'
+export SESSION_BOARD_VAPID_PRIVATE='replace-with-vapid-private-key'
+export SESSION_BOARD_VAPID_SUBJECT='mailto:admin@example.com'
 export CF_Token='cloudflare-dns-edit-token'
 apps/session-board/deploy/install-vps.sh
-unset SESSION_BOARD_REPORTER_TOKENS SESSION_BOARD_ACTION_TOKEN CF_Token
+unset SESSION_BOARD_REPORTER_TOKENS SESSION_BOARD_ACTION_TOKEN SESSION_BOARD_VAPID_PUBLIC SESSION_BOARD_VAPID_PRIVATE SESSION_BOARD_VAPID_SUBJECT CF_Token
 ```
 
 The script installs dependencies, builds the web app, writes the hub environment file with mode `0600`, installs and starts `board-hub.service`, explicitly runs the acme.sh DNS-01 challenge, installs the certificate for Caddy, validates the Caddy configuration, and reloads Caddy. It does not create the permanent DNS record.
+
+Generate a VAPID key pair once from the repository root:
+
+```sh
+pnpm dlx web-push generate-vapid-keys
+```
+
+Keep the private key in the hub environment only. `SESSION_BOARD_VAPID_SUBJECT` is a `mailto:` or `https:` contact URI. Push is optional: if any VAPID variable is absent, the hub returns a null public key and the board continues without push.
 
 Verify:
 
@@ -75,6 +86,29 @@ systemctl --user disable --now board-hub.service
 ```
 
 The hub token file is `~/.config/commonkit/session-board/hub.env`. Persistent board layout is stored under `apps/session-board/hub/data/` in the repository checkout.
+
+## Board actions, history, and authentication
+
+The approval-card verbs are:
+
+- **Allow**: allow this request once.
+- **Always**: allow this request and ask Claude Code to persist the exact rule previewed on the card. The hook returns `updatedPermissions` with destination `localSettings`, so Claude Code writes `<cwd>/.claude/settings.local.json`; the board never edits settings and never writes global configuration (ADR 0009).
+- **Deny**: deny the request, optionally with a steer message.
+- **Numbered option**: select the displayed Codex option.
+
+Every verdict comes from a human tap. Failures and timeouts return no decision and fall back to the terminal prompt. Deny steer delivery is best-effort and only reaches Claude sessions whose `cwd` matches an Orca-managed worktree; unmatched sessions are skipped silently.
+
+The hub records human decisions for seven days in `data/decisions.json`. The board's Decisions tab reads them from `GET /decisions`; older records are removed as new decisions are appended.
+
+The tailnet is the read boundary. `GET /state`, `GET /events`, `GET /sessions/:id/tail`, `GET /decisions`, and the VAPID public-key read are tokenless. Mutating endpoints are token-gated: decisions and push subscription registration require the board action bearer token, while reporter writes use that Target's reporter token.
+
+## Push subscriptions
+
+On the first board open per device, the PWA reads `GET /push/vapid-public-key` and offers notification permission when push is configured. It records that the offer was made so a denial or dismissal is not repeatedly prompted. The small bell control in the header shows the device state and can retry opt-in later.
+
+After permission is granted, the service worker creates a browser push subscription with the VAPID public key. The PWA posts that subscription to `POST /push/subscriptions` using the board action token already stored on the device. Subscriptions are stored by endpoint in `data/push-subscriptions.json`. Turning the bell off unsubscribes that browser endpoint; the hub also prunes endpoints when their push service reports them expired.
+
+Each newly seen pending action produces at most one push containing its summary. Opening the notification focuses an existing board window or opens the board. Push delivery is informational only and never approves, denies, delays, or otherwise affects the decision path. Verify delivery manually on each deployed device because browser push services are not exercised in local tests.
 
 ## Install a Mac reporter
 

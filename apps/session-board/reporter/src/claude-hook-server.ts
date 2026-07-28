@@ -14,6 +14,7 @@ export interface ClaudeHookServerOptions {
   now?: () => Date;
   openAction: (action: ClaudePermissionAction) => void;
   closeAction: (actionId: string, outcome?: "allowed" | "denied" | "stale" | "failed") => void;
+  steer?: (cwd: string, text: string) => Promise<void>;
 }
 
 const truncate = (value: string, max = 200) => (value.length > max ? `${value.slice(0, max - 1)}…` : value);
@@ -31,6 +32,27 @@ export function describePermission(tool: string, input: unknown, cwd: string): s
     tool === "Task" ? `Agent: ${text("description") ?? text("prompt") ?? "subagent"}` :
     undefined;
   return truncate(body ? `[${project}] ${body}` : `[${project}] Allow ${tool}`);
+}
+
+export function deriveRuleSuggestion(tool: string, input: unknown): string | undefined {
+  if (tool === "Edit" || tool === "Write" || tool === "NotebookEdit" || tool === "WebFetch") return tool;
+  if (tool !== "Bash" || !input || typeof input !== "object") return undefined;
+  const command = (input as Record<string, unknown>).command;
+  if (typeof command !== "string") return undefined;
+  const tokens = command.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return undefined;
+  const prefixLength = ["git", "npm", "pnpm", "gh"].includes(tokens[0]!) ? 2 : 1;
+  return `Bash(${tokens.slice(0, prefixLength).join(" ")}:*)`;
+}
+
+export function responseForDecision(action: ClaudePermissionAction, decision: Decision): ClaudeHookResponse | undefined {
+  if (decision.verdict === "allow" || decision.verdict === "deny") return { decision: decision.verdict };
+  if (decision.verdict === "always" && action.detail.ruleSuggestion) {
+    return {
+      decision: "allow",
+      updatedPermissions: [{ rule: action.detail.ruleSuggestion, destination: "localSettings" }],
+    };
+  }
 }
 
 export async function lastAssistantText(transcriptPath: string | undefined, maxBytes = 131_072): Promise<string | undefined> {
@@ -105,6 +127,7 @@ export class ClaudeHookServer {
 
     const now = this.options.now ?? (() => new Date());
     const timeoutMs = Math.min(55_000, Math.max(1, this.options.timeoutMs ?? 54_000));
+    const ruleSuggestion = deriveRuleSuggestion(payload.tool, payload.input);
     const action: ClaudePermissionAction = {
       id: crypto.randomUUID(),
       kind: "claude-permission",
@@ -113,6 +136,7 @@ export class ClaudeHookServer {
       detail: {
         tool: payload.tool,
         input: payload.input,
+        ...(ruleSuggestion ? { ruleSuggestion } : {}),
         ...(await lastAssistantText(payload.session.transcriptPath).then((intent) => (intent ? { intent } : {}))),
       },
       createdAt: now().toISOString(),
@@ -123,12 +147,18 @@ export class ClaudeHookServer {
       this.#pending.set(action.id, (value) => { clearTimeout(timer); this.#pending.delete(action.id); resolve(value); });
       this.options.openAction(action);
     });
-    if (!decision || (decision.verdict !== "allow" && decision.verdict !== "deny")) {
+    const body = decision ? responseForDecision(action, decision) : undefined;
+    if (!decision || !body) {
       this.options.closeAction(action.id, "stale");
       return { status: 204 };
     }
-    const body: ClaudeHookResponse = { decision: decision.verdict };
-    this.options.closeAction(action.id, decision.verdict === "allow" ? "allowed" : "denied");
+    this.options.closeAction(action.id, decision.verdict === "deny" ? "denied" : "allowed");
+    if (decision.verdict === "deny" && decision.steer && this.options.steer) {
+      setTimeout(() => {
+        try { void this.options.steer!(action.sessionRef.worktreeId, decision.steer!).catch(() => {}); }
+        catch { /* fail open — steering never affects the decision */ }
+      }, 0);
+    }
     return { status: 200, body };
   }
 }

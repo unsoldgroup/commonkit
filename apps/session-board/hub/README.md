@@ -15,5 +15,9 @@ bun run apps/session-board/hub/src/main.ts
 uses `SESSION_BOARD_ACTION_TOKEN`. Optional `SESSION_BOARD_HOST` and `SESSION_BOARD_PORT`
 default to `127.0.0.1:8787`.
 
-The hub keeps board state in memory. It persists only group layout, at `data/layout.json`, and
-serves the PWA from `../web/dist` when that directory exists.
+The hub keeps live board state in memory. It stores group layout, the seven-day decision log,
+and push subscriptions under `data/`, and serves the PWA from `../web/dist` when that directory
+exists.
+
+Web push is enabled only when `SESSION_BOARD_VAPID_PUBLIC`, `SESSION_BOARD_VAPID_PRIVATE`, and
+`SESSION_BOARD_VAPID_SUBJECT` are all set. Without them, the rest of the hub continues normally.

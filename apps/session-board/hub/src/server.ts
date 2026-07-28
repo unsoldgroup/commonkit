@@ -1,12 +1,16 @@
 import { timingSafeEqual } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, isAbsolute, join, normalize, relative, sep } from "node:path";
 
 import {
   boardSnapshotSchema,
+  decisionRecordSchema,
   decisionRequestSchema,
+  decisionValidForAction,
+  decisionsResponseSchema,
   reporterToHubMessageSchema,
   type BoardSnapshot,
+  type DecisionRecord,
   type Machine,
   type PendingAction,
   type ReporterToHubMessage,
@@ -17,6 +21,16 @@ import {
 type ReporterSocketData = { machineId: string };
 type Socket = Bun.ServerWebSocket<ReporterSocketData>;
 
+export interface PushSubscription {
+  endpoint: string;
+  expirationTime?: number | null;
+  keys: { p256dh: string; auth: string };
+}
+
+export interface PushSender {
+  send(subscription: PushSubscription, payload: string): Promise<void>;
+}
+
 export interface HubOptions {
   reporterTokens: Record<string, string>;
   actionToken: string;
@@ -24,8 +38,10 @@ export interface HubOptions {
   port?: number;
   eventBufferSize?: number;
   layoutPath?: string;
+  dataDir?: string;
   webDistPath?: string;
   now?: () => Date;
+  push?: { publicKey: string; sender: PushSender };
 }
 
 export interface HubServer {
@@ -61,20 +77,131 @@ function encodeEvent(item: BufferedEvent) {
   return `id: ${item.id}\nevent: ${item.event.type}\ndata: ${JSON.stringify(item.event)}\n\n`;
 }
 
+async function readDecisionRecords(path: string): Promise<DecisionRecord[]> {
+  try {
+    const stored = JSON.parse(await readFile(path, "utf8"));
+    return decisionsResponseSchema.parse(stored).records;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function writeJson(path: string, value: unknown) {
+  await mkdir(dirname(path), { recursive: true });
+  const temporaryPath = `${path}.${crypto.randomUUID()}.tmp`;
+  await writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporaryPath, path);
+}
+
+function parsePushSubscription(value: unknown): PushSubscription {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("invalid subscription");
+  const subscription = value as Record<string, unknown>;
+  const keys = subscription.keys;
+  if (
+    typeof subscription.endpoint !== "string"
+    || !subscription.endpoint
+    || !keys
+    || typeof keys !== "object"
+    || Array.isArray(keys)
+    || typeof (keys as Record<string, unknown>).p256dh !== "string"
+    || typeof (keys as Record<string, unknown>).auth !== "string"
+    || (subscription.expirationTime !== undefined
+      && subscription.expirationTime !== null
+      && typeof subscription.expirationTime !== "number")
+  ) {
+    throw new Error("invalid subscription");
+  }
+  return subscription as unknown as PushSubscription;
+}
+
 export function startHub(options: HubOptions): HubServer {
   const now = options.now ?? (() => new Date());
   const eventBufferSize = Math.max(1, options.eventBufferSize ?? 256);
-  const layoutPath = options.layoutPath ?? join(import.meta.dir, "../data/layout.json");
+  const dataDir = options.dataDir ?? (options.layoutPath ? dirname(options.layoutPath) : join(import.meta.dir, "../data"));
+  const layoutPath = options.layoutPath ?? join(dataDir, "layout.json");
+  const decisionsPath = join(dataDir, "decisions.json");
+  const pushSubscriptionsPath = join(dataDir, "push-subscriptions.json");
   const webDistPath = options.webDistPath ?? join(import.meta.dir, "../../web/dist");
   const machines = new Map<string, Machine>();
   const sessions = new Map<string, Session>();
   const actions = new Map<string, PendingAction>();
+  const actionOwners = new Map<string, string>();
   const reporters = new Map<string, Socket>();
   const subscribers = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const eventBuffer: BufferedEvent[] = [];
   const tailRequests = new Map<string, { machineId: string; resolve: (lines: string[]) => void; timer: ReturnType<typeof setTimeout> }>();
   const encoder = new TextEncoder();
   let latestEventId = 0;
+  let decisionWrite = Promise.resolve();
+  let subscriptionWrite = Promise.resolve();
+
+  const appendDecision = (record: DecisionRecord) => {
+    decisionWrite = decisionWrite.catch(() => {}).then(async () => {
+      const cutoff = now().getTime() - 7 * 24 * 60 * 60 * 1_000;
+      const records = (await readDecisionRecords(decisionsPath))
+        .filter((item) => Date.parse(item.decidedAt) >= cutoff);
+      records.push(decisionRecordSchema.parse(record));
+      await writeJson(decisionsPath, { records });
+    });
+    return decisionWrite;
+  };
+
+  const readPushSubscriptions = async (): Promise<Record<string, PushSubscription>> => {
+    try {
+      const stored = JSON.parse(await readFile(pushSubscriptionsPath, "utf8"));
+      if (!stored || typeof stored !== "object" || Array.isArray(stored)) throw new Error("invalid subscriptions");
+      const parsed: Record<string, PushSubscription> = {};
+      for (const [endpoint, value] of Object.entries(stored)) {
+        const subscription = parsePushSubscription(value);
+        if (subscription.endpoint !== endpoint) throw new Error("subscription endpoint mismatch");
+        parsed[endpoint] = subscription;
+      }
+      return parsed;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+      throw error;
+    }
+  };
+
+  const updatePushSubscriptions = (update: (subscriptions: Record<string, PushSubscription>) => void) => {
+    subscriptionWrite = subscriptionWrite.catch(() => {}).then(async () => {
+      const subscriptions = await readPushSubscriptions();
+      update(subscriptions);
+      await writeJson(pushSubscriptionsPath, subscriptions);
+    });
+    return subscriptionWrite;
+  };
+
+  const notifyNewAction = (action: PendingAction) => {
+    if (actionOwners.has(action.id)) return;
+    actionOwners.set(action.id, action.sessionRef.machineId);
+    if (!options.push) return;
+    const payload = JSON.stringify({
+      title: "Session Board approval needed",
+      body: action.summary,
+      actionId: action.id,
+    });
+    void (async () => {
+      await subscriptionWrite;
+      const subscriptions = await readPushSubscriptions();
+      const expired: string[] = [];
+      await Promise.all(Object.values(subscriptions).map(async (subscription) => {
+        try {
+          await options.push!.sender.send(subscription, payload);
+        } catch (error) {
+          const statusCode = (error as { statusCode?: number }).statusCode;
+          if (statusCode === 404 || statusCode === 410) expired.push(subscription.endpoint);
+          else console.error("Session Board push delivery failed", error);
+        }
+      }));
+      if (expired.length > 0) {
+        await updatePushSubscriptions((current) => {
+          for (const endpoint of expired) delete current[endpoint];
+        });
+      }
+    })().catch((error) => console.error("Session Board push delivery failed", error));
+  };
 
   const snapshot = (): BoardSnapshot =>
     boardSnapshotSchema.parse({
@@ -112,6 +239,8 @@ export function startHub(options: HubOptions): HubServer {
     if (existing && existing.sessionRef.machineId !== machineId) {
       throw new Error("action id is already owned by another machine");
     }
+    const owner = actionOwners.get(action.id);
+    if (owner && owner !== machineId) throw new Error("action id was owned by another machine");
   };
 
   const handleReporterMessage = (socket: Socket, raw: string | Buffer) => {
@@ -141,7 +270,10 @@ export function startHub(options: HubOptions): HubServer {
       }
       machines.set(socket.data.machineId, { ...message.machine, online: true });
       for (const session of message.sessions) sessions.set(sessionKey(session), session);
-      for (const action of message.pendingActions) actions.set(action.id, action);
+      for (const action of message.pendingActions) {
+        actions.set(action.id, action);
+        notifyNewAction(action);
+      }
       publish({ type: "snapshot", data: snapshot() });
       return;
     }
@@ -157,7 +289,10 @@ export function startHub(options: HubOptions): HubServer {
       machines.set(socket.data.machineId, { ...message.machine, online: true });
       for (const session of message.sessions.upsert) sessions.set(sessionKey(session), session);
       for (const ref of message.sessions.remove) sessions.delete(sessionKey(ref));
-      for (const action of message.pendingActions.upsert) actions.set(action.id, action);
+      for (const action of message.pendingActions.upsert) {
+        actions.set(action.id, action);
+        notifyNewAction(action);
+      }
       for (const id of message.pendingActions.remove) {
         const action = actions.get(id);
         if (action?.sessionRef.machineId === socket.data.machineId) actions.delete(id);
@@ -169,13 +304,20 @@ export function startHub(options: HubOptions): HubServer {
     if (message.type === "actionOpened") {
       assertActionOwnership(message.action, socket.data.machineId);
       actions.set(message.action.id, message.action);
+      notifyNewAction(message.action);
       publish({ type: "actionOpened", data: message.action });
       return;
     }
 
     const action = actions.get(message.actionId);
-    if (action?.sessionRef.machineId === socket.data.machineId) {
-      actions.delete(message.actionId);
+    if (action?.sessionRef.machineId === socket.data.machineId) actions.delete(message.actionId);
+    if (
+      action?.sessionRef.machineId === socket.data.machineId
+      || (
+        actionOwners.get(message.actionId) === socket.data.machineId
+        && (message.outcome === "stale" || message.outcome === "failed")
+      )
+    ) {
       publish({ type: "actionClosed", data: { actionId: message.actionId, outcome: message.outcome } });
     }
   };
@@ -197,6 +339,38 @@ export function startHub(options: HubOptions): HubServer {
       }
 
       if (url.pathname === "/state" && request.method === "GET") return json(snapshot());
+
+      if (url.pathname === "/decisions" && request.method === "GET") {
+        try {
+          await decisionWrite;
+          return json({ records: await readDecisionRecords(decisionsPath) });
+        } catch {
+          return json({ error: "stored decisions are invalid" }, 500);
+        }
+      }
+
+      if (url.pathname === "/push/vapid-public-key" && request.method === "GET") {
+        return json({ publicKey: options.push?.publicKey ?? null });
+      }
+
+      if (url.pathname === "/push/subscriptions" && request.method === "POST") {
+        const token = bearerToken(request);
+        if (!token || !secureEqual(token, options.actionToken)) return json({ error: "unauthorized" }, 401);
+        let subscription: PushSubscription;
+        try {
+          subscription = parsePushSubscription(await request.json());
+        } catch {
+          return json({ error: "invalid subscription" }, 400);
+        }
+        try {
+          await updatePushSubscriptions((subscriptions) => {
+            subscriptions[subscription.endpoint] = subscription;
+          });
+        } catch {
+          return json({ error: "failed to store subscription" }, 500);
+        }
+        return json({ subscription }, 201);
+      }
 
       if (url.pathname === "/events" && request.method === "GET") {
         const lastId = Number.parseInt(request.headers.get("Last-Event-ID") ?? "", 10);
@@ -251,10 +425,16 @@ export function startHub(options: HubOptions): HubServer {
         } catch {
           return json({ error: "invalid decision" }, 400);
         }
+        if (!decisionValidForAction(action, requestBody)) return json({ error: "invalid decision for action" }, 400);
         if (actions.get(actionId) !== action || reporters.get(action.sessionRef.machineId) !== reporter) {
           return json({ error: "action closed or Target offline" }, 410);
         }
-        const decision = { actionId, verdict: requestBody.verdict, decidedAt: now().toISOString() };
+        const decision = {
+          actionId,
+          verdict: requestBody.verdict,
+          ...(requestBody.steer === undefined ? {} : { steer: requestBody.steer }),
+          decidedAt: now().toISOString(),
+        };
         let sentBytes = 0;
         try {
           sentBytes = reporter.send(JSON.stringify({ type: "decision", decision }));
@@ -264,6 +444,23 @@ export function startHub(options: HubOptions): HubServer {
         if (sentBytes <= 0) return json({ error: "action closed or Target offline" }, 410);
         actions.delete(actionId);
         publish({ type: "decision", data: decision });
+        publish({
+          type: "actionClosed",
+          data: { actionId, outcome: decision.verdict === "deny" ? "denied" : "allowed" },
+        });
+        try {
+          await appendDecision({
+            id: crypto.randomUUID(),
+            actionId,
+            summary: action.summary,
+            verdict: decision.verdict,
+            ...(decision.steer === undefined ? {} : { steer: decision.steer }),
+            machineId: action.sessionRef.machineId,
+            decidedAt: decision.decidedAt,
+          });
+        } catch (error) {
+          console.error("Session Board failed to persist decision", error);
+        }
         return json({ decision });
       }
 
@@ -311,10 +508,7 @@ export function startHub(options: HubOptions): HubServer {
         } catch {
           return json({ error: "invalid JSON" }, 400);
         }
-        await mkdir(dirname(layoutPath), { recursive: true });
-        const temporaryPath = `${layoutPath}.${crypto.randomUUID()}.tmp`;
-        await writeFile(temporaryPath, `${JSON.stringify(layout, null, 2)}\n`, { mode: 0o600 });
-        await rename(temporaryPath, layoutPath);
+        await writeJson(layoutPath, layout);
         return json(layout);
       }
 
