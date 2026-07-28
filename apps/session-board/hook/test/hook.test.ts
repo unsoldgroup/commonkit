@@ -62,4 +62,20 @@ describe("Claude PermissionRequest hook", () => {
       },
     });
   });
+
+  test("forwards project-local updated permissions verbatim", async () => {
+    const updatedPermissions = [{ rule: "Bash(git push:*)", destination: "localSettings" as const }];
+    const output = await runHook(JSON.stringify({
+      session_id: "session-1",
+      hook_event_name: "PermissionRequest",
+      tool_name: "Bash",
+      tool_input: { command: "git push --force" },
+      cwd: "/worktree",
+    }), async () => Response.json({ decision: "allow", updatedPermissions }));
+
+    expect(JSON.parse(output!).hookSpecificOutput.decision).toEqual({
+      behavior: "allow",
+      updatedPermissions,
+    });
+  });
 });

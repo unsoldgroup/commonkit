@@ -4,6 +4,7 @@ import { loadConfig } from "./config.js";
 import { HubClient } from "./hub-client.js";
 import { FallbackStateSource, OrcaCliPollingStateSource, OrcaWebSocketStateSource } from "./state-source.js";
 import { TailReader } from "./tail.js";
+import { OrcaSteerer } from "./steer.js";
 
 const config = await loadConfig();
 let client: HubClient;
@@ -11,6 +12,7 @@ let hook: ClaudeHookServer;
 const codex = new CodexTerminalExecutor(undefined, ({ actionId, outcome }) => client.closeAction(actionId, outcome));
 const decisions = new DecisionExecutor(() => client.actions, codex);
 const tails = new TailReader();
+const steerer = new OrcaSteerer();
 client = new HubClient({
   url: config.hubUrl,
   machineToken: config.machineToken,
@@ -28,6 +30,7 @@ hook = new ClaudeHookServer({
   port: config.hookPort,
   openAction: (action) => client.openAction(action),
   closeAction: (actionId, outcome) => client.closeAction(actionId, outcome),
+  steer: (cwd, text) => steerer.send(cwd, text),
 });
 const source = new FallbackStateSource(
   new OrcaWebSocketStateSource({ machineId: config.machineId }),
