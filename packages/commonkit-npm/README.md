@@ -3,7 +3,7 @@
 Install the CommonKit Rust command-line runtime:
 
 ```sh
-npm install --global commonkit
+npm install --global @alunsoldgroup/commonkit
 commonkit --version
 ```
 

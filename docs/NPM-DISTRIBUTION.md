@@ -1,6 +1,6 @@
 # npm distribution
 
-The public `commonkit` package is a small Node.js launcher for the production
+The public `@alunsoldgroup/commonkit` package is a small Node.js launcher for the production
 Rust runtime. It does not contain the legacy JavaScript reconciliation
 prototype and does not download executables during installation.
 
@@ -55,7 +55,7 @@ launcher with optional dependency resolution disabled:
 npm install --global --prefix /tmp/commonkit-prefix \
   /tmp/commonkit-npm/commonkit-darwin-arm64-0.1.0.tgz
 npm install --global --prefix /tmp/commonkit-prefix --omit=optional \
-  /tmp/commonkit-npm/commonkit-0.1.0.tgz
+  /tmp/commonkit-npm/alunsoldgroup-commonkit-0.1.0.tgz
 /tmp/commonkit-prefix/bin/commonkit --version
 /tmp/commonkit-prefix/bin/commonkitd --help
 ```
@@ -77,9 +77,9 @@ dependency:
 ```sh
 npm publish commonkit-darwin-arm64-0.1.0.tgz --access public
 npm publish commonkit-linux-x64-0.1.0.tgz --access public
-npm publish commonkit-0.1.0.tgz --access public
+npm publish alunsoldgroup-commonkit-0.1.0.tgz --access public
 ```
 
-After publication, install `commonkit@0.1.0` into a fresh prefix from the
+After publication, install `@alunsoldgroup/commonkit@0.1.0` into a fresh prefix from the
 registry and repeat the version and daemon checks. npm publication is manual;
 CommonKit does not use GitHub Actions.

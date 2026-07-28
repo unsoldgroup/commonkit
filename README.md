@@ -47,7 +47,7 @@ exact configured versions before use.
 For a normal CLI and daemon installation, use the public npm package:
 
 ```sh
-npm install --global commonkit
+npm install --global @alunsoldgroup/commonkit
 commonkit --version
 commonkit daemon install
 commonkit daemon start

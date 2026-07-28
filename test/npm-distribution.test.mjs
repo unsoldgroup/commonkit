@@ -39,6 +39,7 @@ test("the public commonkit package contains only the native launcher and public 
     );
     const manifest = JSON.parse(manifestText);
 
+    assert.equal(manifest.name, "@alunsoldgroup/commonkit");
     assert.deepEqual(paths, [
       "LICENSE",
       "README.md",

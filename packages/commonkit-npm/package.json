@@ -1,5 +1,5 @@
 {
-  "name": "commonkit",
+  "name": "@alunsoldgroup/commonkit",
   "version": "0.1.0",
   "description": "Portable, layered developer capabilities and policy across machines, projects, and coding agents",
   "type": "module",
