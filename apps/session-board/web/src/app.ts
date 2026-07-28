@@ -20,16 +20,24 @@ function actionButtons(action: PendingAction) {
     : action.detail.options.map((label, index) => [label, `option:${index + 1}`, index === 0 ? "allow" : ""]);
   return `<div class="actions">${options.map(([label, verdict, style]) => `<button class="${style}" data-action="${escape(action.id)}" data-verdict="${verdict}">${escape(label!)}</button>`).join("")}</div>`;
 }
+function actionDetail(action: PendingAction) {
+  if (action.kind !== "claude-permission") return "";
+  const input = (action.detail.input && typeof action.detail.input === "object" ? action.detail.input : {}) as Record<string, unknown>;
+  const primary = ["command", "file_path", "url", "query", "prompt"].map((key) => input[key]).find((value) => typeof value === "string" && value);
+  if (typeof primary !== "string") return "";
+  const text = primary.length > 600 ? `${primary.slice(0, 599)}…` : primary;
+  return `<pre class="detail">${escape(text)}</pre>`;
+}
 function card(session: Session) {
   const action = pendingFor(session, snapshot.pendingActions)[0];
-  return `<article class="card" data-session='${escape(sessionId(session))}' tabindex="0"><div class="card-top"><div><div class="repo">${escape(session.repo)} · ${escape(session.agent)}</div><div class="agent">${escape(session.title || session.paneKey)}</div></div><span class="badge ${session.state}">${escape(session.state)}</span></div>${action ? `<p class="summary">${escape(action.summary)}</p>${actionButtons(action)}` : ""}<div class="elapsed" data-since="${session.stateSince}">${elapsed(session.stateSince)} in state</div></article>`;
+  return `<article class="card" data-session='${escape(sessionId(session))}' tabindex="0"><div class="card-top"><div><div class="repo">${escape(session.repo)} · ${escape(session.agent)}</div><div class="agent">${escape(session.title || session.paneKey)}</div></div><span class="badge ${session.state}">${escape(session.state)}</span></div>${action ? `<p class="summary">${escape(action.summary)}</p>${actionDetail(action)}${actionButtons(action)}` : ""}<div class="elapsed" data-since="${session.stateSince}">${elapsed(session.stateSince)} in state</div></article>`;
 }
 function render() {
   groups = groupBoard(snapshot, layout);
   groupRoot.innerHTML = groups.length ? groups.map((group) => `<section class="group" data-group="${escape(group.id)}"><div class="group-head"><h2>${escape(group.name)}</h2><span class="count">${group.sessions.length}</span></div>${group.sessions.map(card).join("")}</section>`).join("") : `<p class="empty">No active sessions.</p>`;
   const pending = pendingOldestFirst(snapshot);
   $("#queue-count").textContent = String(pending.length);
-  queueRoot.innerHTML = pending.length ? pending.map((action) => `<div class="queue-item"><strong>${escape(action.summary)}</strong><time>${new Date(action.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>${actionButtons(action)}</div>`).join("") : `<p class="empty">No pending actions.</p>`;
+  queueRoot.innerHTML = pending.length ? pending.map((action) => `<div class="queue-item"><strong>${escape(action.summary)}</strong>${actionDetail(action)}<time>${new Date(action.createdAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>${actionButtons(action)}</div>`).join("") : `<p class="empty">No pending actions.</p>`;
   bindDrag();
 }
 async function loadState() { const response = await fetch("/state", { cache: "no-store" }); if (!response.ok) throw new Error("State unavailable"); snapshot = await response.json(); updatedAt = Date.now(); render(); }
