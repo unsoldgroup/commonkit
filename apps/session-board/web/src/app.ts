@@ -1,5 +1,6 @@
 import type { BoardSnapshot, DecisionRecord, PendingAction, Session, Verdict } from "@commonkit/session-board-protocol";
 import { actionPayload, decisionsNewestFirst, groupBoard, moveSession, outcomeText, pendingFor, pendingOldestFirst, sessionId, type BoardGroup, type Layout } from "./model.js";
+import { decodeVapidPublicKey, pushOptInState, type PushOptInState } from "./push.js";
 
 const empty: BoardSnapshot = { machines: [], sessions: [], pendingActions: [] };
 let snapshot = empty;
@@ -18,7 +19,11 @@ const $ = <T extends Element>(selector: string) => document.querySelector<T>(sel
 const groupRoot = $("#groups");
 const queueRoot = $("#queue");
 const drawer = $("#drawer") as HTMLDialogElement;
+const pushToggle = $("#push-toggle") as HTMLButtonElement;
 const token = () => localStorage.getItem("session-board-token") ?? "";
+const pushOfferedKey = "session-board-push-offered";
+let pushState: PushOptInState = "off";
+let vapidPublicKey: string | null = null;
 
 function escape(value: string) { const node = document.createElement("span"); node.textContent = value; return node.innerHTML.replaceAll('"', "&quot;").replaceAll("'", "&#39;"); }
 function elapsed(iso: string) { const seconds = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 1000)); return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m` : `${Math.floor(seconds / 3600)}h ${Math.floor(seconds % 3600 / 60)}m`; }
@@ -78,8 +83,7 @@ function render() {
 async function loadState() { const response = await fetch("/state", { cache: "no-store" }); if (!response.ok) throw new Error("State unavailable"); snapshot = await response.json(); updatedAt = Date.now(); render(); }
 async function loadDecisions() { const response = await fetch("/decisions", { cache: "no-store" }); if (!response.ok) throw new Error("Decisions unavailable"); decisions = (await response.json()).records; render(); }
 async function decide(id: string, verdict: Verdict, steer?: string) {
-  let auth = token();
-  if (!auth) { auth = prompt("Board action token") ?? ""; if (auth) localStorage.setItem("session-board-token", auth); }
+  const auth = await actionToken(true);
   if (!auth) return;
   const response = await fetch(`/actions/${encodeURIComponent(id)}/decision`, { method: "POST", headers: { Authorization: `Bearer ${auth}`, "Content-Type": "application/json" }, body: JSON.stringify({ verdict, ...(steer ? { steer } : {}) }) });
   if (!response.ok) throw new Error((await response.json()).error ?? "Decision failed");
@@ -105,6 +109,73 @@ async function openTail(session: Session) {
 }
 function toast(message: string) { const item = $("#toast"); item.textContent = message; item.classList.add("show"); setTimeout(() => item.classList.remove("show"), 2200); }
 function runDecision(id: string, verdict: Verdict, steer?: string) { void decide(id, verdict, steer).catch((error) => toast(error.message)); }
+function renderPushToggle() {
+  const label = pushState === "on" ? "Push notifications on" : pushState === "available" ? "Turn on push notifications" : "Push notifications off";
+  pushToggle.className = `push-toggle ${pushState}`;
+  pushToggle.textContent = "🔔";
+  pushToggle.setAttribute("aria-label", label);
+  pushToggle.setAttribute("aria-pressed", String(pushState === "on"));
+  pushToggle.title = label;
+}
+function pushSupported() {
+  return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+}
+async function actionToken(promptUser: boolean) {
+  let auth = token();
+  if (!auth && promptUser) {
+    auth = prompt("Board action token") ?? "";
+    if (auth) localStorage.setItem("session-board-token", auth);
+  }
+  return auth;
+}
+async function refreshPushState() {
+  if (!pushSupported()) { pushState = "off"; renderPushToggle(); return; }
+  try {
+    const response = await fetch("/push/vapid-public-key", { cache: "no-store" });
+    vapidPublicKey = response.ok ? (await response.json()).publicKey : null;
+    const subscription = vapidPublicKey ? await (await navigator.serviceWorker.ready).pushManager.getSubscription() : null;
+    pushState = pushOptInState({ supported: true, hubEnabled: Boolean(vapidPublicKey), permission: Notification.permission, subscribed: Boolean(subscription) });
+  } catch {
+    vapidPublicKey = null;
+    pushState = "off";
+  }
+  renderPushToggle();
+}
+async function enablePush(promptForToken: boolean) {
+  if (!pushSupported() || !vapidPublicKey || Notification.permission === "denied") { pushState = "off"; renderPushToggle(); return; }
+  localStorage.setItem(pushOfferedKey, "1");
+  const permission = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
+  if (permission !== "granted") { await refreshPushState(); return; }
+  const auth = await actionToken(promptForToken);
+  if (!auth) { await refreshPushState(); return; }
+  const registration = await navigator.serviceWorker.ready;
+  const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: decodeVapidPublicKey(vapidPublicKey) });
+  const response = await fetch("/push/subscriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${auth}`, "Content-Type": "application/json" },
+    body: JSON.stringify(subscription),
+  });
+  if (!response.ok) {
+    await subscription.unsubscribe();
+    if (response.status === 401) localStorage.removeItem("session-board-token");
+    throw new Error(response.status === 401 ? "Push needs a valid board action token" : "Could not enable push notifications");
+  }
+  await refreshPushState();
+}
+async function togglePush() {
+  if (pushState === "on") {
+    const subscription = await (await navigator.serviceWorker.ready).pushManager.getSubscription();
+    await subscription?.unsubscribe();
+    await refreshPushState();
+    return;
+  }
+  await enablePush(true);
+}
+async function initializePush() {
+  await refreshPushState();
+  // Auto-offer never prompts for a token: it uses the stored one or leaves the bell in its available state.
+  if (pushState === "available" && !localStorage.getItem(pushOfferedKey)) await enablePush(false).catch(() => refreshPushState());
+}
 
 document.addEventListener("click", (event) => {
   const target = event.target as Element;
@@ -138,6 +209,7 @@ $("#new-group").addEventListener("click", () => {
   render();
   void fetch("/layout", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(layout) }).catch(() => toast("Could not save layout"));
 });
+pushToggle.addEventListener("click", () => void togglePush().catch((error) => { void refreshPushState(); toast(error.message); }));
 
 function bindDrag() {
   for (const item of document.querySelectorAll<HTMLElement>(".card")) {
@@ -162,4 +234,7 @@ setInterval(() => { $("#updated").textContent = updatedAt ? `Updated ${elapsed(n
 async function wake() { try { if ("wakeLock" in navigator) await navigator.wakeLock.request("screen"); } catch {} }
 
 void Promise.all([loadState(), fetch("/layout").then((response) => response.json()).then((value) => { layout = value; render(); })]).catch((error) => toast(error.message));
-void wake(); if ("serviceWorker" in navigator) void navigator.serviceWorker.register("/sw.js");
+void wake();
+if ("serviceWorker" in navigator) {
+  void navigator.serviceWorker.register("/sw.js").then(() => initializePush()).catch(() => { pushState = "off"; renderPushToggle(); });
+} else renderPushToggle();
