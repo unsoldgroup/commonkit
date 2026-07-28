@@ -23,10 +23,22 @@ function actionButtons(action: PendingAction) {
 function actionDetail(action: PendingAction) {
   if (action.kind !== "claude-permission") return "";
   const input = (action.detail.input && typeof action.detail.input === "object" ? action.detail.input : {}) as Record<string, unknown>;
-  const primary = ["command", "file_path", "url", "query", "prompt"].map((key) => input[key]).find((value) => typeof value === "string" && value);
-  if (typeof primary !== "string") return "";
-  const text = primary.length > 600 ? `${primary.slice(0, 599)}…` : primary;
-  return `<pre class="detail">${escape(text)}</pre>`;
+  const str = (key: string) => (typeof input[key] === "string" && input[key] ? (input[key] as string) : undefined);
+  const clip = (value: string, max = 600) => (value.length > max ? `${value.slice(0, max - 1)}…` : value);
+  const tool = action.detail.tool;
+  const body =
+    tool === "Bash" ? str("command") :
+    tool === "Write" ? str("content") :
+    tool === "Edit" ? (str("old_string") || str("new_string")
+      ? `${(str("old_string") ?? "").split("\n").map((line) => `- ${line}`).join("\n")}\n${(str("new_string") ?? "").split("\n").map((line) => `+ ${line}`).join("\n")}`
+      : undefined) :
+    tool === "NotebookEdit" ? str("new_source") :
+    tool === "WebFetch" ? [str("url"), str("prompt")].filter(Boolean).join("\n") :
+    tool === "WebSearch" ? str("query") :
+    tool === "Task" ? str("prompt") :
+    str("command") ?? str("content") ?? str("prompt");
+  const intent = typeof action.detail.intent === "string" && action.detail.intent ? `<p class="intent">${escape(action.detail.intent)}</p>` : "";
+  return `${intent}${body ? `<pre class="detail">${escape(clip(body))}</pre>` : ""}`;
 }
 function card(session: Session) {
   const action = pendingFor(session, snapshot.pendingActions)[0];
