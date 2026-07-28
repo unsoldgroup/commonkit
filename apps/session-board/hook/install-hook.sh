@@ -16,11 +16,16 @@ try { settings = JSON.parse(await readFile(path, "utf8")); }
 catch (error) { if (error?.code !== "ENOENT") throw error; }
 settings.hooks ??= {};
 if (!settings.hooks || typeof settings.hooks !== "object" || Array.isArray(settings.hooks)) throw new Error("settings.hooks must be an object");
-settings.hooks.PreToolUse ??= [];
-if (!Array.isArray(settings.hooks.PreToolUse)) throw new Error("settings.hooks.PreToolUse must be an array");
-const exists = settings.hooks.PreToolUse.some((entry) =>
-  Array.isArray(entry?.hooks) && entry.hooks.some((hook) => hook?.type === "command" && hook?.command === command));
-if (!exists) settings.hooks.PreToolUse.push({
+const isOurs = (hook) => hook?.type === "command" && typeof hook?.command === "string" && hook.command.includes("session-board-hook.ts");
+// Migrate: session-board used to register under PreToolUse, which also fires for auto-approved calls.
+if (Array.isArray(settings.hooks.PreToolUse)) {
+  settings.hooks.PreToolUse = settings.hooks.PreToolUse.filter((entry) => !(Array.isArray(entry?.hooks) && entry.hooks.some(isOurs)));
+  if (settings.hooks.PreToolUse.length === 0) delete settings.hooks.PreToolUse;
+}
+settings.hooks.PermissionRequest ??= [];
+if (!Array.isArray(settings.hooks.PermissionRequest)) throw new Error("settings.hooks.PermissionRequest must be an array");
+settings.hooks.PermissionRequest = settings.hooks.PermissionRequest.filter((entry) => !(Array.isArray(entry?.hooks) && entry.hooks.some(isOurs)));
+settings.hooks.PermissionRequest.push({
   matcher: "Bash|Edit|Write|NotebookEdit|WebFetch|WebSearch|Task",
   hooks: [{ type: "command", command, timeout: 60 }],
 });
