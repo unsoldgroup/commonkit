@@ -17,3 +17,23 @@ test("an active registered target unlocks the management application", () => {
     "complete",
   );
 });
+
+test("a persisted selected target unlocks setup when legacy status fields are empty", () => {
+  assert.equal(
+    setupCompletion(
+      { activeTarget: null, activeLoadout: null },
+      { selected: ["macbook"], targets: [{ id: "macbook" }] },
+    ),
+    "complete",
+  );
+});
+
+test("a stale selected target does not unlock setup", () => {
+  assert.equal(
+    setupCompletion(
+      { activeTarget: null, activeLoadout: null },
+      { selected: ["removed"], targets: [{ id: "macbook" }] },
+    ),
+    "required",
+  );
+});

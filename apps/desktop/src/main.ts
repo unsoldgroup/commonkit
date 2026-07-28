@@ -11,6 +11,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { assertPlanTarget, convergenceTarget } from "./target-selection.ts";
 import { refreshDesktopState, shouldRunLiveRefresh } from "./live-refresh.ts";
 import { setupCompletion } from "./setup-gate.ts";
+import { withDeadline } from "./async-deadline.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
@@ -136,12 +137,22 @@ function bindOnboardingActions(): void {
       return;
     }
     if (onboardingState.submitting || onboardingState.auth.state !== "authenticated") return;
+    if (setupCompletion(snapshot?.status ?? null, targets) === "complete") {
+      setupUnlocked = true;
+      location.hash = "#status";
+      render();
+      return;
+    }
     onboardingState.draft.publishRegistration = new FormData(form).get("publishRegistration") === "true";
     onboardingState.submitting = true;
     onboardingState.message = "Checking your setup and preparing the preview…";
     render();
     try {
-      const result = await desktopApi.onboardingInitialize(onboardingRequest(onboardingState.draft, onboardingState.auth.login));
+      const result = await withDeadline(
+        desktopApi.onboardingInitialize(onboardingRequest(onboardingState.draft, onboardingState.auth.login)),
+        45_000,
+        "Setup is taking too long. CommonKit stopped waiting for a response. Do not retry immediately; reopen CommonKit and check Diagnostics first.",
+      );
       const plan = (result as { firstPlanId?: string }).firstPlanId ?? "ready";
       onboardingState.message = `Your setup preview ${plan} is ready. Review it before applying any changes.`;
       setupUnlocked = true;

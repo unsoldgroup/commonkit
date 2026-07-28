@@ -1533,6 +1533,18 @@ fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     let window = app
         .get_webview_window("main")
         .ok_or("main window unavailable")?;
+    let scale = window.scale_factor().map_err(|error| error.to_string())?;
+    let current = window.inner_size().map_err(|error| error.to_string())?;
+    let current_width = f64::from(current.width) / scale;
+    let current_height = f64::from(current.height) / scale;
+    if current_width < 1_180.0 || current_height < 760.0 {
+        window
+            .set_size(tauri::LogicalSize::new(
+                current_width.max(1_200.0),
+                current_height.max(800.0),
+            ))
+            .map_err(|error| error.to_string())?;
+    }
     window.show().map_err(|error| error.to_string())?;
     window.set_focus().map_err(|error| error.to_string())
 }

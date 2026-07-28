@@ -74,6 +74,11 @@ test("macOS shows the Dock icon only while the main window is open", async () =>
     "the Dock icon must be restored before showing the window",
   );
   assert.match(
+    showWindow,
+    /window\.inner_size\(\)[\s\S]*?window\s*\.set_size\(/,
+    "existing installations must expand a restored undersized window before showing it",
+  );
+  assert.match(
     hideWindow,
     /set_activation_policy\(tauri::ActivationPolicy::Accessory\)/,
   );
