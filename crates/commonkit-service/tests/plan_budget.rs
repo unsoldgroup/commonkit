@@ -65,6 +65,7 @@ fn plan_writing(
                 before_digest: None,
                 after_digest: Some(reference.digest),
                 payload_digest: digest('e'),
+                provenance: None,
                 summary: format!("write {path}"),
             })
             .expect("operation")
@@ -201,6 +202,7 @@ async fn plan_budget_ignores_removals_so_an_eviction_measures_after_itself() {
         before_digest: None,
         after_digest: Some(kept.digest),
         payload_digest: digest('e'),
+        provenance: None,
         summary: "write kept".into(),
     })
     .expect("operation");
@@ -220,6 +222,7 @@ async fn plan_budget_ignores_removals_so_an_eviction_measures_after_itself() {
         before_digest: Some(digest('9')),
         after_digest: None,
         payload_digest: digest('e'),
+        provenance: None,
         summary: "evict skill".into(),
     })
     .expect("operation");
