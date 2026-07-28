@@ -15,6 +15,22 @@ export interface ClaudeHookServerOptions {
   closeAction: (actionId: string, outcome?: "allowed" | "denied" | "stale" | "failed") => void;
 }
 
+const truncate = (value: string, max = 200) => (value.length > max ? `${value.slice(0, max - 1)}…` : value);
+
+export function describePermission(tool: string, input: unknown, cwd: string): string {
+  const record = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+  const text = (key: string) => (typeof record[key] === "string" && record[key] ? (record[key] as string) : undefined);
+  const project = cwd.split("/").filter(Boolean).pop() ?? cwd;
+  const body =
+    tool === "Bash" ? (text("description") ? `${text("description")} — ${text("command") ?? ""}` : text("command")) :
+    tool === "Edit" || tool === "Write" || tool === "NotebookEdit" ? `${tool} ${text("file_path") ?? "file"}` :
+    tool === "WebFetch" ? `Fetch ${text("url") ?? "URL"}` :
+    tool === "WebSearch" ? `Search "${text("query") ?? ""}"` :
+    tool === "Task" ? `Agent: ${text("description") ?? text("prompt") ?? "subagent"}` :
+    undefined;
+  return truncate(body ? `[${project}] ${body}` : `[${project}] Allow ${tool}`);
+}
+
 export class ClaudeHookServer {
   #pending = new Map<string, (decision: Decision) => void>();
   #server?: Server;
@@ -65,7 +81,7 @@ export class ClaudeHookServer {
       id: crypto.randomUUID(),
       kind: "claude-permission",
       sessionRef: { machineId: this.options.machineId, worktreeId: payload.session.cwd, paneKey: payload.session.id },
-      summary: `Allow ${payload.tool}`,
+      summary: describePermission(payload.tool, payload.input, payload.session.cwd),
       detail: { tool: payload.tool, input: payload.input },
       createdAt: now().toISOString(),
       expiresAt: new Date(now().getTime() + timeoutMs).toISOString(),

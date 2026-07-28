@@ -18,7 +18,7 @@ export async function runHook(rawInput: string, fetcher: typeof fetch = fetch): 
   } catch {
     return;
   }
-  if (hook.hook_event_name !== "PreToolUse" || typeof hook.tool_name !== "string" || typeof hook.session_id !== "string" || typeof hook.cwd !== "string") return;
+  if (hook.hook_event_name !== "PermissionRequest" || typeof hook.tool_name !== "string" || typeof hook.session_id !== "string" || typeof hook.cwd !== "string") return;
 
   try {
     const request = claudeHookRequestSchema.parse({
@@ -42,9 +42,8 @@ export async function runHook(rawInput: string, fetcher: typeof fetch = fetch): 
     const { decision } = claudeHookResponseSchema.parse(await response.json());
     return JSON.stringify({
       hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: decision,
-        permissionDecisionReason: "Human decision from Session Board",
+        hookEventName: "PermissionRequest",
+        decision: { behavior: decision },
       },
     });
   } catch {

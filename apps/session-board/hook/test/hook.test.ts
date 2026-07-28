@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { runHook } from "../session-board-hook.js";
 
-describe("Claude PreToolUse hook", () => {
+describe("Claude PermissionRequest hook", () => {
   test("fails open with no permission decision when the reporter returns no decision", async () => {
     const mockReporter: typeof fetch = async (_input, init) => await new Promise<Response>((_resolve, reject) => {
       init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), { once: true });
@@ -11,7 +11,7 @@ describe("Claude PreToolUse hook", () => {
     const output = await runHook(JSON.stringify({
       session_id: "session-1",
       transcript_path: "/tmp/transcript.jsonl",
-      hook_event_name: "PreToolUse",
+      hook_event_name: "PermissionRequest",
       tool_name: "Bash",
       tool_input: { command: "pnpm test" },
       cwd: "/worktree",
@@ -35,7 +35,7 @@ describe("Claude PreToolUse hook", () => {
     });
     child.stdin.write(JSON.stringify({
       session_id: "session-1",
-      hook_event_name: "PreToolUse",
+      hook_event_name: "PermissionRequest",
       tool_name: "Bash",
       tool_input: { command: "pnpm test" },
       cwd: "/worktree",
@@ -49,7 +49,7 @@ describe("Claude PreToolUse hook", () => {
   test("returns only the human reporter decision to Claude", async () => {
     const output = await runHook(JSON.stringify({
       session_id: "session-1",
-      hook_event_name: "PreToolUse",
+      hook_event_name: "PermissionRequest",
       tool_name: "Bash",
       tool_input: { command: "pnpm test" },
       cwd: "/worktree",
@@ -57,9 +57,8 @@ describe("Claude PreToolUse hook", () => {
 
     expect(JSON.parse(output!)).toEqual({
       hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: "Human decision from Session Board",
+        hookEventName: "PermissionRequest",
+        decision: { behavior: "deny" },
       },
     });
   });
