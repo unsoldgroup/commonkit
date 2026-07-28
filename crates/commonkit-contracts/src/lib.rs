@@ -712,6 +712,7 @@ pub const V1_LAYER_SPEC_FIELDS: &[&str] = &[
     "adapters",
     "arguments",
     "capabilities",
+    "contextBudget",
     "credentials",
     "databases",
     "denials",

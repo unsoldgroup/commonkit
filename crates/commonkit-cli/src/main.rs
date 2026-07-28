@@ -63,6 +63,8 @@ enum Command {
     },
     /// Show the deterministic changes in a synchronization plan.
     Diff { plan_id: String },
+    /// Report what a plan's loadout costs an agent on every turn.
+    Budget { plan_id: String },
     /// Apply a content-addressed plan through the local daemon.
     Apply {
         plan_id: String,
@@ -780,6 +782,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Diff { plan_id } => print_daemon(daemon_control(
             "GET",
             &format!("/control/v1/plans/{plan_id}"),
+            None,
+            None,
+        )?)?,
+        Command::Budget { plan_id } => print_daemon(daemon_control(
+            "GET",
+            &format!("/control/v1/plans/{plan_id}/budget"),
             None,
             None,
         )?)?,

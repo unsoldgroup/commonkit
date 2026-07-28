@@ -61,6 +61,7 @@
         "adapters": true,
         "arguments": true,
         "capabilities": true,
+        "contextBudget": true,
         "credentials": true,
         "databases": true,
         "denials": true,

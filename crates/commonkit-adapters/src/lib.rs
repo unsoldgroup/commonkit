@@ -2,6 +2,7 @@
 
 mod apm;
 mod artifacts;
+mod budget;
 mod chezmoi;
 mod credentials;
 mod files;
@@ -23,6 +24,10 @@ mod target;
 
 pub use apm::{ApmProvider, ApmProviderConfig, redacted_apm_diagnostic_summary};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
+pub use budget::{
+    BYTES_PER_TOKEN, BudgetEntry, BudgetError, CONTEXT_BUDGET_FIELD, ContextBudgetLedger,
+    ContextClass, declared_limit, tokens_for_bytes,
+};
 pub use chezmoi::{ChezmoiProvider, TESTED_CHEZMOI_VERSION};
 pub use credentials::{
     BwsCommandError, BwsCommandRunner, BwsCredentialResolver, CredentialReadiness,

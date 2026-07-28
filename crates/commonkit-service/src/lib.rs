@@ -19,8 +19,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use commonkit_adapters::{
-    CredentialReadinessInspector, CredentialReference, FileAdapter,
-    LocalCredentialReadinessInspector, MaterializedState, ProviderCapability,
+    ArtifactStore, ContextBudgetLedger, CredentialReadinessInspector, CredentialReference,
+    FileAdapter, LocalCredentialReadinessInspector, MaterializedState, ProviderCapability,
 };
 use commonkit_contracts::{
     CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan, PlanBindings,
@@ -654,6 +654,9 @@ struct ApiState {
     relay_runtime: Arc<ManagedRelayRuntime>,
     skills: Option<Arc<SkillEngine>>,
     skill_canary: Option<Arc<skill_canary::SkillCanaryRuntime>>,
+    /// Provider artifact store, present once the daemon has a state directory.
+    /// Read-only here: the budget ledger reads planned content by digest.
+    artifacts: Option<Arc<ArtifactStore>>,
 }
 
 struct ManagedRelayRuntime {
@@ -837,6 +840,35 @@ pub fn router_with_control(
             relay_runtime,
             skills: None,
             skill_canary: None,
+            artifacts: None,
+        },
+    )
+}
+
+/// Router that can also report context budget ledgers.
+///
+/// The artifact store is the only extra input the budget endpoint needs: plans
+/// already carry the managed paths and content digests it measures.
+pub fn router_with_control_and_artifacts(
+    token: ControlToken,
+    status: Arc<RwLock<ServiceStatus>>,
+    authority: impl Into<String>,
+    events: EventHub,
+    control: ControlPlane,
+    artifacts: Arc<ArtifactStore>,
+) -> Router {
+    let relay_runtime = default_relay_runtime(&token);
+    router_with_control_and_relay(
+        token,
+        status,
+        authority,
+        events,
+        RouterRuntime {
+            control,
+            relay_runtime,
+            skills: None,
+            skill_canary: None,
+            artifacts: Some(artifacts),
         },
     )
 }
@@ -859,6 +891,7 @@ pub fn router_with_skills(
             relay_runtime,
             skills: Some(skills),
             skill_canary: None,
+            artifacts: None,
         },
     )
 }
@@ -868,6 +901,7 @@ struct RouterRuntime {
     relay_runtime: Arc<ManagedRelayRuntime>,
     skills: Option<Arc<SkillEngine>>,
     skill_canary: Option<Arc<skill_canary::SkillCanaryRuntime>>,
+    artifacts: Option<Arc<ArtifactStore>>,
 }
 
 fn router_with_control_and_relay(
@@ -886,6 +920,7 @@ fn router_with_control_and_relay(
         relay_runtime: runtime.relay_runtime,
         skills: runtime.skills,
         skill_canary: runtime.skill_canary,
+        artifacts: runtime.artifacts,
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
@@ -937,6 +972,7 @@ fn router_with_control_and_relay(
         .route("/control/v1/rollback", post(rollback_run))
         .route("/control/v1/plans", post(plan_registration_disabled))
         .route("/control/v1/plans/{id}", get(get_plan))
+        .route("/control/v1/plans/{id}/budget", get(get_plan_budget))
         .route("/control/v1/plans/{id}/apply", post(apply_plan))
         .route("/control/v1/operations/{id}", get(get_operation))
         .route("/control/v1/skills", get(skill_inventory))
@@ -2554,6 +2590,73 @@ async fn get_plan(
         .ok_or_else(|| ApiError::not_found("plan_not_found"))
 }
 
+/// Reports what a plan's loadout would cost an agent on every turn.
+///
+/// Read-only: it reads planned content by digest from the provider artifact
+/// store and never mutates a target. The limit comes from the composed
+/// loadout's `contextBudget`; when none is declared the ledger is report-only
+/// and an overage is impossible rather than merely tolerated.
+async fn get_plan_budget(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let id = Sha256Digest::parse(id).map_err(|_| ApiError::bad_request("invalid_plan_id"))?;
+    let plan = state
+        .control
+        .plan(&id)
+        .ok_or_else(|| ApiError::not_found("plan_not_found"))?;
+    let artifacts = state
+        .artifacts
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable_code("artifacts_unavailable"))?;
+
+    let limit = composed_context_budget(&state)?;
+    let ledger = ContextBudgetLedger::measure_plan(&plan, artifacts, limit)
+        .map_err(|_| ApiError::internal("budget_measurement_failed"))?;
+
+    let mut report =
+        serde_json::to_value(&ledger).map_err(|_| ApiError::internal("budget_measurement_failed"))?;
+    // Derived totals are computed rather than stored, so they are attached here
+    // instead of duplicated as fields that could drift from the entries.
+    if let Some(object) = report.as_object_mut() {
+        object.insert("chargedTokens".into(), ledger.charged_tokens().into());
+        object.insert("overLimit".into(), ledger.over_limit().into());
+        object.insert(
+            "remainingTokens".into(),
+            match ledger.remaining_tokens() {
+                Some(remaining) => remaining.into(),
+                None => Value::Null,
+            },
+        );
+    }
+    Ok(Json(report))
+}
+
+/// Reads `contextBudget` from the composed loadout, if composition is wired.
+///
+/// An unconfigured composition domain yields no limit rather than an error: a
+/// ledger still reports figures without one.
+fn composed_context_budget(state: &ApiState) -> Result<Option<u64>, ApiError> {
+    let domain = state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .composition
+        .clone();
+    let Some(domain) = domain else {
+        return Ok(None);
+    };
+    let Ok(composed) = domain.compose() else {
+        return Ok(None);
+    };
+    let spec = composed.get("spec").unwrap_or(&Value::Null);
+    commonkit_adapters::declared_limit(spec)
+        .map_err(|_| ApiError::bad_request("invalid_context_budget"))
+}
+
 async fn apply_plan(
     State(state): State<ApiState>,
     AxumPath(id): AxumPath<String>,
@@ -4089,6 +4192,11 @@ impl BoundServer {
                 relay_runtime: relay_runtime.clone(),
                 skills,
                 skill_canary,
+                // Absent until a provider has staged artifacts; the budget
+                // endpoint reports unavailable rather than failing the daemon.
+                artifacts: ArtifactStore::open(paths.state.join("provider-artifacts"))
+                    .ok()
+                    .map(Arc::new),
             },
         );
         // The listener is bound before provider domains are loaded so its
