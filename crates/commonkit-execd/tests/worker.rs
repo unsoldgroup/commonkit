@@ -298,6 +298,63 @@ async fn policy_denied_repository_is_never_fetched() {
     assert!(!workspace_root.exists(), "denied repository was fetched");
 }
 
+/// The manifest declares `env://TASK_TOKEN`; this target cannot resolve it.
+#[tokio::test]
+async fn unresolved_secret_fails_the_attempt_and_is_audited() {
+    let directory = tempfile::tempdir().unwrap();
+    let objects = LocalObjectStore::open(directory.path().join("objects")).unwrap();
+    let state = ApiState::new(
+        Scheduler::open(directory.path().join("jobs.db")).unwrap(),
+        vec![(
+            "client-token".into(),
+            "client".into(),
+            BTreeSet::from([Capability::Submit]),
+        )],
+        false,
+    );
+    let (submitted, _) = manifest_for(&directory.path().join("source"));
+    let body = json!({"manifest":submitted,"idempotencyKey":"unresolved-secret"}).to_string();
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/execution/v1/jobs")
+                .header("authorization", "Bearer client-token")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let supervisor = ProcessSupervisor::new(
+        SupervisorMode::ProcessGroup,
+        directory.path().join("diagnostics"),
+    )
+    .unwrap();
+    let error = run_once(
+        &state,
+        &target(),
+        StableId::parse("linux-vps").unwrap(),
+        &WorkerContext {
+            workspace_root: &directory.path().join("workspace"),
+            objects: &objects,
+            resolved_secrets: &BTreeMap::new(),
+            supervisor: &supervisor,
+            keep_failed_workspaces: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("secret was not resolved"));
+    let audit = state.audit_entries().unwrap();
+    assert!(
+        audit
+            .iter()
+            .any(|entry| !entry.allowed && entry.reason == "execution_secret_denied")
+    );
+}
+
 #[tokio::test]
 async fn unknown_revision_fails_preparation_and_is_audited() {
     let directory = tempfile::tempdir().unwrap();

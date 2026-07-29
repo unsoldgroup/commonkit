@@ -221,9 +221,7 @@ fn task_environment(
     let mut environment = BTreeMap::new();
     let mut secret_values = Vec::new();
     for reference in references {
-        let name = reference
-            .strip_prefix("env://")
-            .filter(|name| valid_environment_name(name) && !reserved_environment_name(name))
+        let name = crate::secrets::environment_name(reference)
             .ok_or_else(|| WorkerError::UnsupportedSecretReference(reference.clone()))?;
         let value = resolved
             .get(reference)
@@ -233,19 +231,6 @@ fn task_environment(
         secret_values.push(value);
     }
     Ok((environment, secret_values))
-}
-
-fn valid_environment_name(name: &str) -> bool {
-    let mut chars = name.chars();
-    chars
-        .next()
-        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
-        && chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
-}
-
-fn reserved_environment_name(name: &str) -> bool {
-    matches!(name, "PATH" | "LANG" | "LC_ALL" | "HOME" | "TMPDIR")
-        || name.starts_with("COMMONKIT_EXECD_")
 }
 
 fn fail_enforcement(

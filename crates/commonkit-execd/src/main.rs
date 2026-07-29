@@ -29,6 +29,9 @@ struct Args {
     diagnostic_root: PathBuf,
     #[arg(long, default_value = "execution-policy.json")]
     policy: PathBuf,
+    /// Target-local secret values keyed by `env://NAME`, rendered by the operator.
+    #[arg(long)]
+    secrets: Option<PathBuf>,
     /// Retain the prepared worktree of a failed job so it can be inspected on the target.
     #[arg(long)]
     keep_failed_workspaces: bool,
@@ -77,18 +80,25 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_object_store(objects.clone(), artifact_signing_key)
     .with_policy(policy);
+    let secrets = match &args.secrets {
+        Some(path) => commonkit_execd::secrets::load(path)?,
+        None => BTreeMap::new(),
+    };
     if let Some(target_path) = args.target {
-        let target: ExecutionTarget = serde_json::from_slice(&tokio::fs::read(target_path).await?)?;
+        let mut target: ExecutionTarget =
+            serde_json::from_slice(&tokio::fs::read(target_path).await?)?;
         if target.id != worker_id {
             anyhow::bail!("worker ID must match target ID");
         }
+        // Placement trusts what this target can actually resolve, not what the
+        // target file claims.
+        target.ready_secret_refs = secrets.keys().cloned().collect();
         let worker_state = state.clone();
         let workspace = args.workspace_root.clone();
         let keep_failed_workspaces = args.keep_failed_workspaces;
         let supervisor =
             ProcessSupervisor::new(SupervisorMode::SystemdScope, args.diagnostic_root)?;
         tokio::spawn(async move {
-            let secrets = BTreeMap::new();
             let context = WorkerContext {
                 workspace_root: &workspace,
                 objects: &objects,
