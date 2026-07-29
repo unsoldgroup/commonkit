@@ -38,6 +38,8 @@ pub struct ApiState {
     policy: Option<Arc<ExecutionPolicy>>,
 }
 
+pub mod workspace;
+
 pub mod worker;
 
 impl ApiState {

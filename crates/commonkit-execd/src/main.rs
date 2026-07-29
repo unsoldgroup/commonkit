@@ -1,6 +1,6 @@
 use clap::Parser;
 use commonkit_contracts::{ExecutionTarget, StableId};
-use commonkit_execd::worker::run_once;
+use commonkit_execd::worker::{WorkerContext, run_once};
 use commonkit_execd::{ApiState, Capability, ExecutionPolicy, router};
 use commonkit_execution::supervisor::{ProcessSupervisor, SupervisorMode};
 use commonkit_execution::{LocalObjectStore, Scheduler};
@@ -29,6 +29,9 @@ struct Args {
     diagnostic_root: PathBuf,
     #[arg(long, default_value = "execution-policy.json")]
     policy: PathBuf,
+    /// Retain the prepared worktree of a failed job so it can be inspected on the target.
+    #[arg(long)]
+    keep_failed_workspaces: bool,
 }
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -81,20 +84,21 @@ async fn main() -> anyhow::Result<()> {
         }
         let worker_state = state.clone();
         let workspace = args.workspace_root.clone();
+        let keep_failed_workspaces = args.keep_failed_workspaces;
         let supervisor =
             ProcessSupervisor::new(SupervisorMode::SystemdScope, args.diagnostic_root)?;
         tokio::spawn(async move {
+            let secrets = BTreeMap::new();
+            let context = WorkerContext {
+                workspace_root: &workspace,
+                objects: &objects,
+                resolved_secrets: &secrets,
+                supervisor: &supervisor,
+                keep_failed_workspaces,
+            };
             loop {
-                if let Err(error) = run_once(
-                    &worker_state,
-                    &target,
-                    worker_id.clone(),
-                    &workspace,
-                    &objects,
-                    &BTreeMap::new(),
-                    &supervisor,
-                )
-                .await
+                if let Err(error) =
+                    run_once(&worker_state, &target, worker_id.clone(), &context).await
                 {
                     eprintln!("worker iteration failed: {error}");
                 }

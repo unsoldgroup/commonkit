@@ -1,5 +1,6 @@
 //! Single-target Linux worker loop. Workspace preparation and secret resolution stay outside durable state.
 use crate::ApiState;
+use crate::workspace::{self, WorkspaceError};
 use commonkit_contracts::{ExecutionTarget, JobState, StableId};
 use commonkit_execution::supervisor::{ProcessSupervisor, SupervisorError};
 use commonkit_execution::{ExecutionError, LocalObjectStore};
@@ -7,15 +8,29 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
+/// Everything the worker loop reuses across iterations.
+pub struct WorkerContext<'a> {
+    pub workspace_root: &'a Path,
+    pub objects: &'a LocalObjectStore,
+    pub resolved_secrets: &'a BTreeMap<String, String>,
+    pub supervisor: &'a ProcessSupervisor,
+    /// Retain the prepared worktree of a failed job so it can be inspected.
+    pub keep_failed_workspaces: bool,
+}
+
 pub async fn run_once(
     state: &ApiState,
     target: &ExecutionTarget,
     worker_id: StableId,
-    workspace: &Path,
-    objects: &LocalObjectStore,
-    resolved_secrets: &BTreeMap<String, String>,
-    supervisor: &ProcessSupervisor,
+    context: &WorkerContext<'_>,
 ) -> Result<Option<String>, WorkerError> {
+    let WorkerContext {
+        workspace_root,
+        objects,
+        resolved_secrets,
+        supervisor,
+        keep_failed_workspaces,
+    } = *context;
     let now = now_ms();
     state
         .scheduler
@@ -57,6 +72,26 @@ pub async fn run_once(
         JobState::Preparing,
         now_ms(),
     )?;
+    // Preparation fetches from the manifest repository, so it must stay after the
+    // policy check above: a denied repository is never contacted.
+    let workspace = match workspace::prepare(
+        &snapshot.job.manifest,
+        workspace_root,
+        &lease.job_id,
+    ) {
+        Ok(path) => path,
+        Err(error) => {
+            fail_enforcement(state, &lease, target, "workspace_preparation_failed")?;
+            return Err(error.into());
+        }
+    };
+    let mut guard = WorkspaceGuard {
+        root: workspace_root,
+        repository: snapshot.job.manifest.repository.clone(),
+        job_id: lease.job_id.clone(),
+        keep_on_failure: keep_failed_workspaces,
+        succeeded: false,
+    };
     let running = state.scheduler.lock().unwrap().transition(
         &lease.attempt_id,
         preparing.revision,
@@ -73,7 +108,7 @@ pub async fn run_once(
         };
     let mut process = match supervisor.spawn_with_environment(
         &snapshot.job.manifest,
-        workspace,
+        &workspace,
         &task_environment,
     ) {
         Ok(process) => process,
@@ -156,7 +191,27 @@ pub async fn run_once(
         .lock()
         .unwrap()
         .complete(&lease, terminal, outcome.status.code(), now_ms())?;
+    guard.succeeded = terminal == JobState::Succeeded;
     Ok(Some(lease.job_id))
+}
+
+/// Removes a prepared worktree on every exit path. Failed workspaces are retained
+/// when the operator asked for them so a failure can be inspected on the target.
+struct WorkspaceGuard<'a> {
+    root: &'a Path,
+    repository: String,
+    job_id: String,
+    keep_on_failure: bool,
+    succeeded: bool,
+}
+
+impl Drop for WorkspaceGuard<'_> {
+    fn drop(&mut self) {
+        if self.keep_on_failure && !self.succeeded {
+            return;
+        }
+        let _ = workspace::remove(self.root, &self.repository, &self.job_id);
+    }
 }
 
 fn task_environment(
@@ -229,4 +284,6 @@ pub enum WorkerError {
     UnsupportedSecretReference(String),
     #[error("execution secret was not resolved: {0}")]
     MissingResolvedSecret(String),
+    #[error("workspace preparation failed")]
+    Workspace(#[from] WorkspaceError),
 }

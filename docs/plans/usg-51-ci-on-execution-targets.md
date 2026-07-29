@@ -101,6 +101,10 @@ Ordered; each is independently landable and verifiable.
 - Populate `ExecutionTarget.ready_secret_refs` from the loaded keys so
   placement's secret-readiness check becomes live.
 - On the VPS the file is rendered from `bws` at deploy time, not committed.
+- Workspace preparation clones over HTTPS with `GIT_TERMINAL_PROMPT=0`, so a private
+  repository needs a credential source. Resolve it here rather than in the manifest:
+  a git credential helper configured on the target, never a token embedded in
+  `manifest.repository`.
 - Tests: missing ref fails with `execution_secret_denied`; resolved ref reaches
   the child env; secret value absent from stdout/stderr artifacts.
 
