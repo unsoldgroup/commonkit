@@ -392,7 +392,7 @@ struct ManagementSnapshot {
 #[serde(rename_all = "camelCase")]
 struct TraySummary {
     health: String,
-    loadout: String,
+    computer: String,
     git_sync: String,
     policy: String,
     drift: String,
@@ -403,7 +403,7 @@ struct TraySummary {
 #[derive(Clone)]
 struct TrayItems {
     health: MenuItem<tauri::Wry>,
-    loadout: MenuItem<tauri::Wry>,
+    computer: MenuItem<tauri::Wry>,
     git_sync: MenuItem<tauri::Wry>,
     policy: MenuItem<tauri::Wry>,
     drift: MenuItem<tauri::Wry>,
@@ -419,7 +419,6 @@ impl TraySummary {
         diagnostics: Option<&serde_json::Value>,
     ) -> Self {
         let target = status.active_target.as_deref().unwrap_or("no target");
-        let loadout = status.active_loadout.as_deref().unwrap_or("not selected");
         let relay = relay
             .and_then(|value| value.get("state"))
             .and_then(serde_json::Value::as_str)
@@ -451,7 +450,7 @@ impl TraySummary {
             .map_or(0, Vec::len);
         Self {
             health: format!("Health: {}", status.state),
-            loadout: format!("Loadout: {loadout} · {target}"),
+            computer: format!("Computer: {target}"),
             git_sync,
             policy: format!(
                 "Policy: {violations} violation{}",
@@ -506,6 +505,47 @@ struct OnboardingDefaults {
     kit_directory: PathBuf,
     target_root: PathBuf,
     computer_name: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopSettingsSnapshot {
+    autostart: bool,
+    config_directory: PathBuf,
+    state_directory: PathBuf,
+    repository: Option<String>,
+    target_root: Option<String>,
+}
+
+#[tauri::command]
+fn desktop_settings_snapshot(
+    app: tauri::AppHandle,
+) -> Result<DesktopSettingsSnapshot, DesktopError> {
+    let paths = AppPaths::discover().map_err(|_| DesktopError::ServiceUnavailable)?;
+    let config = std::fs::read(paths.config.join("headless.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+        .unwrap_or_default();
+    let sync = config.get("sync").unwrap_or(&serde_json::Value::Null);
+    let repository = sync
+        .pointer("/providerPipeline/source/trustedRemoteUrl")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let target_root = sync
+        .get("targetRoot")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let autostart = app
+        .autolaunch()
+        .is_enabled()
+        .map_err(|_| DesktopError::ServiceUnavailable)?;
+    Ok(DesktopSettingsSnapshot {
+        autostart,
+        config_directory: paths.config,
+        state_directory: paths.state,
+        repository,
+        target_root,
+    })
 }
 
 fn onboarding_defaults_from(
@@ -1565,74 +1605,17 @@ fn report_window_lifecycle_error(action: &str, result: Result<(), String>) {
     }
 }
 
-fn show_route(app: tauri::AppHandle, route: &str) -> Result<(), String> {
-    if !matches!(route, "status" | "plans" | "relay" | "snapshots") {
-        return Err("invalid desktop route".into());
-    }
-    show_main_window(app.clone())?;
-    let window = app
-        .get_webview_window("main")
-        .ok_or("main window unavailable")?;
-    window
-        .eval(format!("window.location.hash = '#{route}'"))
-        .map_err(|error| error.to_string())
-}
-
-async fn tray_plan(app: tauri::AppHandle) {
-    let client = app.state::<ServiceClient>().inner().clone();
-    if let Ok(status) = client.status().await {
-        if let Some(target) = status.active_target {
-            let path = target_convergence_route(&target, "sync/plan");
-            if let Ok(path) = path {
-                let confirmation = format!("desktop-tray-plan-{}", std::process::id());
-                let _ = post_confirmed(&client, &path, serde_json::json!({}), &confirmation).await;
-            }
-        }
-    }
-    let _ = show_route(app.clone(), "plans");
-    refresh_tray(app).await;
-}
-
-async fn tray_verify(app: tauri::AppHandle) {
-    let client = app.state::<ServiceClient>().inner().clone();
-    if let Ok(status) = client.status().await {
-        if let Some(target) = status.active_target {
-            if let Ok(path) = target_convergence_route(&target, "verify") {
-                let _ = client
-                    .json(
-                        reqwest::Method::POST,
-                        &path,
-                        Some(serde_json::json!({"targetId": target, "pointer": null})),
-                    )
-                    .await;
-            }
-        }
-    }
-    refresh_tray(app).await;
-}
-
-async fn tray_fetch(app: tauri::AppHandle) {
-    let client = app.state::<ServiceClient>().inner().clone();
-    if let Ok(status) = client.status().await {
-        if let Some(target) = status.active_target {
-            let _ = client
-                .json(
-                    reqwest::Method::POST,
-                    &format!("/targets/{target}/git"),
-                    Some(serde_json::json!({})),
-                )
-                .await;
-        }
-    }
-    refresh_tray(app).await;
-}
-
 async fn refresh_tray(app: tauri::AppHandle) {
     let client = app.state::<ServiceClient>().inner().clone();
-    let status = client
+    let mut status = client
         .status()
         .await
         .unwrap_or_else(|_| ServiceStatus::offline());
+    if status.active_target.is_none()
+        && let Ok(inventory) = client.json(reqwest::Method::GET, "/targets", None).await
+    {
+        status.active_target = selected_target(&inventory);
+    }
     let relay = client.json(reqwest::Method::GET, "/relay", None).await.ok();
     let snapshots = client
         .json(reqwest::Method::GET, "/snapshots", None)
@@ -1661,7 +1644,7 @@ async fn refresh_tray(app: tauri::AppHandle) {
         TraySummary::from_observed(&status, relay.as_ref(), snapshots.as_ref(), Some(&peer));
     let items = app.state::<TrayItems>();
     let _ = items.health.set_text(&summary.health);
-    let _ = items.loadout.set_text(&summary.loadout);
+    let _ = items.computer.set_text(&summary.computer);
     let _ = items.git_sync.set_text(&summary.git_sync);
     let _ = items.policy.set_text(&summary.policy);
     let _ = items.drift.set_text(&summary.drift);
@@ -1696,6 +1679,22 @@ async fn refresh_tray(app: tauri::AppHandle) {
     }
 }
 
+fn selected_target(inventory: &serde_json::Value) -> Option<String> {
+    let selected = inventory.get("selected")?.as_array()?;
+    let id = selected.as_slice().first()?.as_str()?;
+    if selected.len() == 1
+        && inventory
+            .get("targets")?
+            .as_array()?
+            .iter()
+            .any(|target| target.get("id").and_then(serde_json::Value::as_str) == Some(id))
+    {
+        Some(id.to_owned())
+    } else {
+        None
+    }
+}
+
 pub fn run() {
     let client = ServiceClient::discover().unwrap_or_else(|_| ServiceClient {
         discovery: PathBuf::new(),
@@ -1719,6 +1718,7 @@ pub fn run() {
             github_auth_status,
             github_auth_login,
             onboarding_defaults,
+            desktop_settings_snapshot,
             onboarding_initialize,
             desktop_management_snapshot,
             apply_plan,
@@ -1748,8 +1748,8 @@ pub fn run() {
             let supervisor = ServiceSupervisor::ensure_started(&client)?;
             app.manage(supervisor);
             let health = MenuItem::with_id(app, "health", "Health: starting", false, None::<&str>)?;
-            let loadout =
-                MenuItem::with_id(app, "loadout", "Loadout: loading", false, None::<&str>)?;
+            let computer =
+                MenuItem::with_id(app, "computer", "Computer: loading", false, None::<&str>)?;
             let relay =
                 MenuItem::with_id(app, "relay-status", "Relay: loading", false, None::<&str>)?;
             let snapshots = MenuItem::with_id(
@@ -1770,50 +1770,11 @@ pub fn run() {
                 false,
                 None::<&str>,
             )?;
-            let refresh = MenuItem::with_id(app, "refresh", "Refresh health", true, None::<&str>)?;
-            let fetch_now = MenuItem::with_id(
-                app,
-                "quick-fetch",
-                "Fetch trusted Git remote",
-                true,
-                None::<&str>,
-            )?;
-            let plan_now = MenuItem::with_id(
-                app,
-                "quick-plan",
-                "Plan selected target",
-                true,
-                None::<&str>,
-            )?;
-            let verify_now = MenuItem::with_id(
-                app,
-                "quick-verify",
-                "Verify selected target",
-                true,
-                None::<&str>,
-            )?;
-            let snapshot_review = MenuItem::with_id(
-                app,
-                "quick-snapshot",
-                "Create snapshot…",
-                true,
-                None::<&str>,
-            )?;
-            let review = MenuItem::with_id(app, "review", "Review plan…", true, None::<&str>)?;
-            let manage_relay =
-                MenuItem::with_id(app, "manage-relay", "Manage relay…", true, None::<&str>)?;
-            let manage_snapshots = MenuItem::with_id(
-                app,
-                "manage-snapshots",
-                "Manage snapshots…",
-                true,
-                None::<&str>,
-            )?;
             let open = MenuItem::with_id(app, "open", "Open CommonKit", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             app.manage(TrayItems {
                 health: health.clone(),
-                loadout: loadout.clone(),
+                computer: computer.clone(),
                 git_sync: git_sync.clone(),
                 policy: policy.clone(),
                 drift: drift.clone(),
@@ -1824,20 +1785,12 @@ pub fn run() {
                 app,
                 &[
                     &health,
-                    &loadout,
+                    &computer,
                     &git_sync,
                     &policy,
                     &drift,
                     &relay,
                     &snapshots,
-                    &refresh,
-                    &fetch_now,
-                    &plan_now,
-                    &verify_now,
-                    &snapshot_review,
-                    &review,
-                    &manage_relay,
-                    &manage_snapshots,
                     &open,
                     &quit,
                 ],
@@ -1853,30 +1806,6 @@ pub fn run() {
                             "show the main window",
                             show_main_window(app.clone()),
                         );
-                    }
-                    "refresh" => {
-                        tauri::async_runtime::spawn(refresh_tray(app.clone()));
-                    }
-                    "quick-plan" => {
-                        tauri::async_runtime::spawn(tray_plan(app.clone()));
-                    }
-                    "quick-fetch" => {
-                        tauri::async_runtime::spawn(tray_fetch(app.clone()));
-                    }
-                    "quick-verify" => {
-                        tauri::async_runtime::spawn(tray_verify(app.clone()));
-                    }
-                    "quick-snapshot" => {
-                        let _ = show_route(app.clone(), "snapshots");
-                    }
-                    "review" => {
-                        let _ = show_route(app.clone(), "plans");
-                    }
-                    "manage-relay" => {
-                        let _ = show_route(app.clone(), "relay");
-                    }
-                    "manage-snapshots" => {
-                        let _ = show_route(app.clone(), "snapshots");
                     }
                     "quit" => {
                         app.state::<ServiceSupervisor>().stop();
@@ -2237,12 +2166,30 @@ mod tests {
             })),
         );
         assert_eq!(summary.health, "Health: degraded");
-        assert_eq!(summary.loadout, "Loadout: personal · macbook");
+        assert_eq!(summary.computer, "Computer: macbook");
         assert_eq!(summary.relay, "Relay: healthy");
         assert_eq!(summary.snapshots, "Snapshots: 2 available");
         assert_eq!(summary.git_sync, "Git: diverged · 2 ahead · 1 behind");
         assert_eq!(summary.policy, "Policy: 1 violation");
         assert_eq!(summary.drift, "Last drift check: never");
+    }
+
+    #[test]
+    fn tray_uses_the_one_persisted_selected_target() {
+        assert_eq!(
+            selected_target(&serde_json::json!({
+                "selected": ["al-macbook"],
+                "targets": [{"id": "al-macbook"}]
+            })),
+            Some("al-macbook".into())
+        );
+        assert_eq!(
+            selected_target(&serde_json::json!({
+                "selected": ["one", "two"],
+                "targets": [{"id": "one"}, {"id": "two"}]
+            })),
+            None
+        );
     }
 
     #[test]

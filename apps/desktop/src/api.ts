@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } from "./contracts.ts";
-import type { UpdateSummary } from "./updater-view.ts";
+import type { SettingsSnapshot, UpdateSummary } from "./updater-view.ts";
 
 export type GithubAuthStatus =
   | { state: "authenticated"; login: string; method: "githubCli" }
@@ -16,6 +16,7 @@ export const desktopApi = {
   githubAuthStatus: () => invoke<GithubAuthStatus>("github_auth_status"),
   githubAuthLogin: () => invoke<GithubAuthStatus>("github_auth_login"),
   onboardingDefaults: () => invoke<OnboardingDefaults>("onboarding_defaults"),
+  settingsSnapshot: () => invoke<SettingsSnapshot>("desktop_settings_snapshot"),
   snapshot: () => invoke<DesktopSnapshot>("desktop_snapshot"),
   managementSnapshot: () => invoke<ManagementSnapshot>("desktop_management_snapshot"),
   targets: () => invoke<TargetInventorySnapshot>("targets_list"),
@@ -26,7 +27,6 @@ export const desktopApi = {
   snapshotCreate: (databaseId: string, confirmationId: string) => invoke<unknown>("snapshot_create", { databaseId, confirmationId }),
   snapshotRestore: (snapshotId: string, confirmationId: string) => invoke<unknown>("snapshot_restore", { snapshotId, confirmationId }),
   snapshotPromote: (databaseId: string, targetId: string, confirmationId: string) => invoke<unknown>("snapshot_promote", { databaseId, targetId, confirmationId }),
-  relayReconcile: (request: unknown, confirmationId: string) => invoke<unknown>("relay_reconcile", { request, confirmationId }),
   relayRestart: (confirmationId: string) => invoke<unknown>("relay_restart", { confirmationId }),
   scheduleConfigure: (enabled: boolean, intervalSeconds: number, confirmationId: string) => invoke<unknown>("schedule_configure", { enabled, intervalSeconds, confirmationId }),
   credentialReadiness: (references: string[]) => invoke<unknown>("credential_readiness", { references }),

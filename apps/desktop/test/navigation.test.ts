@@ -3,8 +3,18 @@ import test from "node:test";
 import { navigation, navigationForSetup, routeForSetup, routeFromHash } from "../src/navigation.ts";
 
 test("management navigation covers every v1 operator workflow", () => {
+  assert.deepEqual(navigation.map((item) => [item.group, item.route, item.label]), [
+    ["Overview", "status", "Status"],
+    ["Operate", "plans", "Changes"],
+    ["Operate", "credentials", "Credentials"],
+    ["Operate", "snapshots", "Data"],
+    ["Operate", "relay", "MCP connections"],
+    ["Operate", "schedule", "Drift checks"],
+    ["System", "diagnostics", "Diagnostics"],
+    ["System", "settings", "Settings"],
+  ]);
   assert.deepEqual(navigation.map((item) => item.route), [
-    "onboarding", "status", "plans", "credentials", "snapshots",
+    "status", "plans", "credentials", "snapshots",
     "relay", "schedule", "diagnostics", "settings",
   ]);
 });
@@ -19,6 +29,7 @@ test("unconfigured first run exposes only the setup wizard", () => {
 test("completing setup unlocks all operational routes", () => {
   assert.equal(navigationForSetup(true), navigation);
   assert.equal(routeForSetup("plans", true), "plans");
+  assert.equal(routeForSetup("onboarding", true), "settings");
 });
 
 test("unknown locations fail safely to status", () => {

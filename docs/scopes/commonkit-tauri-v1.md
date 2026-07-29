@@ -258,24 +258,58 @@ The Tauri 2 application replaces the macOS-only SwiftUI relay status app. It is 
 ### Tray
 
 - Overall state: healthy, drifted, blocked, applying, degraded, or offline.
+- Selected computer.
 - Git ahead/behind/diverged state.
-- Active loadout and target.
 - Organization-policy violations.
 - Relay and upstream health.
 - Last drift check and snapshot.
-- Quick actions: fetch, plan, verify, snapshot, open dashboard.
+- `Open CommonKit` and `Quit`.
+
+The tray is a glanceable, read-only status surface. It does not duplicate
+mutation workflows or present technical shortcuts without the plan,
+confirmation, and explanatory context available in the management window.
 
 ### Management window
 
 - First-run onboarding and GitHub repository selection/creation.
-- Layer and target inventory.
-- Human-readable plan with provenance and risk.
-- Apply confirmation and progress.
-- Credential-reference readiness without displaying values.
-- Snapshot history, authoritative-writer status, restore, and promotion.
-- Relay upstream inventory and health.
-- Adapter diagnostics and redacted export.
-- Scheduling and update settings.
+- A grouped information architecture:
+  - **Overview:** Status.
+  - **Operate:** Changes, Credentials, Data, MCP connections, Drift checks.
+  - **System:** Diagnostics, Settings.
+- Setup-only navigation is hidden after onboarding; management navigation is
+  hidden until a valid selected target makes setup complete.
+- Status answers whether the selected computer and each v1 capability is ready,
+  needs setup, or is unavailable, and identifies the next safe action.
+- Every operating screen states its objective before showing controls.
+- Changes distinguishes “ready to inspect,” “up to date,” and a bound
+  operation plan. Apply exists only for a reviewed non-empty plan.
+- Credential-reference readiness never displays values. Provisioning applies
+  only the exact redacted plan selected in the UI.
+- Data shows snapshot history and authoritative-writer state. Create, restore,
+  and promotion controls appear only when the snapshot domain is configured.
+- MCP connections shows portable upstream inventory and relay health.
+  Unconfigured state explains the declaration/runtime boundary; the UI never
+  submits observed relay status as desired configuration.
+- Drift checks use human-readable intervals and explicitly state that scheduled
+  checks are read-only and never apply changes.
+- Diagnostics refreshes observed state and exports only the daemon's redacted
+  diagnostic contract.
+- Settings identifies the connected repository, managed root, private config
+  and state locations, launch-at-login state, signed updates, and an explicit
+  reconnect path.
+- Technical identifiers are selected from observed inventory. The desktop does
+  not use browser prompts for destination IDs or schedule values.
+- Readiness, errors, loading, progress, and no-op states are distinct and
+  accessible; controls have keyboard-visible focus and 44px minimum targets.
+- The sidebar fills the application height while content scrolls independently;
+  narrow layouts collapse capability grids and make settings actions full-width.
+
+Portable capability editing remains governed by the layer and production-domain
+contracts. A screen may direct the user to Settings when setup is missing, but
+must not invent a desktop-only manifest, write provider output directly, or
+silently edit generated `headless.json`. A future editor must produce a
+reviewable personal-kit change, recompute its content digest, validate the
+organization policy floor, and enter the ordinary CommonKit plan path.
 
 ### Onboarding entry points
 

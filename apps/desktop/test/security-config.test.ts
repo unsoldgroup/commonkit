@@ -121,6 +121,19 @@ test("macOS Dock lifecycle smoke verifies open, close, and reopen against OS sta
   assert.match(smoke, /expected Accessory/);
 });
 
+test("tray is a read-only status surface with only open and quit actions", async () => {
+  const source = await readFile(new URL("src/lib.rs", root), "utf8");
+  const setup = source.slice(source.indexOf(".setup(move |app|"), source.indexOf(".on_window_event"));
+  for (const removed of [
+    "quick-fetch", "quick-plan", "quick-verify", "quick-snapshot",
+    "review", "manage-relay", "manage-snapshots", "refresh",
+  ]) {
+    assert.doesNotMatch(setup, new RegExp(`\"${removed}\"`));
+  }
+  assert.match(setup, /MenuItem::with_id\(app,\s*"open"/);
+  assert.match(setup, /MenuItem::with_id\(app,\s*"quit"/);
+});
+
 test("manual release policy requires native desktop and daemon lifecycle evidence", async () => {
   const release = await readFile(new URL("../../../docs/RELEASING.md", import.meta.url), "utf8");
   assert.match(release, /trusted release workstation/i);
@@ -196,6 +209,12 @@ test("credential provisioning reviews a redacted plan before applying its exact 
   assert.ok(plan >= 0 && review > plan && apply > review);
   assert.match(api, /credentialApply:\s*\(planId: string/);
   assert.doesNotMatch(api, /credentialApply:\s*\(destinationIds/);
+});
+
+test("operator workflows use inline controls instead of technical browser prompts", async () => {
+  const source = await readFile(new URL("../src/main.ts", root), "utf8");
+  assert.doesNotMatch(source, /window\.prompt/);
+  assert.doesNotMatch(source, /Configured credential destination ID/);
 });
 
 test("application and menu-bar icons share the same Ck monogram geometry", async () => {

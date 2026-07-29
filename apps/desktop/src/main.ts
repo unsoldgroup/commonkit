@@ -1,9 +1,8 @@
 import "./style.css";
 import { desktopApi } from "./api.ts";
 import { navigationForSetup, routeForSetup, routeFromHash, type Route } from "./navigation.ts";
-import { statusView } from "./view-model.ts";
 import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } from "./contracts.ts";
-import { updatePanel, type UpdateUiState } from "./updater-view.ts";
+import { updatePanel, type SettingsSnapshot, type UpdateUiState } from "./updater-view.ts";
 import { managementPanel } from "./management-view.ts";
 import { defaultOnboardingDraft, onboardingPanel, type OnboardingViewState } from "./onboarding-view.ts";
 import { applyOnboardingValues, onboardingRequest } from "./onboarding-controller.ts";
@@ -12,12 +11,14 @@ import { assertPlanTarget, convergenceTarget } from "./target-selection.ts";
 import { refreshDesktopState, shouldRunLiveRefresh } from "./live-refresh.ts";
 import { setupCompletion } from "./setup-gate.ts";
 import { withDeadline } from "./async-deadline.ts";
+import { statusPanel } from "./status-panel.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
 let management: ManagementSnapshot | null = null;
 let targets: TargetInventorySnapshot | null = null;
 let updateState: UpdateUiState = { kind: "idle" };
+let settingsSnapshot: SettingsSnapshot | null = null;
 let onboardingState: OnboardingViewState = {
   step: 1,
   auth: { state: "checking" },
@@ -27,6 +28,7 @@ let onboardingState: OnboardingViewState = {
 };
 let setupUnlocked = false;
 let setupCheckFailed = false;
+let reconnectMode = false;
 
 function placeholder(route: Route): string {
   const copy: Record<Route, [string, string]> = {
@@ -48,16 +50,19 @@ function render(): void {
   // Live domain refreshes can arrive while a user is typing in the wizard.
   // Preserve the visible form before replacing the DOM so no keystroke is lost.
   captureOnboardingDraft();
-  const completion = setupUnlocked ? "complete" : setupCheckFailed ? "required" : setupCompletion(snapshot?.status ?? null, targets);
+  const completion = reconnectMode ? "required" : setupUnlocked ? "complete" : setupCheckFailed ? "required" : setupCompletion(snapshot?.status ?? null, targets);
   const setupComplete = completion === "complete";
   const route = routeForSetup(routeFromHash(location.hash), setupComplete);
   const visibleNavigation = navigationForSetup(setupComplete);
-  const body = completion === "checking" ? `<section class="panel setup-check"><p class="eyebrow">First run</p><h1>Checking this computer…</h1><p>CommonKit is checking whether setup is already complete.</p></section>` : route === "onboarding" ? onboardingPanel(onboardingState) : route === "settings" ? updatePanel(updateState) : route === "status" && snapshot ? (() => {
-    const view = statusView(snapshot.status);
-    const inventory = targets ? `<fieldset><legend>Managed targets</legend>${targets.targets.map((target) => `<label><input type="checkbox" name="managed-target" value="${target.id}" ${targets?.selected.includes(target.id) ? "checked" : ""}> ${target.id} · ${target.transport.type}</label>`).join("")}<button id="save-target-selection" type="button">Save target selection</button></fieldset>` : "";
-    return `<section class="panel"><p class="eyebrow">Selected targets</p><h1>${view.heading}</h1><p>${view.detail}</p><dl><dt>Active target</dt><dd>${snapshot.status.activeTarget ?? "Multiple or not selected"}</dd><dt>Loadout</dt><dd>${snapshot.status.activeLoadout ?? "Not selected"}</dd><dt>Runtime</dt><dd>${snapshot.status.runtimeVersion}</dd></dl>${inventory}${view.primaryRoute !== "status" ? `<a class="primary" href="#${view.primaryRoute}">Continue</a>` : ""}</section>`;
-  })() : management && route in management ? managementPanel(route, management) : placeholder(route);
-  app.innerHTML = `<aside><div class="brand">CommonKit</div><nav>${visibleNavigation.map(({ route: id, label }) => `<a class="${route === id ? "active" : ""}" href="#${id}">${label}</a>`).join("")}</nav></aside><main>${body}</main>`;
+  const body = completion === "checking" ? `<section class="panel setup-check"><p class="eyebrow">First run</p><h1>Checking this computer…</h1><p>CommonKit is checking whether setup is already complete.</p></section>` : route === "onboarding" ? onboardingPanel(onboardingState) : route === "settings" ? updatePanel(updateState, settingsSnapshot) : route === "status" && snapshot && targets ? statusPanel(snapshot, targets, management, settingsSnapshot) : management && route in management ? managementPanel(route, management) : placeholder(route);
+  const groups = visibleNavigation.reduce<Record<string, typeof visibleNavigation[number][]>>((result, item) => {
+    (result[item.group] ??= []).push(item);
+    return result;
+  }, {});
+  const navigation = Object.entries(groups).map(([group, items]) =>
+    `<section class="nav-group"><p>${group}</p>${items.map(({ route: id, label }) => `<a class="${route === id ? "active" : ""}" href="#${id}">${label}</a>`).join("")}</section>`
+  ).join("");
+  app.innerHTML = `<aside><div class="brand">CommonKit</div><nav aria-label="CommonKit">${navigation}</nav></aside><main>${body}</main>`;
   if (route === "onboarding") bindOnboardingActions();
   else if (route === "settings") bindUpdateActions();
   else if (route === "status") bindTargetActions();
@@ -156,6 +161,7 @@ function bindOnboardingActions(): void {
       const plan = (result as { firstPlanId?: string }).firstPlanId ?? "ready";
       onboardingState.message = `Your setup preview ${plan} is ready. Review it before applying any changes.`;
       setupUnlocked = true;
+      reconnectMode = false;
       location.hash = "#plans";
     } catch (error) {
       onboardingState.message = errorMessage(error);
@@ -181,6 +187,18 @@ function errorMessage(error: unknown): string {
 }
 
 function bindUpdateActions(): void {
+  document.querySelector<HTMLButtonElement>("#autostart-enable")?.addEventListener("click", async () => {
+    await updateAutostart(true);
+  });
+  document.querySelector<HTMLButtonElement>("#autostart-disable")?.addEventListener("click", async () => {
+    await updateAutostart(false);
+  });
+  document.querySelector<HTMLButtonElement>("#reconnect-setup")?.addEventListener("click", () => {
+    reconnectMode = true;
+    onboardingState.step = 1;
+    location.hash = "#onboarding";
+    render();
+  });
   document.querySelector<HTMLButtonElement>("#check-update")?.addEventListener("click", async () => {
     updateState = { kind: "checking" };
     render();
@@ -207,13 +225,18 @@ function bindUpdateActions(): void {
   });
 }
 
-function confirmationId(action: string): string {
-  return `desktop-${action}-${Date.now()}`;
+async function updateAutostart(enabled: boolean): Promise<void> {
+  try {
+    const result = await desktopApi.setAutostart(enabled);
+    if (settingsSnapshot) settingsSnapshot.autostart = result;
+  } catch (error) {
+    updateState = { kind: "error", message: errorMessage(error) };
+  }
+  render();
 }
 
-function required(promptText: string): string | null {
-  const value = window.prompt(promptText)?.trim();
-  return value || null;
+function confirmationId(action: string): string {
+  return `desktop-${action}-${Date.now()}`;
 }
 
 function controlValue(name: string): string | null {
@@ -289,13 +312,8 @@ function bindManagementActions(route: Route): void {
     if (!window.confirm("Restart the managed relay runtime?")) return;
     void showResult(route, () => desktopApi.relayRestart(confirmationId("relay-restart")));
   });
-  document.querySelector("#relay-reconcile")?.addEventListener("click", () => {
-    const request = management?.relay;
-    if (!request || !window.confirm("Reconcile the configured relay inventory shown above?")) return;
-    void showResult(route, () => desktopApi.relayReconcile(request, confirmationId("relay-reconcile")));
-  });
   document.querySelector("#schedule-enable")?.addEventListener("click", () => {
-    const raw = required("Drift-check interval in seconds");
+    const raw = controlValue("schedule-interval");
     const interval = raw ? Number(raw) : 0;
     if (!Number.isSafeInteger(interval) || interval < 1 || !window.confirm(`Enable read-only drift checks every ${interval} seconds?`)) return;
     void showResult(route, () => desktopApi.scheduleConfigure(true, interval, confirmationId("schedule-enable")));
@@ -305,11 +323,11 @@ function bindManagementActions(route: Route): void {
     void showResult(route, () => desktopApi.scheduleConfigure(false, 1, confirmationId("schedule-disable")));
   });
   document.querySelector("#credential-readiness")?.addEventListener("click", () => {
-    const reference = required("Credential reference (for example bws://secret-id)");
+    const reference = controlValue("credential-reference");
     if (reference) void showResult(route, () => desktopApi.credentialReadiness([reference]));
   });
   document.querySelector("#credential-apply")?.addEventListener("click", () => {
-    const id = required("Configured credential destination ID");
+    const id = controlValue("credential-destination");
     if (!id) return;
     void showResult(route, async () => {
       const plan = await desktopApi.credentialPlan([id]);
@@ -323,7 +341,7 @@ function bindManagementActions(route: Route): void {
     });
   });
   document.querySelector("#credential-verify")?.addEventListener("click", () => {
-    const id = required("Configured credential destination ID to verify");
+    const id = controlValue("credential-destination");
     if (id) void showResult(route, () => desktopApi.credentialVerify([id]));
   });
   document.querySelector("#diagnostics-export")?.addEventListener("click", () => {
@@ -335,6 +353,9 @@ function bindManagementActions(route: Route): void {
       link.click();
       URL.revokeObjectURL(url);
     }).catch((error) => showError(route, error));
+  });
+  document.querySelector("#diagnostics-refresh")?.addEventListener("click", () => {
+    void refreshLiveState();
   });
 }
 
@@ -356,6 +377,12 @@ async function initializeOnboarding(): Promise<void> {
   render();
 }
 void initializeOnboarding();
+void desktopApi.settingsSnapshot().then((value) => {
+  settingsSnapshot = value;
+  render();
+}).catch(() => {
+  settingsSnapshot = null;
+});
 async function initializeSetupGate(): Promise<void> {
   const [observed, inventory] = await Promise.allSettled([desktopApi.snapshot(), desktopApi.targets()]);
   if (observed.status === "fulfilled") snapshot = observed.value;

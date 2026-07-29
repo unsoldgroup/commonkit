@@ -13,19 +13,78 @@ test("management panels render live domain state without secret values", () => {
   assert.doesNotMatch(html, /secretValue/);
 });
 
-test("management panels report unavailable domains as unavailable", () => {
+test("every operator screen states its objective before exposing controls", () => {
+  const fixtures = {
+    plans: { specDigest: "sha256:spec" },
+    credentials: { credentials: [] },
+    snapshots: { error: "snapshot_domain_unconfigured" },
+    relay: { servers: [] },
+    schedule: { enabled: false, intervalSeconds: 900 },
+    diagnostics: { checks: [] },
+  } as const;
+
+  for (const [route, value] of Object.entries(fixtures)) {
+    const html = managementPanel(route as keyof typeof fixtures, { [route]: value });
+    assert.match(html, /class="screen-objective"/);
+  }
+});
+
+test("credentials empty state offers an inline reference check without technical prompts", () => {
+  const html = managementPanel("credentials", {
+    credentials: { credentials: [] },
+  });
+
+  assert.match(html, /Setup needed/i);
+  assert.match(html, /Credential reference/i);
+  assert.match(html, /name="credential-reference"/);
+  assert.match(html, /id="credential-readiness"/);
+  assert.doesNotMatch(html, /id="credential-apply"/);
+  assert.doesNotMatch(html, /destination ID/i);
+});
+
+test("an unconfigured data domain explains the prerequisite instead of exposing an error", () => {
   const html = managementPanel("snapshots", {
     snapshots: { error: "snapshot_domain_unconfigured" },
   });
 
-  assert.match(html, /snapshot_domain_unconfigured/);
+  assert.match(html, /Setup needed/i);
+  assert.match(html, /protect a database/i);
+  assert.match(html, /Configure database/i);
+  assert.doesNotMatch(html, /snapshot_domain_unconfigured/);
+  assert.doesNotMatch(html, /id="snapshot-create"/);
+});
+
+test("an empty relay explains portable MCP connections and hides mutation controls", () => {
+  const html = managementPanel("relay", {
+    relay: { configured: false, servers: [] },
+  });
+
+  assert.match(html, /Setup needed/i);
+  assert.match(html, /MCP connection/i);
+  assert.match(html, /Add connection/i);
+  assert.doesNotMatch(html, /id="relay-reconcile"/);
+  assert.doesNotMatch(html, /id="relay-restart"/);
+});
+
+test("drift checks use an inline human-readable schedule instead of a numeric prompt", () => {
+  const html = managementPanel("schedule", {
+    schedule: { enabled: false, intervalSeconds: 900 },
+  });
+
+  assert.match(html, /Every 15 minutes/i);
+  assert.match(html, /name="schedule-interval"/);
+  assert.match(html, /value="900"/);
+  assert.match(html, /id="schedule-enable"/);
+  assert.match(html, /Read-only/i);
 });
 
 test("operator panels expose explicit fixed actions without rendering secret inputs", () => {
   assert.match(managementPanel("snapshots", { snapshots: { snapshots: [] } }), /id="snapshot-create"/);
-  assert.match(managementPanel("relay", { relay: { state: "healthy" } }), /id="relay-restart"/);
+  const relay = managementPanel("relay", { relay: { state: "healthy", servers: [{ id: "docs" }] } });
+  assert.match(relay, /id="relay-restart"/);
+  assert.doesNotMatch(relay, /id="relay-reconcile"/);
   assert.match(managementPanel("schedule", { schedule: { enabled: false } }), /id="schedule-enable"/);
-  assert.match(managementPanel("credentials", { credentials: { credentials: [] } }), /id="credential-apply"/);
+  assert.match(managementPanel("credentials", { credentials: { credentials: [{ id: "api", readiness: "ready" }] } }), /id="credential-apply"/);
   assert.match(managementPanel("diagnostics", { diagnostics: { status: "healthy" } }), /id="diagnostics-export"/);
   assert.doesNotMatch(managementPanel("credentials", { credentials: {} }), /type="password"/);
 });
@@ -45,6 +104,19 @@ test("plan review is human-readable and selects a bound digest without raw JSON"
   assert.match(html, /1 of 3/i);
   assert.match(html, /name="plan-id"/);
   assert.doesNotMatch(html, /<pre>/);
+});
+
+test("changes distinguishes composition readiness from a generated zero-operation plan", () => {
+  const composed = managementPanel("plans", { plans: { specDigest: "sha256:spec", trace: [] } });
+  assert.match(composed, /Ready to inspect/i);
+  assert.match(composed, /Generate plan/i);
+  assert.doesNotMatch(composed, /Apply reviewed plan/);
+
+  const current = managementPanel("plans", { plans: {
+    id: `sha256:${"a".repeat(64)}`, targetId: "macbook", operations: [],
+  } });
+  assert.match(current, /Up to date/i);
+  assert.doesNotMatch(current, /Apply reviewed plan/);
 });
 
 test("plan review renders the production Rust plan contract faithfully", () => {
@@ -99,4 +171,6 @@ test("snapshot, relay, and diagnostics panels expose typed inventory controls", 
   } });
   assert.match(diagnostics, /filesystem/);
   assert.match(diagnostics, /3 managed paths/);
+  assert.match(diagnostics, /id="diagnostics-refresh"/);
+  assert.match(diagnostics, /id="diagnostics-export"/);
 });
