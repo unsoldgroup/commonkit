@@ -166,6 +166,7 @@ async fn submitted_job_runs_after_client_disconnect_and_returns_artifacts() {
             )]),
             supervisor: &supervisor,
             keep_failed_workspaces: false,
+            status: None,
         },
     )
     .await
@@ -290,6 +291,7 @@ async fn policy_denied_repository_is_never_fetched() {
             resolved_secrets: &BTreeMap::new(),
             supervisor: &supervisor,
             keep_failed_workspaces: false,
+            status: None,
         },
     )
     .await
@@ -342,6 +344,7 @@ async fn unresolved_secret_fails_the_attempt_and_is_audited() {
             resolved_secrets: &BTreeMap::new(),
             supervisor: &supervisor,
             keep_failed_workspaces: false,
+            status: None,
         },
     )
     .await
@@ -402,6 +405,7 @@ async fn unknown_revision_fails_preparation_and_is_audited() {
             )]),
             supervisor: &supervisor,
             keep_failed_workspaces: false,
+            status: None,
         },
     )
     .await

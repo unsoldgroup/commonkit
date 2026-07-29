@@ -1,5 +1,6 @@
 //! Single-target Linux worker loop. Workspace preparation and secret resolution stay outside durable state.
 use crate::ApiState;
+use crate::github::{StatusReporter, StatusState};
 use crate::workspace::{self, WorkspaceError};
 use commonkit_contracts::{ExecutionTarget, JobState, StableId};
 use commonkit_execution::supervisor::{ProcessSupervisor, SupervisorError};
@@ -16,6 +17,8 @@ pub struct WorkerContext<'a> {
     pub supervisor: &'a ProcessSupervisor,
     /// Retain the prepared worktree of a failed job so it can be inspected.
     pub keep_failed_workspaces: bool,
+    /// Reports declared CI tasks to GitHub. Absent when no token is configured.
+    pub status: Option<&'a StatusReporter>,
 }
 
 pub async fn run_once(
@@ -30,6 +33,7 @@ pub async fn run_once(
         resolved_secrets,
         supervisor,
         keep_failed_workspaces,
+        status,
     } = *context;
     let now = now_ms();
     state
@@ -74,17 +78,21 @@ pub async fn run_once(
     )?;
     // Preparation fetches from the manifest repository, so it must stay after the
     // policy check above: a denied repository is never contacted.
-    let workspace = match workspace::prepare(
-        &snapshot.job.manifest,
-        workspace_root,
-        &lease.job_id,
-    ) {
-        Ok(path) => path,
-        Err(error) => {
-            fail_enforcement(state, &lease, target, "workspace_preparation_failed")?;
-            return Err(error.into());
-        }
-    };
+    let workspace =
+        match workspace::prepare(&snapshot.job.manifest, workspace_root, &lease.job_id) {
+            Ok(path) => path,
+            Err(error) => {
+                fail_enforcement(
+                    state,
+                    &lease,
+                    target,
+                    "workspace_preparation_failed",
+                    status.map(|status| (status, &snapshot.job.manifest)),
+                )
+                .await?;
+                return Err(error.into());
+            }
+        };
     let mut guard = WorkspaceGuard {
         root: workspace_root,
         repository: snapshot.job.manifest.repository.clone(),
@@ -92,6 +100,11 @@ pub async fn run_once(
         keep_on_failure: keep_failed_workspaces,
         succeeded: false,
     };
+    if let Some(status) = status {
+        status
+            .report(&snapshot.job.manifest, StatusState::Pending)
+            .await;
+    }
     let running = state.scheduler.lock().unwrap().transition(
         &lease.attempt_id,
         preparing.revision,
@@ -102,7 +115,14 @@ pub async fn run_once(
         match task_environment(&snapshot.job.manifest.secret_refs, resolved_secrets) {
             Ok(values) => values,
             Err(error) => {
-                fail_enforcement(state, &lease, target, "execution_secret_denied")?;
+                fail_enforcement(
+                    state,
+                    &lease,
+                    target,
+                    "execution_secret_denied",
+                    status.map(|status| (status, &snapshot.job.manifest)),
+                )
+                .await?;
                 return Err(error);
             }
         };
@@ -113,7 +133,14 @@ pub async fn run_once(
     ) {
         Ok(process) => process,
         Err(error) => {
-            fail_enforcement(state, &lease, target, error.audit_code())?;
+            fail_enforcement(
+                state,
+                &lease,
+                target,
+                error.audit_code(),
+                status.map(|status| (status, &snapshot.job.manifest)),
+            )
+            .await?;
             return Err(error.into());
         }
     };
@@ -123,11 +150,25 @@ pub async fn run_once(
             Ok(Some(status)) => break process.finish(status, &secret_values)?,
             Ok(None) => {}
             Err(error @ (SupervisorError::TimedOut | SupervisorError::DiskLimitExceeded)) => {
-                fail_enforcement(state, &lease, target, error.audit_code())?;
+                fail_enforcement(
+                state,
+                &lease,
+                target,
+                error.audit_code(),
+                status.map(|status| (status, &snapshot.job.manifest)),
+            )
+            .await?;
                 return Err(error.into());
             }
             Err(error) => {
-                fail_enforcement(state, &lease, target, error.audit_code())?;
+                fail_enforcement(
+                state,
+                &lease,
+                target,
+                error.audit_code(),
+                status.map(|status| (status, &snapshot.job.manifest)),
+            )
+            .await?;
                 return Err(error.into());
             }
         }
@@ -192,6 +233,18 @@ pub async fn run_once(
         .unwrap()
         .complete(&lease, terminal, outcome.status.code(), now_ms())?;
     guard.succeeded = terminal == JobState::Succeeded;
+    if let Some(status) = status {
+        status
+            .report(
+                &snapshot.job.manifest,
+                match terminal {
+                    JobState::Succeeded => StatusState::Success,
+                    JobState::Canceled => StatusState::Error,
+                    _ => StatusState::Failure,
+                },
+            )
+            .await;
+    }
     Ok(Some(lease.job_id))
 }
 
@@ -233,22 +286,29 @@ fn task_environment(
     Ok((environment, secret_values))
 }
 
-fn fail_enforcement(
+/// Fails the attempt, audits why, and tells GitHub the task could not run.
+async fn fail_enforcement(
     state: &ApiState,
     lease: &commonkit_contracts::Lease,
     target: &ExecutionTarget,
     code: &'static str,
+    reported: Option<(&StatusReporter, &commonkit_contracts::ExecutionManifest)>,
 ) -> Result<(), ExecutionError> {
-    let mut scheduler = state.scheduler.lock().unwrap();
-    scheduler.audit(
-        now_ms(),
-        target.id.as_str(),
-        "execute",
-        &lease.job_id,
-        false,
-        code,
-    )?;
-    scheduler.complete(lease, JobState::Failed, None, now_ms())?;
+    {
+        let mut scheduler = state.scheduler.lock().unwrap();
+        scheduler.audit(
+            now_ms(),
+            target.id.as_str(),
+            "execute",
+            &lease.job_id,
+            false,
+            code,
+        )?;
+        scheduler.complete(lease, JobState::Failed, None, now_ms())?;
+    }
+    if let Some((status, manifest)) = reported {
+        status.report(manifest, StatusState::Error).await;
+    }
     Ok(())
 }
 fn now_ms() -> u64 {

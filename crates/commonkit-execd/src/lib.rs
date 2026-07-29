@@ -38,6 +38,8 @@ pub struct ApiState {
     policy: Option<Arc<ExecutionPolicy>>,
 }
 
+pub mod github;
+
 pub mod secrets;
 
 pub mod workspace;

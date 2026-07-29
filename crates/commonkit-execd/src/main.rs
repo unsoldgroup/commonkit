@@ -1,5 +1,6 @@
 use clap::Parser;
-use commonkit_contracts::{ExecutionTarget, StableId};
+use commonkit_contracts::{ExecutionManifest, ExecutionTarget, StableId};
+use commonkit_execd::github::StatusReporter;
 use commonkit_execd::worker::{WorkerContext, run_once};
 use commonkit_execd::{ApiState, Capability, ExecutionPolicy, router};
 use commonkit_execution::supervisor::{ProcessSupervisor, SupervisorMode};
@@ -8,6 +9,15 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+
+/// The secret reference the commit-status poster authenticates with.
+const GITHUB_STATUS_TOKEN: &str = "env://GITHUB_STATUS_TOKEN";
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecutionContextFile {
+    tasks: BTreeMap<String, ExecutionManifest>,
+}
 
 #[derive(Parser)]
 struct Args {
@@ -32,6 +42,12 @@ struct Args {
     /// Target-local secret values keyed by `env://NAME`, rendered by the operator.
     #[arg(long)]
     secrets: Option<PathBuf>,
+    /// Repository-declared task manifests. Enables GitHub commit statuses when the
+    /// secret file also resolves `env://GITHUB_STATUS_TOKEN`.
+    #[arg(long)]
+    tasks: Option<PathBuf>,
+    #[arg(long, default_value = "https://api.github.com")]
+    github_api: String,
     /// Retain the prepared worktree of a failed job so it can be inspected on the target.
     #[arg(long)]
     keep_failed_workspaces: bool,
@@ -84,6 +100,20 @@ async fn main() -> anyhow::Result<()> {
         Some(path) => commonkit_execd::secrets::load(path)?,
         None => BTreeMap::new(),
     };
+    let status = match (&args.tasks, secrets.get(GITHUB_STATUS_TOKEN)) {
+        (Some(path), Some(token)) => {
+            let declared: ExecutionContextFile =
+                serde_json::from_slice(&tokio::fs::read(path).await?)?;
+            for manifest in declared.tasks.values() {
+                manifest.validate()?;
+            }
+            Some(StatusReporter::new(&args.github_api, token, &declared.tasks)?)
+        }
+        (Some(_), None) => {
+            anyhow::bail!("--tasks requires {GITHUB_STATUS_TOKEN} in the secret file");
+        }
+        _ => None,
+    };
     if let Some(target_path) = args.target {
         let mut target: ExecutionTarget =
             serde_json::from_slice(&tokio::fs::read(target_path).await?)?;
@@ -105,6 +135,7 @@ async fn main() -> anyhow::Result<()> {
                 resolved_secrets: &secrets,
                 supervisor: &supervisor,
                 keep_failed_workspaces,
+                status: status.as_ref(),
             };
             loop {
                 if let Err(error) =
