@@ -235,14 +235,18 @@ impl PortableSourcePath {
     pub fn parse(value: impl Into<String>) -> Result<Self, ContractError> {
         let value = value.into();
         let segments: Vec<_> = value.split('/').collect();
+        // A bare "." is the root itself, which an execution manifest needs to name
+        // as its working directory. Traversal stays rejected: ".." is never a
+        // segment, and "." is only legal as the whole path.
         let valid = !value.is_empty()
             && !value.starts_with('/')
             && !value.contains('\\')
             && !value.contains('\0')
             && !value.contains(':')
-            && segments
-                .iter()
-                .all(|segment| !segment.is_empty() && !matches!(*segment, "." | ".."));
+            && (value == "."
+                || segments
+                    .iter()
+                    .all(|segment| !segment.is_empty() && !matches!(*segment, "." | "..")));
         if valid {
             Ok(Self(value))
         } else {

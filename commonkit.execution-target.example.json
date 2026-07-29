@@ -1,0 +1,17 @@
+{
+  "id": "linux-vps",
+  "platform": "linux-x86_64",
+  "healthy": true,
+  "draining": false,
+  "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+  "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+  "capabilities": ["ci-linux-x64"],
+  "readySecretRefs": [],
+  "free": {
+    "cpuMillis": 8000,
+    "memoryMib": 24576,
+    "diskMib": 204800
+  },
+  "queueDepth": 0,
+  "costScore": 0
+}
