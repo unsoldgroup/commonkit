@@ -1,8 +1,8 @@
 # CommonKit CI — user flows
 
-Status of this document: **step 3 of the product loop**. The flow list must be
-agreed as a whole before any single flow is deepened. Nothing here is a
-commitment yet.
+Status of this document: flow list agreed as a whole; flows 2, 5, 7, 10, and 14
+deepened and resolved. Flows 1, 4, and 12 remain partly open, and 3, 8, 9, 13,
+and 15 are untouched.
 
 ## Positioning decision (settled)
 
@@ -101,7 +101,7 @@ Resolved: MCP exposes `commonkit_submit_task` restricted to declared tasks, plus
 job, event, cancel, retry, resume, and artifact tools.
 Open: no CLI path. A human at a terminal has no first-class way in.
 
-### 5. Watch a run and control it mid-flight — `in progress`
+### 5. Watch a run and control it mid-flight — `resolved`
 
 Pain: it has been eight minutes and there is no way to tell running from wedged.
 
@@ -110,9 +110,13 @@ Pain: it has been eight minutes and there is no way to tell running from wedged.
 
 Resolved: the durable API covers all of it, with per-job monotonic event
 sequences and at-least-once delivery consumers deduplicate by ID.
-Open: no surface renders it. The Session Board is the obvious home — it already
-aggregates per-machine agent state on an always-on hub — but a CI run is not a
-pending human decision, so the board's card model does not fit as-is.
+Resolved in this session: the **CLI is the primary surface**. A developer
+watching a run is at a terminal, and three of the four surface-gap flows start
+there. The Session Board becomes a read-only mirror for the glanceable case,
+consuming the execution API as a client rather than fronting it — which it must,
+since the board is tailnet-only while `execd` is publicly reachable so claude.ai
+environments can use it. ADR 0008 is untouched: cancel and retry are human taps,
+and no board component computes a decision.
 
 ### 6. See the result where the work already is — `resolved`
 
@@ -128,7 +132,7 @@ and cannot change a job's outcome. Deliberately omitted: `target_url`, because
 signed artifact URLs expire in five minutes and the job endpoint needs a bearer
 token a GitHub viewer does not have.
 
-### 7. Diagnose a failure on a platform you are not sitting at — `in progress`
+### 7. Diagnose a failure on a platform you are not sitting at — `resolved`
 
 Pain: it failed on Linux; the developer is on macOS. This is the single most
 common CI experience and the one most often left to "read the log".
@@ -140,8 +144,24 @@ common CI experience and the one most often left to "read the log".
 Resolved: stdout and stderr are committed as artifacts with secret values
 redacted; artifact downloads use signed five-minute URLs; the operator can retain
 a failed worktree with `--keep-failed-workspaces`.
-Open: nothing lets a developer *reach* a retained workspace, and no client
-fetches artifacts outside MCP. "Give me a shell in the failure" is unbuilt.
+Resolved in this session, and this is the flow that justifies the whole feature:
+CommonKit **sends an agent to the failure**. An **Investigation** is a declared
+task that runs a coding agent on the target that failed, inside the retained
+workspace, inheriting that target's loadout — so it reasons with the same skills
+and hooks the developer's own agent has. That is the thing shipping logs to a
+laptop cannot reproduce, and it is only possible because the product already
+makes a loadout portable.
+
+The seam exists: `ImplementorAdapter` already defines start, events,
+`send(message)`, cancel, resume, and result, with engine references opaque. Only
+a `FakeImplementor` implements it today.
+
+Bounded by ADR 0011: the agent reports. Findings land as a signed artifact, a
+proposed patch may land as a second artifact, and nothing is pushed.
+`repositoryWrite` and `allowRepositoryWrite` stay false and no push credential
+reaches a machine whose job is running untrusted repository code. A CI target
+produces evidence and analysis; it never authors history. The manual step
+between a correct diagnosis and a merged fix is the price, deliberately paid.
 
 ### 8. Prove a platform is supported — `todo`
 
@@ -169,7 +189,7 @@ Open: durable execution v1 explicitly supports **one authoritative Linux
 worker**. Multi-platform fan-out is the product's reason to exist and is out of
 the current engineering scope. This tension needs an explicit decision.
 
-### 10. Survive a loadout change — `in progress`
+### 10. Survive a loadout change — `resolved`
 
 Pain: a toolchain moves under you and results quietly stop meaning what they did.
 
@@ -179,8 +199,13 @@ Pain: a toolchain moves under you and results quietly stop meaning what they did
 
 Resolved by design: placement refuses on `loadout_digest_mismatch`, which is
 fail-closed and correct.
-Open: the operator experience is a job that mysteriously never places. There is
-no "your declaration is stale, here is the new digest" path.
+Resolved in this session: this stops being a flow of its own once flow 2 lands.
+The target no longer carries an authored digest — it resolves the composed digest
+of its last successful reconciliation — so the failure mode inverts. Instead of a
+job silently never placing, the mismatch is between a repository's declaration
+and a target's current reality, which the CLI reports as exactly that, with the
+digest to update to. Placement explanations already carry
+`loadout_digest_mismatch`; the work is surfacing them, not computing them.
 
 ### 11. Keep a CI job from harming the target — `resolved`
 
@@ -217,7 +242,7 @@ fails fast rather than hanging, but no credential path exists. It must be a git
 credential helper on the target — never a token embedded in
 `manifest.repository`, which is portable reviewable state.
 
-### 14. Live with one target and many checks — `in progress`
+### 14. Live with one target and many checks — `resolved`
 
 Pain: five declared checks and one machine means the fifth pull request waits.
 
@@ -227,9 +252,12 @@ Pain: five declared checks and one machine means the fifth pull request waits.
 
 Resolved: the scheduler queues durably and placement scores on queue depth, free
 memory, and cost.
-Open: the worker loop leases one job at a time, so a repository's five checks run
-serially. Placement explanations exist as a contract but are not surfaced, so
-"why is mine not running" has no answer a user can read.
+Resolved in this session, in two halves. "Why is mine not running" is a surface
+problem: `PlacementExplanation` already carries per-target eligibility and
+ordered reasons, and the CLI renders them, so the answer becomes readable without
+new scheduler work. Serial execution is a real limit and stays one: the worker
+leases one job at a time by design, and concurrency is a capacity decision that
+belongs with flow 9's multi-target question rather than being solved twice.
 
 ### 15. Decommission a CI target — `todo`
 
@@ -247,13 +275,16 @@ reassign to.
 
 ## Cross-cutting observations
 
-- **Eight of fifteen flows have a working durable core and no surface.** The
-  scarce thing is not scheduler capability; it is a way for a human to see and
-  act on any of it. Flows 5, 7, 10, and 14 all fail for the same reason.
-- **Two open items are load-bearing for the product claim itself**: real loadout
-  digests (flow 2) and multi-platform targets (flow 9). Without the first, the
-  evidence claim is unproven. Without the second, it is unprovable for macOS and
-  Windows, which is where the matrix is emptiest.
+- **The surface gap was one problem, not four.** Flows 5, 7, 10, and 14 all
+  failed because a working durable core had nowhere to be seen or acted on. They
+  resolve together into one CLI, with the Session Board mirroring it read-only.
+  Two of the four needed no new scheduler work at all: placement explanations and
+  event streams already exist and were simply never rendered.
+- **The digest gap is closed** (flow 2), so the evidence claim is provable rather
+  than asserted.
+- **One load-bearing item remains**: multi-platform targets (flow 9). Durable
+  execution v1 supports one Linux worker, which leaves the claim unprovable for
+  macOS and Windows — where the support matrix is emptiest.
 - **The engineering scope and the product scope disagree.** Durable execution v1
   deliberately supports one Linux worker; the product's reason to exist is
   per-platform evidence. That is a decision to take, not a gap to quietly close.

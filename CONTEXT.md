@@ -78,6 +78,14 @@ _Avoid_: Test run, CI result, green build
 A repository-owned, immutable **ExecutionManifest** named by a stable task ID, the only thing a remote agent or webhook may submit.
 _Avoid_: CI job, pipeline step, workflow
 
+**Investigation**:
+A **Declared task** that runs a coding agent on the **Execution Target** that produced a failed **Attempt**, inside its retained workspace, and emits findings as an artifact (ADR 0011).
+_Avoid_: Auto-fix, self-healing CI, agent remediation
+
+**Implementor**:
+The adapter contract through which CommonKit drives a coding-agent engine as a **Job** — start, events, send, cancel, resume, result — keeping engine references opaque.
+_Avoid_: Claude adapter, Codex integration
+
 **Execution Target**:
 A managed **Target** advertising durable-execution readiness, capacity, and an exact Loadout digest.
 _Avoid_: Worker box
@@ -117,6 +125,8 @@ _Avoid_: Upstream drift, breaking change
 - An **Execution Target**'s Loadout digest is the composed loadout digest of that **Target**'s last successful **Reconciliation**, not an independently authored value. A **Job** whose digests differ does not place, so a drifted target fails closed instead of producing incomparable results.
 - A repository declares its own checks as **Declared tasks**. CommonKit submits them; it never accepts arbitrary argv, and a shell string is not a task.
 - **Validation evidence** is commit-bound. It proves the platform and the CommonKit-managed environment; the toolchain is proven by the repository's own commit-pinned files (ADR 0010).
+- An **Investigation** inherits the **Loadout** of the target it runs on, so it reasons with the same skills and hooks the developer's own agent would. Its output is artifacts only; an **Execution Target** produces evidence and analysis but never authors repository history (ADR 0011).
+- The CLI is the primary surface for durable execution. The Session Board mirrors runs read-only for the glanceable case; it consumes the execution API as a client and never fronts it.
 - MCP exposes context and durable execution controls; `commonkit-execd` owns lifecycle persistence independently of MCP sessions.
 - An **Adapter** participates in **Reconciliation** for one agent or service.
 - A **Loadout** selects a version-pinned **Agent-context provider** for portable agent content.
