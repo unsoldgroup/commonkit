@@ -17,10 +17,13 @@ use commonkit_adapters::{
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
     materialize_mcp_client_state, validate_ownership,
 };
-use commonkit_config::{LayerSet, compose_layers, v1_merge_rules, validate_layer_content_digest};
+use commonkit_config::{
+    LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
+    validate_layer_content_digest,
+};
 use commonkit_contracts::{
     LayerDocument, LayerKind, Plan, ReceiptState, SecurityPolicy, Sha256Digest, StableId,
-    assert_no_embedded_secrets, digest_domain_json,
+    StyleguideDescriptor, StyleguideSelection, assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, build_plan, enforce_policy_floor};
 use commonkit_reconcile::{
@@ -83,6 +86,7 @@ struct SyncConfig {
     #[serde(default)]
     materialized_states: Vec<PathBuf>,
     provider_pipeline: Option<ProviderPipelineConfig>,
+    styleguide: Option<StyleguideRuntimeConfig>,
     target_transport: Option<SyncTargetTransport>,
     /// Explicit facts for the managed target. Legacy local configurations may
     /// omit this and inherit the controller facts; SSH targets may not.
@@ -100,6 +104,25 @@ struct SyncConfig {
     /// portable configuration so clients cannot drift from daemon discovery.
     #[serde(skip)]
     relay_endpoint: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StyleguideRuntimeConfig {
+    selection: StyleguideSelection,
+    descriptors: Vec<PathBuf>,
+    manifest: PathBuf,
+    lockfile: PathBuf,
+    #[serde(default)]
+    policy: StyleguideRuntimePolicy,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StyleguideRuntimePolicy {
+    #[serde(default)]
+    denied: bool,
+    pinned_skill_id: Option<StableId>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -179,6 +202,7 @@ enum ConfiguredProvider {
         lockfile: PathBuf,
         policy: PathBuf,
         targets: Vec<String>,
+        #[serde(rename = "managedRoot")]
         managed_root: NormalizedManagedPath,
     },
     Chezmoi {
@@ -1156,6 +1180,7 @@ impl ProductionSyncDomain {
                 "composedLoadoutDigest":self.config.composed_loadout_digest,
                 "policyDigest":self.config.policy_digest,
                 "relayClientRoot":self.config.relay_client_root,
+                "styleguide":self.config.styleguide,
                 "sourceRevision":self.config.provider_pipeline.as_ref().map(|pipeline| &pipeline.source.revision),
                 "providers":providers,
             }),
@@ -1164,38 +1189,165 @@ impl ProductionSyncDomain {
     }
 
     fn provider_input_digests(&self) -> Result<BTreeMap<PathBuf, Sha256Digest>, DomainFailure> {
-        let Some(pipeline) = &self.config.provider_pipeline else {
-            return Ok(BTreeMap::new());
-        };
-        let mut paths = Vec::new();
-        for provider in &pipeline.providers {
-            match provider {
-                ConfiguredProvider::Native { files, .. } => {
-                    paths.extend(files.iter().map(|file| file.source.to_string()));
-                }
-                ConfiguredProvider::Apm {
-                    manifest,
-                    lockfile,
-                    policy,
-                    ..
-                } => {
-                    paths.extend([
-                        path_text(manifest)?.to_owned(),
-                        path_text(lockfile)?.to_owned(),
-                        path_text(policy)?.to_owned(),
-                    ]);
-                }
-                ConfiguredProvider::Chezmoi { source, config, .. } => {
-                    paths.extend([path_text(source)?.to_owned(), path_text(config)?.to_owned()]);
+        let mut digests = BTreeMap::new();
+        if let Some(pipeline) = &self.config.provider_pipeline {
+            let mut paths = Vec::new();
+            for provider in &pipeline.providers {
+                match provider {
+                    ConfiguredProvider::Native { files, .. } => {
+                        paths.extend(files.iter().map(|file| file.source.to_string()));
+                    }
+                    ConfiguredProvider::Apm {
+                        manifest,
+                        lockfile,
+                        policy,
+                        ..
+                    } => {
+                        paths.extend([
+                            path_text(manifest)?.to_owned(),
+                            path_text(lockfile)?.to_owned(),
+                            path_text(policy)?.to_owned(),
+                        ]);
+                    }
+                    ConfiguredProvider::Chezmoi { source, config, .. } => {
+                        paths
+                            .extend([path_text(source)?.to_owned(), path_text(config)?.to_owned()]);
+                    }
                 }
             }
+            for relative in paths {
+                let path = checked_repository_path(&pipeline.source.repository, &relative)?;
+                collect_local_input_digests(&pipeline.source.repository, &path, &mut digests)?;
+            }
         }
-        let mut digests = BTreeMap::new();
-        for relative in paths {
-            let path = checked_repository_path(&pipeline.source.repository, &relative)?;
-            collect_local_input_digests(&pipeline.source.repository, &path, &mut digests)?;
+        if let Some(styleguide) = &self.config.styleguide {
+            for input in styleguide
+                .descriptors
+                .iter()
+                .chain([&styleguide.manifest, &styleguide.lockfile])
+            {
+                let path = self.styleguide_input_path(input)?;
+                digests.insert(
+                    input.clone(),
+                    digest_bytes(&fs::read(path).map_err(|_| DomainFailure::OperationFailed)?)?,
+                );
+            }
         }
         Ok(digests)
+    }
+
+    fn styleguide_input_path(&self, path: &Path) -> Result<PathBuf, DomainFailure> {
+        if let Some(pipeline) = &self.config.provider_pipeline {
+            return checked_repository_path(&pipeline.source.repository, path_text(path)?);
+        }
+        if !path.is_absolute() {
+            return Err(DomainFailure::OperationFailed);
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|_| DomainFailure::OperationFailed)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(DomainFailure::OperationFailed);
+        }
+        path.canonicalize()
+            .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn bind_styleguide(
+        &self,
+        states: &[MaterializedState],
+    ) -> Result<Option<MaterializedState>, DomainFailure> {
+        let Some(config) = &self.config.styleguide else {
+            return Ok(None);
+        };
+        let mut descriptors = BTreeMap::new();
+        for path in &config.descriptors {
+            let path = self.styleguide_input_path(path)?;
+            let descriptor: StyleguideDescriptor = serde_json::from_slice(
+                &fs::read(path).map_err(|_| DomainFailure::OperationFailed)?,
+            )
+            .map_err(|error| {
+                eprintln!("commonkitd: styleguide descriptor parse failed: {error}");
+                DomainFailure::OperationFailed
+            })?;
+            descriptor.validate().map_err(|error| {
+                eprintln!("commonkitd: styleguide descriptor validation failed: {error}");
+                DomainFailure::OperationFailed
+            })?;
+            if descriptors
+                .insert(descriptor.exported_skill.clone(), descriptor)
+                .is_some()
+            {
+                return Err(DomainFailure::OperationFailed);
+            }
+        }
+        let staged_exports = descriptors
+            .keys()
+            .filter(|skill_id| {
+                let suffix = format!("/skills/{}/SKILL.md", skill_id.as_str());
+                let source_suffix = format!(".apm/skills/{}/SKILL.md", skill_id.as_str());
+                states.iter().any(|state| {
+                    state.resources.iter().any(|resource| {
+                        resource.provenance.source.ends_with(&source_suffix)
+                            && matches!(
+                                &resource.intent,
+                                FilesystemIntent::File { path, .. }
+                                    if path.as_str().ends_with(&suffix)
+                            )
+                    })
+                })
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let policy = StyleguidePolicy {
+            denied: config.policy.denied,
+            pinned_skill_id: config.policy.pinned_skill_id.clone(),
+        };
+        let resolved = resolve_styleguide_selection(
+            Some(&config.selection),
+            &descriptors,
+            &staged_exports,
+            &policy,
+        )
+        .map_err(|error| {
+            eprintln!("commonkitd: styleguide admission failed: {error}");
+            DomainFailure::OperationFailed
+        })?
+        .ok_or(DomainFailure::OperationFailed)?;
+        let manifest_digest = digest_bytes(
+            &fs::read(self.styleguide_input_path(&config.manifest)?)
+                .map_err(|_| DomainFailure::OperationFailed)?,
+        )?;
+        let lock_digest = digest_bytes(
+            &fs::read(self.styleguide_input_path(&config.lockfile)?)
+                .map_err(|_| DomainFailure::OperationFailed)?,
+        )?;
+        if resolved.descriptor.package.manifest_digest != manifest_digest
+            || resolved.descriptor.package.lock_digest != lock_digest
+        {
+            eprintln!(
+                "commonkitd: styleguide APM manifest or lock digest does not match the descriptor"
+            );
+            return Err(DomainFailure::OperationFailed);
+        }
+        let binding_digest = resolved
+            .binding
+            .digest()
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let inputs = ProviderInputs::new(
+            StableId::parse("commonkit-styleguide").map_err(|_| DomainFailure::OperationFailed)?,
+            ExactProviderVersion::parse(&resolved.descriptor.package.version)
+                .map_err(|_| DomainFailure::OperationFailed)?,
+            "commonkit.styleguide-binding.v1".into(),
+            BTreeMap::from([
+                ("binding".into(), binding_digest),
+                ("manifestFile".into(), manifest_digest),
+                ("lockFile".into(), lock_digest),
+            ]),
+            vec!["styleguide".into()],
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        MaterializedState::finalize(inputs, Vec::new(), Vec::new(), Vec::new())
+            .map(Some)
+            .map_err(|_| DomainFailure::OperationFailed)
     }
 
     fn external_state_digests(&self) -> Result<BTreeMap<PathBuf, Sha256Digest>, DomainFailure> {
@@ -1517,6 +1669,9 @@ impl ProductionSyncDomain {
         artifacts: &ArtifactStore,
     ) -> Result<Vec<MaterializedState>, DomainFailure> {
         let mut states = self.states()?;
+        if let Some(binding) = self.bind_styleguide(&states)? {
+            states.push(binding);
+        }
         let has_mcp = states.iter().any(|state| !state.capabilities.is_empty());
         if has_mcp {
             if matches!(

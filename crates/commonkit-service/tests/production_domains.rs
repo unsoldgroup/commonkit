@@ -407,6 +407,166 @@ fn lifecycle_config() -> serde_json::Value {
     })
 }
 
+fn file_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn styleguide_descriptor(
+    retention: char,
+    manifest_digest: &str,
+    lock_digest: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 1,
+        "id": "commonkit-technical-writing",
+        "exportedSkill": "technical-writing",
+        "modes": ["strict", "technical"],
+        "proseScopes": ["documentation"],
+        "exclusions": ["source-code"],
+        "evaluationSuite": "technical-writing-v1",
+        "evaluationSuiteDigest": format!("sha256:{}", "1".repeat(64)),
+        "upstreamUrl": "https://example.com/upstream",
+        "upstreamRevision": "b912d5fa59f368253683af2ebfac64ad6d08312d",
+        "retentionMapDigest": format!("sha256:{}", retention.to_string().repeat(64)),
+        "package": {
+            "id": "commonkit-styleguide",
+            "version": "0.1.0",
+            "manifestDigest": manifest_digest,
+            "lockDigest": lock_digest
+        }
+    })
+}
+
+#[test]
+fn styleguide_binding_participates_in_plans_and_invalidates_existing_authority() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let target = root.join("target");
+    let state = root.join("state");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
+
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let skill = artifacts
+        .put(
+            b"---\nname: technical-writing\n---\n",
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("0.1.0").unwrap(),
+        "commonkit.native-provider.v1".into(),
+        BTreeMap::from([(
+            "manifest".into(),
+            digest_domain_json("test.styleguide", &"manifest").unwrap(),
+        )]),
+        vec!["skills".into()],
+    )
+    .unwrap();
+    let materialized = MaterializedState::finalize(
+        inputs.clone(),
+        vec![NormalizedResource {
+            intent: FilesystemIntent::File {
+                path: NormalizedManagedPath::parse(
+                    "agent-context/.agents/skills/technical-writing/SKILL.md",
+                )
+                .unwrap(),
+                content: skill,
+                mode: None,
+                expected_before: None,
+            },
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id.clone(),
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest.clone(),
+                source: "providers/apm/.apm/skills/technical-writing/SKILL.md".into(),
+            },
+        }],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let materialized_path = root.join("apm.json");
+    write_json(&materialized_path, &materialized);
+    let manifest = b"name: commonkit-styleguide\n";
+    let lockfile = b"lockfile_version: \"1\"\n";
+    let manifest_path = root.join("apm.yml");
+    let lockfile_path = root.join("apm.lock.yaml");
+    std::fs::write(&manifest_path, manifest).unwrap();
+    std::fs::write(&lockfile_path, lockfile).unwrap();
+    let descriptor_path = root.join("styleguide-descriptor.json");
+    write_json(
+        &descriptor_path,
+        &styleguide_descriptor('2', &file_digest(manifest), &file_digest(lockfile)),
+    );
+    let config_path = root.join("headless.json");
+    write_json(
+        &config_path,
+        &serde_json::json!({
+            "sync": {
+                "targetId": "local",
+                "targetRoot": target,
+                "adapterState": state.join("filesystem"),
+                "providerArtifacts": root.join("provider-artifacts"),
+                "materializedStates": [materialized_path],
+                "styleguide": {
+                    "selection": {"skillId": "technical-writing", "activation": "routed"},
+                    "descriptors": [descriptor_path],
+                    "manifest": manifest_path,
+                    "lockfile": lockfile_path,
+                    "policy": {"denied": false, "pinnedSkillId": "technical-writing"}
+                },
+                "declaredRoots": ["agent-context"],
+                "protectedRoots": [],
+                "caseSensitive": true,
+                "targetIdentityDigest": digest_domain_json("test", &"target").unwrap(),
+                "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
+                "policyDigest": digest_domain_json("test", &"policy").unwrap()
+            }
+        }),
+    );
+    let registry = ProductionDomainRegistry::load(
+        &config_path,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap();
+    let sync = registry.sync.unwrap();
+    let initial: commonkit_contracts::Plan = serde_json::from_value(
+        sync.plan(serde_json::json!({
+            "confirmed": true,
+            "confirmationId": "styleguide-initial"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    sync.plan_execution_authority(&initial).unwrap();
+
+    write_json(
+        &descriptor_path,
+        &styleguide_descriptor('5', &file_digest(manifest), &file_digest(lockfile)),
+    );
+    assert_eq!(
+        sync.plan_execution_authority(&initial),
+        Err(commonkit_service::DomainFailure::OperationFailed)
+    );
+    let changed: commonkit_contracts::Plan = serde_json::from_value(
+        sync.plan(serde_json::json!({
+            "confirmed": true,
+            "confirmationId": "styleguide-changed"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_ne!(
+        initial.bindings.provider_inputs_digest,
+        changed.bindings.provider_inputs_digest
+    );
+}
+
 #[test]
 fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
     let temporary = tempfile::tempdir().unwrap();

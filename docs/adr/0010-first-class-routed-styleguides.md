@@ -58,6 +58,11 @@ command or reconciliation gate.
 - APM continues to own package resolution, compilation, and lock integrity.
 - Providers compute staged desired resources. Only CommonKit adapters mutate
   managed targets.
+- macOS keeps the external-provider fail-closed boundary. Until a proven
+  disposable-user or VM isolation helper exists, a reviewed APM package may
+  use the native provider fallback to materialize the exact Git-owned skill
+  bytes. The styleguide binding still includes the APM manifest, lock,
+  descriptor, evaluation-suite, and retention-map digests.
 - SkillOpt may produce isolated candidates, but human review and Git promotion
   remain mandatory.
 - Promotion from experimental requires the pinned model thresholds, mandatory
