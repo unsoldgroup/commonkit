@@ -4,7 +4,9 @@
 
 The daemon loads this file at process start. Desktop first-run onboarding writes it atomically and, when Desktop launched the bundled daemon, replaces only that owned process and waits for authenticated health before reporting success. If Desktop attached to a daemon managed by launchd, systemd, Windows Services, or another supervisor, it never terminates that process; onboarding reports that the external service manager must reload it instead of falsely claiming the new domains are active.
 
-The configuration has three independent sections:
+The configuration has four independent sections:
+
+- `aboutMe` configures the encrypted owner profile database, its separately provisioned key reference, and the Loadout/project view exposed to agent tools. The database contains personal text and never enters Git. Agent tools can read the approved summary, search approved claims, submit direct-statement suggestions, and replace a conflicting claim only after explicit user clarification.
 
 - `sync` identifies the target root, adapter state, declared and protected portable roots, composed-loadout and policy bindings, and a provider artifact store. Production loadouts use `providerPipeline`: CommonKit fetches and validates the trusted Git remote and exact pinned revision, runs configured native/APM/chezmoi providers in isolated controller workspaces, validates the combined ownership map, and persists digest-addressed `MaterializedState` records before planning. `materializedStates` remains a migration path and is mutually exclusive with `providerPipeline`. Provider code never runs during apply, recovery, or rollback.
 - `credentials` maps stable destination IDs to a credential reference and a relative path below a capability-rooted private directory. Requests name destination IDs only. Secret bytes are resolved during confirmed apply; verification uses the applied receipt and does not resolve the provider again. Values never enter configuration responses, plans, receipts, logs, or portable metadata. The production registry accepts `env://` and absolute `file://` references, `bws://` references when an explicit BWS executable is configured, and `keychain://service/account` references through the target platform's native integration (`/usr/bin/security` on macOS, `/usr/bin/secret-tool` on Linux, and the native Credential Manager API on Windows). Unknown schemes, unavailable executables or stores, malformed references, symlinks in file references, and provider failures fail closed before credential mutation.
@@ -20,6 +22,13 @@ are rejected. The confirmation ID is embedded in the immutable relay operation
 payload and checked again by the durable executor, so a stale or replayed
 confirmation cannot authorize a different reviewed state.
 - `snapshots` maps database IDs to configured local database paths, source formats, and target identities. `portableState` is a required directory inside the Git kit: CommonKit atomically writes content-addressed snapshot descriptors there after uploading both the encrypted database and encrypted manifest to the object store. A second machine discovers the descriptor from Git and fetches the authenticated ciphertext; the separately provisioned key reference never enters Git. Use `sqlite` for SQLite databases so planning uses the online backup API and consumes WAL state consistently; `file` is reserved for stores whose own lifecycle guarantees a consistent single-file image. `observedPaths` explicitly maps any other locally inspectable target identity to its database path. Promotion hashes consistent exports of both the recorded writer and candidate itself; an unconfigured/unavailable target fails closed, and caller-provided digest assertions are rejected. The production `s3` backend uses the AWS CLI credential chain, keeping credentials outside CommonKit configuration; `local` is an explicit test/development backend. Authoritative-writer assignments are durable and list responses contain decrypted metadata only.
+
+  Register the About Me database with `format: "file"`, not `format: "sqlite"`.
+  Its SQLCipher file is already encrypted and the profile service uses short-lived
+  connections without WAL mode, so the stopped file is the portable snapshot
+  unit. The normal snapshot encryption is then applied around that ciphertext.
+  Provision the same About Me key reference separately on each target; neither
+  key enters the kit or snapshot metadata.
 
 When `snapshots.gitAuthority` is configured, normal startup requires the append-only
 `refs/commonkit-authority/<database>` chain ref on the trusted remote. Its commit ancestry
@@ -39,6 +48,13 @@ Example shape (digests abbreviated here must be full valid `sha256:` values in r
 
 ```json
 {
+  "aboutMe": {
+    "database": "/home/al/.local/share/commonkit/about-me.sqlite",
+    "keyReference": "file:///home/al/.config/commonkit/about-me.key",
+    "loadoutId": "personal",
+    "projectId": "commonkit",
+    "agentId": "commonkit-agent"
+  },
   "sync": {
     "targetId": "local",
     "targetRoot": "/home/al",

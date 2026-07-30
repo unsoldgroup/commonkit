@@ -23,6 +23,7 @@ export interface DesktopSnapshot {
 }
 
 export interface ManagementSnapshot {
+  aboutMe: unknown;
   plans: unknown;
   credentials: unknown;
   snapshots: unknown;

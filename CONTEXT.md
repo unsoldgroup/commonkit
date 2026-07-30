@@ -98,6 +98,22 @@ _Avoid_: Source map, diff
 An upstream revision that touches or removes a section the **Retention map** marks kept, or adds a section matching no known digest or heading. Only a material change warrants re-distillation.
 _Avoid_: Upstream drift, breaking change
 
+**About Me Profile**:
+The kit owner’s encrypted, portable collection of approved personal facts and preferences.
+_Avoid_: Project memory, transcript archive, user account
+
+**Claim**:
+One approved, versioned fact or preference in an **About Me Profile**.
+_Avoid_: Observation, project fact
+
+**Scoped View**:
+The subset of profile claims available to one Loadout and trusted project.
+_Avoid_: Separate profile, persona
+
+**Suggestion**:
+A proposed claim based on words the user stated directly; it is not approved memory.
+_Avoid_: Automatic learning, inference
+
 **Styleguide**:
 An optional, single-valued **Loadout** capability that routes one selected
 writing skill for declared prose scopes and modes. It is not always-on
@@ -143,6 +159,9 @@ _Avoid_: Default voice, prose policy
 - The version 1 runtime is implemented in Rust and shared by the CLI, local service, MCP server, and Tauri 2 desktop application. The existing TypeScript reconciliation engine and `mcp-local-relay` runtime are migration sources, not permanent sidecars.
 - Database adapters create consistent, integrity-checked, encrypted snapshots in S3-compatible object storage. Git records only snapshot descriptors and content hashes.
 - Version 1 uses one authoritative writer per database. Cross-machine database portability is snapshot and restore, not binary merging; multi-writer synchronization requires a later application-level export/import model.
+- An **About Me Profile** is stored in a dedicated encrypted SQLite database with one writer; context-mode and Engram remain project-memory systems.
+- A **Scoped View** controls disclosure by Loadout and trusted project. Organization policy may narrow access but never broaden it.
+- Agents may create **Suggestions**, but only direct user edits or explicit contradiction clarifications create approved **Claims**.
 
 ## Example dialogue
 

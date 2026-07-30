@@ -8,13 +8,14 @@ test("management navigation covers every v1 operator workflow", () => {
     ["Operate", "plans", "Changes"],
     ["Operate", "credentials", "Credentials"],
     ["Operate", "snapshots", "Data"],
+    ["Operate", "aboutMe", "About Me"],
     ["Operate", "relay", "MCP connections"],
     ["Operate", "schedule", "Drift checks"],
     ["System", "diagnostics", "Diagnostics"],
     ["System", "settings", "Settings"],
   ]);
   assert.deepEqual(navigation.map((item) => item.route), [
-    "status", "plans", "credentials", "snapshots",
+    "status", "plans", "credentials", "snapshots", "aboutMe",
     "relay", "schedule", "diagnostics", "settings",
   ]);
 });

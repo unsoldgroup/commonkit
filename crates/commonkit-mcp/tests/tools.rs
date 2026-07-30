@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use commonkit_contracts::*;
 use commonkit_mcp::{
+    AboutMeResolveInput, AboutMeSearchInput, AboutMeSuggestionInput,
     ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend, ExecutionBackend,
     ExecutionContext, ProposeSkillCanaryApplyInput, ProposeSkillCanaryRollbackInput,
     ProposeSkillPromotionInput, ReadInput, RelayReconcileInput, RelayReviewInput,
@@ -95,6 +96,10 @@ fn publishes_stable_initial_tool_names() {
     assert_eq!(
         names,
         [
+            "commonkit_about_me_get_summary",
+            "commonkit_about_me_resolve_conflict",
+            "commonkit_about_me_search",
+            "commonkit_about_me_suggest",
             "commonkit_apply_plan",
             "commonkit_cancel_job",
             "commonkit_compose",
@@ -137,6 +142,50 @@ fn publishes_stable_initial_tool_names() {
             | "commonkit_apply_skill_promotion"
             | "commonkit_rollback_skill_promotion"
     )));
+}
+
+#[tokio::test]
+async fn about_me_tools_use_the_profile_service_boundary() {
+    let backend = Arc::new(FakeBackend::default());
+    let server = CommonKitMcp::new(backend.clone());
+
+    server.about_me_summary().await.unwrap();
+    server
+        .about_me_search(Parameters(AboutMeSearchInput {
+            query: "answer style".into(),
+            categories: vec!["communication".into()],
+            limit: 5,
+        }))
+        .await
+        .unwrap();
+    server
+        .about_me_suggest(Parameters(AboutMeSuggestionInput {
+            topic_key: "workflow/testing".into(),
+            category: "workflow".into(),
+            text: "I prefer tests first.".into(),
+            evidence_quote: "Please use tests first.".into(),
+        }))
+        .await
+        .unwrap();
+    server
+        .about_me_resolve_conflict(Parameters(AboutMeResolveInput {
+            active_claim_id: "claim-1".into(),
+            expected_revision: 2,
+            replacement_text: "I prefer concise answers.".into(),
+            evidence_quote: "Keep it concise.".into(),
+            confirmed: true,
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        backend.posts.lock().unwrap().as_slice(),
+        [
+            "/control/v1/about-me/search",
+            "/control/v1/about-me/suggestions",
+            "/control/v1/about-me/conflicts/resolve"
+        ]
+    );
 }
 
 #[tokio::test]

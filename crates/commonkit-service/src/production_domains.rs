@@ -17,6 +17,7 @@ use commonkit_adapters::{
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
     materialize_mcp_client_state, validate_ownership,
 };
+use commonkit_about_me::{ClaimCategory, ClaimInput, ProfileStore, ScopedView};
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
     validate_layer_content_digest,
@@ -44,13 +45,14 @@ use thiserror::Error;
 
 use crate::skill_canary::{SkillCanaryConfig, SkillCanaryRuntime};
 use crate::{
-    ApplyStatus, CompositionDomain, CredentialDomain, DomainFailure, ExecutionResult,
+    AboutMeDomain, ApplyStatus, CompositionDomain, CredentialDomain, DomainFailure, ExecutionResult,
     HeadlessDomainRegistry, PlanExecutor, RelayProviderAuthority, SnapshotDomain, SyncDomain,
 };
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProductionConfig {
+    about_me: Option<AboutMeConfig>,
     targets: Option<TargetInventoryConfig>,
     composition: Option<CompositionConfig>,
     sync: Option<SyncConfig>,
@@ -59,6 +61,22 @@ struct ProductionConfig {
     credentials: Option<CredentialConfig>,
     snapshots: Option<SnapshotConfig>,
     skill_canary: Option<SkillCanaryConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeConfig {
+    database: PathBuf,
+    key_reference: CredentialReference,
+    bws_executable: Option<PathBuf>,
+    loadout_id: String,
+    project_id: String,
+    #[serde(default = "default_about_me_agent")]
+    agent_id: String,
+}
+
+fn default_about_me_agent() -> String {
+    "commonkit-agent".into()
 }
 
 #[derive(Clone, Deserialize)]
@@ -307,6 +325,7 @@ enum SnapshotSourceFormat {
 }
 
 pub struct ProductionDomainRegistry {
+    pub about_me: Option<Arc<dyn AboutMeDomain>>,
     pub composition: Option<Arc<dyn CompositionDomain>>,
     pub sync: Option<Arc<dyn SyncDomain>>,
     pub credentials: Option<Arc<dyn CredentialDomain>>,
@@ -555,6 +574,7 @@ impl ProductionDomainRegistry {
     ) -> Result<Self, ProductionDomainError> {
         if !config_path.exists() {
             return Ok(Self {
+                about_me: None,
                 composition: None,
                 sync: None,
                 credentials: None,
@@ -738,6 +758,22 @@ impl ProductionDomainRegistry {
                 },
             )
             .transpose()?;
+        let about_me = config
+            .about_me
+            .map(|config| -> Result<Arc<dyn AboutMeDomain>, ProductionDomainError> {
+                if !config.database.is_absolute()
+                    || config.loadout_id.trim().is_empty()
+                    || config.project_id.trim().is_empty()
+                {
+                    return Err(ProductionDomainError::UnsafeConfig);
+                }
+                let domain = ProductionAboutMeDomain { config };
+                domain
+                    .store()
+                    .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                Ok(Arc::new(domain))
+            })
+            .transpose()?;
         let mut target_sync_domains = BTreeMap::new();
         for (id, sync_config) in &sync_configs {
             validate_sync_config(sync_config)?;
@@ -881,6 +917,7 @@ impl ProductionDomainRegistry {
             })
             .transpose()?;
         Ok(Self {
+            about_me,
             composition,
             sync,
             credentials,
@@ -894,6 +931,7 @@ impl ProductionDomainRegistry {
     }
     pub fn into_headless(self) -> HeadlessDomainRegistry {
         HeadlessDomainRegistry {
+            about_me: self.about_me,
             composition: self.composition,
             sync: self.sync,
             credentials: self.credentials,
@@ -2974,6 +3012,238 @@ fn resolve(
     };
     SecretValue::new(bytes).map_err(|_| DomainFailure::OperationFailed)
 }
+
+struct ProductionAboutMeDomain {
+    config: AboutMeConfig,
+}
+
+impl ProductionAboutMeDomain {
+    fn view(&self) -> ScopedView {
+        ScopedView {
+            loadout_id: self.config.loadout_id.clone(),
+            project_id: self.config.project_id.clone(),
+        }
+    }
+
+    fn store(&self) -> Result<ProfileStore, DomainFailure> {
+        let secret = resolve(
+            &self.config.key_reference,
+            self.config.bws_executable.as_deref(),
+        )?;
+        ProfileStore::open(&self.config.database, secret.expose_for_apply())
+            .map_err(|_| DomainFailure::OperationFailed)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeSearchRequest {
+    query: String,
+    #[serde(default)]
+    categories: BTreeSet<String>,
+    limit: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeSuggestionRequest {
+    topic_key: String,
+    category: ClaimCategory,
+    text: String,
+    evidence_quote: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeResolveRequest {
+    active_claim_id: String,
+    expected_revision: u64,
+    replacement_text: String,
+    evidence_quote: String,
+    confirmed: bool,
+    confirmation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeDraftRequest {
+    expected_revision: u64,
+    summary: String,
+    claims: Vec<AboutMeClaimRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeClaimRequest {
+    topic_key: String,
+    category: ClaimCategory,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMePublishRequest {
+    draft_id: String,
+    expected_revision: u64,
+    confirmed: bool,
+    confirmation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeDecisionRequest {
+    suggestion_id: String,
+    decision: commonkit_about_me::SuggestionDecision,
+    confirmed: bool,
+    confirmation_id: Option<String>,
+}
+
+impl AboutMeDomain for ProductionAboutMeDomain {
+    fn inspect(&self) -> Result<Value, DomainFailure> {
+        let store = self.store()?;
+        let suggestions = store
+            .pending_suggestions()
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(serde_json::json!({
+            "revision": store.revision().map_err(|_| DomainFailure::OperationFailed)?,
+            "summary": store.summary(&self.view()).map_err(|_| DomainFailure::OperationFailed)?,
+            "pendingSuggestions": suggestions.len(),
+            "suggestions": suggestions,
+            "loadoutId": self.config.loadout_id,
+            "projectId": self.config.project_id,
+            "encrypted": true
+        }))
+    }
+
+    fn create_draft(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeDraftRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let view = self.view();
+        let claims = request
+            .claims
+            .into_iter()
+            .map(|claim| ClaimInput {
+                topic_key: claim.topic_key,
+                category: claim.category,
+                text: claim.text,
+                views: vec![view.clone()],
+            })
+            .collect();
+        let mut store = self.store()?;
+        let draft = store
+            .create_draft(request.expected_revision, request.summary, claims)
+            .map_err(|error| match error {
+                commonkit_about_me::ProfileError::StaleRevision => DomainFailure::StalePlan,
+                _ => DomainFailure::InvalidRequest,
+            })?;
+        serde_json::to_value(draft).map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn publish_draft(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMePublishRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        if !request.confirmed {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let _ = request.confirmation_id;
+        let mut store = self.store()?;
+        let published = store
+            .publish_draft(&request.draft_id, request.expected_revision)
+            .map_err(|error| match error {
+                commonkit_about_me::ProfileError::StaleRevision => DomainFailure::StalePlan,
+                _ => DomainFailure::OperationFailed,
+            })?;
+        serde_json::to_value(published).map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn suggestions(&self) -> Result<Value, DomainFailure> {
+        let store = self.store()?;
+        let suggestions = store
+            .pending_suggestions()
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(serde_json::json!({"suggestions": suggestions}))
+    }
+
+    fn decide_suggestion(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeDecisionRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        if !request.confirmed {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let _ = request.confirmation_id;
+        let mut store = self.store()?;
+        let published = store
+            .decide_suggestion(&request.suggestion_id, request.decision)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(serde_json::json!({"published": published}))
+    }
+
+    fn summary(&self) -> Result<Value, DomainFailure> {
+        let store = self.store()?;
+        Ok(serde_json::json!({
+            "revision": store.revision().map_err(|_| DomainFailure::OperationFailed)?,
+            "summary": store.summary(&self.view()).map_err(|_| DomainFailure::OperationFailed)?,
+        }))
+    }
+
+    fn search(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeSearchRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let mut store = self.store()?;
+        let mut results = store
+            .search(&self.view(), &request.query, request.limit as usize)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        if !request.categories.is_empty() {
+            results.retain(|result| request.categories.contains(result.category.as_str()));
+        }
+        serde_json::to_value(serde_json::json!({"claims": results}))
+            .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn suggest(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeSuggestionRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let view = self.view();
+        let mut store = self.store()?;
+        let suggestion = store
+            .suggest(
+                view.clone(),
+                ClaimInput {
+                    topic_key: request.topic_key,
+                    category: request.category,
+                    text: request.text,
+                    views: vec![view],
+                },
+                &request.evidence_quote,
+                &self.config.agent_id,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        serde_json::to_value(suggestion).map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn resolve_conflict(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeResolveRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        if !request.confirmed {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let _ = request.confirmation_id;
+        let mut store = self.store()?;
+        let published = store
+            .resolve_contradiction(
+                &request.active_claim_id,
+                request.expected_revision,
+                &request.replacement_text,
+                &request.evidence_quote,
+            )
+            .map_err(|error| match error {
+                commonkit_about_me::ProfileError::StaleRevision => DomainFailure::StalePlan,
+                _ => DomainFailure::OperationFailed,
+            })?;
+        serde_json::to_value(published).map_err(|_| DomainFailure::OperationFailed)
+    }
+}
+
 impl CredentialDomain for ProductionCredentialDomain {
     fn plan(&self, request: Value) -> Result<Value, DomainFailure> {
         let _guard = self

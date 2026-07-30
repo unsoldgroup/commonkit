@@ -19,6 +19,10 @@ export const desktopApi = {
   settingsSnapshot: () => invoke<SettingsSnapshot>("desktop_settings_snapshot"),
   snapshot: () => invoke<DesktopSnapshot>("desktop_snapshot"),
   managementSnapshot: () => invoke<ManagementSnapshot>("desktop_management_snapshot"),
+  aboutMeSetup: (answers: Record<string, string>, confirmed: boolean) =>
+    invoke<unknown>("desktop_about_me_setup", { answers, confirmed }),
+  aboutMeDecide: (suggestionId: string, decision: "accept" | "reject", confirmationId: string) =>
+    invoke<unknown>("desktop_about_me_decide", { suggestionId, decision, confirmationId }),
   targets: () => invoke<TargetInventorySnapshot>("targets_list"),
   selectTargets: (targets: string[], confirmationId: string) => invoke<TargetInventorySnapshot>("targets_select", { targets, confirmationId }),
   planSync: (targetId: string, confirmationId: string) => invoke<unknown>("plan_sync", { targetId, confirmationId }),

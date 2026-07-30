@@ -3,6 +3,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use commonkit_cli::about_me_setup::{SetupAnswers, SetupRequest, setup_profile};
 use commonkit_platform::AppPaths;
 use serde::{Deserialize, Serialize};
 use tauri::image::Image;
@@ -380,6 +381,7 @@ struct DesktopSnapshot {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ManagementSnapshot {
+    about_me: serde_json::Value,
     plans: serde_json::Value,
     credentials: serde_json::Value,
     snapshots: serde_json::Value,
@@ -497,6 +499,17 @@ struct OnboardingRequest {
     chezmoi_source: Option<PathBuf>,
     chezmoi_config: Option<PathBuf>,
     publish_registration: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeSetupAnswers {
+    name: String,
+    explanation_style: String,
+    decision_style: String,
+    tools: String,
+    constraints: String,
+    never_assume: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -909,8 +922,9 @@ fn target_apply_route(target_id: &str, plan_id: &str) -> Result<String, DesktopE
 }
 
 #[cfg(test)]
-fn management_routes() -> [(&'static str, &'static str); 6] {
+fn management_routes() -> [(&'static str, &'static str); 7] {
     [
+        ("about_me", "/about-me"),
         ("plans", "/compose"),
         ("credentials", "/credentials/readiness"),
         ("snapshots", "/snapshots"),
@@ -921,8 +935,10 @@ fn management_routes() -> [(&'static str, &'static str); 6] {
 }
 
 #[cfg(test)]
-fn operator_routes() -> [(&'static str, &'static str); 13] {
+fn operator_routes() -> [(&'static str, &'static str); 15] {
     [
+        ("about_me_reload", "/domains/reload"),
+        ("about_me_decide", "/about-me/suggestions/decide"),
         ("plan", "/targets/{target}/sync/plan"),
         ("verify", "/targets/{target}/verify"),
         ("apply", "/targets/{target}/plans/{plan}/apply"),
@@ -989,6 +1005,8 @@ enum DesktopError {
     GithubAuthenticationFailed,
     #[error("CommonKit onboarding failed: {0}")]
     OnboardingFailed(String),
+    #[error("About Me setup could not be completed")]
+    AboutMeSetupFailed,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -1106,6 +1124,10 @@ async fn desktop_snapshot(
 async fn desktop_management_snapshot(
     client: tauri::State<'_, ServiceClient>,
 ) -> Result<ManagementSnapshot, DesktopError> {
+    let about_me = client
+        .json(reqwest::Method::GET, "/about-me", None)
+        .await
+        .unwrap_or_else(unavailable);
     let plans = client
         .json(reqwest::Method::GET, "/compose", None)
         .await
@@ -1135,6 +1157,7 @@ async fn desktop_management_snapshot(
         .await
         .unwrap_or_else(unavailable);
     Ok(ManagementSnapshot {
+        about_me,
         plans,
         credentials,
         snapshots,
@@ -1142,6 +1165,82 @@ async fn desktop_management_snapshot(
         schedule,
         diagnostics,
     })
+}
+
+#[tauri::command]
+async fn desktop_about_me_setup(
+    client: tauri::State<'_, ServiceClient>,
+    answers: AboutMeSetupAnswers,
+    confirmed: bool,
+) -> Result<serde_json::Value, DesktopError> {
+    if !confirmed {
+        return Err(DesktopError::InvalidInput);
+    }
+    let paths = AppPaths::discover().map_err(|_| DesktopError::ServiceUnavailable)?;
+    let loadout = client
+        .status()
+        .await
+        .ok()
+        .and_then(|status| status.active_loadout)
+        .unwrap_or_else(|| "personal".into());
+    tauri::async_runtime::spawn_blocking(move || {
+        setup_profile(SetupRequest {
+            config_directory: paths.config,
+            state_directory: paths.state,
+            loadout_id: loadout,
+            project_id: "default".into(),
+            agent_id: "commonkit-agent".into(),
+            answers: SetupAnswers {
+                name: answers.name,
+                explanation_style: answers.explanation_style,
+                decision_style: answers.decision_style,
+                tools: answers.tools,
+                constraints: answers.constraints,
+                never_assume: answers.never_assume,
+            },
+            approved: true,
+        })
+    })
+    .await
+    .map_err(|_| DesktopError::AboutMeSetupFailed)?
+    .map_err(|_| DesktopError::AboutMeSetupFailed)?;
+    client
+        .json(
+            reqwest::Method::POST,
+            "/domains/reload",
+            Some(serde_json::json!({"confirmed": true})),
+        )
+        .await
+        .map_err(|_| DesktopError::ServiceReloadFailed)?;
+    client
+        .json(reqwest::Method::GET, "/about-me", None)
+        .await
+}
+
+#[tauri::command]
+async fn desktop_about_me_decide(
+    client: tauri::State<'_, ServiceClient>,
+    suggestion_id: String,
+    decision: String,
+    confirmation_id: String,
+) -> Result<serde_json::Value, DesktopError> {
+    validate_id(&suggestion_id)?;
+    validate_id(&confirmation_id)?;
+    if !matches!(decision.as_str(), "accept" | "reject") {
+        return Err(DesktopError::InvalidInput);
+    }
+    client
+        .json(
+            reqwest::Method::POST,
+            "/about-me/suggestions/decide",
+            Some(serde_json::json!({
+                "suggestionId": suggestion_id,
+                "decision": decision,
+                "confirmed": true,
+                "confirmationId": confirmation_id
+            })),
+        )
+        .await
 }
 
 #[tauri::command]
@@ -1721,6 +1820,8 @@ pub fn run() {
             desktop_settings_snapshot,
             onboarding_initialize,
             desktop_management_snapshot,
+            desktop_about_me_setup,
+            desktop_about_me_decide,
             apply_plan,
             plan_sync,
             desktop_verify,
@@ -2207,6 +2308,7 @@ mod tests {
         assert_eq!(
             management_routes(),
             [
+                ("about_me", "/about-me"),
                 ("plans", "/compose"),
                 ("credentials", "/credentials/readiness"),
                 ("snapshots", "/snapshots"),
@@ -2221,6 +2323,8 @@ mod tests {
         assert_eq!(
             operator_routes(),
             [
+                ("about_me_reload", "/domains/reload"),
+                ("about_me_decide", "/about-me/suggestions/decide"),
                 ("plan", "/targets/{target}/sync/plan"),
                 ("verify", "/targets/{target}/verify"),
                 ("apply", "/targets/{target}/plans/{plan}/apply"),
