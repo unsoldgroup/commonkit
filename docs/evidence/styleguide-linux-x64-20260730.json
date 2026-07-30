@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "platform": "linux",
+  "distribution": "ubuntu",
+  "distributionVersion": "24.04",
+  "architecture": "x64",
+  "kernel": "6.8.0-134-generic",
+  "nodeVersion": "v24.18.0",
+  "apmVersion": "Agent Package Manager (APM) CLI version 0.25.0 (d73e6ac)",
+  "targets": [
+    "claude",
+    "codex"
+  ],
+  "skillDigest": "sha256:92b721d0af1d1fc98696a4a8cbbb6ecff618ca84beedcf8d2a0bde7a57dfe6fc",
+  "scorerTests": {
+    "total": 4,
+    "passed": 4
+  },
+  "auditChecks": 9,
+  "auditPassed": 9,
+  "frozenReplay": "passed",
+  "execution": {
+    "host": "Hostinger VPS",
+    "isolation": "temporary directory",
+    "productionTargetsMutated": false
+  }
+}

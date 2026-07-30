@@ -1,0 +1,14 @@
+{
+  "name": "@commonkit/styleguide",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "test": "node --test evaluation/*.test.mjs",
+    "test:apm": "node evaluation/validate-apm.mjs"
+  },
+  "license": "MIT"
+}
