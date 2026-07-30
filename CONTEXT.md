@@ -98,6 +98,12 @@ _Avoid_: Source map, diff
 An upstream revision that touches or removes a section the **Retention map** marks kept, or adds a section matching no known digest or heading. Only a material change warrants re-distillation.
 _Avoid_: Upstream drift, breaking change
 
+**Styleguide**:
+An optional, single-valued **Loadout** capability that routes one selected
+writing skill for declared prose scopes and modes. It is not always-on
+instruction text and is not a public lint gate.
+_Avoid_: Default voice, prose policy
+
 ## Relationships
 
 - A **CommonKit** defines one or more **Loadouts**.
@@ -118,6 +124,13 @@ _Avoid_: Upstream drift, breaking change
 - An imported skill retains its upstream reference and revision as provenance. The upstream reference is decoupled from the distilled form; re-pulling upstream is a three-way merge against the distilled fork, not a replacement.
 - Scheduled read-only upstream checks classify revisions against the **Retention map**. Non-material changes advance the recorded upstream revision silently; only a **Material change** notifies a human and queues re-distillation.
 - Imported skills are admitted by human review against the **Context budget**, not by automated evaluation. An admitted skill may afterward enter the SkillOpt evaluation and promotion path unchanged.
+- A **Loadout** can select at most one **Styleguide**. Later layers replace the
+  complete selection, while organization policy can deny or pin it. CommonKit
+  binds its descriptor, APM manifest and lock, evaluation suite, and retention
+  map into normalized state and plan provenance.
+- A **Styleguide** activates through skill routing. It does not enter public-base
+  instructions, and its deterministic writing-form metric is internal
+  evaluation evidence rather than a reconciliation gate.
 - SkillOpt is an exact-version external candidate-computation provider, not a target mutator. CommonKit independently evaluates held-out evidence and policy, requires human promotion into canonical Git source, then uses APM and CommonKit reconciliation for compilation and named-canary deployment.
 - Native providers remain available for migration, fallback, and capabilities not safely delegated upstream.
 - CommonKit stages provider output and applies it through CommonKit **Reconciliation** so target mutation remains plan-bound, receipted, verifiable, and recoverable.

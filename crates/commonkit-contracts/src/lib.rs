@@ -328,6 +328,85 @@ pub struct SkillDescriptor {
     pub lifecycle: SkillLifecycle,
 }
 
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum StyleguideActivation {
+    Routed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StyleguideSelection {
+    pub skill_id: StableId,
+    pub activation: StyleguideActivation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StyleguidePackageProvenance {
+    pub id: StableId,
+    pub version: String,
+    pub manifest_digest: Sha256Digest,
+    pub lock_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StyleguideDescriptor {
+    pub schema_version: SchemaVersion,
+    pub id: StableId,
+    pub exported_skill: StableId,
+    pub modes: BTreeSet<StableId>,
+    pub prose_scopes: BTreeSet<StableId>,
+    pub exclusions: BTreeSet<StableId>,
+    pub evaluation_suite: StableId,
+    pub evaluation_suite_digest: Sha256Digest,
+    pub upstream_url: String,
+    pub upstream_revision: GitRevision,
+    pub retention_map_digest: Sha256Digest,
+    pub package: StyleguidePackageProvenance,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StyleguideBinding {
+    pub selection: StyleguideSelection,
+    pub descriptor_digest: Sha256Digest,
+    pub package_manifest_digest: Sha256Digest,
+    pub package_lock_digest: Sha256Digest,
+    pub evaluation_suite_digest: Sha256Digest,
+    pub retention_map_digest: Sha256Digest,
+}
+
+impl StyleguideBinding {
+    pub fn digest(&self) -> Result<Sha256Digest, ContractError> {
+        digest_domain_json("commonkit.styleguide-binding.v1", self)
+    }
+}
+
+impl StyleguideDescriptor {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.modes.is_empty()
+            || self.prose_scopes.is_empty()
+            || self.exclusions.is_empty()
+            || self.package.version.is_empty()
+            || self.package.version.contains(char::is_whitespace)
+            || !(self.upstream_url.starts_with("https://")
+                || self.upstream_url.starts_with("http://"))
+        {
+            return Err(ContractError::InvalidStyleguideDescriptor);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, ContractError> {
+        self.validate()?;
+        digest_domain_json("commonkit.styleguide-descriptor.v1", self)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EvaluationCaseManifest {
@@ -606,6 +685,8 @@ pub struct EvidenceEnvelope {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SkillLifecycleSchema {
     pub descriptor: SkillDescriptor,
+    pub styleguide_descriptor: StyleguideDescriptor,
+    pub styleguide_binding: StyleguideBinding,
     pub suite: SkillEvaluationSuite,
     pub manifest: SkillOptimizationManifest,
     pub candidate: SkillCandidate,
@@ -1473,6 +1554,8 @@ pub enum ContractError {
     InvalidLockText(&'static str),
     #[error("an optimizable skill must declare at least one target")]
     MissingSkillTarget,
+    #[error("styleguide descriptor fields must be non-empty and provenance must use an HTTP URL")]
+    InvalidStyleguideDescriptor,
     #[error("optimization limits must be positive")]
     InvalidOptimizationLimits,
     #[error("unsupported SkillOpt provider version or compatibility contract")]

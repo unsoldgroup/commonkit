@@ -1,4 +1,4 @@
-use commonkit_config::{MergeRules, MergeStrategy, merge_specs};
+use commonkit_config::{MergeRules, MergeStrategy, merge_specs, v1_merge_rules};
 
 #[test]
 fn applies_schema_selected_merge_strategies() {
@@ -42,6 +42,31 @@ fn applies_schema_selected_merge_strategies() {
                 {"id": "claude", "enabled": true}
             ]
         })
+    );
+}
+
+#[test]
+fn later_styleguide_layers_replace_the_complete_selection() {
+    let base = serde_json::json!({
+        "capabilities": {
+            "styleguide": {
+                "skillId": "technical-writing",
+                "activation": "routed"
+            }
+        }
+    });
+    let overlay = serde_json::json!({
+        "capabilities": {
+            "styleguide": {
+                "skillId": "organization-writing",
+                "activation": "routed"
+            }
+        }
+    });
+
+    assert_eq!(
+        merge_specs(&base, &overlay, &v1_merge_rules()).expect("merge"),
+        overlay
     );
 }
 

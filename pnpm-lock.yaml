@@ -81,6 +81,8 @@ importers:
         specifier: workspace:0.1.0
         version: link:../commonkit-linux-x64
 
+  packages/commonkit-styleguide: {}
+
   packages/mcp-local-relay:
     dependencies:
       '@modelcontextprotocol/sdk':

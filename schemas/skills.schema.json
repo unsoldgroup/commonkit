@@ -574,6 +574,154 @@
         "repositoryRevision"
       ],
       "type": "object"
+    },
+    "StyleguideActivation": {
+      "enum": [
+        "routed"
+      ],
+      "type": "string"
+    },
+    "StyleguideBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "descriptorDigest": {
+          "type": "string"
+        },
+        "evaluationSuiteDigest": {
+          "type": "string"
+        },
+        "packageLockDigest": {
+          "type": "string"
+        },
+        "packageManifestDigest": {
+          "type": "string"
+        },
+        "retentionMapDigest": {
+          "type": "string"
+        },
+        "selection": {
+          "$ref": "#/$defs/StyleguideSelection"
+        }
+      },
+      "required": [
+        "selection",
+        "descriptorDigest",
+        "packageManifestDigest",
+        "packageLockDigest",
+        "evaluationSuiteDigest",
+        "retentionMapDigest"
+      ],
+      "type": "object"
+    },
+    "StyleguideDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "evaluationSuite": {
+          "type": "string"
+        },
+        "evaluationSuiteDigest": {
+          "type": "string"
+        },
+        "exclusions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "exportedSkill": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "package": {
+          "$ref": "#/$defs/StyleguidePackageProvenance"
+        },
+        "proseScopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "retentionMapDigest": {
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "upstreamRevision": {
+          "type": "string"
+        },
+        "upstreamUrl": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "exportedSkill",
+        "modes",
+        "proseScopes",
+        "exclusions",
+        "evaluationSuite",
+        "evaluationSuiteDigest",
+        "upstreamUrl",
+        "upstreamRevision",
+        "retentionMapDigest",
+        "package"
+      ],
+      "type": "object"
+    },
+    "StyleguidePackageProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "lockDigest": {
+          "type": "string"
+        },
+        "manifestDigest": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "manifestDigest",
+        "lockDigest"
+      ],
+      "type": "object"
+    },
+    "StyleguideSelection": {
+      "additionalProperties": false,
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/StyleguideActivation"
+        },
+        "skillId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "skillId",
+        "activation"
+      ],
+      "type": "object"
     }
   },
   "$id": "https://schemas.commonkit.dev/v1/skills.schema.json",
@@ -592,12 +740,20 @@
     "manifest": {
       "$ref": "#/$defs/SkillOptimizationManifest"
     },
+    "styleguideBinding": {
+      "$ref": "#/$defs/StyleguideBinding"
+    },
+    "styleguideDescriptor": {
+      "$ref": "#/$defs/StyleguideDescriptor"
+    },
     "suite": {
       "$ref": "#/$defs/SkillEvaluationSuite"
     }
   },
   "required": [
     "descriptor",
+    "styleguideDescriptor",
+    "styleguideBinding",
     "suite",
     "manifest",
     "candidate",

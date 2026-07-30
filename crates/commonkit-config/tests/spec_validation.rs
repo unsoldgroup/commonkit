@@ -93,3 +93,55 @@ fn rejects_ambiguous_ids_within_the_first_layer() {
             if field == "adapters" && id == "codex"
     ));
 }
+
+#[test]
+fn rejects_unsupported_styleguide_activation_before_composition() {
+    let public = layer(
+        "public",
+        LayerKind::PublicBase,
+        serde_json::json!({
+            "capabilities": {
+                "styleguide": {
+                    "skillId": "technical-writing",
+                    "activation": "always_on"
+                }
+            }
+        }),
+    );
+    let organization = layer(
+        "organization",
+        LayerKind::OrganizationPolicy,
+        serde_json::json!({}),
+    );
+
+    assert!(matches!(
+        LayerSet::new(vec![public, organization]),
+        Err(LayerSetError::InvalidStyleguideSelection(_))
+    ));
+}
+
+#[test]
+fn rejects_multiple_active_styleguides_before_composition() {
+    let public = layer(
+        "public",
+        LayerKind::PublicBase,
+        serde_json::json!({
+            "capabilities": {
+                "styleguide": [
+                    {"skillId": "technical-writing", "activation": "routed"},
+                    {"skillId": "other-writing", "activation": "routed"}
+                ]
+            }
+        }),
+    );
+    let organization = layer(
+        "organization",
+        LayerKind::OrganizationPolicy,
+        serde_json::json!({}),
+    );
+
+    assert!(matches!(
+        LayerSet::new(vec![public, organization]),
+        Err(LayerSetError::InvalidStyleguideSelection(_))
+    ));
+}

@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "id": "commonkit-technical-writing",
+  "exportedSkill": "technical-writing",
+  "modes": ["strict", "technical"],
+  "proseScopes": [
+    "api-documentation",
+    "code-comment",
+    "deprecation-notice",
+    "documentation",
+    "error-message",
+    "pr-description",
+    "procedure",
+    "readme",
+    "release-note",
+    "runbook",
+    "safety-text"
+  ],
+  "exclusions": [
+    "command-syntax",
+    "creative-writing",
+    "essay",
+    "identifier",
+    "marketing-copy",
+    "quoted-source",
+    "source-code",
+    "voice-sensitive-prose"
+  ],
+  "evaluationSuite": "technical-writing-v1",
+  "evaluationSuiteDigest": "sha256:94a79cc9c35249636b00dd5a9a66f4bfd579ea6b2a65668b9a52d16bb9aab9c3",
+  "upstreamUrl": "https://github.com/woosal1337/blog",
+  "upstreamRevision": "b912d5fa59f368253683af2ebfac64ad6d08312d",
+  "retentionMapDigest": "sha256:d8e5b38f38de79406f85c7a6f79f759e07657bd0f3ecd15cbf9a23c6d49e68d1",
+  "package": {
+    "id": "commonkit-styleguide",
+    "version": "0.1.0",
+    "manifestDigest": "sha256:169b122c0e18599d4e8944c276689116825931e5d881a330e298144117ffe908",
+    "lockDigest": "sha256:de824c4d5a41a0b2fcad104edad331f73715069ef2bc726f7142b0ea208b272d"
+  }
+}

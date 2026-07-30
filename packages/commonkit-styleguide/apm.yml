@@ -1,0 +1,11 @@
+name: commonkit-styleguide
+version: 0.1.0
+description: Opt-in routed technical writing styleguide for CommonKit loadouts
+targets:
+  - claude
+  - codex
+includes:
+  - .apm/skills/
+dependencies:
+  apm: []
+  mcp: []
