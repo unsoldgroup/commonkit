@@ -1,8 +1,8 @@
 # CommonKit CI — user flows
 
-Status of this document: flow list agreed as a whole; flows 2, 5, 7, 10, and 14
-deepened and resolved. Flows 1, 4, and 12 remain partly open, and 3, 8, 9, 13,
-and 15 are untouched.
+Status of this document: flow list agreed as a whole. Flows 2, 5, 6, 7, 9, 10,
+11, and 14 are resolved. Flows 1, 4, and 12 are partly open; 3, 8, 13, and 15
+remain, though flow 8 largely collapses into flow 9's evidence artifact.
 
 ## Positioning decision (settled)
 
@@ -176,7 +176,7 @@ Open: entirely, and this is the flow that distinguishes the product. Execution
 receipts exist as a contract; nothing connects a receipt to a support-matrix row
 or to `scripts/qualify-eight-flows.sh`.
 
-### 9. Add a second and third platform — `todo`
+### 9. Add a second and third platform — `resolved`
 
 Pain: one Linux VPS cannot produce macOS or Windows evidence, and the policy
 forbids substituting one for another.
@@ -185,9 +185,49 @@ forbids substituting one for another.
 2. Submit the same declared task set to each.
 3. Collect per-platform receipts for one commit.
 
-Open: durable execution v1 explicitly supports **one authoritative Linux
-worker**. Multi-platform fan-out is the product's reason to exist and is out of
-the current engineering scope. This tension needs an explicit decision.
+Resolved in this session, after codebase archaeology that changed the shape of
+the problem.
+
+**The scheduler is already multi-target.** `targets.id` is a primary key holding
+its own worker ID, capabilities, and heartbeat, and `acquire` transitions only a
+still-queued attempt inside an `IMMEDIATE` transaction, so distinct workers lease
+distinct jobs without coordinating. The one-worker limit lives in the *process*,
+not the design: `commonkit-execd` binds one worker token to one worker ID,
+couples API and worker in one binary, and hardcodes `SystemdScope` — which
+returns `UnsupportedIsolation` off Linux, so a macOS or Windows worker fails
+before executing anything.
+
+**Topology: one authoritative scheduler, many target-resident workers**
+(ADR 0012). Federating across per-machine schedulers is a dead end; it would mean
+inventing cross-scheduler identity, idempotency, cancellation, and evidence
+semantics. The real work is per-target worker tokens, a worker-only mode, and
+completing the remote worker data plane — the authenticated worker API has lease,
+renew, checkpoint, complete, and heartbeat but no state transitions and no
+artifact upload, which an off-box worker needs.
+
+**Isolation is recorded, not required** (ADR 0013). macOS gets a process group,
+timeout, `RLIMIT_FSIZE`, and polled disk growth but no cgroup ceilings and no
+sandbox; Windows additionally cannot kill a process tree, since cancellation
+kills the child rather than a Job Object. Those workers ship, and the execution
+profile records the boundary each result was produced under so unlike targets are
+never silently compared. Windows still fails closed on one point: its secret-file
+permission validation does not exist, so a Windows worker must refuse a secrets
+file rather than load one it cannot vouch for.
+
+**Fan-out is three declarations, not a feature.** One declared task per platform,
+each capability-labelled, rather than matrix semantics in the scheduler.
+Immutable manifests make three explicit declarations honest and need no new
+machinery.
+
+**The evidence artifact already exists.** `scripts/qualify-eight-flows.sh` emits
+`eight-flow-evidence.json` carrying commit, platform, architecture, kernel, Node
+version, result, and SHA-256 digests of four installed binaries — and it already
+handles the Windows `.exe` suffix. It becomes a declared task nearly as-is, which
+collapses most of flow 8 into this one.
+
+Out of scope and staying there: high availability, a second writer, live process
+migration, and cross-machine *performance* comparison. Correctness evidence is a
+different claim from performance comparability.
 
 ### 10. Survive a loadout change — `resolved`
 
@@ -282,9 +322,14 @@ reassign to.
   event streams already exist and were simply never rendered.
 - **The digest gap is closed** (flow 2), so the evidence claim is provable rather
   than asserted.
-- **One load-bearing item remains**: multi-platform targets (flow 9). Durable
-  execution v1 supports one Linux worker, which leaves the claim unprovable for
-  macOS and Windows — where the support matrix is emptiest.
+- **Multi-platform turned out to be mostly deployment, not design** (flow 9). The
+  scheduler already supports many targets; the binary does not. That reframes the
+  largest-looking item in the list as bounded work.
+- **What CI evidence cannot prove** stays explicit: production signing and
+  notarization, published updater paths, native Keychain, Secret Service, and
+  Credential Manager behaviour, Windows ACL and reparse handling, real `sshd` and
+  host-key confirmation, and interactive desktop or hardware behaviour. Those
+  support-matrix rows still need a human.
 - **The engineering scope and the product scope disagree.** Durable execution v1
   deliberately supports one Linux worker; the product's reason to exist is
   per-platform evidence. That is a decision to take, not a gap to quietly close.

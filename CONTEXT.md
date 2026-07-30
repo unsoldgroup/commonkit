@@ -82,6 +82,10 @@ _Avoid_: CI job, pipeline step, workflow
 A **Declared task** that runs a coding agent on the **Execution Target** that produced a failed **Attempt**, inside its retained workspace, and emits findings as an artifact (ADR 0011).
 _Avoid_: Auto-fix, self-healing CI, agent remediation
 
+**Isolation level**:
+The enforced execution boundary a target actually provides — namespace sandbox with cgroup ceilings, process group with resource limits, or process only — recorded in the **Execution Profile** rather than required of every target (ADR 0013).
+_Avoid_: Sandbox, security level
+
 **Implementor**:
 The adapter contract through which CommonKit drives a coding-agent engine as a **Job** — start, events, send, cancel, resume, result — keeping engine references opaque.
 _Avoid_: Claude adapter, Codex integration
@@ -126,6 +130,9 @@ _Avoid_: Upstream drift, breaking change
 - A repository declares its own checks as **Declared tasks**. CommonKit submits them; it never accepts arbitrary argv, and a shell string is not a task.
 - **Validation evidence** is commit-bound. It proves the platform and the CommonKit-managed environment; the toolchain is proven by the repository's own commit-pinned files (ADR 0010).
 - An **Investigation** inherits the **Loadout** of the target it runs on, so it reasons with the same skills and hooks the developer's own agent would. Its output is artifacts only; an **Execution Target** produces evidence and analysis but never authors repository history (ADR 0011).
+- One authoritative scheduler serves many target-resident workers; a scheduler per machine with federation is not v1 (ADR 0012). The single-writer database limit is deliberate and is not high availability.
+- "Run this on every platform" is one **Declared task** per platform, each capability-labelled. The scheduler has no matrix or fan-out semantics.
+- **Validation evidence** states the **Isolation level** it was produced under, so results from unlike targets are never silently compared.
 - The CLI is the primary surface for durable execution. The Session Board mirrors runs read-only for the glanceable case; it consumes the execution API as a client and never fronts it.
 - MCP exposes context and durable execution controls; `commonkit-execd` owns lifecycle persistence independently of MCP sessions.
 - An **Adapter** participates in **Reconciliation** for one agent or service.
