@@ -100,6 +100,8 @@ struct SyncConfig {
     provider_artifacts: PathBuf,
     #[serde(default)]
     materialized_states: Vec<PathBuf>,
+    #[serde(default, rename = "styleguide")]
+    _styleguide: Option<Value>,
     provider_pipeline: Option<ProviderPipelineConfig>,
     target_transport: Option<SyncTargetTransport>,
     /// Explicit facts for the managed target. Legacy local configurations may
@@ -197,6 +199,7 @@ enum ConfiguredProvider {
         lockfile: PathBuf,
         policy: PathBuf,
         targets: Vec<String>,
+        #[serde(rename = "managedRoot")]
         managed_root: NormalizedManagedPath,
     },
     Chezmoi {
