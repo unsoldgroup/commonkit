@@ -134,6 +134,46 @@ creation or registration push. After initialization, it should show the
 machine-readable JSON result and the read-only first plan, then stop again
 before any `commonkit apply ... --confirmed`.
 
+## About Me profile
+
+CommonKit can keep an optional, portable profile about the kit owner. It is
+separate from project memory: approved preferences and background facts live in
+an encrypted local database, and each agent sees only the Loadout/project view
+configured for it.
+
+Agents can search approved claims and suggest a new one when the user states it
+directly. Suggestions remain pending until the user accepts them. If a new
+request conflicts with an approved claim, the agent asks which is current
+before CommonKit replaces the old claim. Rejected suggestions are forgotten
+and suppressed without retaining the rejected text.
+
+Start the guided setup, then inspect or search the approved profile:
+
+```sh
+commonkit about-me setup --loadout personal --project my-project
+commonkit about-me status
+commonkit about-me summary
+commonkit about-me search "communication style"
+commonkit about-me suggestions
+```
+
+`about-me setup` asks a short set of plain-language questions, shows the
+complete proposed profile, and writes nothing unless you answer yes. CommonKit
+creates the private encryption key and database automatically. Reload or
+restart the daemon after setup so connected agents receive the approved
+profile tools.
+
+Once CommonKit's MCP server is included in an agent's CommonKit-managed
+loadout, the agent reads the short approved summary at session start. It
+searches detailed claims only when useful, may propose a memory after a direct
+statement, and asks before replacing something that conflicts with the
+approved profile.
+
+The profile text and key never enter Git. To move it between machines, register
+the encrypted database with CommonKit snapshots using `format: "file"` and
+provision the same key separately on the destination. See
+[the headless-domain guide](docs/HEADLESS-DOMAINS.md) for configuration.
+
 ## Transactions and rollback
 
 Every operation has a deterministic identity and runs through

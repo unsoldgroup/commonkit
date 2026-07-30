@@ -5,9 +5,9 @@ Status: implementation baseline
 ## Assets and trust boundaries
 
 CommonKit protects organization policy, composed desired state, provider inputs,
-target credentials, mutable databases, relay credentials, plans, artifacts,
-backups, receipts, update metadata, durable job metadata, checkpoints, and audit
-records. Trust boundaries exist at Git repositories, provider executables,
+target credentials, the owner's About Me claims and summaries, mutable databases,
+relay credentials, plans, artifacts, backups, receipts, update metadata, durable
+job metadata, checkpoints, and audit records. Trust boundaries exist at Git repositories, provider executables,
 local control clients, the scheduler/client API, workers and remote targets,
 MCP upstreams, credential stores, snapshot/object stores, and desktop
 webview/native IPC. Remote MCP is an untrusted client of the authenticated
@@ -22,6 +22,11 @@ execution API, not a lifecycle authority.
 - Only adapters mutate targets, after confirmation, with durable preimages and recoverable receipts.
 - Recovery verifies plans, artifacts, backups, and receipt chains and never reruns providers or secret resolution.
 - Portable state, plans, receipts, logs, events, diagnostics, Git, and UI never contain secret plaintext.
+- About Me text is encrypted at rest, is never committed to Git, and is returned
+  to an agent only through the configured Loadout/project view.
+- Agents may propose memories but cannot publish them. Direct statements require
+  user review, and contradictions require an explicit user choice before the
+  previous claim is superseded.
 - Managed paths are relative, canonical, root-contained, case-normalized for the target, and reject symlink/reparse escapes.
 - Git fetch never implies apply; dirty, diverged, untrusted, or policy-invalid state stops.
 - Relay endpoints bind loopback by default, require authenticated control, and accept credential references only.
@@ -50,6 +55,9 @@ execution API, not a lifecycle authority.
 | Durable job replay or lease race | Revision checks, digest-bound idempotency, monotonic fencing, authenticated client/worker roles |
 | Remote execution boundary bypass | HTTPS enforcement, trusted proxy contract, unprivileged sandboxed workers, manifest-bound filesystem/network policy |
 | Artifact or diagnostic disclosure | Pre-commit redaction, bounded artifacts, short-lived signed access, encrypted and separately replicated object storage |
+| Personal-profile disclosure | SQLCipher at rest, separately provisioned key reference, view-scoped queries, bounded results, and content-free access records |
+| False or unwanted memory | Draft review before first publish, evidence-bearing suggestions, rejection suppression, revision checks, and explicit contradiction resolution |
+| Cross-project inference | Server-selected Loadout/project scope; callers cannot request an arbitrary profile view |
 
 ## Residual risks
 

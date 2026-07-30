@@ -78,6 +78,20 @@ function snapshotsPanel(value: RecordValue): string {
   return `<div class="summary-card"><h2>Authoritative writer</h2><p>${escapeHtml(writer.databaseId ?? "No database selected")} · ${escapeHtml(writer.targetId ?? "No writer recorded")}</p></div>${rows ? `<ul class="inventory">${rows}</ul>` : empty("No snapshots are available.")}<div class="control-grid"><label>Database<input name="database-id" value="${escapeHtml(writer.databaseId)}"></label><label>Snapshot to restore<select name="snapshot-id">${options}</select></label><label>Promotion target<input name="promotion-target" value="${escapeHtml(writer.targetId)}"></label></div>`;
 }
 
+function aboutMePanel(value: RecordValue): string {
+  if (typeof value.error === "string") {
+    return `<div class="readiness readiness-setup"><span>Setup needed</span><h2>Create your private About Me profile</h2><p>Your profile is encrypted and kept separate from project memory. Nothing personal is written to Git.</p></div><form id="about-me-setup" class="control-grid"><label>What should agents call you?<input name="about-me-name" autocomplete="name"></label><label>How should agents explain unfamiliar or technical things?<textarea name="about-me-explanations"></textarea></label><label>When there are choices, how should agents help you decide?<textarea name="about-me-decisions"></textarea></label><label>Which tools, languages, or areas do you use often?<textarea name="about-me-tools"></textarea></label><label>What recurring limits or working rules should agents remember?<textarea name="about-me-constraints"></textarea></label><label>What should agents never assume about you?<textarea name="about-me-never-assume"></textarea></label><p>Nothing is saved until you review and approve these answers.</p><button class="primary" type="submit">Review profile</button></form>`;
+  }
+  const summary = typeof value.summary === "string" ? value.summary : "";
+  const pending = Number(value.pendingSuggestions ?? 0);
+  const suggestions = list(value.suggestions).map((item) => {
+    const suggestion = record(item);
+    const claim = record(suggestion.claim);
+    return `<li><strong>${escapeHtml(claim.text ?? "Suggested memory")}</strong><span>Based on: “${escapeHtml(suggestion.evidenceQuote ?? "")}”</span><div class="actions"><button type="button" data-about-me-id="${escapeHtml(suggestion.id)}" data-about-me-decision="accept">Remember this</button><button type="button" data-about-me-id="${escapeHtml(suggestion.id)}" data-about-me-decision="reject">Don’t remember this</button></div></li>`;
+  }).join("");
+  return `<div class="summary-card"><span>Encrypted profile</span><h2>${summary ? escapeHtml(summary) : "No approved summary yet"}</h2><p>Revision ${escapeHtml(value.revision ?? 0)} · ${escapeHtml(pending)} suggestion${pending === 1 ? "" : "s"} to review</p></div>${suggestions ? `<h2>Suggestions to review</h2><ul class="inventory">${suggestions}</ul>` : empty("No new memories are waiting for review.")}<p class="empty">Detailed claims are shared only with the current loadout and project.</p>`;
+}
+
 function relayPanel(value: RecordValue): string {
   const upstreams = list(value.upstreams ?? value.servers);
   if (upstreams.length === 0) {
@@ -125,8 +139,12 @@ function genericPanel(value: RecordValue): string {
 
 export function managementPanel(route: Route, state: ManagementState): string {
   const value = record(state[route] ?? { error: `${route}_unavailable` });
-  const renderer = ({ plans: plansPanel, credentials: credentialsPanel, snapshots: snapshotsPanel, relay: relayPanel, schedule: schedulePanel, diagnostics: diagnosticsPanel } as Partial<Record<Route, (v: RecordValue) => string>>)[route];
-  const detail = route === "snapshots" ? snapshotsPanel(value) : error(value) ?? renderer?.(value) ?? genericPanel(value);
+  const renderer = ({ plans: plansPanel, credentials: credentialsPanel, snapshots: snapshotsPanel, aboutMe: aboutMePanel, relay: relayPanel, schedule: schedulePanel, diagnostics: diagnosticsPanel } as Partial<Record<Route, (v: RecordValue) => string>>)[route];
+  const detail = route === "snapshots"
+    ? snapshotsPanel(value)
+    : route === "aboutMe"
+      ? aboutMePanel(value)
+      : error(value) ?? renderer?.(value) ?? genericPanel(value);
   const suppressActions = (route === "snapshots" && typeof value.error === "string")
     || (route === "credentials" && list(value.credentials ?? value.references).length === 0)
     || (route === "relay" && list(value.upstreams ?? value.servers).length === 0);
@@ -134,6 +152,7 @@ export function managementPanel(route: Route, state: ManagementState): string {
   const titles: Partial<Record<Route, string>> = {
     plans: "Changes",
     snapshots: "Data",
+    aboutMe: "About Me",
     relay: "MCP connections",
     schedule: "Drift checks",
   };
@@ -141,6 +160,7 @@ export function managementPanel(route: Route, state: ManagementState): string {
     plans: "Preview, approve, apply, and verify changes to this computer.",
     credentials: "Check secret references and provision approved destinations without exposing secret values.",
     snapshots: "Protect mutable databases, restore known-good state, and control the authoritative writer.",
+    aboutMe: "Review the encrypted personal context that authorized agents may use.",
     relay: "See whether portable MCP connections are reachable through CommonKit’s local relay.",
     schedule: "Choose how often CommonKit checks for drift. Scheduled checks never apply changes.",
     diagnostics: "Understand service and adapter health, then export a redacted support report.",
