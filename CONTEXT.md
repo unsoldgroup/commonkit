@@ -207,8 +207,28 @@ A revisioned execution of a **Job** with its own lease, fencing token, and termi
 _Avoid_: Job retry
 
 **Execution Profile**:
-Execution-only resource, capability, isolation, and comparability requirements for a **Job**.
+Execution-only resource, capability, isolation, and comparability requirements for a **Job**, pinning operating system, architecture, and machine class. It does not pin the toolchain (ADR 0010).
 _Avoid_: Loadout
+
+**Validation evidence**:
+A terminal **Attempt** receipt binding an exact commit, platform, Loadout digest, and **Execution Profile** digest, recorded as a support-matrix row's proof that a platform is supported.
+_Avoid_: Test run, CI result, green build
+
+**Declared task**:
+A repository-owned, immutable **ExecutionManifest** named by a stable task ID, the only thing a remote agent or webhook may submit.
+_Avoid_: CI job, pipeline step, workflow
+
+**Investigation**:
+A **Declared task** that runs a coding agent on the **Execution Target** that produced a failed **Attempt**, inside its retained workspace, and emits findings as an artifact (ADR 0011).
+_Avoid_: Auto-fix, self-healing CI, agent remediation
+
+**Isolation level**:
+The enforced execution boundary a target actually provides — namespace sandbox with cgroup ceilings, process group with resource limits, or process only — recorded in the **Execution Profile** rather than required of every target (ADR 0013).
+_Avoid_: Sandbox, security level
+
+**Implementor**:
+The adapter contract through which CommonKit drives a coding-agent engine as a **Job** — start, events, send, cancel, resume, result — keeping engine references opaque.
+_Avoid_: Claude adapter, Codex integration
 
 **Execution Target**:
 A managed **Target** advertising durable-execution readiness, capacity, and an exact Loadout digest.
@@ -237,6 +257,28 @@ _Avoid_: Source map, diff
 **Material change**:
 An upstream revision that touches or removes a section the **Retention map** marks kept, or adds a section matching no known digest or heading. Only a material change warrants re-distillation.
 _Avoid_: Upstream drift, breaking change
+
+**About Me Profile**:
+The kit owner’s encrypted, portable collection of approved personal facts and preferences.
+_Avoid_: Project memory, transcript archive, user account
+
+**Claim**:
+One approved, versioned fact or preference in an **About Me Profile**.
+_Avoid_: Observation, project fact
+
+**Scoped View**:
+The subset of profile claims available to one Loadout and trusted project.
+_Avoid_: Separate profile, persona
+
+**Suggestion**:
+A proposed claim based on words the user stated directly; it is not approved memory.
+_Avoid_: Automatic learning, inference
+
+**Styleguide**:
+An optional, single-valued **Loadout** capability that routes one selected
+writing skill for declared prose scopes and modes. It is not always-on
+instruction text and is not a public lint gate.
+_Avoid_: Default voice, prose policy
 
 ## Relationships
 
@@ -335,6 +377,14 @@ _Avoid_: Upstream drift, breaking change
 - A **Loadout** is materialized on one or more **Targets**.
 - A **Job** has one or more ordered **Attempts**, but at most one active leased **Attempt**.
 - An **Execution Target** references a managed **Target** and exact Loadout and **Execution Profile** digests.
+- An **Execution Target**'s Loadout digest is the composed loadout digest of that **Target**'s last successful **Reconciliation**, not an independently authored value. A **Job** whose digests differ does not place, so a drifted target fails closed instead of producing incomparable results.
+- A repository declares its own checks as **Declared tasks**. CommonKit submits them; it never accepts arbitrary argv, and a shell string is not a task.
+- **Validation evidence** is commit-bound. It proves the platform and the CommonKit-managed environment; the toolchain is proven by the repository's own commit-pinned files (ADR 0010).
+- An **Investigation** inherits the **Loadout** of the target it runs on, so it reasons with the same skills and hooks the developer's own agent would. Its output is artifacts only; an **Execution Target** produces evidence and analysis but never authors repository history (ADR 0011).
+- One authoritative scheduler serves many target-resident workers; a scheduler per machine with federation is not v1 (ADR 0012). The single-writer database limit is deliberate and is not high availability.
+- "Run this on every platform" is one **Declared task** per platform, each capability-labelled. The scheduler has no matrix or fan-out semantics.
+- **Validation evidence** states the **Isolation level** it was produced under, so results from unlike targets are never silently compared.
+- The CLI is the primary surface for durable execution. The Session Board mirrors runs read-only for the glanceable case; it consumes the execution API as a client and never fronts it.
 - MCP exposes context and durable execution controls; `commonkit-execd` owns lifecycle persistence independently of MCP sessions.
 - An **Adapter** participates in **Reconciliation** for one agent or service.
 - A **Loadout** selects a version-pinned **Agent-context provider** for portable agent content.
@@ -347,6 +397,13 @@ _Avoid_: Upstream drift, breaking change
 - An imported skill retains its upstream reference and revision as provenance. The upstream reference is decoupled from the distilled form; re-pulling upstream is a three-way merge against the distilled fork, not a replacement.
 - Scheduled read-only upstream checks classify revisions against the **Retention map**. Non-material changes advance the recorded upstream revision silently; only a **Material change** notifies a human and queues re-distillation.
 - Imported skills are admitted by human review against the **Context budget**, not by automated evaluation. An admitted skill may afterward enter the SkillOpt evaluation and promotion path unchanged.
+- A **Loadout** can select at most one **Styleguide**. Later layers replace the
+  complete selection, while organization policy can deny or pin it. CommonKit
+  binds its descriptor, APM manifest and lock, evaluation suite, and retention
+  map into normalized state and plan provenance.
+- A **Styleguide** activates through skill routing. It does not enter public-base
+  instructions, and its deterministic writing-form metric is internal
+  evaluation evidence rather than a reconciliation gate.
 - SkillOpt is an exact-version external candidate-computation provider, not a target mutator. CommonKit independently evaluates held-out evidence and policy, requires human promotion into canonical Git source, then uses APM and CommonKit reconciliation for compilation and named-canary deployment.
 - Native providers remain available for migration, fallback, and capabilities not safely delegated upstream.
 - CommonKit stages provider output and applies it through CommonKit **Reconciliation** so target mutation remains plan-bound, receipted, verifiable, and recoverable.
@@ -359,6 +416,9 @@ _Avoid_: Upstream drift, breaking change
 - The version 1 runtime is implemented in Rust and shared by the CLI, local service, MCP server, and Tauri 2 desktop application. The existing TypeScript reconciliation engine and `mcp-local-relay` runtime are migration sources, not permanent sidecars.
 - Database adapters create consistent, integrity-checked, encrypted snapshots in S3-compatible object storage. Git records only snapshot descriptors and content hashes.
 - Version 1 uses one authoritative writer per database. Cross-machine database portability is snapshot and restore, not binary merging; multi-writer synchronization requires a later application-level export/import model.
+- An **About Me Profile** is stored in a dedicated encrypted SQLite database with one writer; context-mode and Engram remain project-memory systems.
+- A **Scoped View** controls disclosure by Loadout and trusted project. Organization policy may narrow access but never broaden it.
+- Agents may create **Suggestions**, but only direct user edits or explicit contradiction clarifications create approved **Claims**.
 
 ## Example dialogue
 

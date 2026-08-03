@@ -191,6 +191,34 @@ pub struct ApplyPlanInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AboutMeSearchInput {
+    pub query: String,
+    #[serde(default)]
+    pub categories: Vec<String>,
+    pub limit: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AboutMeSuggestionInput {
+    pub topic_key: String,
+    pub category: String,
+    pub text: String,
+    pub evidence_quote: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AboutMeResolveInput {
+    pub active_claim_id: String,
+    pub expected_revision: u64,
+    pub replacement_text: String,
+    pub evidence_quote: String,
+    pub confirmed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReadInput {
     pub target_id: Option<String>,
     pub pointer: Option<String>,
@@ -391,6 +419,87 @@ impl CommonKitMcp {
 
 #[tool_router]
 impl CommonKitMcp {
+    #[tool(
+        name = "commonkit_about_me_get_summary",
+        description = "Read the approved About Me summary for the active loadout and project. Call once at session start. This tool never mutates state."
+    )]
+    pub async fn about_me_summary(&self) -> Result<CallToolResult, ErrorData> {
+        tool_result(self.backend.get("/control/v1/about-me/summary").await)
+    }
+
+    #[tool(
+        name = "commonkit_about_me_search",
+        description = "Search approved user facts for the active loadout and project when personal context would materially help. If the user's current request appears to conflict with a result, show both statements and ask which is current; never silently override the remembered preference."
+    )]
+    pub async fn about_me_search(
+        &self,
+        Parameters(input): Parameters<AboutMeSearchInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if input.query.trim().is_empty() || input.limit == 0 || input.limit > 10 {
+            return Ok(input_error(
+                "invalid_about_me_search",
+                "Query and limit 1-10 are required",
+            ));
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/about-me/search",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_about_me_suggest",
+        description = "Suggest a durable user fact only when the user stated it directly. Suggestions require later user review and do not alter the approved profile."
+    )]
+    pub async fn about_me_suggest(
+        &self,
+        Parameters(input): Parameters<AboutMeSuggestionInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if input.text.trim().is_empty() || input.evidence_quote.trim().is_empty() {
+            return Ok(input_error(
+                "invalid_about_me_suggestion",
+                "Text and direct user evidence are required",
+            ));
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/about-me/suggestions",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_about_me_resolve_conflict",
+        description = "Replace an approved user fact only after showing the remembered and current statements side by side and asking the user which is current. The user's explicit clarification is required."
+    )]
+    pub async fn about_me_resolve_conflict(
+        &self,
+        Parameters(input): Parameters<AboutMeResolveInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !input.confirmed {
+            return Ok(CallToolResult::structured_error(json!({
+                "code":"confirmation_required",
+                "message":"The user's explicit clarification is required",
+                "retryable":false
+            })));
+        }
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/about-me/conflicts/resolve",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
     #[tool(
         name = "commonkit_get_status",
         description = "Read CommonKit daemon, target, loadout, and drift status. This tool never mutates state."

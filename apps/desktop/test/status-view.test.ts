@@ -16,6 +16,7 @@ test("status answers whether the selected computer and its capabilities are read
     },
     { selected: ["al-macbook"], targets: [{ id: "al-macbook", identityDigest: "sha256:x", transport: { type: "local" } }] },
     {
+      aboutMe: { error: "about_me_domain_unconfigured" },
       plans: {}, credentials: { credentials: [] },
       snapshots: { error: "snapshot_domain_unconfigured" },
       relay: { configured: false, servers: [] },

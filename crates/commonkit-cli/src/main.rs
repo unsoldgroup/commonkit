@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::error::Error;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use commonkit_cli::about_me_setup::{SetupAnswers, SetupRequest, setup_profile};
 use commonkit_config::{LayerSet, compose_layers, v1_merge_rules};
 use commonkit_contracts::{
     LayerDocument, LayerKind, SchemaVersion, SecurityPolicy, Sha256Digest, StableId,
@@ -10,7 +12,7 @@ use commonkit_contracts::{
 };
 use commonkit_core::enforce_policy_floor;
 use commonkit_personal_context::{
-    EncryptedRevisionStore, FieldOperation, RevisionBinding, SecretValue,
+    EncryptedRevisionStore, FieldOperation, ProfileFieldId, RevisionBinding, SecretValue,
     encrypt_revision_for_recipient_strings,
 };
 use commonkit_platform::AppPaths;
@@ -127,6 +129,11 @@ enum Command {
         #[command(subcommand)]
         command: ContextCommand,
     },
+    /// Read and contribute to the encrypted owner profile.
+    AboutMe {
+        #[command(subcommand)]
+        command: AboutMeCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -189,6 +196,60 @@ enum ProfileCommand {
         parent_hashes: Vec<String>,
         #[arg(long)]
         confirmed: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum AboutMeCommand {
+    /// Create an encrypted profile through a short, reviewable interview.
+    Setup {
+        #[arg(long, default_value = "personal")]
+        loadout: String,
+        #[arg(long, default_value = "default")]
+        project: String,
+        #[arg(long, default_value = "commonkit-agent")]
+        agent: String,
+    },
+    Status,
+    Summary,
+    Draft {
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        summary: String,
+        /// JSON object with topicKey, category, and text. Repeat for each claim.
+        #[arg(long = "claim-json")]
+        claims: Vec<String>,
+    },
+    Publish {
+        draft_id: String,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    Suggestions,
+    Decide {
+        suggestion_id: String,
+        #[arg(long)]
+        decision: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value_t = 5)]
+        limit: u8,
+    },
+    Suggest {
+        #[arg(long)]
+        topic_key: String,
+        #[arg(long)]
+        category: String,
+        #[arg(long)]
+        text: String,
+        #[arg(long)]
+        evidence_quote: String,
     },
 }
 
@@ -875,6 +936,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Skills { command } => run_skills(command)?,
         Command::Profile { command } => run_profile(command)?,
         Command::Context { command } => run_context(command)?,
+        Command::AboutMe { command } => run_about_me(command)?,
     }
     Ok(())
 }
@@ -999,11 +1061,11 @@ fn run_profile(command: ProfileCommand) -> Result<(), Box<dyn Error>> {
                 .into_iter()
                 .map(|(field, value)| {
                     Ok((
-                        StableId::parse(field)?,
+                        ProfileFieldId::parse(field)?,
                         FieldOperation::Set(SecretValue::from_string(value)),
                     ))
                 })
-                .collect::<Result<BTreeMap<_, _>, commonkit_contracts::ContractError>>()?;
+                .collect::<Result<BTreeMap<_, _>, commonkit_personal_context::CryptoError>>()?;
             let binding = RevisionBinding {
                 schema_version: SchemaVersion(1),
                 profile_id: StableId::parse(profile_id)?,
@@ -1035,6 +1097,200 @@ fn run_profile(command: ProfileCommand) -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+fn run_about_me(command: AboutMeCommand) -> Result<(), Box<dyn Error>> {
+    let value = match command {
+        AboutMeCommand::Setup {
+            loadout,
+            project,
+            agent,
+        } => return run_about_me_setup(loadout, project, agent),
+        AboutMeCommand::Status => daemon_control("GET", "/control/v1/about-me", None, None)?,
+        AboutMeCommand::Summary => {
+            daemon_control("GET", "/control/v1/about-me/summary", None, None)?
+        }
+        AboutMeCommand::Draft {
+            expected_revision,
+            summary,
+            claims,
+        } => {
+            let claims = claims
+                .iter()
+                .map(|claim| serde_json::from_str::<Value>(claim))
+                .collect::<Result<Vec<_>, _>>()?;
+            daemon_control(
+                "POST",
+                "/control/v1/about-me/drafts",
+                Some(json!({
+                    "expectedRevision":expected_revision,
+                    "summary":summary,
+                    "claims":claims
+                })),
+                None,
+            )?
+        }
+        AboutMeCommand::Publish {
+            draft_id,
+            expected_revision,
+            confirmed,
+        } => {
+            if !confirmed {
+                return Err("publishing an About Me draft requires --confirmed".into());
+            }
+            daemon_control(
+                "POST",
+                "/control/v1/about-me/drafts/publish",
+                Some(json!({
+                    "draftId":draft_id,
+                    "expectedRevision":expected_revision,
+                    "confirmed":true,
+                    "confirmationId":nonce("about-me-publish")
+                })),
+                None,
+            )?
+        }
+        AboutMeCommand::Suggestions => daemon_control(
+            "GET",
+            "/control/v1/about-me/suggestions/pending",
+            None,
+            None,
+        )?,
+        AboutMeCommand::Decide {
+            suggestion_id,
+            decision,
+            confirmed,
+        } => {
+            if !confirmed || !matches!(decision.as_str(), "accept" | "reject") {
+                return Err("decision must be accept or reject and requires --confirmed".into());
+            }
+            daemon_control(
+                "POST",
+                "/control/v1/about-me/suggestions/decide",
+                Some(json!({
+                    "suggestionId":suggestion_id,
+                    "decision":decision,
+                    "confirmed":true,
+                    "confirmationId":nonce("about-me-suggestion-decision")
+                })),
+                None,
+            )?
+        }
+        AboutMeCommand::Search { query, limit } => daemon_control(
+            "POST",
+            "/control/v1/about-me/search",
+            Some(json!({"query":query,"categories":[],"limit":limit})),
+            None,
+        )?,
+        AboutMeCommand::Suggest {
+            topic_key,
+            category,
+            text,
+            evidence_quote,
+        } => daemon_control(
+            "POST",
+            "/control/v1/about-me/suggestions",
+            Some(json!({
+                "topicKey":topic_key,
+                "category":category,
+                "text":text,
+                "evidenceQuote":evidence_quote
+            })),
+            None,
+        )?,
+    };
+    print_daemon(value)
+}
+
+fn run_about_me_setup(
+    loadout: String,
+    project: String,
+    agent: String,
+) -> Result<(), Box<dyn Error>> {
+    println!("Let’s create your private About Me profile.");
+    println!("Press Enter to skip anything. Nothing is saved until you approve.\n");
+    let stdin = std::io::stdin();
+    let mut input = stdin.lock();
+    let mut output = std::io::stdout();
+    let answers = SetupAnswers {
+        name: ask(&mut input, &mut output, "What should I call you?")?,
+        explanation_style: ask(
+            &mut input,
+            &mut output,
+            "How should I explain unfamiliar or technical things?",
+        )?,
+        decision_style: ask(
+            &mut input,
+            &mut output,
+            "When there are choices, how should I help you decide?",
+        )?,
+        tools: ask(
+            &mut input,
+            &mut output,
+            "Which tools, languages, or areas do you use often?",
+        )?,
+        constraints: ask(
+            &mut input,
+            &mut output,
+            "What recurring limits or working rules should I remember?",
+        )?,
+        never_assume: ask(
+            &mut input,
+            &mut output,
+            "What should an agent never assume about you?",
+        )?,
+    };
+
+    println!("\nReview what CommonKit will remember:");
+    for (label, value) in [
+        ("Name", &answers.name),
+        ("Explanations", &answers.explanation_style),
+        ("Decisions", &answers.decision_style),
+        ("Tools and experience", &answers.tools),
+        ("Working rules", &answers.constraints),
+        ("Never assume", &answers.never_assume),
+    ] {
+        if !value.trim().is_empty() {
+            println!("  {label}: {}", value.trim());
+        }
+    }
+    let approved = ask(
+        &mut input,
+        &mut output,
+        "\nSave this encrypted profile? [yes/no]",
+    )?;
+    if !matches!(approved.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        println!("Canceled. Nothing was saved.");
+        return Ok(());
+    }
+
+    let paths = AppPaths::discover()?;
+    let outcome = setup_profile(SetupRequest {
+        config_directory: paths.config,
+        state_directory: paths.state,
+        loadout_id: loadout,
+        project_id: project,
+        agent_id: agent,
+        answers,
+        approved: true,
+    })?;
+    println!(
+        "Profile saved as revision {}. Restart or reload the CommonKit daemon, then run `commonkit about-me summary`.",
+        outcome.revision
+    );
+    Ok(())
+}
+
+fn ask(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    question: &str,
+) -> Result<String, std::io::Error> {
+    write!(output, "{question}\n> ")?;
+    output.flush()?;
+    let mut answer = String::new();
+    input.read_line(&mut answer)?;
+    Ok(answer.trim().to_owned())
 }
 
 fn run_relay_client() -> Result<(), Box<dyn Error>> {

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+use commonkit_about_me::{ClaimCategory, ClaimInput, ProfileStore, ScopedView};
 use commonkit_adapters::{
     ApmProvider, ApmProviderConfig, ArtifactStore, BwsCredentialResolver, ChezmoiProvider,
     ContentSensitivity, CredentialReference, CredentialResolver, DesiredStateProvider,
@@ -17,10 +18,13 @@ use commonkit_adapters::{
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
     materialize_mcp_client_state, validate_ownership,
 };
-use commonkit_config::{LayerSet, compose_layers, v1_merge_rules, validate_layer_content_digest};
+use commonkit_config::{
+    LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
+    validate_layer_content_digest,
+};
 use commonkit_contracts::{
     LayerDocument, LayerKind, Plan, ReceiptState, SecurityPolicy, Sha256Digest, StableId,
-    assert_no_embedded_secrets, digest_domain_json,
+    StyleguideDescriptor, StyleguideSelection, assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, build_plan, enforce_policy_floor};
 use commonkit_reconcile::{
@@ -41,13 +45,15 @@ use thiserror::Error;
 
 use crate::skill_canary::{SkillCanaryConfig, SkillCanaryRuntime};
 use crate::{
-    ApplyStatus, CompositionDomain, CredentialDomain, DomainFailure, ExecutionResult,
-    HeadlessDomainRegistry, PlanExecutor, RelayProviderAuthority, SnapshotDomain, SyncDomain,
+    AboutMeDomain, ApplyStatus, CompositionDomain, CredentialDomain, DomainFailure,
+    ExecutionResult, HeadlessDomainRegistry, PlanExecutor, RelayProviderAuthority, SnapshotDomain,
+    SyncDomain,
 };
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProductionConfig {
+    about_me: Option<AboutMeConfig>,
     targets: Option<TargetInventoryConfig>,
     composition: Option<CompositionConfig>,
     sync: Option<SyncConfig>,
@@ -56,6 +62,22 @@ struct ProductionConfig {
     credentials: Option<CredentialConfig>,
     snapshots: Option<SnapshotConfig>,
     skill_canary: Option<SkillCanaryConfig>,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeConfig {
+    database: PathBuf,
+    key_reference: CredentialReference,
+    bws_executable: Option<PathBuf>,
+    loadout_id: String,
+    project_id: String,
+    #[serde(default = "default_about_me_agent")]
+    agent_id: String,
+}
+
+fn default_about_me_agent() -> String {
+    "commonkit-agent".into()
 }
 
 #[derive(Clone, Deserialize)]
@@ -83,6 +105,7 @@ struct SyncConfig {
     #[serde(default)]
     materialized_states: Vec<PathBuf>,
     provider_pipeline: Option<ProviderPipelineConfig>,
+    styleguide: Option<StyleguideRuntimeConfig>,
     target_transport: Option<SyncTargetTransport>,
     /// Explicit facts for the managed target. Legacy local configurations may
     /// omit this and inherit the controller facts; SSH targets may not.
@@ -100,6 +123,25 @@ struct SyncConfig {
     /// portable configuration so clients cannot drift from daemon discovery.
     #[serde(skip)]
     relay_endpoint: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StyleguideRuntimeConfig {
+    selection: StyleguideSelection,
+    descriptors: Vec<PathBuf>,
+    manifest: PathBuf,
+    lockfile: PathBuf,
+    #[serde(default)]
+    policy: StyleguideRuntimePolicy,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StyleguideRuntimePolicy {
+    #[serde(default)]
+    denied: bool,
+    pinned_skill_id: Option<StableId>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -179,6 +221,7 @@ enum ConfiguredProvider {
         lockfile: PathBuf,
         policy: PathBuf,
         targets: Vec<String>,
+        #[serde(rename = "managedRoot")]
         managed_root: NormalizedManagedPath,
     },
     Chezmoi {
@@ -283,6 +326,7 @@ enum SnapshotSourceFormat {
 }
 
 pub struct ProductionDomainRegistry {
+    pub about_me: Option<Arc<dyn AboutMeDomain>>,
     pub composition: Option<Arc<dyn CompositionDomain>>,
     pub sync: Option<Arc<dyn SyncDomain>>,
     pub credentials: Option<Arc<dyn CredentialDomain>>,
@@ -531,6 +575,7 @@ impl ProductionDomainRegistry {
     ) -> Result<Self, ProductionDomainError> {
         if !config_path.exists() {
             return Ok(Self {
+                about_me: None,
                 composition: None,
                 sync: None,
                 credentials: None,
@@ -714,6 +759,24 @@ impl ProductionDomainRegistry {
                 },
             )
             .transpose()?;
+        let about_me = config
+            .about_me
+            .map(
+                |config| -> Result<Arc<dyn AboutMeDomain>, ProductionDomainError> {
+                    if !config.database.is_absolute()
+                        || config.loadout_id.trim().is_empty()
+                        || config.project_id.trim().is_empty()
+                    {
+                        return Err(ProductionDomainError::UnsafeConfig);
+                    }
+                    let domain = ProductionAboutMeDomain { config };
+                    domain
+                        .store()
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    Ok(Arc::new(domain))
+                },
+            )
+            .transpose()?;
         let mut target_sync_domains = BTreeMap::new();
         for (id, sync_config) in &sync_configs {
             validate_sync_config(sync_config)?;
@@ -857,6 +920,7 @@ impl ProductionDomainRegistry {
             })
             .transpose()?;
         Ok(Self {
+            about_me,
             composition,
             sync,
             credentials,
@@ -870,6 +934,7 @@ impl ProductionDomainRegistry {
     }
     pub fn into_headless(self) -> HeadlessDomainRegistry {
         HeadlessDomainRegistry {
+            about_me: self.about_me,
             composition: self.composition,
             sync: self.sync,
             credentials: self.credentials,
@@ -1156,6 +1221,7 @@ impl ProductionSyncDomain {
                 "composedLoadoutDigest":self.config.composed_loadout_digest,
                 "policyDigest":self.config.policy_digest,
                 "relayClientRoot":self.config.relay_client_root,
+                "styleguide":self.config.styleguide,
                 "sourceRevision":self.config.provider_pipeline.as_ref().map(|pipeline| &pipeline.source.revision),
                 "providers":providers,
             }),
@@ -1164,38 +1230,165 @@ impl ProductionSyncDomain {
     }
 
     fn provider_input_digests(&self) -> Result<BTreeMap<PathBuf, Sha256Digest>, DomainFailure> {
-        let Some(pipeline) = &self.config.provider_pipeline else {
-            return Ok(BTreeMap::new());
-        };
-        let mut paths = Vec::new();
-        for provider in &pipeline.providers {
-            match provider {
-                ConfiguredProvider::Native { files, .. } => {
-                    paths.extend(files.iter().map(|file| file.source.to_string()));
-                }
-                ConfiguredProvider::Apm {
-                    manifest,
-                    lockfile,
-                    policy,
-                    ..
-                } => {
-                    paths.extend([
-                        path_text(manifest)?.to_owned(),
-                        path_text(lockfile)?.to_owned(),
-                        path_text(policy)?.to_owned(),
-                    ]);
-                }
-                ConfiguredProvider::Chezmoi { source, config, .. } => {
-                    paths.extend([path_text(source)?.to_owned(), path_text(config)?.to_owned()]);
+        let mut digests = BTreeMap::new();
+        if let Some(pipeline) = &self.config.provider_pipeline {
+            let mut paths = Vec::new();
+            for provider in &pipeline.providers {
+                match provider {
+                    ConfiguredProvider::Native { files, .. } => {
+                        paths.extend(files.iter().map(|file| file.source.to_string()));
+                    }
+                    ConfiguredProvider::Apm {
+                        manifest,
+                        lockfile,
+                        policy,
+                        ..
+                    } => {
+                        paths.extend([
+                            path_text(manifest)?.to_owned(),
+                            path_text(lockfile)?.to_owned(),
+                            path_text(policy)?.to_owned(),
+                        ]);
+                    }
+                    ConfiguredProvider::Chezmoi { source, config, .. } => {
+                        paths
+                            .extend([path_text(source)?.to_owned(), path_text(config)?.to_owned()]);
+                    }
                 }
             }
+            for relative in paths {
+                let path = checked_repository_path(&pipeline.source.repository, &relative)?;
+                collect_local_input_digests(&pipeline.source.repository, &path, &mut digests)?;
+            }
         }
-        let mut digests = BTreeMap::new();
-        for relative in paths {
-            let path = checked_repository_path(&pipeline.source.repository, &relative)?;
-            collect_local_input_digests(&pipeline.source.repository, &path, &mut digests)?;
+        if let Some(styleguide) = &self.config.styleguide {
+            for input in styleguide
+                .descriptors
+                .iter()
+                .chain([&styleguide.manifest, &styleguide.lockfile])
+            {
+                let path = self.styleguide_input_path(input)?;
+                digests.insert(
+                    input.clone(),
+                    digest_bytes(&fs::read(path).map_err(|_| DomainFailure::OperationFailed)?)?,
+                );
+            }
         }
         Ok(digests)
+    }
+
+    fn styleguide_input_path(&self, path: &Path) -> Result<PathBuf, DomainFailure> {
+        if let Some(pipeline) = &self.config.provider_pipeline {
+            return checked_repository_path(&pipeline.source.repository, path_text(path)?);
+        }
+        if !path.is_absolute() {
+            return Err(DomainFailure::OperationFailed);
+        }
+        let metadata = fs::symlink_metadata(path).map_err(|_| DomainFailure::OperationFailed)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(DomainFailure::OperationFailed);
+        }
+        path.canonicalize()
+            .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn bind_styleguide(
+        &self,
+        states: &[MaterializedState],
+    ) -> Result<Option<MaterializedState>, DomainFailure> {
+        let Some(config) = &self.config.styleguide else {
+            return Ok(None);
+        };
+        let mut descriptors = BTreeMap::new();
+        for path in &config.descriptors {
+            let path = self.styleguide_input_path(path)?;
+            let descriptor: StyleguideDescriptor = serde_json::from_slice(
+                &fs::read(path).map_err(|_| DomainFailure::OperationFailed)?,
+            )
+            .map_err(|error| {
+                eprintln!("commonkitd: styleguide descriptor parse failed: {error}");
+                DomainFailure::OperationFailed
+            })?;
+            descriptor.validate().map_err(|error| {
+                eprintln!("commonkitd: styleguide descriptor validation failed: {error}");
+                DomainFailure::OperationFailed
+            })?;
+            if descriptors
+                .insert(descriptor.exported_skill.clone(), descriptor)
+                .is_some()
+            {
+                return Err(DomainFailure::OperationFailed);
+            }
+        }
+        let staged_exports = descriptors
+            .keys()
+            .filter(|skill_id| {
+                let suffix = format!("/skills/{}/SKILL.md", skill_id.as_str());
+                let source_suffix = format!(".apm/skills/{}/SKILL.md", skill_id.as_str());
+                states.iter().any(|state| {
+                    state.resources.iter().any(|resource| {
+                        resource.provenance.source.ends_with(&source_suffix)
+                            && matches!(
+                                &resource.intent,
+                                FilesystemIntent::File { path, .. }
+                                    if path.as_str().ends_with(&suffix)
+                            )
+                    })
+                })
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let policy = StyleguidePolicy {
+            denied: config.policy.denied,
+            pinned_skill_id: config.policy.pinned_skill_id.clone(),
+        };
+        let resolved = resolve_styleguide_selection(
+            Some(&config.selection),
+            &descriptors,
+            &staged_exports,
+            &policy,
+        )
+        .map_err(|error| {
+            eprintln!("commonkitd: styleguide admission failed: {error}");
+            DomainFailure::OperationFailed
+        })?
+        .ok_or(DomainFailure::OperationFailed)?;
+        let manifest_digest = digest_bytes(
+            &fs::read(self.styleguide_input_path(&config.manifest)?)
+                .map_err(|_| DomainFailure::OperationFailed)?,
+        )?;
+        let lock_digest = digest_bytes(
+            &fs::read(self.styleguide_input_path(&config.lockfile)?)
+                .map_err(|_| DomainFailure::OperationFailed)?,
+        )?;
+        if resolved.descriptor.package.manifest_digest != manifest_digest
+            || resolved.descriptor.package.lock_digest != lock_digest
+        {
+            eprintln!(
+                "commonkitd: styleguide APM manifest or lock digest does not match the descriptor"
+            );
+            return Err(DomainFailure::OperationFailed);
+        }
+        let binding_digest = resolved
+            .binding
+            .digest()
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let inputs = ProviderInputs::new(
+            StableId::parse("commonkit-styleguide").map_err(|_| DomainFailure::OperationFailed)?,
+            ExactProviderVersion::parse(&resolved.descriptor.package.version)
+                .map_err(|_| DomainFailure::OperationFailed)?,
+            "commonkit.styleguide-binding.v1".into(),
+            BTreeMap::from([
+                ("binding".into(), binding_digest),
+                ("manifestFile".into(), manifest_digest),
+                ("lockFile".into(), lock_digest),
+            ]),
+            vec!["styleguide".into()],
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        MaterializedState::finalize(inputs, Vec::new(), Vec::new(), Vec::new())
+            .map(Some)
+            .map_err(|_| DomainFailure::OperationFailed)
     }
 
     fn external_state_digests(&self) -> Result<BTreeMap<PathBuf, Sha256Digest>, DomainFailure> {
@@ -1517,6 +1710,9 @@ impl ProductionSyncDomain {
         artifacts: &ArtifactStore,
     ) -> Result<Vec<MaterializedState>, DomainFailure> {
         let mut states = self.states()?;
+        if let Some(binding) = self.bind_styleguide(&states)? {
+            states.push(binding);
+        }
         let has_mcp = states.iter().any(|state| !state.capabilities.is_empty());
         if has_mcp {
             if matches!(
@@ -2819,6 +3015,238 @@ fn resolve(
     };
     SecretValue::new(bytes).map_err(|_| DomainFailure::OperationFailed)
 }
+
+struct ProductionAboutMeDomain {
+    config: AboutMeConfig,
+}
+
+impl ProductionAboutMeDomain {
+    fn view(&self) -> ScopedView {
+        ScopedView {
+            loadout_id: self.config.loadout_id.clone(),
+            project_id: self.config.project_id.clone(),
+        }
+    }
+
+    fn store(&self) -> Result<ProfileStore, DomainFailure> {
+        let secret = resolve(
+            &self.config.key_reference,
+            self.config.bws_executable.as_deref(),
+        )?;
+        ProfileStore::open(&self.config.database, secret.expose_for_apply())
+            .map_err(|_| DomainFailure::OperationFailed)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeSearchRequest {
+    query: String,
+    #[serde(default)]
+    categories: BTreeSet<String>,
+    limit: u8,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeSuggestionRequest {
+    topic_key: String,
+    category: ClaimCategory,
+    text: String,
+    evidence_quote: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeResolveRequest {
+    active_claim_id: String,
+    expected_revision: u64,
+    replacement_text: String,
+    evidence_quote: String,
+    confirmed: bool,
+    confirmation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeDraftRequest {
+    expected_revision: u64,
+    summary: String,
+    claims: Vec<AboutMeClaimRequest>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeClaimRequest {
+    topic_key: String,
+    category: ClaimCategory,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMePublishRequest {
+    draft_id: String,
+    expected_revision: u64,
+    confirmed: bool,
+    confirmation_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AboutMeDecisionRequest {
+    suggestion_id: String,
+    decision: commonkit_about_me::SuggestionDecision,
+    confirmed: bool,
+    confirmation_id: Option<String>,
+}
+
+impl AboutMeDomain for ProductionAboutMeDomain {
+    fn inspect(&self) -> Result<Value, DomainFailure> {
+        let store = self.store()?;
+        let suggestions = store
+            .pending_suggestions()
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(serde_json::json!({
+            "revision": store.revision().map_err(|_| DomainFailure::OperationFailed)?,
+            "summary": store.summary(&self.view()).map_err(|_| DomainFailure::OperationFailed)?,
+            "pendingSuggestions": suggestions.len(),
+            "suggestions": suggestions,
+            "loadoutId": self.config.loadout_id,
+            "projectId": self.config.project_id,
+            "encrypted": true
+        }))
+    }
+
+    fn create_draft(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeDraftRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let view = self.view();
+        let claims = request
+            .claims
+            .into_iter()
+            .map(|claim| ClaimInput {
+                topic_key: claim.topic_key,
+                category: claim.category,
+                text: claim.text,
+                views: vec![view.clone()],
+            })
+            .collect();
+        let mut store = self.store()?;
+        let draft = store
+            .create_draft(request.expected_revision, request.summary, claims)
+            .map_err(|error| match error {
+                commonkit_about_me::ProfileError::StaleRevision => DomainFailure::StalePlan,
+                _ => DomainFailure::InvalidRequest,
+            })?;
+        serde_json::to_value(draft).map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn publish_draft(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMePublishRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        if !request.confirmed {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let _ = request.confirmation_id;
+        let mut store = self.store()?;
+        let published = store
+            .publish_draft(&request.draft_id, request.expected_revision)
+            .map_err(|error| match error {
+                commonkit_about_me::ProfileError::StaleRevision => DomainFailure::StalePlan,
+                _ => DomainFailure::OperationFailed,
+            })?;
+        serde_json::to_value(published).map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn suggestions(&self) -> Result<Value, DomainFailure> {
+        let store = self.store()?;
+        let suggestions = store
+            .pending_suggestions()
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(serde_json::json!({"suggestions": suggestions}))
+    }
+
+    fn decide_suggestion(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeDecisionRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        if !request.confirmed {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let _ = request.confirmation_id;
+        let mut store = self.store()?;
+        let published = store
+            .decide_suggestion(&request.suggestion_id, request.decision)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        Ok(serde_json::json!({"published": published}))
+    }
+
+    fn summary(&self) -> Result<Value, DomainFailure> {
+        let store = self.store()?;
+        Ok(serde_json::json!({
+            "revision": store.revision().map_err(|_| DomainFailure::OperationFailed)?,
+            "summary": store.summary(&self.view()).map_err(|_| DomainFailure::OperationFailed)?,
+        }))
+    }
+
+    fn search(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeSearchRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let mut store = self.store()?;
+        let mut results = store
+            .search(&self.view(), &request.query, request.limit as usize)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        if !request.categories.is_empty() {
+            results.retain(|result| request.categories.contains(result.category.as_str()));
+        }
+        serde_json::to_value(serde_json::json!({"claims": results}))
+            .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn suggest(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeSuggestionRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        let view = self.view();
+        let mut store = self.store()?;
+        let suggestion = store
+            .suggest(
+                view.clone(),
+                ClaimInput {
+                    topic_key: request.topic_key,
+                    category: request.category,
+                    text: request.text,
+                    views: vec![view],
+                },
+                &request.evidence_quote,
+                &self.config.agent_id,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        serde_json::to_value(suggestion).map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn resolve_conflict(&self, request: Value) -> Result<Value, DomainFailure> {
+        let request: AboutMeResolveRequest =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        if !request.confirmed {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let _ = request.confirmation_id;
+        let mut store = self.store()?;
+        let published = store
+            .resolve_contradiction(
+                &request.active_claim_id,
+                request.expected_revision,
+                &request.replacement_text,
+                &request.evidence_quote,
+            )
+            .map_err(|error| match error {
+                commonkit_about_me::ProfileError::StaleRevision => DomainFailure::StalePlan,
+                _ => DomainFailure::OperationFailed,
+            })?;
+        serde_json::to_value(published).map_err(|_| DomainFailure::OperationFailed)
+    }
+}
+
 impl CredentialDomain for ProductionCredentialDomain {
     fn plan(&self, request: Value) -> Result<Value, DomainFailure> {
         let _guard = self
@@ -2894,10 +3322,8 @@ impl CredentialDomain for ProductionCredentialDomain {
                 .destinations
                 .get(&planned.destination_id)
                 .ok_or(DomainFailure::StalePlan)?;
-            match resolve(&destination.reference, self.bws_executable.as_deref()) {
-                Ok(secret) => resolved.push((planned, destination, secret)),
-                Err(error) => return Err(error),
-            }
+            let secret = resolve(&destination.reference, self.bws_executable.as_deref())?;
+            resolved.push((planned, destination, secret));
         }
         let recovery = resolved
             .iter()

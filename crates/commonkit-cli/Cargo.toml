@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 commonkit-config = { path = "../commonkit-config" }
+commonkit-about-me = { path = "../commonkit-about-me" }
 commonkit-adapters = { path = "../commonkit-adapters" }
 commonkit-contracts = { path = "../commonkit-contracts" }
 commonkit-core = { path = "../commonkit-core" }
@@ -23,6 +24,7 @@ commonkit-service = { path = "../commonkit-service" }
 commonkit-skills = { path = "../commonkit-skills" }
 serde_json.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
+rand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true

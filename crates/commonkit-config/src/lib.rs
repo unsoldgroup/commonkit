@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use commonkit_contracts::{
     CommonKitLock, ContractError, Contribution, LayerDocument, LayerKind, LockedLayer,
     MergeOperation, ProvenanceTrace, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
-    TraceEntry, V1_LAYER_SPEC_FIELDS, canonical_json, digest_domain_json, digest_json,
+    StyleguideBinding, StyleguideDescriptor, StyleguideSelection, TraceEntry, V1_LAYER_SPEC_FIELDS,
+    canonical_json, digest_domain_json, digest_json,
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -77,6 +78,14 @@ fn validate_v1_spec(spec: &Value) -> Result<(), LayerSetError> {
             field: "theme".into(),
             expected: "string",
         });
+    }
+    if let Some(styleguide) = object
+        .get("capabilities")
+        .and_then(Value::as_object)
+        .and_then(|capabilities| capabilities.get("styleguide"))
+    {
+        serde_json::from_value::<StyleguideSelection>(styleguide.clone())
+            .map_err(|error| LayerSetError::InvalidStyleguideSelection(error.to_string()))?;
     }
     for field in ["adapters", "hooks", "plugins", "targets"] {
         let Some(value) = object.get(field) else {
@@ -289,6 +298,8 @@ pub enum LayerSetError {
     InvalidSpecItemId { field: String, id: String },
     #[error("CommonKit v1 spec collection {field} contains duplicate ID {id}")]
     DuplicateSpecItemId { field: String, id: String },
+    #[error("invalid styleguide selection: {0}")]
+    InvalidStyleguideSelection(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,8 +369,9 @@ impl MergeRules {
 /// one authoritative rule set instead of letting entry points infer collection
 /// behavior independently.
 pub fn v1_merge_rules() -> MergeRules {
-    let mut rules =
-        MergeRules::new().with_strategy("/securityPolicy/deniedPaths", MergeStrategy::SetUnion);
+    let mut rules = MergeRules::new()
+        .with_strategy("/securityPolicy/deniedPaths", MergeStrategy::SetUnion)
+        .with_strategy("/capabilities/styleguide", MergeStrategy::Replace);
     for pointer in ["/requirements", "/denials"] {
         rules = rules.with_strategy(pointer, MergeStrategy::SetUnion);
     }
@@ -372,6 +384,99 @@ pub fn v1_merge_rules() -> MergeRules {
         );
     }
     rules
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StyleguidePolicy {
+    pub denied: bool,
+    pub pinned_skill_id: Option<StableId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedStyleguide {
+    pub selection: StyleguideSelection,
+    pub descriptor: StyleguideDescriptor,
+    /// Canonical normalized-state and plan-provenance binding. Callers include
+    /// `binding.digest()` in their provider-input digest before planning.
+    pub binding: StyleguideBinding,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum StyleguideResolutionError {
+    #[error("organization policy denies styleguides")]
+    DeniedByOrganization,
+    #[error("organization policy pins styleguide {expected}, but the loadout selected {actual}")]
+    OrganizationPinMismatch {
+        expected: StableId,
+        actual: StableId,
+    },
+    #[error("selected styleguide skill is not exported by staged APM output: {0}")]
+    MissingExport(StableId),
+    #[error("staged APM output contains multiple active styleguide exports")]
+    AmbiguousExports,
+    #[error("selected styleguide has no descriptor: {0}")]
+    MissingDescriptor(StableId),
+    #[error("styleguide descriptor exports {descriptor}, but the loadout selected {selection}")]
+    DescriptorExportMismatch {
+        selection: StableId,
+        descriptor: StableId,
+    },
+    #[error(transparent)]
+    InvalidDescriptor(#[from] ContractError),
+}
+
+pub fn resolve_styleguide_selection(
+    selection: Option<&StyleguideSelection>,
+    descriptors: &BTreeMap<StableId, StyleguideDescriptor>,
+    staged_styleguide_exports: &BTreeSet<StableId>,
+    policy: &StyleguidePolicy,
+) -> Result<Option<ResolvedStyleguide>, StyleguideResolutionError> {
+    let Some(selection) = selection else {
+        return Ok(None);
+    };
+    if policy.denied {
+        return Err(StyleguideResolutionError::DeniedByOrganization);
+    }
+    if let Some(expected) = &policy.pinned_skill_id
+        && expected != &selection.skill_id
+    {
+        return Err(StyleguideResolutionError::OrganizationPinMismatch {
+            expected: expected.clone(),
+            actual: selection.skill_id.clone(),
+        });
+    }
+    if staged_styleguide_exports.len() > 1 {
+        return Err(StyleguideResolutionError::AmbiguousExports);
+    }
+    if !staged_styleguide_exports.contains(&selection.skill_id) {
+        return Err(StyleguideResolutionError::MissingExport(
+            selection.skill_id.clone(),
+        ));
+    }
+    let descriptor = descriptors
+        .get(&selection.skill_id)
+        .ok_or_else(|| StyleguideResolutionError::MissingDescriptor(selection.skill_id.clone()))?
+        .clone();
+    if descriptor.exported_skill != selection.skill_id {
+        return Err(StyleguideResolutionError::DescriptorExportMismatch {
+            selection: selection.skill_id.clone(),
+            descriptor: descriptor.exported_skill,
+        });
+    }
+    let descriptor_digest = descriptor.digest()?;
+    let binding = StyleguideBinding {
+        selection: selection.clone(),
+        descriptor_digest,
+        package_manifest_digest: descriptor.package.manifest_digest.clone(),
+        package_lock_digest: descriptor.package.lock_digest.clone(),
+        evaluation_suite_digest: descriptor.evaluation_suite_digest.clone(),
+        retention_map_digest: descriptor.retention_map_digest.clone(),
+    };
+    Ok(Some(ResolvedStyleguide {
+        selection: selection.clone(),
+        descriptor,
+        binding,
+    }))
 }
 
 pub fn merge_specs(base: &Value, overlay: &Value, rules: &MergeRules) -> Result<Value, MergeError> {

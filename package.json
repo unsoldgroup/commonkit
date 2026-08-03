@@ -6,6 +6,9 @@
   "type": "module",
   "packageManager": "pnpm@10.28.2",
   "scripts": {
+    "ci:test": "pnpm install --frozen-lockfile && pnpm run test",
+    "ci:desktop-test": "pnpm install --frozen-lockfile && pnpm --dir apps/desktop test",
+    "ci:desktop-typecheck": "pnpm install --frozen-lockfile && pnpm --dir apps/desktop typecheck",
     "build": "pnpm --filter mcp-local-relay build && pnpm --filter @commonkit/session-board-protocol build",
     "test": "pnpm run test:commonkit && pnpm run test:relay && pnpm --filter @commonkit/session-board-protocol build && pnpm run test:session-board-protocol && pnpm run test:session-board-hub && pnpm run test:session-board-reporter && pnpm run test:session-board-hook && pnpm run test:session-board-web",
     "test:commonkit": "node --test test/*.test.mjs",

@@ -986,6 +986,27 @@ fn router_with_control_and_relay(
             "/control/v1/context/profile-revision-proposals",
             post(context_propose_profile_revision),
         )
+        .route("/control/v1/about-me", get(about_me_inspect))
+        .route("/control/v1/about-me/summary", get(about_me_summary))
+        .route("/control/v1/about-me/drafts", post(about_me_create_draft))
+        .route(
+            "/control/v1/about-me/drafts/publish",
+            post(about_me_publish_draft),
+        )
+        .route("/control/v1/about-me/search", post(about_me_search))
+        .route("/control/v1/about-me/suggestions", post(about_me_suggest))
+        .route(
+            "/control/v1/about-me/suggestions/pending",
+            get(about_me_suggestions),
+        )
+        .route(
+            "/control/v1/about-me/suggestions/decide",
+            post(about_me_decide_suggestion),
+        )
+        .route(
+            "/control/v1/about-me/conflicts/resolve",
+            post(about_me_resolve_conflict),
+        )
         .route("/control/v1/compose", get(compose_state))
         .route("/control/v1/explain", post(explain_state))
         .route("/control/v1/sync/plan", post(sync_plan))
@@ -2143,6 +2164,18 @@ pub trait SnapshotDomain: Send + Sync + 'static {
     fn promote(&self, request: Value) -> Result<Value, DomainFailure>;
 }
 
+pub trait AboutMeDomain: Send + Sync + 'static {
+    fn inspect(&self) -> Result<Value, DomainFailure>;
+    fn create_draft(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn publish_draft(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn suggestions(&self) -> Result<Value, DomainFailure>;
+    fn decide_suggestion(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn summary(&self) -> Result<Value, DomainFailure>;
+    fn search(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn suggest(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn resolve_conflict(&self, request: Value) -> Result<Value, DomainFailure>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainFailure {
     InvalidRequest,
@@ -2154,6 +2187,7 @@ pub enum DomainFailure {
 
 #[derive(Clone, Default)]
 pub struct HeadlessDomainRegistry {
+    pub about_me: Option<Arc<dyn AboutMeDomain>>,
     pub composition: Option<Arc<dyn CompositionDomain>>,
     pub sync: Option<Arc<dyn SyncDomain>>,
     pub credentials: Option<Arc<dyn CredentialDomain>>,
@@ -3712,6 +3746,76 @@ async fn credentials_verify(
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("credential_domain_unconfigured"))?;
     safe_domain_result(domain.verify(request))
+}
+
+async fn about_me_summary(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    safe_domain_result(about_me_domain(&state)?.summary())
+}
+
+async fn about_me_inspect(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    safe_domain_result(about_me_domain(&state)?.inspect())
+}
+
+async fn about_me_create_draft(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    safe_domain_result(about_me_domain(&state)?.create_draft(request))
+}
+
+async fn about_me_publish_draft(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    safe_domain_result(about_me_domain(&state)?.publish_draft(request))
+}
+
+async fn about_me_suggestions(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    safe_domain_result(about_me_domain(&state)?.suggestions())
+}
+
+async fn about_me_decide_suggestion(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    safe_domain_result(about_me_domain(&state)?.decide_suggestion(request))
+}
+
+async fn about_me_search(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    safe_domain_result(about_me_domain(&state)?.search(request))
+}
+
+async fn about_me_suggest(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    safe_domain_result(about_me_domain(&state)?.suggest(request))
+}
+
+async fn about_me_resolve_conflict(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    require_consent(&request)?;
+    safe_domain_result(about_me_domain(&state)?.resolve_conflict(request))
+}
+
+fn about_me_domain(state: &ApiState) -> Result<Arc<dyn AboutMeDomain>, ApiError> {
+    state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .about_me
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("about_me_domain_unconfigured"))
 }
 
 async fn snapshot_create(

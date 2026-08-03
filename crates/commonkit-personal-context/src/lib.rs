@@ -423,6 +423,47 @@ pub struct RevisionBinding {
     pub parent_hashes: Vec<Sha256Digest>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct ProfileFieldId(String);
+
+impl ProfileFieldId {
+    pub fn parse(value: impl Into<String>) -> Result<Self, CryptoError> {
+        let value = value.into();
+        let valid_length = !value.is_empty() && value.len() <= 127;
+        let mut segments = value.split('.');
+        let valid_segments = segments.all(|segment| {
+            let mut characters = segment.chars();
+            characters
+                .next()
+                .is_some_and(|character| character.is_ascii_lowercase())
+                && characters.all(|character| {
+                    character.is_ascii_lowercase()
+                        || character.is_ascii_digit()
+                        || matches!(character, '_' | '-')
+                })
+        });
+        if valid_length && valid_segments {
+            Ok(Self(value))
+        } else {
+            Err(CryptoError::InvalidFieldId)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ProfileFieldId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EncryptedOperation {
@@ -440,7 +481,7 @@ pub struct WrappedDataKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EncryptedField {
-    pub field_id: StableId,
+    pub field_id: ProfileFieldId,
     pub operation: EncryptedOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nonce: Option<String>,
@@ -461,20 +502,20 @@ pub struct EncryptedRevision {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldConflict {
-    pub field_id: StableId,
+    pub field_id: ProfileFieldId,
     pub left: EncryptedField,
     pub right: EncryptedField,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeOutcome {
-    pub merged: BTreeMap<StableId, EncryptedField>,
+    pub merged: BTreeMap<ProfileFieldId, EncryptedField>,
     pub conflicts: Vec<FieldConflict>,
 }
 
 pub fn merge_concurrent_operations(
-    left: BTreeMap<StableId, EncryptedField>,
-    mut right: BTreeMap<StableId, EncryptedField>,
+    left: BTreeMap<ProfileFieldId, EncryptedField>,
+    mut right: BTreeMap<ProfileFieldId, EncryptedField>,
 ) -> MergeOutcome {
     let mut merged = BTreeMap::new();
     let mut conflicts = Vec::new();
@@ -501,7 +542,7 @@ pub fn merge_concurrent_operations(
 #[serde(rename_all = "camelCase")]
 struct LeafBinding<'a> {
     revision: &'a RevisionBinding,
-    field_id: &'a StableId,
+    field_id: &'a ProfileFieldId,
     operation: EncryptedOperation,
     recipient_set_digest: &'a Sha256Digest,
 }
@@ -534,11 +575,13 @@ pub enum CryptoError {
     RevisionCollision,
     #[error("recovery recipient is invalid")]
     InvalidRecipient,
+    #[error("profile field ID is invalid")]
+    InvalidFieldId,
 }
 
 pub fn encrypt_revision_for_recipient_strings(
     binding: RevisionBinding,
-    fields: BTreeMap<StableId, FieldOperation>,
+    fields: BTreeMap<ProfileFieldId, FieldOperation>,
     recipients: &[String],
 ) -> Result<EncryptedRevision, CryptoError> {
     let recipients = recipients
@@ -552,7 +595,7 @@ pub fn encrypt_revision_for_recipient_strings(
 
 pub fn encrypt_revision(
     binding: RevisionBinding,
-    fields: BTreeMap<StableId, FieldOperation>,
+    fields: BTreeMap<ProfileFieldId, FieldOperation>,
     recipients: &[x25519::Recipient],
 ) -> Result<EncryptedRevision, CryptoError> {
     if recipients.is_empty() {
@@ -657,7 +700,7 @@ pub fn encrypt_revision(
 pub fn decrypt_revision(
     revision: &EncryptedRevision,
     identity: &x25519::Identity,
-) -> Result<BTreeMap<StableId, DecryptedValue>, CryptoError> {
+) -> Result<BTreeMap<ProfileFieldId, DecryptedValue>, CryptoError> {
     let mut recipient_names = revision
         .wrapped_data_keys
         .iter()

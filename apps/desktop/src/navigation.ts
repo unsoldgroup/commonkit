@@ -4,6 +4,7 @@ export const navigation = [
   { group: "Operate", route: "plans", label: "Changes" },
   { group: "Operate", route: "credentials", label: "Credentials" },
   { group: "Operate", route: "snapshots", label: "Data" },
+  { group: "Operate", route: "aboutMe", label: "About Me" },
   { group: "Operate", route: "relay", label: "MCP connections" },
   { group: "Operate", route: "schedule", label: "Drift checks" },
   { group: "System", route: "diagnostics", label: "Diagnostics" },

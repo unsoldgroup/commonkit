@@ -36,7 +36,16 @@ pub struct ApiState {
     objects: Option<LocalObjectStore>,
     artifact_signing_key: Option<Arc<String>>,
     policy: Option<Arc<ExecutionPolicy>>,
+    webhook: Option<Arc<webhook::WebhookConfig>>,
 }
+
+pub mod github;
+
+pub mod webhook;
+
+pub mod secrets;
+
+pub mod workspace;
 
 pub mod worker;
 
@@ -65,6 +74,7 @@ impl ApiState {
             objects: None,
             artifact_signing_key: None,
             policy: None,
+            webhook: None,
         }
     }
 
@@ -79,6 +89,10 @@ impl ApiState {
     }
     pub fn with_policy(mut self, policy: ExecutionPolicy) -> Self {
         self.policy = Some(Arc::new(policy));
+        self
+    }
+    pub fn with_github_webhook(mut self, config: webhook::WebhookConfig) -> Self {
+        self.webhook = Some(Arc::new(config));
         self
     }
 }
@@ -138,6 +152,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/execution/v1/worker/complete", post(complete))
         .route("/execution/v1/worker/heartbeat", post(heartbeat))
         .route("/execution/v1/targets", get(targets))
+        .route("/execution/v1/github/webhook", post(webhook::receive))
         .with_state(state)
 }
 

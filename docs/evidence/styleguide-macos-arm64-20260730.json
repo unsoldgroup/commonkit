@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "recordedAt": "2026-07-30",
+  "package": "commonkit-styleguide",
+  "packageVersion": "0.1.0",
+  "lifecycle": "experimental",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "nodeVersion": "v25.5.0",
+  "apmVersion": "0.25.0",
+  "apmRevision": "d73e6ac",
+  "targets": [
+    "claude",
+    "codex"
+  ],
+  "skillDigest": "sha256:92b721d0af1d1fc98696a4a8cbbb6ecff618ca84beedcf8d2a0bde7a57dfe6fc",
+  "checks": {
+    "install": "passed",
+    "frozenReplay": "passed",
+    "audit": {
+      "passed": 9,
+      "failed": 0
+    },
+    "claudeSourceParity": "passed",
+    "codexSourceParity": "passed"
+  },
+  "command": "APM_BIN=/Users/astemarie/.local/bin/apm pnpm --filter @commonkit/styleguide test:apm"
+}

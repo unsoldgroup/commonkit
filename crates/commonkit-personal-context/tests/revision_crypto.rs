@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, str::FromStr};
 use age::x25519;
 use commonkit_contracts::{SchemaVersion, Sha256Digest, StableId};
 use commonkit_personal_context::{
-    FieldOperation, RevisionBinding, SecretValue, decrypt_revision, encrypt_revision,
-    rotate_recipients,
+    FieldOperation, ProfileFieldId, RevisionBinding, SecretValue, decrypt_revision,
+    encrypt_revision, rotate_recipients,
 };
 
 fn digest(character: char) -> Sha256Digest {
@@ -29,11 +29,11 @@ fn revision_values_round_trip_through_either_recovery_recipient() {
     let recipients = vec![device.to_public(), offline.to_public()];
     let fields = BTreeMap::from([
         (
-            StableId::parse("communication.tone").unwrap(),
+            ProfileFieldId::parse("communication.tone").unwrap(),
             FieldOperation::Set(SecretValue::new("direct and warm")),
         ),
         (
-            StableId::parse("identity.pronouns").unwrap(),
+            ProfileFieldId::parse("identity.pronouns").unwrap(),
             FieldOperation::Delete,
         ),
     ]);
@@ -43,13 +43,13 @@ fn revision_values_round_trip_through_either_recovery_recipient() {
     let with_offline = decrypt_revision(&encrypted, &offline).unwrap();
 
     assert_eq!(
-        with_device[&StableId::parse("communication.tone").unwrap()]
+        with_device[&ProfileFieldId::parse("communication.tone").unwrap()]
             .expose()
             .unwrap(),
         b"direct and warm"
     );
     assert!(
-        with_device[&StableId::parse("identity.pronouns").unwrap()]
+        with_device[&ProfileFieldId::parse("identity.pronouns").unwrap()]
             .expose()
             .is_none()
     );
@@ -61,7 +61,7 @@ fn tampering_and_wrong_recipients_are_rejected() {
     let owner = x25519::Identity::generate();
     let stranger = x25519::Identity::generate();
     let fields = BTreeMap::from([(
-        StableId::parse("communication-tone").unwrap(),
+        ProfileFieldId::parse("communication-tone").unwrap(),
         FieldOperation::Set(SecretValue::new("concise")),
     )]);
     let mut encrypted = encrypt_revision(binding(), fields, &[owner.to_public()]).unwrap();
@@ -75,7 +75,7 @@ fn tampering_and_wrong_recipients_are_rejected() {
     assert!(decrypt_revision(&encrypted, &owner).is_err());
 
     let fields = BTreeMap::from([(
-        StableId::parse("communication-tone").unwrap(),
+        ProfileFieldId::parse("communication-tone").unwrap(),
         FieldOperation::Set(SecretValue::new("concise")),
     )]);
     let mut recipient_tamper = encrypt_revision(binding(), fields, &[owner.to_public()]).unwrap();
@@ -96,7 +96,7 @@ fn portable_document_and_debug_output_never_expose_plaintext() {
     let secret = SecretValue::new("never-store-this-phrase");
     assert_eq!(format!("{secret:?}"), "SecretValue([REDACTED])");
     let fields = BTreeMap::from([(
-        StableId::parse("agents-response-style").unwrap(),
+        ProfileFieldId::parse("agents-response-style").unwrap(),
         FieldOperation::Set(secret),
     )]);
 
@@ -111,7 +111,7 @@ fn rotating_recipients_reencrypts_fields_and_revokes_the_old_identity() {
     let old = x25519::Identity::generate();
     let replacement = x25519::Identity::generate();
     let fields = BTreeMap::from([(
-        StableId::parse("communication-tone").unwrap(),
+        ProfileFieldId::parse("communication-tone").unwrap(),
         FieldOperation::Set(SecretValue::new("plainspoken")),
     )]);
     let encrypted = encrypt_revision(binding(), fields, &[old.to_public()]).unwrap();
@@ -120,7 +120,7 @@ fn rotating_recipients_reencrypts_fields_and_revokes_the_old_identity() {
     assert!(decrypt_revision(&rotated, &old).is_err());
     assert_eq!(
         decrypt_revision(&rotated, &replacement).unwrap()
-            [&StableId::parse("communication-tone").unwrap()]
+            [&ProfileFieldId::parse("communication-tone").unwrap()]
             .expose()
             .unwrap(),
         b"plainspoken"

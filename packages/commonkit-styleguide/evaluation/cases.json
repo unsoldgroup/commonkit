@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "suiteId": "technical-writing-v1",
+  "metric": {
+    "name": "writing-form violations per 100 words",
+    "minimumAggregateReductionBasisPoints": 3000,
+    "longFormRegressionAllowed": false,
+    "shortOutputComparison": "absolute_violation_count"
+  },
+  "requiredAssertions": [
+    "factual_fidelity",
+    "required_detail",
+    "applicability",
+    "mode_selection"
+  ],
+  "splits": {
+    "train": [
+      {"id": "readme-train", "scope": "readme", "mode": "technical"},
+      {"id": "procedure-train", "scope": "procedure", "mode": "strict"},
+      {"id": "error-train", "scope": "error-message", "mode": "strict"}
+    ],
+    "validation": [
+      {"id": "api-validation", "scope": "api-documentation", "mode": "technical"},
+      {"id": "pr-validation", "scope": "pr-description", "mode": "technical"},
+      {"id": "deprecation-validation", "scope": "deprecation-notice", "mode": "technical"}
+    ],
+    "heldOut": [
+      {"id": "readme-held-out", "scope": "readme", "mode": "technical"},
+      {"id": "procedure-held-out", "scope": "procedure", "mode": "strict"},
+      {"id": "error-held-out", "scope": "error-message", "mode": "strict"},
+      {"id": "api-held-out", "scope": "api-documentation", "mode": "technical"},
+      {"id": "pr-held-out", "scope": "pr-description", "mode": "technical"},
+      {"id": "deprecation-held-out", "scope": "deprecation-notice", "mode": "technical"},
+      {"id": "code-negative", "scope": "source-code", "route": false},
+      {"id": "command-negative", "scope": "command-syntax", "route": false},
+      {"id": "marketing-negative", "scope": "marketing-copy", "route": false},
+      {"id": "voice-negative", "scope": "voice-sensitive-prose", "route": false}
+    ]
+  }
+}

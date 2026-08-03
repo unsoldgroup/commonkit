@@ -13,6 +13,42 @@ test("management panels render live domain state without secret values", () => {
   assert.doesNotMatch(html, /secretValue/);
 });
 
+test("about me panel explains encryption and keeps project memory separate", () => {
+  const html = managementPanel("aboutMe", {
+    aboutMe: {
+      revision: 3,
+      summary: "Call me Al.",
+      pendingSuggestions: 1,
+      suggestions: [{
+        id: "suggestion-1",
+        claim: { text: "Use fewer acronyms." },
+        evidenceQuote: "Please use fewer acronyms.",
+      }],
+    },
+  });
+  assert.match(html, /Encrypted profile/i);
+  assert.match(html, /Call me Al/);
+  assert.match(html, /1 suggestion/i);
+  assert.match(html, /Use fewer acronyms/);
+  assert.match(html, /Please use fewer acronyms/);
+  assert.match(html, /data-about-me-decision="accept"/);
+  assert.match(html, /data-about-me-decision="reject"/);
+  assert.match(html, /current loadout and project/i);
+});
+
+test("unconfigured about me panel contains a plain-language setup interview", () => {
+  const html = managementPanel("aboutMe", {
+    aboutMe: { error: "about_me_domain_unconfigured" },
+  });
+
+  assert.match(html, /What should agents call you/i);
+  assert.match(html, /How should agents explain/i);
+  assert.match(html, /What should agents never assume/i);
+  assert.match(html, /id="about-me-setup"/);
+  assert.match(html, /Nothing is saved until/i);
+  assert.doesNotMatch(html, /about_me_domain_unconfigured/);
+});
+
 test("every operator screen states its objective before exposing controls", () => {
   const fixtures = {
     plans: { specDigest: "sha256:spec" },

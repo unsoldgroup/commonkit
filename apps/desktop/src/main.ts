@@ -45,6 +45,7 @@ function placeholder(route: Route): string {
     plans: ["Plan review", "Plans show semantic operations, provenance, risk, and required confirmation before apply."],
     credentials: ["Credential readiness", "CommonKit reports references and readiness here. Secret values never enter this window."],
     snapshots: ["Snapshots", "Review encrypted snapshot history, writer authority, restore plans, and promotions."],
+    aboutMe: ["About Me", "Review the encrypted personal context available to this loadout and project."],
     relay: ["Relay", "Review persistent relay health and authenticated upstream readiness."],
     schedule: ["Drift schedule", "Configure read-only checks and notifications. Mutations remain explicitly confirmed."],
     diagnostics: ["Diagnostics", "Inspect redacted component health and export a schema-bound diagnostic bundle."],
@@ -337,6 +338,37 @@ function showError(route: Route, error: unknown): void {
 }
 
 function bindManagementActions(route: Route): void {
+  document.querySelector<HTMLFormElement>("#about-me-setup")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const values = new FormData(event.currentTarget as HTMLFormElement);
+    const answers = {
+      name: String(values.get("about-me-name") ?? "").trim(),
+      explanationStyle: String(values.get("about-me-explanations") ?? "").trim(),
+      decisionStyle: String(values.get("about-me-decisions") ?? "").trim(),
+      tools: String(values.get("about-me-tools") ?? "").trim(),
+      constraints: String(values.get("about-me-constraints") ?? "").trim(),
+      neverAssume: String(values.get("about-me-never-assume") ?? "").trim(),
+    };
+    const review = Object.values(answers).filter(Boolean).map((value) => `• ${value}`).join("\n");
+    if (!review || !window.confirm(`Review what CommonKit will remember:\n\n${review}\n\nSave this encrypted profile?`)) return;
+    void showResult(route, async () => {
+      await desktopApi.aboutMeSetup(answers, true);
+      return desktopApi.managementSnapshot().then((value) => value.aboutMe);
+    });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-about-me-decision]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const suggestionId = button.dataset.aboutMeId;
+      const decision = button.dataset.aboutMeDecision;
+      if (!suggestionId || (decision !== "accept" && decision !== "reject")) return;
+      const verb = decision === "accept" ? "Remember this" : "Forget and stop suggesting this";
+      if (!window.confirm(`${verb}?`)) return;
+      void showResult(route, async () => {
+        await desktopApi.aboutMeDecide(suggestionId, decision, confirmationId(`about-me-${decision}`));
+        return desktopApi.managementSnapshot().then((value) => value.aboutMe);
+      });
+    });
+  });
   document.querySelector("#plan-sync")?.addEventListener("click", () => {
     try {
       const targetId = convergenceTarget(targets);
