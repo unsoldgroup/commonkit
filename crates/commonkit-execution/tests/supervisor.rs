@@ -129,6 +129,34 @@ fn rejects_a_workspace_bundle_changed_after_materialization() {
     ));
 }
 
+/// A check that finishes just as its budget runs out has produced a real result.
+/// Reporting it as timed out would throw away validation evidence over a
+/// scheduling coincidence, and would do it most often to the slowest platform in
+/// the support matrix — the one whose evidence is hardest to get.
+#[test]
+fn a_process_that_finished_before_its_deadline_lapsed_reports_its_own_result() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("work")).unwrap();
+    let mut manifest = support::manifest();
+    manifest.repository_revision = support::init_repository(directory.path());
+    manifest.timeout_seconds = 1;
+    manifest.argv = vec!["true".into()];
+    let supervisor = ProcessSupervisor::new(
+        SupervisorMode::ProcessGroup,
+        directory.path().join("diagnostics"),
+    )
+    .unwrap();
+    let mut process = supervisor.spawn(&manifest, directory.path()).unwrap();
+    // Let the deadline lapse while the process is already finished and waiting to
+    // be harvested.
+    std::thread::sleep(Duration::from_millis(1200));
+    let status = process
+        .try_wait()
+        .expect("a finished process must not be reported as timed out")
+        .expect("a finished process must report its status");
+    assert!(status.success());
+}
+
 #[test]
 fn timeout_hard_kills_descendants_and_leaves_no_late_output() {
     let directory = tempfile::tempdir().unwrap();
@@ -399,4 +427,41 @@ fn enforcement_failures_have_stable_audit_categories() {
         SupervisorError::DiskLimitExceeded.audit_code(),
         "execution_disk_limit"
     );
+}
+
+/// A build tool churns through temporary files; the accounting walk must not
+/// turn that normal work into an enforcement failure by tripping over an entry
+/// that vanished between reading the directory and stat-ing it.
+#[test]
+fn disk_accounting_tolerates_files_the_job_deletes_underneath_it() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("work")).unwrap();
+    let mut manifest = support::manifest();
+    manifest.repository_revision = support::init_repository(directory.path());
+    manifest.timeout_seconds = 30;
+    manifest.resources.disk_mib = 64;
+    // Written only once the job is running, so the workspace is still a clean
+    // materialization at spawn.
+    manifest.argv = vec![
+        "sh".into(),
+        "-c".into(),
+        "for i in $(seq 1 400); do mkdir -p churn/$i; echo x > churn/$i/f; rm -rf churn/$i; done"
+            .into(),
+    ];
+    let supervisor = ProcessSupervisor::new(
+        SupervisorMode::ProcessGroup,
+        directory.path().join("diagnostics"),
+    )
+    .unwrap();
+    let mut process = supervisor.spawn(&manifest, directory.path()).unwrap();
+    loop {
+        match process.try_wait() {
+            Ok(Some(status)) => {
+                assert!(status.success());
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => panic!("accounting failed on a churning workspace: {error}"),
+        }
+    }
 }

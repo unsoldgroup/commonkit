@@ -100,19 +100,37 @@ async fn main() -> anyhow::Result<()> {
         Some(path) => commonkit_execd::secrets::load(path)?,
         None => BTreeMap::new(),
     };
-    let status = match (&args.tasks, secrets.get(GITHUB_STATUS_TOKEN)) {
-        (Some(path), Some(token)) => {
+    let declared = match &args.tasks {
+        Some(path) => {
             let declared: ExecutionContextFile =
                 serde_json::from_slice(&tokio::fs::read(path).await?)?;
             for manifest in declared.tasks.values() {
                 manifest.validate()?;
             }
-            Some(StatusReporter::new(&args.github_api, token, &declared.tasks)?)
+            Some(declared.tasks)
         }
+        None => None,
+    };
+    let status = match (&declared, secrets.get(GITHUB_STATUS_TOKEN)) {
+        (Some(tasks), Some(token)) => Some(StatusReporter::new(&args.github_api, token, tasks)?),
         (Some(_), None) => {
             anyhow::bail!("--tasks requires {GITHUB_STATUS_TOKEN} in the secret file");
         }
         _ => None,
+    };
+    // Declared tasks are what a delivery may submit; without them a webhook secret
+    // would authenticate a request that could not run anything.
+    let state = match (
+        std::env::var("COMMONKIT_EXECD_WEBHOOK_SECRET").ok(),
+        declared,
+    ) {
+        (Some(secret), Some(tasks)) => {
+            state.with_github_webhook(commonkit_execd::webhook::WebhookConfig::new(secret, tasks))
+        }
+        (Some(_), None) => {
+            anyhow::bail!("COMMONKIT_EXECD_WEBHOOK_SECRET requires --tasks");
+        }
+        _ => state,
     };
     if let Some(target_path) = args.target {
         let mut target: ExecutionTarget =
@@ -141,7 +159,16 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(error) =
                     run_once(&worker_state, &target, worker_id.clone(), &context).await
                 {
-                    eprintln!("worker iteration failed: {error}");
+                    // The top-level message names the stage; only the source chain
+                    // says what actually went wrong, and an operator diagnosing a
+                    // remote failure has nothing else to read.
+                    let mut line = format!("worker iteration failed: {error}");
+                    let mut source = std::error::Error::source(&error);
+                    while let Some(cause) = source {
+                        line.push_str(&format!(": {cause}"));
+                        source = cause.source();
+                    }
+                    eprintln!("{line}");
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }

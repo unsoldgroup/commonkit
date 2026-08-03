@@ -3319,10 +3319,8 @@ impl CredentialDomain for ProductionCredentialDomain {
                 .destinations
                 .get(&planned.destination_id)
                 .ok_or(DomainFailure::StalePlan)?;
-            match resolve(&destination.reference, self.bws_executable.as_deref()) {
-                Ok(secret) => resolved.push((planned, destination, secret)),
-                Err(error) => return Err(error),
-            }
+            let secret = resolve(&destination.reference, self.bws_executable.as_deref())?;
+            resolved.push((planned, destination, secret));
         }
         let recovery = resolved
             .iter()

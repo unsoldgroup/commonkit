@@ -183,7 +183,10 @@ fn skill_without_frontmatter_contributes_no_router_text() {
     let ledger = fixture.measure(
         &[
             fixture.file("skills/bare/SKILL.md", "# Bare skill\n\nNo frontmatter."),
-            fixture.file("skills/unterminated/SKILL.md", "---\nname: broken\nstill open"),
+            fixture.file(
+                "skills/unterminated/SKILL.md",
+                "---\nname: broken\nstill open",
+            ),
         ],
         None,
     );

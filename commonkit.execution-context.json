@@ -8,7 +8,13 @@
       "repository": "https://github.com/unsoldgroup/commonkit.git",
       "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
       "workspaceBundleDigest": null,
-      "argv": ["cargo", "test", "--workspace", "--all-features", "--locked"],
+      "argv": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--all-features",
+        "--locked"
+      ],
       "workdir": ".",
       "secretRefs": [],
       "timeoutSeconds": 2400,
@@ -18,21 +24,25 @@
         "memoryMib": 8192,
         "diskMib": 20480
       },
-      "requiredCapabilities": ["ci-linux-x64"],
-      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "requiredCapabilities": [
+        "ci-linux-x64"
+      ],
+      "loadoutDigest": "sha256:96eba9a0d2e0a1dc96e197b367d49d0248ae564002eede6b232bba87925960ea",
+      "executionProfileDigest": "sha256:5c732baaf81d9a49065a4e571d6108d8ca39527f61520b18f398f3878ab0f2b5",
       "retry": {
         "maxAttempts": 1,
         "retryableExitCodes": []
       },
       "checkpointEnabled": false,
       "artifacts": {
-        "globs": ["diagnostics/**"],
+        "globs": [
+          "diagnostics/**"
+        ],
         "retentionSeconds": 604800,
         "maxBytes": 8388608
       },
-      "networkPolicy": "restricted",
-      "repositoryWrite": false,
+      "networkPolicy": "allow",
+      "repositoryWrite": true,
       "browser": null
     },
     "ci-cargo-clippy": {
@@ -60,21 +70,25 @@
         "memoryMib": 8192,
         "diskMib": 20480
       },
-      "requiredCapabilities": ["ci-linux-x64"],
-      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "requiredCapabilities": [
+        "ci-linux-x64"
+      ],
+      "loadoutDigest": "sha256:96eba9a0d2e0a1dc96e197b367d49d0248ae564002eede6b232bba87925960ea",
+      "executionProfileDigest": "sha256:5c732baaf81d9a49065a4e571d6108d8ca39527f61520b18f398f3878ab0f2b5",
       "retry": {
         "maxAttempts": 1,
         "retryableExitCodes": []
       },
       "checkpointEnabled": false,
       "artifacts": {
-        "globs": ["diagnostics/**"],
+        "globs": [
+          "diagnostics/**"
+        ],
         "retentionSeconds": 604800,
         "maxBytes": 8388608
       },
-      "networkPolicy": "restricted",
-      "repositoryWrite": false,
+      "networkPolicy": "allow",
+      "repositoryWrite": true,
       "browser": null
     },
     "ci-pnpm-test": {
@@ -82,7 +96,11 @@
       "repository": "https://github.com/unsoldgroup/commonkit.git",
       "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
       "workspaceBundleDigest": null,
-      "argv": ["pnpm", "test"],
+      "argv": [
+        "pnpm",
+        "run",
+        "ci:test"
+      ],
       "workdir": ".",
       "secretRefs": [],
       "timeoutSeconds": 900,
@@ -92,21 +110,25 @@
         "memoryMib": 4096,
         "diskMib": 10240
       },
-      "requiredCapabilities": ["ci-linux-x64"],
-      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "requiredCapabilities": [
+        "ci-linux-x64"
+      ],
+      "loadoutDigest": "sha256:96eba9a0d2e0a1dc96e197b367d49d0248ae564002eede6b232bba87925960ea",
+      "executionProfileDigest": "sha256:5c732baaf81d9a49065a4e571d6108d8ca39527f61520b18f398f3878ab0f2b5",
       "retry": {
         "maxAttempts": 1,
         "retryableExitCodes": []
       },
       "checkpointEnabled": false,
       "artifacts": {
-        "globs": ["diagnostics/**"],
+        "globs": [
+          "diagnostics/**"
+        ],
         "retentionSeconds": 604800,
         "maxBytes": 8388608
       },
-      "networkPolicy": "restricted",
-      "repositoryWrite": false,
+      "networkPolicy": "allow",
+      "repositoryWrite": true,
       "browser": null
     },
     "ci-desktop-test": {
@@ -114,7 +136,11 @@
       "repository": "https://github.com/unsoldgroup/commonkit.git",
       "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
       "workspaceBundleDigest": null,
-      "argv": ["pnpm", "--dir", "apps/desktop", "test"],
+      "argv": [
+        "pnpm",
+        "run",
+        "ci:desktop-test"
+      ],
       "workdir": ".",
       "secretRefs": [],
       "timeoutSeconds": 900,
@@ -124,21 +150,25 @@
         "memoryMib": 4096,
         "diskMib": 10240
       },
-      "requiredCapabilities": ["ci-linux-x64"],
-      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "requiredCapabilities": [
+        "ci-linux-x64"
+      ],
+      "loadoutDigest": "sha256:96eba9a0d2e0a1dc96e197b367d49d0248ae564002eede6b232bba87925960ea",
+      "executionProfileDigest": "sha256:5c732baaf81d9a49065a4e571d6108d8ca39527f61520b18f398f3878ab0f2b5",
       "retry": {
         "maxAttempts": 1,
         "retryableExitCodes": []
       },
       "checkpointEnabled": false,
       "artifacts": {
-        "globs": ["diagnostics/**"],
+        "globs": [
+          "diagnostics/**"
+        ],
         "retentionSeconds": 604800,
         "maxBytes": 8388608
       },
-      "networkPolicy": "restricted",
-      "repositoryWrite": false,
+      "networkPolicy": "allow",
+      "repositoryWrite": true,
       "browser": null
     },
     "ci-desktop-typecheck": {
@@ -146,7 +176,11 @@
       "repository": "https://github.com/unsoldgroup/commonkit.git",
       "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
       "workspaceBundleDigest": null,
-      "argv": ["pnpm", "--dir", "apps/desktop", "typecheck"],
+      "argv": [
+        "pnpm",
+        "run",
+        "ci:desktop-typecheck"
+      ],
       "workdir": ".",
       "secretRefs": [],
       "timeoutSeconds": 600,
@@ -156,21 +190,25 @@
         "memoryMib": 4096,
         "diskMib": 10240
       },
-      "requiredCapabilities": ["ci-linux-x64"],
-      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "requiredCapabilities": [
+        "ci-linux-x64"
+      ],
+      "loadoutDigest": "sha256:96eba9a0d2e0a1dc96e197b367d49d0248ae564002eede6b232bba87925960ea",
+      "executionProfileDigest": "sha256:5c732baaf81d9a49065a4e571d6108d8ca39527f61520b18f398f3878ab0f2b5",
       "retry": {
         "maxAttempts": 1,
         "retryableExitCodes": []
       },
       "checkpointEnabled": false,
       "artifacts": {
-        "globs": ["diagnostics/**"],
+        "globs": [
+          "diagnostics/**"
+        ],
         "retentionSeconds": 604800,
         "maxBytes": 8388608
       },
-      "networkPolicy": "restricted",
-      "repositoryWrite": false,
+      "networkPolicy": "allow",
+      "repositoryWrite": true,
       "browser": null
     }
   }

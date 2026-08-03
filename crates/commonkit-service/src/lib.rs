@@ -2650,8 +2650,8 @@ async fn get_plan_budget(
     let ledger = ContextBudgetLedger::measure_plan(&plan, artifacts, limit)
         .map_err(|_| ApiError::internal("budget_measurement_failed"))?;
 
-    let mut report =
-        serde_json::to_value(&ledger).map_err(|_| ApiError::internal("budget_measurement_failed"))?;
+    let mut report = serde_json::to_value(&ledger)
+        .map_err(|_| ApiError::internal("budget_measurement_failed"))?;
     // Derived totals are computed rather than stored, so they are attached here
     // instead of duplicated as fields that could drift from the entries.
     if let Some(object) = report.as_object_mut() {

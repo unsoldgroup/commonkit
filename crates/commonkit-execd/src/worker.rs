@@ -78,21 +78,21 @@ pub async fn run_once(
     )?;
     // Preparation fetches from the manifest repository, so it must stay after the
     // policy check above: a denied repository is never contacted.
-    let workspace =
-        match workspace::prepare(&snapshot.job.manifest, workspace_root, &lease.job_id) {
-            Ok(path) => path,
-            Err(error) => {
-                fail_enforcement(
-                    state,
-                    &lease,
-                    target,
-                    "workspace_preparation_failed",
-                    status.map(|status| (status, &snapshot.job.manifest)),
-                )
-                .await?;
-                return Err(error.into());
-            }
-        };
+    let workspace = match workspace::prepare(&snapshot.job.manifest, workspace_root, &lease.job_id)
+    {
+        Ok(path) => path,
+        Err(error) => {
+            fail_enforcement(
+                state,
+                &lease,
+                target,
+                "workspace_preparation_failed",
+                status.map(|status| (status, &snapshot.job.manifest)),
+            )
+            .await?;
+            return Err(error.into());
+        }
+    };
     let mut guard = WorkspaceGuard {
         root: workspace_root,
         repository: snapshot.job.manifest.repository.clone(),
@@ -151,24 +151,24 @@ pub async fn run_once(
             Ok(None) => {}
             Err(error @ (SupervisorError::TimedOut | SupervisorError::DiskLimitExceeded)) => {
                 fail_enforcement(
-                state,
-                &lease,
-                target,
-                error.audit_code(),
-                status.map(|status| (status, &snapshot.job.manifest)),
-            )
-            .await?;
+                    state,
+                    &lease,
+                    target,
+                    error.audit_code(),
+                    status.map(|status| (status, &snapshot.job.manifest)),
+                )
+                .await?;
                 return Err(error.into());
             }
             Err(error) => {
                 fail_enforcement(
-                state,
-                &lease,
-                target,
-                error.audit_code(),
-                status.map(|status| (status, &snapshot.job.manifest)),
-            )
-            .await?;
+                    state,
+                    &lease,
+                    target,
+                    error.audit_code(),
+                    status.map(|status| (status, &snapshot.job.manifest)),
+                )
+                .await?;
                 return Err(error.into());
             }
         }

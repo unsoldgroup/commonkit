@@ -1,5 +1,5 @@
 //! The committed CI declaration must actually place on the committed CI target.
-use commonkit_contracts::{ExecutionManifest, ExecutionTarget};
+use commonkit_contracts::{ExecutionManifest, ExecutionTarget, digest_domain_json};
 use commonkit_execd::ExecutionPolicy;
 use commonkit_execution::placement;
 use serde::Deserialize;
@@ -29,6 +29,37 @@ fn tasks() -> BTreeMap<String, ExecutionManifest> {
     read::<ExecutionContextFile>("commonkit.execution-context.json").tasks
 }
 
+/// The digests a task pins are not free-standing constants: they are the digests
+/// of the committed loadout and execution-profile documents. Editing either
+/// document without re-pinning stops every declared task from placing, which is
+/// the fail-closed behaviour placement exists to give.
+#[test]
+fn the_pinned_digests_are_the_digests_of_the_committed_documents() {
+    let loadout = digest_domain_json(
+        "commonkit.loadout.v1",
+        &read::<serde_json::Value>("commonkit.ci-loadout.json"),
+    )
+    .unwrap();
+    let profile = digest_domain_json(
+        "commonkit.execution-profile.v1",
+        &read::<serde_json::Value>("commonkit.execution-profile.json"),
+    )
+    .unwrap();
+    let target: ExecutionTarget = read("commonkit.execution-target.example.json");
+    assert_eq!(target.loadout_digest, loadout, "target loadout digest");
+    assert_eq!(
+        target.execution_profile_digest, profile,
+        "target execution profile digest"
+    );
+    for (id, manifest) in tasks() {
+        assert_eq!(manifest.loadout_digest, loadout, "{id} loadout digest");
+        assert_eq!(
+            manifest.execution_profile_digest, profile,
+            "{id} execution profile digest"
+        );
+    }
+}
+
 #[test]
 fn every_declared_task_is_a_valid_manifest() {
     let tasks = tasks();
@@ -52,9 +83,28 @@ fn declared_tasks_do_not_shell_out() {
             !matches!(manifest.argv[0].as_str(), "sh" | "bash" | "zsh" | "cmd"),
             "{id} invokes a shell"
         );
+    }
+}
+
+/// `repositoryWrite` grants a writable bind of the job's own disposable worktree,
+/// which every build needs, and grants nothing else: a job cannot author history
+/// because no credential reaches it (ADR 0011), and the worktree is removed when
+/// the job reaches a terminal state.
+#[test]
+fn declared_tasks_get_a_writable_workspace_and_the_network_their_toolchain_needs() {
+    for (id, manifest) in tasks() {
         assert!(
-            !manifest.repository_write,
-            "{id} requests repository write"
+            manifest.repository_write,
+            "{id} cannot write its own build output"
+        );
+        assert_eq!(
+            manifest.network_policy,
+            commonkit_contracts::NetworkPolicy::Allow,
+            "{id} declares a network policy the supervisor cannot enforce"
+        );
+        assert!(
+            manifest.secret_refs.is_empty(),
+            "{id} asks for a secret a public check does not need"
         );
     }
 }

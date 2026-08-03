@@ -22,7 +22,9 @@ fn owner_only_secret_file_is_loaded() {
     let resolved = secrets::load(&path).unwrap();
 
     assert_eq!(
-        resolved.get("env://GITHUB_STATUS_TOKEN").map(String::as_str),
+        resolved
+            .get("env://GITHUB_STATUS_TOKEN")
+            .map(String::as_str),
         Some("token-value")
     );
 }

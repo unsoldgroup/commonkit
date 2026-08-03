@@ -159,6 +159,12 @@ impl ProcessSupervisor {
 }
 impl RunningProcess {
     pub fn try_wait(&mut self) -> Result<Option<ExitStatus>, SupervisorError> {
+        // Harvest first. A process that finished before this poll has already
+        // produced its result, and reporting it as timed out or over its disk
+        // limit would discard a real outcome over a scheduling coincidence.
+        if let Some(status) = self.child.try_wait()? {
+            return Ok(Some(status));
+        }
         if self.started.elapsed() >= self.timeout {
             self.kill_group()?;
             return Err(SupervisorError::TimedOut);
@@ -175,7 +181,7 @@ impl RunningProcess {
             self.kill_group()?;
             return Err(SupervisorError::DiskLimitExceeded);
         }
-        Ok(self.child.try_wait()?)
+        Ok(None)
     }
     pub fn wait(mut self, secrets: &[String]) -> Result<ProcessOutcome, SupervisorError> {
         loop {
@@ -394,11 +400,35 @@ fn collect_entries(
     Ok(())
 }
 
+/// Accounting walks a tree the job is actively writing, so entries appear and
+/// vanish underneath it. A build tool churning through temporary files is normal
+/// work, not an enforcement failure, and a file that no longer exists occupies
+/// nothing — so a vanished entry is skipped rather than failing the attempt.
+fn vanished(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    )
+}
+
 fn directory_size(root: &Path) -> Result<u64, SupervisorError> {
     let mut total = 0_u64;
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
-        let metadata = entry.metadata()?;
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if vanished(&error) => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if vanished(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if vanished(&error) => continue,
+            Err(error) => return Err(error.into()),
+        };
         if metadata.is_dir() {
             total = total.saturating_add(directory_size(&entry.path())?);
         } else if metadata.is_file() {
@@ -409,7 +439,11 @@ fn directory_size(root: &Path) -> Result<u64, SupervisorError> {
 }
 
 fn path_size(path: &Path) -> Result<u64, SupervisorError> {
-    let metadata = std::fs::metadata(path)?;
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if vanished(&error) => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
     if metadata.is_dir() {
         directory_size(path)
     } else {
@@ -506,6 +540,9 @@ fn sandbox_args(
     }
     args.extend(["--dir".into(), "/etc".into()]);
     for path in [
+        // Debian and Ubuntu route compilers, linkers, and interpreters through
+        // this symlink farm, so a toolchain in /usr is unreachable without it.
+        "/etc/alternatives",
         "/etc/ld.so.cache",
         "/etc/ssl/certs",
         "/etc/resolv.conf",

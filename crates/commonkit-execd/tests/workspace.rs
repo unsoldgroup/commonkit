@@ -81,7 +81,8 @@ fn prepared_workspace_matches_the_pinned_revision_and_origin() {
     let root = directory.path().join("workspaces");
     let (repository, first, _) = source_repository(&directory.path().join("source"));
 
-    let prepared = workspace::prepare(&manifest(&repository, first.clone()), &root, "job_a").unwrap();
+    let prepared =
+        workspace::prepare(&manifest(&repository, first.clone()), &root, "job_a").unwrap();
 
     assert_eq!(git(&prepared, &["rev-parse", "HEAD"]), first.as_str());
     // `verify_workspace` compares the origin URL against `manifest.repository`.
@@ -127,7 +128,8 @@ fn preparation_fetches_commits_pushed_after_the_mirror_was_created() {
     git(&source, &["commit", "-qm", "third"]);
     let third = GitRevision::parse(git(&source, &["rev-parse", "HEAD"])).unwrap();
 
-    let prepared = workspace::prepare(&manifest(&repository, third.clone()), &root, "job_b").unwrap();
+    let prepared =
+        workspace::prepare(&manifest(&repository, third.clone()), &root, "job_b").unwrap();
     assert_eq!(git(&prepared, &["rev-parse", "HEAD"]), third.as_str());
 }
 
@@ -150,8 +152,7 @@ fn job_identifiers_cannot_escape_the_workspace_root() {
     let root = directory.path().join("workspaces");
     let (repository, first, _) = source_repository(&directory.path().join("source"));
 
-    let error =
-        workspace::prepare(&manifest(&repository, first), &root, "../escape").unwrap_err();
+    let error = workspace::prepare(&manifest(&repository, first), &root, "../escape").unwrap_err();
 
     assert!(matches!(error, workspace::WorkspaceError::InvalidJobId(_)));
     assert!(!root.exists());

@@ -3,8 +3,8 @@
   "platform": "linux-x86_64",
   "healthy": true,
   "draining": false,
-  "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-  "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+  "loadoutDigest": "sha256:96eba9a0d2e0a1dc96e197b367d49d0248ae564002eede6b232bba87925960ea",
+  "executionProfileDigest": "sha256:5c732baaf81d9a49065a4e571d6108d8ca39527f61520b18f398f3878ab0f2b5",
   "capabilities": ["ci-linux-x64"],
   "readySecretRefs": [],
   "free": {

@@ -109,10 +109,7 @@ async fn a_declared_task_posts_a_namespaced_status_for_its_revision() {
     assert_eq!(payload["state"], "success");
     // Namespaced so it cannot collide with the existing `Workers Builds` status.
     assert_eq!(payload["context"], "commonkit/ci-cargo-test");
-    assert_eq!(
-        headers.get("authorization").unwrap(),
-        "Bearer secret-token"
-    );
+    assert_eq!(headers.get("authorization").unwrap(), "Bearer secret-token");
 }
 
 #[tokio::test]

@@ -86,9 +86,9 @@ fn job_path(root: &Path, job_id: &str) -> PathBuf {
 
 fn valid_job_id(job_id: &str) -> bool {
     !job_id.is_empty()
-        && job_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '_' || character == '-')
+        && job_id.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '_' || character == '-'
+        })
 }
 
 fn path_arg(path: &Path) -> Result<&str, WorkspaceError> {

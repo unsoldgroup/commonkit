@@ -7,5 +7,5 @@
   "maxMemoryMib": 16384,
   "maxDiskMib": 40960,
   "allowNetwork": true,
-  "allowRepositoryWrite": false
+  "allowRepositoryWrite": true
 }
