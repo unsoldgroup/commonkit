@@ -234,7 +234,12 @@ fn composes_layers_and_explains_the_winning_value() {
     let personal = directory.join("personal.json");
     fs::write(
         &base,
-        serde_json::to_vec(&layer("base", "public_base", json!({"theme": "light"}))).expect("base"),
+        serde_json::to_vec(&layer(
+            "base",
+            "public_base",
+            json!({"contextBudget": {"maxTotalTokens": 100}}),
+        ))
+        .expect("base"),
     )
     .expect("write base");
     fs::write(
@@ -245,8 +250,12 @@ fn composes_layers_and_explains_the_winning_value() {
     .expect("write organization");
     fs::write(
         &personal,
-        serde_json::to_vec(&layer("personal", "personal_kit", json!({"theme": "dark"})))
-            .expect("personal"),
+        serde_json::to_vec(&layer(
+            "personal",
+            "personal_kit",
+            json!({"contextBudget": {"maxTotalTokens": 80}}),
+        ))
+        .expect("personal"),
     )
     .expect("write personal");
 
@@ -265,10 +274,10 @@ fn composes_layers_and_explains_the_winning_value() {
         String::from_utf8_lossy(&output.stderr)
     );
     let composition: Value = serde_json::from_slice(&output.stdout).expect("JSON");
-    assert_eq!(composition["spec"]["theme"], "dark");
+    assert_eq!(composition["spec"]["contextBudget"]["maxTotalTokens"], 80);
 
     let explanation = Command::new(env!("CARGO_BIN_EXE_commonkit"))
-        .args(["explain", "/theme", "--layer"])
+        .args(["explain", "/contextBudget/maxTotalTokens", "--layer"])
         .arg(&base)
         .arg("--layer")
         .arg(&organization)

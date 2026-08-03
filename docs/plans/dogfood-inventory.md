@@ -84,14 +84,13 @@ where a secret comes from and where it must land, and never persists the value.
 `public_base` and `organization_policy` are mandatory; each kind appears at
 most once.
 
-All five share one closed 19-field spec vocabulary (`V1_LAYER_SPEC_FIELDS`,
-`contracts/src/lib.rs:796-816`).
+All five share one closed four-field spec vocabulary (`V1_LAYER_SPEC_FIELDS`):
+`securityPolicy`, `contextBudget`, `files`, and `capabilities`.
 
-Merge rules (`v1_merge_rules`, `config/src/lib.rs:371-387`):
-`deniedPaths`/`requirements`/`denials` set-union; `adapters`/`hooks`/`plugins`/`targets`
-merge by `id`; `capabilities.styleguide` whole-replace; everything else
-recursive-map. **`$delete` is registered nowhere** — no later layer can remove
-anything an earlier layer established.
+Merge rules (`v1_merge_rules`): `securityPolicy.deniedPaths` set-union and
+`capabilities.styleguide` whole-replace; everything else recursively merges or
+replaces according to its JSON type. **`$delete` is registered nowhere** — no
+later layer can remove anything an earlier layer established.
 
 Monotonicity is enforced in code, not by convention: `enforce_policy_floor`
 (`crates/commonkit-core/src/lib.rs:242-287`) applies five checks to
@@ -156,7 +155,7 @@ kit or target overrides.
 | G2 | **Adoption of pre-existing symlink farms.** Absolute symlink targets are rejected, and CommonKit refuses to traverse existing symlinks when inspecting a target. | The entire `~/.claude` / `~/.codex` / `~/.agents` topology as it stands today. Manageable only after links are rewritten relative under a single managed root. | `resources.rs:98-140`; `tests/target_filesystem.rs:42-62`. |
 | G3 | **System-level services.** `--user` is hardcoded in the systemd backend. | VPS Caddy, cloudflared, docker, sshd, tailscaled, and the four GitHub Actions runners. | `service_lifecycle.rs:72-122`. |
 | G4 | **macOS external provider execution.** Both pinned providers fail closed; there is no macOS asset in the release lock. | The Mac can only use `native`. The sandboxed-provider contract is unprovable on the machine Al uses most. | `providers/provider-release-lock.json`; `docs/SUPPORT-MATRIX.md`. |
-| G5 | **Inert layer fields.** `schedules`, `databases`, `hooks`, `plugins`, `settings`, `theme`, `arguments`, `requirements`, `denials`, `adapters`, `targets`, `snapshots`, `credentials` are accepted and merged but have no adapter behind them. | Anything declared in these fields silently does nothing. This is the most dangerous gap because it fails quietly rather than closed. | Layer spec accepts them; no adapter consumes them. |
+| G5 | **Inert layer fields (closed).** `adapters`, `arguments`, `credentials`, `databases`, `denials`, `hooks`, `plugins`, `relay`, `requirements`, `schedules`, `services`, `settings`, `snapshots`, `targets`, and `theme` are rejected as unsupported v1 layer declarations. | These domains remain available through their actual runtime or daemon configuration surfaces; layers no longer silently accept them. | `V1_LAYER_SPEC_FIELDS` contains only the four consumed fields. |
 | G6 | **No composition deletion.** `$delete` is registered nowhere, so a later layer can never remove an item an earlier layer established. | Any future need to drop a skill, agent, or service on one machine only. | `v1_merge_rules`, `config/src/lib.rs:371-387`. |
 | G7 | **Environment variables and shell env as resources.** Manageable only indirectly, by owning the dotfile that sets them. | Acceptable for now; noted so it is not mistaken for coverage. | No env resource type. |
 | G8 | **SSH keys, `known_hosts`, GPG.** Structurally banned. | `~/.ssh/config` and key material stay hand-managed permanently. | `is_forbidden_path`, `core/src/lib.rs:211-240`. |

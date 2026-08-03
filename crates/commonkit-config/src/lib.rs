@@ -44,17 +44,20 @@ fn validate_v1_spec(spec: &Value) -> Result<(), LayerSetError> {
         .keys()
         .find(|field| !V1_LAYER_SPEC_FIELDS.contains(&field.as_str()))
     {
+        if FORMER_V1_LAYER_SPEC_FIELDS.contains(&field.as_str()) {
+            return Err(LayerSetError::UnsupportedLayerSpecField {
+                field: field.clone(),
+            });
+        }
         return Err(LayerSetError::UnknownSpecField {
             field: field.clone(),
         });
     }
-    for field in ["arguments", "requirements", "denials", "files"] {
-        if object.get(field).is_some_and(|value| !value.is_array()) {
-            return Err(LayerSetError::InvalidSpecFieldType {
-                field: field.into(),
-                expected: "array",
-            });
-        }
+    if object.get("files").is_some_and(|value| !value.is_array()) {
+        return Err(LayerSetError::InvalidSpecFieldType {
+            field: "files".into(),
+            expected: "array",
+        });
     }
     if object
         .get("securityPolicy")
@@ -65,18 +68,13 @@ fn validate_v1_spec(spec: &Value) -> Result<(), LayerSetError> {
             expected: "object",
         });
     }
-    for field in ["capabilities", "relay", "settings"] {
-        if object.get(field).is_some_and(|value| !value.is_object()) {
-            return Err(LayerSetError::InvalidSpecFieldType {
-                field: field.into(),
-                expected: "object",
-            });
-        }
-    }
-    if object.get("theme").is_some_and(|value| !value.is_string()) {
+    if object
+        .get("capabilities")
+        .is_some_and(|value| !value.is_object())
+    {
         return Err(LayerSetError::InvalidSpecFieldType {
-            field: "theme".into(),
-            expected: "string",
+            field: "capabilities".into(),
+            expected: "object",
         });
     }
     if let Some(styleguide) = object
@@ -87,39 +85,26 @@ fn validate_v1_spec(spec: &Value) -> Result<(), LayerSetError> {
         serde_json::from_value::<StyleguideSelection>(styleguide.clone())
             .map_err(|error| LayerSetError::InvalidStyleguideSelection(error.to_string()))?;
     }
-    for field in ["adapters", "hooks", "plugins", "targets"] {
-        let Some(value) = object.get(field) else {
-            continue;
-        };
-        let items = value
-            .as_array()
-            .ok_or_else(|| LayerSetError::InvalidSpecFieldType {
-                field: field.into(),
-                expected: "array",
-            })?;
-        let mut ids = BTreeSet::new();
-        for item in items {
-            let id = item
-                .as_object()
-                .and_then(|item| item.get("id"))
-                .and_then(Value::as_str)
-                .ok_or_else(|| LayerSetError::MissingSpecItemId {
-                    field: field.into(),
-                })?;
-            StableId::parse(id).map_err(|_| LayerSetError::InvalidSpecItemId {
-                field: field.into(),
-                id: id.into(),
-            })?;
-            if !ids.insert(id) {
-                return Err(LayerSetError::DuplicateSpecItemId {
-                    field: field.into(),
-                    id: id.into(),
-                });
-            }
-        }
-    }
     Ok(())
 }
+
+const FORMER_V1_LAYER_SPEC_FIELDS: &[&str] = &[
+    "adapters",
+    "arguments",
+    "credentials",
+    "databases",
+    "denials",
+    "hooks",
+    "plugins",
+    "relay",
+    "requirements",
+    "schedules",
+    "services",
+    "settings",
+    "snapshots",
+    "targets",
+    "theme",
+];
 
 pub struct CompositionResult {
     pub spec: Value,
@@ -287,17 +272,15 @@ pub enum LayerSetError {
     SpecMustBeObject,
     #[error("unknown CommonKit v1 spec field: {field}")]
     UnknownSpecField { field: String },
+    #[error(
+        "CommonKit v1 layer declaration {field} is not supported; this does not mean the feature is unavailable, only that it is configured outside layers"
+    )]
+    UnsupportedLayerSpecField { field: String },
     #[error("CommonKit v1 spec field {field} must be {expected}")]
     InvalidSpecFieldType {
         field: String,
         expected: &'static str,
     },
-    #[error("CommonKit v1 spec collection {field} requires an ID on every item")]
-    MissingSpecItemId { field: String },
-    #[error("CommonKit v1 spec collection {field} contains invalid ID {id}")]
-    InvalidSpecItemId { field: String, id: String },
-    #[error("CommonKit v1 spec collection {field} contains duplicate ID {id}")]
-    DuplicateSpecItemId { field: String, id: String },
     #[error("invalid styleguide selection: {0}")]
     InvalidStyleguideSelection(String),
 }
@@ -369,21 +352,9 @@ impl MergeRules {
 /// one authoritative rule set instead of letting entry points infer collection
 /// behavior independently.
 pub fn v1_merge_rules() -> MergeRules {
-    let mut rules = MergeRules::new()
+    MergeRules::new()
         .with_strategy("/securityPolicy/deniedPaths", MergeStrategy::SetUnion)
-        .with_strategy("/capabilities/styleguide", MergeStrategy::Replace);
-    for pointer in ["/requirements", "/denials"] {
-        rules = rules.with_strategy(pointer, MergeStrategy::SetUnion);
-    }
-    for pointer in ["/adapters", "/hooks", "/plugins", "/targets"] {
-        rules = rules.with_strategy(
-            pointer,
-            MergeStrategy::MergeById {
-                id_key: "id".to_owned(),
-            },
-        );
-    }
-    rules
+        .with_strategy("/capabilities/styleguide", MergeStrategy::Replace)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

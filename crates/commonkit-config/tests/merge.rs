@@ -71,6 +71,32 @@ fn later_styleguide_layers_replace_the_complete_selection() {
 }
 
 #[test]
+fn v1_rules_merge_all_supported_fields() {
+    let base = serde_json::json!({
+        "securityPolicy": {"deniedPaths": ["**/.env"]},
+        "contextBudget": {"maxTotalTokens": 100},
+        "files": [{"path": "base", "source": "base"}],
+        "capabilities": {"styleguide": {"skillId": "base-writing", "activation": "routed"}}
+    });
+    let overlay = serde_json::json!({
+        "securityPolicy": {"deniedPaths": ["**/.ssh"]},
+        "contextBudget": {"maxTotalTokens": 80},
+        "files": [{"path": "project", "source": "project"}],
+        "capabilities": {"styleguide": {"skillId": "project-writing", "activation": "routed"}}
+    });
+
+    assert_eq!(
+        merge_specs(&base, &overlay, &v1_merge_rules()).expect("merge supported fields"),
+        serde_json::json!({
+            "securityPolicy": {"deniedPaths": ["**/.env", "**/.ssh"]},
+            "contextBudget": {"maxTotalTokens": 80},
+            "files": [{"path": "project", "source": "project"}],
+            "capabilities": {"styleguide": {"skillId": "project-writing", "activation": "routed"}}
+        })
+    );
+}
+
+#[test]
 fn rejects_deletion_on_paths_not_enabled_by_the_schema() {
     let error = merge_specs(
         &serde_json::json!({"protected": true}),

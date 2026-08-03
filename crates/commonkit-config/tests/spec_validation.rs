@@ -24,38 +24,21 @@ fn rejects_unknown_commonkit_owned_spec_fields() {
 }
 
 #[test]
-fn accepts_current_v1_fields_and_provider_owned_adapter_payloads() {
+fn accepts_exactly_the_supported_v1_fields() {
     let public = layer(
         "public",
         LayerKind::PublicBase,
         serde_json::json!({
-            "theme": "dark",
             "capabilities": {
-                "agentContext": {
-                    "provider": "apm",
-                    "version": "0.25.0",
-                    "manifest": "./apm.yml",
-                    "lockfile": "./apm.lock.yaml",
-                    "policy": "./apm-policy.yml",
-                    "targets": ["claude", "codex"]
+                "styleguide": {
+                    "skillId": "technical-writing",
+                    "activation": "routed"
                 }
             },
-            "requirements": ["git"],
-            "denials": ["insecure_transport"],
+            "contextBudget": {
+                "maxTotalTokens": 1000
+            },
             "files": [{"path":"home/editor.conf","source":"portable/editor.conf"}],
-            "adapters": [{
-                "id":"codex",
-                "settings":{"provider.example/approvalMode":"on-request"}
-            }],
-            "hooks": [{"id":"session-end","provider.example/payload":{"event":"stop"}}],
-            "plugins": [{"id":"review","provider.example/config":{"strict":true}}],
-            "targets": [{"id":"workstation","provider.example/transport":{"kind":"local"}}]
-        }),
-    );
-    let organization = layer(
-        "organization",
-        LayerKind::OrganizationPolicy,
-        serde_json::json!({
             "securityPolicy": {
                 "deniedPaths": [],
                 "requiredControls": {},
@@ -65,20 +48,22 @@ fn accepts_current_v1_fields_and_provider_owned_adapter_payloads() {
             }
         }),
     );
+    let organization = layer(
+        "organization",
+        LayerKind::OrganizationPolicy,
+        serde_json::json!({}),
+    );
 
-    LayerSet::new(vec![public, organization]).expect("valid current v1 layer fields");
+    LayerSet::new(vec![public, organization]).expect("supported v1 layer fields");
 }
 
 #[test]
-fn rejects_ambiguous_ids_within_the_first_layer() {
+fn rejects_formerly_declared_domains_with_layer_specific_guidance() {
     let public = layer(
         "public",
         LayerKind::PublicBase,
         serde_json::json!({
-            "adapters": [
-                {"id":"codex","enabled":true},
-                {"id":"codex","enabled":false}
-            ]
+            "adapters": [{"id":"codex","enabled":true}]
         }),
     );
     let organization = layer(
@@ -89,9 +74,33 @@ fn rejects_ambiguous_ids_within_the_first_layer() {
 
     assert!(matches!(
         LayerSet::new(vec![public, organization]),
-        Err(LayerSetError::DuplicateSpecItemId { field, id })
-            if field == "adapters" && id == "codex"
+        Err(LayerSetError::UnsupportedLayerSpecField { field }) if field == "adapters"
     ));
+}
+
+#[test]
+fn removed_domain_error_explains_that_the_feature_still_exists() {
+    let result = LayerSet::new(vec![
+        layer(
+            "public",
+            LayerKind::PublicBase,
+            serde_json::json!({"credentials": {}}),
+        ),
+        layer(
+            "organization",
+            LayerKind::OrganizationPolicy,
+            serde_json::json!({}),
+        ),
+    ]);
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("credentials are not configured through layers"),
+    };
+
+    assert_eq!(
+        error.to_string(),
+        "CommonKit v1 layer declaration credentials is not supported; this does not mean the feature is unavailable, only that it is configured outside layers"
+    );
 }
 
 #[test]

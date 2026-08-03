@@ -42,11 +42,11 @@ case "$1 $2" in
   "auth status") exit 0 ;;
   "repo clone")
     mkdir -p "$4/layers"
-    printf '%s' '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"base"}}' > "$4/layers/public-base.json"
-    printf '%s' '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"org","securityPolicy":{"deniedPaths":["**/.env"],"requiredControls":{"secret_scan":true},"allowlists":{"git_hosts":["github.com"]},"minimums":{"backup_count":1},"maximums":{"snapshot_age_hours":24}}}}' > "$4/layers/organization-policy.json"
-    printf '%s' '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"personal"}}' > "$4/layers/personal.json"
-    printf '%s' '{"schemaVersion":1,"id":"project-web","kind":"project_loadout","source":{"path":"layers/project-web.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"project"}}' > "$4/layers/project-web.json"
-    printf '%s' '{"schemaVersion":1,"id":"target-workstation","kind":"target_overrides","source":{"path":"layers/target-workstation.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"theme":"target"}}' > "$4/layers/target-workstation.json"
+    printf '%s' '{"schemaVersion":1,"id":"public-base","kind":"public_base","source":{"path":"layers/public-base.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"contextBudget":{"maxTotalTokens":100}}}' > "$4/layers/public-base.json"
+    printf '%s' '{"schemaVersion":1,"id":"organization-policy","kind":"organization_policy","source":{"path":"layers/organization-policy.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"contextBudget":{"maxTotalTokens":95},"securityPolicy":{"deniedPaths":["**/.env"],"requiredControls":{"secret_scan":true},"allowlists":{"git_hosts":["github.com"]},"minimums":{"backup_count":1},"maximums":{"snapshot_age_hours":24}}}}' > "$4/layers/organization-policy.json"
+    printf '%s' '{"schemaVersion":1,"id":"personal","kind":"personal_kit","source":{"path":"layers/personal.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"contextBudget":{"maxTotalTokens":90}}}' > "$4/layers/personal.json"
+    printf '%s' '{"schemaVersion":1,"id":"project-web","kind":"project_loadout","source":{"path":"layers/project-web.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"contextBudget":{"maxTotalTokens":85}}}' > "$4/layers/project-web.json"
+    printf '%s' '{"schemaVersion":1,"id":"target-workstation","kind":"target_overrides","source":{"path":"layers/target-workstation.json","revision":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","contentDigest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"spec":{"contextBudget":{"maxTotalTokens":80}}}' > "$4/layers/target-workstation.json"
     exit 0 ;;
 esac
 exit 91
@@ -77,7 +77,7 @@ exit 91
     .unwrap();
     let composition = registry.composition.unwrap();
     let composed = composition.compose().unwrap();
-    assert_eq!(composed["spec"]["theme"], "target");
+    assert_eq!(composed["spec"]["contextBudget"]["maxTotalTokens"], 80);
     for (index, path) in config["composition"]["layers"]
         .as_array()
         .unwrap()
@@ -95,9 +95,11 @@ exit 91
             )
         );
     }
-    let theme = composition.explain("/theme").unwrap();
-    assert_eq!(theme["winner"]["layerId"], "target-workstation");
-    assert_eq!(theme["contributions"].as_array().unwrap().len(), 5);
+    let budget = composition
+        .explain("/contextBudget/maxTotalTokens")
+        .unwrap();
+    assert_eq!(budget["winner"]["layerId"], "target-workstation");
+    assert_eq!(budget["contributions"].as_array().unwrap().len(), 5);
     assert_eq!(
         composition.explain("/securityPolicy/deniedPaths").unwrap()["governingRules"],
         serde_json::json!([

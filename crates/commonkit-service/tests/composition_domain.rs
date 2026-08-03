@@ -26,11 +26,13 @@ struct CompositionFixture;
 
 impl CompositionDomain for CompositionFixture {
     fn compose(&self) -> Result<Value, DomainFailure> {
-        Ok(json!({"spec":{"theme":"dark"},"specDigest":format!("sha256:{}", "1".repeat(64))}))
+        Ok(
+            json!({"spec":{"contextBudget":{"maxTotalTokens":80}},"specDigest":format!("sha256:{}", "1".repeat(64))}),
+        )
     }
 
     fn explain(&self, pointer: &str) -> Result<Value, DomainFailure> {
-        assert_eq!(pointer, "/theme");
+        assert_eq!(pointer, "/contextBudget/maxTotalTokens");
         Ok(json!({"pointer":pointer,"winner":{"layerId":"personal"}}))
     }
 }
@@ -79,13 +81,13 @@ async fn configured_composition_domain_serves_composed_state_and_provenance() {
     );
 
     let composed = call(app.clone(), &token, "GET", "/control/v1/compose", json!({})).await;
-    assert_eq!(composed["spec"]["theme"], "dark");
+    assert_eq!(composed["spec"]["contextBudget"]["maxTotalTokens"], 80);
     let explained = call(
         app,
         &token,
         "POST",
         "/control/v1/explain",
-        json!({"pointer":"/theme"}),
+        json!({"pointer":"/contextBudget/maxTotalTokens"}),
     )
     .await;
     assert_eq!(explained["winner"]["layerId"], "personal");

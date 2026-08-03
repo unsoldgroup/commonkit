@@ -791,29 +791,9 @@ pub struct LayerDocument {
     pub spec: Value,
 }
 
-/// Closed top-level vocabulary for a CommonKit v1 layer. Provider-specific
-/// payloads remain nested below these owned capability and adapter envelopes.
-pub const V1_LAYER_SPEC_FIELDS: &[&str] = &[
-    "adapters",
-    "arguments",
-    "capabilities",
-    "contextBudget",
-    "credentials",
-    "databases",
-    "denials",
-    "files",
-    "hooks",
-    "plugins",
-    "relay",
-    "requirements",
-    "schedules",
-    "securityPolicy",
-    "services",
-    "settings",
-    "snapshots",
-    "targets",
-    "theme",
-];
+/// Closed top-level vocabulary for a CommonKit v1 layer.
+pub const V1_LAYER_SPEC_FIELDS: &[&str] =
+    &["capabilities", "contextBudget", "files", "securityPolicy"];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

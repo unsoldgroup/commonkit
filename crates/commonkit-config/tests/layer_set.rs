@@ -55,3 +55,14 @@ fn requires_base_and_organization_and_rejects_duplicates() {
         Err(LayerSetError::DuplicateKind(LayerKind::OrganizationPolicy))
     ));
 }
+
+#[test]
+fn validates_layer_specs_before_applying_precedence() {
+    let mut base = layer("base", LayerKind::PublicBase);
+    base.spec = serde_json::json!({"theme": "dark"});
+
+    assert!(matches!(
+        LayerSet::new(vec![base, layer("org", LayerKind::OrganizationPolicy)]),
+        Err(LayerSetError::UnsupportedLayerSpecField { field }) if field == "theme"
+    ));
+}
