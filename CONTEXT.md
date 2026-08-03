@@ -140,6 +140,32 @@ writing skill for declared prose scopes and modes. It is not always-on
 instruction text and is not a public lint gate.
 _Avoid_: Default voice, prose policy
 
+**Scope**:
+The ownership axis naming who owns a contributing piece of a **CommonKit** and
+who may lend it — `personal`, `team`, or `org`. It is not a precedence layer
+(ADR 0015).
+_Avoid_: Layer, tier, namespace, workspace
+
+**Principal**:
+An acting person, identified by a GitHub login and proven through the installed
+GitHub CLI, resolved the same way on every surface (ADR 0021).
+_Avoid_: User, account, actor, identity
+
+**Policy floor**:
+The resolved intersection of the submitter's and target owner's policy for a
+shared **Job**, recorded in the terminal **Attempt** receipt (ADR 0018).
+_Avoid_: Audience floor, least privilege, effective policy
+
+**Grant graph**:
+The live record of scope membership and which scope lends which capability to
+which, owned by the authoritative scheduler and never stored in Git (ADR 0014).
+_Avoid_: Permissions file, ACL config, share list
+
+**Grant**:
+One edge in the **Grant graph**: an owning scope lending one named capability
+to one grantee scope at one permission.
+_Avoid_: Share, invite, copy
+
 ## Relationships
 
 - A **CommonKit** defines one or more **Loadouts**.
@@ -155,6 +181,13 @@ _Avoid_: Default voice, prose policy
 - One authoritative scheduler serves many target-resident workers; a scheduler per machine with federation is not v1 (ADR 0012). The single-writer database limit is deliberate and is not high availability.
 - "Run this on every platform" is one **Declared task** per platform, each capability-labelled. The scheduler has no matrix or fan-out semantics.
 - **Validation evidence** states the **Isolation level** it was produced under, so results from unlike targets are never silently compared.
+- A **Job** submitted onto an **Execution Target** owned by someone else runs under a **Policy floor**: allowed hosts intersect, denied hosts union, over the submitter and the target owner only. Neither principal's policy can be widened by the other (ADR 0018).
+- **Validation evidence** states the **Policy floor** it was produced under, for the same reason it states **Isolation level**.
+- A **Job** places on an **Execution Target** owned by someone else only when the submitter holds a **Grant** edge to that target's **Scope**, and a **Declared task** requiring credentials does not place off-owner at all (ADR 0019).
+- A terminal **Attempt** receipt on a shared **Execution Target** is readable by the submitter and the target owner.
+- The Session Board shows every **Principal**'s sessions in a shared **Scope**, and every verb stays bound to the session's owning **Principal**. A teammate never resolves another **Principal**'s pending action, so an "Always" rule is only ever written by the owner of the project it lands in (ADR 0008, ADR 0009).
+- A shared **Scope** has no shared credentials in version 1. A credential a target needs is provisioned on that target from its owner's password manager, as for a single-owner kit.
+- Onboarding a **Principal** is: add them to the **Grant graph**, extend read on the shared team repository, and let their first **Reconciliation** materialize team and org **Scope** content plus every resolved **Grant**. Their personal kit stays their own repository and may lend back.
 - The CLI is the primary surface for durable execution. The Session Board mirrors runs read-only for the glanceable case; it consumes the execution API as a client and never fronts it.
 - MCP exposes context and durable execution controls; `commonkit-execd` owns lifecycle persistence independently of MCP sessions.
 - An **Adapter** participates in **Reconciliation** for one agent or service.
@@ -180,6 +213,19 @@ _Avoid_: Default voice, prose policy
 - CommonKit stages provider output and applies it through CommonKit **Reconciliation** so target mutation remains plan-bound, receipted, verifiable, and recoverable.
 - APM policy governs which agent packages and primitives may be installed; CommonKit policy governs targets, paths, permissions, services, credentials, schedules, relay exposure, and mutation authorization.
 - The APM lockfile owns the resolved agent-package graph and content integrity; the CommonKit lockfile references its digest and owns composed loadout, target, and adapter state.
+- The ordered composition chain decides precedence; **Scope** decides ownership and lending authority. The two axes are orthogonal, and a **Scope** owning content says nothing on its own about where that content lands in precedence (ADR 0015).
+- A `team` **Scope** exists to own and lend. Organization security policy remains the non-overridable floor, enforced structurally by composition rather than by instructions to a model.
+- Shared content — skills, loadouts, policy, styleguides — is Git-owned and applied by **Reconciliation**. The **Grant graph** is owned by the authoritative scheduler and is never Git-owned (ADR 0014).
+- The **Grant graph** keys on **Principals**, and every surface resolves the acting **Principal** identically. Multiplayer CommonKit requires GitHub; a single-owner kit does not (ADR 0021).
+- Team and org **Scopes** live in one shared team repository; each personal **Scope** is a private repository of its own (ADR 0016).
+- A **Grant** materializes the owner's content at a handle path on the grantee's target and is removed on revoke. It is a mount, never a copy.
+- A **Grant** between personal **Scopes** confers composition, not Git read access. The owner extends repository access out of band, and an edge the grantee's target cannot read stays unresolved.
+- Content arriving through a **Grant** composes beneath the grantee's personal kit, so the grantee's own content always wins a name collision and the lent contribution is recorded as shadowed in the plan and receipt (ADR 0017).
+- A `team` **Scope** lends; it does not bind. A binding rule is organization policy, which is a non-overridable floor and is not a **Grant**.
+- Promoting content to a higher **Scope** is a pull request into the shared team repository. Organization policy governs whether it requires review.
+- The grantee's **Loadout** pays the **Context budget** for lent content. A **Grant** that would exceed it stays unresolved and is reported by **Reconciliation**; the grantee admits it by evicting something explicitly.
+- A **Grant** resolves to Git-owned content plus a live graph edge. Content reachable in Git is not granted without an edge, and an edge whose content is absent is unresolved rather than an error.
+- Revoking a **Grant** takes effect at the graph, not at the grantee's next pull.
 - **Reconciliation** never treats secrets or machine identity as portable CommonKit content.
 - **mcp-local-relay** is an independently publishable package in the CommonKit repository. It remains the MCP data plane; CommonKit owns desired-state composition and reconciliation.
 - A GitHub repository is the durable store for portable, reviewable CommonKit state. Secrets and mutable database files do not belong in Git.
@@ -188,6 +234,7 @@ _Avoid_: Default voice, prose policy
 - Database adapters create consistent, integrity-checked, encrypted snapshots in S3-compatible object storage. Git records only snapshot descriptors and content hashes.
 - Version 1 uses one authoritative writer per database. Cross-machine database portability is snapshot and restore, not binary merging; multi-writer synchronization requires a later application-level export/import model.
 - An **About Me Profile** is stored in a dedicated encrypted SQLite database with one writer; context-mode and Engram remain project-memory systems.
+- Memory is never shared across **Scopes**. There is no team **About Me Profile**; shared team knowledge is Git-owned reviewable content circulated by **Grant** (ADR 0020).
 - A **Scoped View** controls disclosure by Loadout and trusted project. Organization policy may narrow access but never broaden it.
 - Agents may create **Suggestions**, but only direct user edits or explicit contradiction clarifications create approved **Claims**.
 
