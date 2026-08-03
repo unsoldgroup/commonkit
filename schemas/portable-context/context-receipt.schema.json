@@ -1,0 +1,91 @@
+{
+  "$defs": {
+    "OwnerKind": {
+      "enum": [
+        "organization",
+        "project",
+        "user"
+      ],
+      "type": "string"
+    },
+    "RecordOwner": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/OwnerKind"
+        }
+      },
+      "required": [
+        "kind",
+        "id"
+      ],
+      "type": "object"
+    },
+    "RecordScope": {
+      "additionalProperties": false,
+      "properties": {
+        "organizationId": {
+          "type": "string"
+        },
+        "projectId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "organizationId"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/portable-context/context-receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contentHash": {
+      "type": "string"
+    },
+    "createdAtUnixMs": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "id": {
+      "type": "string"
+    },
+    "owner": {
+      "$ref": "#/$defs/RecordOwner"
+    },
+    "provenance": {
+      "description": "Opaque source-record identifiers; never embeds source content.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "scope": {
+      "$ref": "#/$defs/RecordScope"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "id",
+    "owner",
+    "scope",
+    "contentHash",
+    "createdAtUnixMs",
+    "provenance"
+  ],
+  "title": "context-receipt",
+  "type": "object"
+}

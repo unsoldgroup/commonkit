@@ -10,6 +10,18 @@ export interface CredentialPlan {
   planId: string;
   operations: Array<{ destinationId: string; path: string; action: string; credential: "<redacted>" }>;
 }
+export interface ProfileEncryptionRequest {
+  binding: {
+    schemaVersion: number;
+    profileId: string;
+    profileSchemaId: string;
+    profileSchemaVersion: number;
+    revisionId: string;
+    parentHashes: string[];
+  };
+  recipients: string[];
+  fields: Record<string, string | null>;
+}
 
 export const desktopApi = {
   onboardingInitialize: (request: Record<string, unknown>) => invoke<unknown>("onboarding_initialize", { request }),
@@ -34,6 +46,8 @@ export const desktopApi = {
   credentialApply: (planId: string, confirmationId: string) => invoke<unknown>("credential_apply", { planId, confirmationId }),
   credentialVerify: (destinationIds: string[]) => invoke<unknown>("credential_verify", { destinationIds }),
   diagnosticsExport: () => invoke<unknown>("diagnostics_export"),
+  encryptProfileRevision: (request: ProfileEncryptionRequest) =>
+    invoke<unknown>("encrypt_profile_revision", { request }),
   setAutostart: (enabled: boolean) => invoke<boolean>("set_autostart", { enabled }),
   checkForUpdate: () => invoke<UpdateSummary | null>("check_for_update"),
   installUpdate: (expectedVersion: string, confirmed: boolean) => invoke<void>("install_update", { expectedVersion, confirmed }),

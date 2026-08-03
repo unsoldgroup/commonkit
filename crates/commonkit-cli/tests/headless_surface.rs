@@ -120,3 +120,30 @@ fn skill_canary_mutations_require_operator_confirmation_before_daemon_contact() 
         assert!(String::from_utf8_lossy(&output.stderr).contains("confirmation_required"));
     }
 }
+
+#[test]
+fn context_cli_enforces_bounds_before_contacting_the_daemon() {
+    let invalid = command(&[
+        "context",
+        "search",
+        "anything",
+        "--session-id",
+        "session-1",
+        "--limit",
+        "101",
+    ]);
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("limit 1..=100"));
+
+    let valid = command(&[
+        "context",
+        "search",
+        "anything",
+        "--session-id",
+        "session-1",
+        "--limit",
+        "10",
+    ]);
+    assert!(!valid.status.success());
+    assert!(String::from_utf8_lossy(&valid.stderr).contains("daemon_unavailable"));
+}

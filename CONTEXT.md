@@ -30,6 +30,146 @@ Concise, confident craftsperson. Use plain claims, concrete verbs, short sentenc
 The complete portable collection of shared developer capabilities and policies.
 _Avoid_: Toolbox, toolchain, environment sync
 
+**Organization CommonKit**:
+An organization-provisioned CommonKit that supplies shared policy, documentation, capabilities, and project context to its users.
+_Avoid_: Team profile, company account
+
+**User context**:
+User-owned, structured personal information and working preferences selected for injection into agent work.
+_Avoid_: User data, memory dump
+
+**User profile**:
+The structured, user-owned portion of **User context** initialized through an interview and revised under the user's control.
+_Avoid_: Loadout, account profile
+
+**Core profile schema**:
+The stable CommonKit-owned set of universal fields available in every structured user-profile interview.
+_Avoid_: Organization questionnaire, profile template
+
+**Profile extension**:
+A namespaced set of organization-supplied interview questions whose source remains visible to the user.
+_Avoid_: Core field, hidden policy
+
+**Organization onboarding record**:
+Organization-owned information explicitly required for access, compliance, or employment and collected outside the user-owned profile.
+_Avoid_: Required profile field, personal context
+
+**Project context source**:
+The project-owned documentation, terminology, decisions, and agent instructions authored beside the project's code or working artifacts.
+_Avoid_: Organization context copy, personal profile
+
+**Project context map**:
+An editor-approved manifest of project context sources, ownership, scopes, conflicts, duplicates, and known gaps.
+_Avoid_: Generated project summary, repository file list
+
+**Project editor**:
+An organization-designated repository maintainer authorized to approve and publish project context through CommonKit.
+_Avoid_: Repository writer, organization administrator
+
+**Profile draft**:
+The structured, field-by-field representation of interview answers that the user reviews before values enter encrypted storage.
+_Avoid_: Interview transcript, inferred profile
+
+**Profile revision proposal**:
+An agent-suggested, evidence-explained change to a user-profile field that remains a draft until the user confirms it.
+_Avoid_: Learned preference, automatic profile update
+
+**Personal context repository**:
+A user-controlled private GitHub repository containing client-side encrypted user-context values and plaintext canonical schema field names for reviewable history and pre-authorization discovery.
+_Avoid_: Organization repository, plaintext profile
+
+**Context descriptor**:
+A plaintext schema field name indicating that a category of user-owned context exists without revealing its encrypted value.
+_Avoid_: Profile value, authorization grant
+
+**Context grant**:
+A user-issued authorization permitting selected encrypted context to be injected for a defined organization, project, eligible agents, purpose, sensitivity, and duration.
+_Avoid_: Device trust, repository access
+
+**Agent trust class**:
+A policy-defined set of identity, execution, isolation, and data-handling requirements an agent runtime must satisfy before it can receive granted context.
+_Avoid_: Agent product, agent instance
+
+**Recovery identity**:
+A user-controlled identity capable of restoring access to encrypted **User context** after authorized devices are lost.
+_Avoid_: Organization recovery key, account password
+
+**Deletion tombstone**:
+A signed portable record revoking future use of deleted user context and directing CommonKit-controlled devices to remove active copies, caches, and encryption envelopes.
+_Avoid_: Empty profile field, Git deletion
+
+**Profile conflict**:
+Two concurrent encrypted revisions of the same profile field that remain preserved until the user explicitly selects or replaces their value.
+_Avoid_: Latest-write-wins, automatic merge
+
+**Organization documentation**:
+Organization-owned source material onboarded as curated context for agent work.
+_Avoid_: Knowledge dump, shared memory
+
+**Documentation artifact**:
+A versioned organization- or project-owned source plus its normalized agent-ready representation, provenance, integrity hash, and scope.
+_Avoid_: Live web page, untracked extraction
+
+**Documentation revision candidate**:
+An inactive proposed revision containing the upstream diff, normalized output, extraction warnings, and affected-context preview for editor review.
+_Avoid_: Automatic documentation update, live revision
+
+**Context section**:
+An addressable agent-ready portion derived from semantic boundaries in an immutable **Documentation artifact** and retaining exact source provenance.
+_Avoid_: Detached chunk, generated summary
+
+**Documentation conflict**:
+Two published context claims that disagree and must remain source-attributed until an authorized editor resolves them.
+_Avoid_: Layer override, newest-wins merge
+
+**Task context brief**:
+The compact initial context injected for agent work, containing critical policy, authorized profile values, relevant source descriptors, and selected documentation within budget.
+_Avoid_: Complete project context, static handbook
+
+**Context receipt**:
+An immutable, redacted explanation of which context was considered, authorized, selected, omitted, injected, or retrieved for agent work and why.
+_Avoid_: Prompt log, plaintext transcript
+
+**Receipt view**:
+An audience-specific projection of a **Context receipt** that reveals only the sources and decisions its viewer is authorized to inspect.
+_Avoid_: Shared audit log, full prompt trace
+
+**Organization membership**:
+The GitHub-backed association and role that authorizes a user to access an **Organization CommonKit** in version 1.
+_Avoid_: CommonKit account, repository collaborator
+
+**Context injection**:
+The policy- and scope-bound delivery of selected organization, project, and user context into agent work.
+_Avoid_: Prompt stuffing, synchronization
+
+**Context plane**:
+The CommonKit-owned selection, budgeting, rendering, and provenance of context injected into agent work.
+_Avoid_: MCP gateway, knowledge base
+
+**Capability control plane**:
+The CommonKit-owned desired state for MCP servers, tools, grants, and credential references.
+_Avoid_: MCP relay, tool registry
+
+**Capability data plane**:
+The replaceable local or hosted transport through which agents discover and invoke authorized capabilities.
+_Avoid_: Context plane, source of truth
+
+**Upstream publication**:
+An explicit user-authorized act that shares selected user-owned context with the organization.
+_Avoid_: Sync back, telemetry
+
+**Generalized contribution**:
+A user-reviewed reusable practice, template, style rule, or documentation improvement derived from personal context without exposing the source profile field or value.
+_Avoid_: Shared profile field, anonymized telemetry
+
+**Contribution attribution**:
+The per-contribution user choice to identify a **Generalized contribution** by name, pseudonym, or no public identity.
+_Avoid_: Organization attribution policy, profile identity
+
+**Contribution license**:
+The explicit durable permission an author grants the organization to use, modify, and redistribute an accepted **Generalized contribution** while retaining authorship.
+_Avoid_: Ownership assignment, revocable access grant
+
 **Loadout**:
 A selected subset and set of overrides from a CommonKit for a particular target.
 _Avoid_: Profile, bundle
@@ -101,6 +241,95 @@ _Avoid_: Upstream drift, breaking change
 ## Relationships
 
 - A **CommonKit** defines one or more **Loadouts**.
+- An organization provisions an **Organization CommonKit** for one or more users; an organization with one user follows the same model.
+- An **Organization CommonKit** contains one or more projects.
+- Each project owns a **Project context source** in its project repository.
+- The organization CommonKit repository registers the project, supplies governing policy, and pins the accepted **Project context source** revision without duplicating its content.
+- Existing-project onboarding scans known documentation, manifests, ADRs, agent instructions, and repository metadata to propose a **Project context map**.
+- A proposed **Project context map** identifies ownership, duplicates, conflicts, gaps, and suggested scopes but remains inactive until a project editor approves it.
+- A **Project editor** must have both qualifying GitHub repository access and the CommonKit role assigned by organization policy.
+- Repository write access permits proposing project-context changes but does not by itself permit publication.
+- GitHub organization or repository access establishes **Organization membership** in version 1 through a replaceable identity-provider boundary.
+- A single-user organization may establish **Organization membership** with a personal GitHub account and private repository.
+- A user owns their **User context**, including their **User profile**.
+- A user's portable **User context** is encrypted before it enters their **Personal context repository**.
+- Each user owns a separate **Personal context repository**; the organization owns its distinct organization CommonKit repository.
+- CommonKit guides the user to create or connect the **Personal context repository** under the user's GitHub account after organization invitation acceptance.
+- An organization may require that a **Personal context repository** exists before personal-context injection, but cannot create, administer, transfer, or delete it.
+- CommonKit composes organization, project, and encrypted personal context locally without copying the complete personal record into organization storage.
+- Decryption identities remain user-controlled and never enter GitHub, portable configuration, plans, receipts, logs, or organization-owned storage.
+- A **Personal context repository** uses partially encrypted structured files: all canonical schema field names and document structure remain plaintext for review, reconciliation, and pre-authorization discovery, while all personal values remain encrypted.
+- A **Context descriptor** allows an agent to determine that potentially relevant context exists before it is authorized to decrypt or inject the value.
+- An existing **Context grant** permits automatic injection only when its organization, project, agent, purpose, sensitivity, and duration cover the current work.
+- Without a matching **Context grant**, an agent sees only the **Context descriptor** and may request just-in-time user approval.
+- A just-in-time approval creates a project-and-purpose **Context grant** by default, persists across sessions, and remains active until the user revokes it.
+- Before issuing a persistent **Context grant**, CommonKit shows the selected context fields, project, stated purpose, eligible agents, and revocation path.
+- A persistent **Context grant** targets one or more **Agent trust classes**, not a product name or individual installation.
+- A new agent runtime receives granted context only after CommonKit verifies that it satisfies the selected **Agent trust class**.
+- Organization policy defines available **Agent trust classes** and their minimum requirements; users select which qualifying classes receive each personal-context grant.
+- A project may narrow eligible **Agent trust classes** but cannot widen them beyond the organization security floor.
+- Possession of an authorized device or repository access does not by itself authorize context injection.
+- The personal-context schema is closed; unknown or newly introduced fields fail closed until the schema explicitly classifies them.
+- Repository access can reveal field names, section presence, edit timing, and approximate encrypted value sizes even though it cannot reveal the values.
+- Each user has two independent **Recovery identities**: an offline user-held recovery key and an encrypted recovery identity provisioned through the user's configured password-manager provider.
+- An organization is never a recovery recipient for a user's complete **User context**.
+- Deleting user context revokes its grants, removes active ciphertext and plaintext caches, destroys active CommonKit-controlled encryption envelopes, and publishes a **Deletion tombstone** to authorized devices.
+- Deletion receipts retain only opaque audit metadata and never retain deleted plaintext.
+- CommonKit guarantees that deleted context cannot be used for future CommonKit-controlled decryption or injection after a target has observed the valid tombstone.
+- CommonKit does not claim cryptographic erasure of historical Git ciphertext from clones or backups when an actor retains a formerly valid recovery identity.
+- CommonKit does not claim to erase plaintext previously exported to an uncontrolled recipient or an organization artifact already incorporated under a **Contribution license**.
+- Concurrent edits to different profile fields merge automatically from their immutable revisions.
+- Concurrent edits to the same field create a **Profile conflict**; both revisions are decrypted only on an authorized user device and remain unresolved until the user chooses or writes a replacement.
+- A structured interview initializes a **User profile**.
+- A structured interview is composed from the **Core profile schema** plus zero or more visibly namespaced **Profile extensions**.
+- CommonKit owns and versions the **Core profile schema**; organizations own and version their **Profile extensions**.
+- Every question identifies whether it came from CommonKit or an organization extension.
+- Every personal-profile question is optional, including questions from a **Profile extension**.
+- Information required for access, compliance, or employment belongs in a separate **Organization onboarding record** with explicit purpose, ownership, and retention.
+- The profile interview is an adaptive conversation that asks one question at a time and maps answers into the selected schema.
+- The interview produces a **Profile draft** showing every field name and proposed stored value for user review and editing before encryption.
+- Interview transcripts and unconfirmed inferences do not become **User context**.
+- The **Core profile schema** is work-focused: identity and role, communication, collaboration, feedback, decision-making, planning, technical preferences, requested accessibility accommodations, boundaries, and agent-interaction preferences.
+- The **Core profile schema** excludes lifestyle, health history or diagnoses, family, financial, and demographic profiling.
+- An eligible agent may create a **Profile revision proposal** from observed collaboration, but cannot update the **User profile** automatically.
+- A **Profile revision proposal** explains the observed pattern without retaining raw conversations as profile evidence by default.
+- A user must review and confirm a **Profile revision proposal** before its values enter encrypted storage.
+- CommonKit suggests profile review after material role or project changes, conflicting agent feedback, and on a lightweight six-month cadence.
+- Users may dismiss review reminders permanently or for individual profile sections.
+- **Organization documentation** remains organization-owned and is onboarded separately from user-owned context.
+- Initial documentation sources include Git repositories, ordinary files, rich-document uploads processed through an isolated extractor, and selected web pages captured as pinned snapshots.
+- Every **Documentation artifact** preserves the original source, normalized content, owner, source revision or capture time, integrity hash, and organization or project scope.
+- Imported documentation is immutable at a revision; a changed source produces a new candidate revision rather than silently changing injected context.
+- Scheduled read-only checks detect changed documentation sources and create **Documentation revision candidates**.
+- Only an authorized organization editor may publish a **Documentation revision candidate** for subsequent context injection.
+- Large **Documentation artifacts** are divided into derived **Context sections** using headings and semantic boundaries while the original and normalized revision remain immutable.
+- A **Context section** inherits its source owner, scope, revision, and hash linkage; authorized editors may adjust its title, tags, and boundaries before publication.
+- Project documentation receives higher task relevance than organization-wide documentation but does not silently override it.
+- When published sources disagree, CommonKit injects both source-attributed claims as a **Documentation conflict** and queues it for authorized editor resolution.
+- **Context injection** composes only the selected organization, project, and user context authorized for the current agent work.
+- Agent work begins with a budgeted **Task context brief** and retrieves complete **Context sections** on demand.
+- A **Context receipt** covers both initial injection and subsequent retrieval without retaining secret or personal plaintext.
+- The user-facing **Receipt view** identifies the user's injected fields, grants, and relevant organization or project sources.
+- The organization-facing **Receipt view** identifies organization and project sources and policy outcomes but represents personal-context participation only as an opaque authorized indicator.
+- Personal field names and values never appear in an organization-facing **Receipt view**.
+- Authorization, mandatory policy, scope, precedence, and context-budget enforcement deterministically define the eligible **Task context brief**.
+- A replaceable relevance ranker may order eligible context but cannot authorize, override, or silently omit mandatory material.
+- Every included and omitted candidate has a reproducible reason in the **Context receipt**.
+- When mandatory explanatory context exceeds the initial budget, the **Task context brief** contains its descriptors and requires retrieval during work rather than blocking task start.
+- Deferred retrieval never defers enforceable policy: CommonKit must block an affected operation until its governing control is enforced and any required instructions have been retrieved.
+- Machine-enforceable organization and project controls are compiled into CommonKit policy and apply independently of prompt contents.
+- Human-readable procedures may be retrieved on demand; an operation governed only by a procedure remains blocked until the agent retrieves that procedure.
+- The **Context plane** and **Capability control plane** remain owned by CommonKit and independent of any relay or hosted gateway.
+- The **Capability data plane** uses a persistent device relay as the default agent endpoint for local, stdio, offline, and private capabilities.
+- An organization may add a hosted MCP portal adapter for remote, organization-governed capabilities without making that portal the canonical registry.
+- The device relay may route organization-governed remote calls through the selected hosted portal while keeping device-private calls local.
+- User-owned context remains private unless the user performs an explicit **Upstream publication**.
+- **Upstream publication** creates a separate, reviewed **Generalized contribution** and never transfers ownership of the source personal record.
+- The user reviews the exact **Generalized contribution** before submission; the source profile field and value remain private.
+- Before submission, the user selects a **Contribution attribution** of named, pseudonymous, or anonymous.
+- Private derivation provenance remains visible only to the user unless the user explicitly authorizes its disclosure.
+- Submission presents the applicable **Contribution license** before confirmation; repository placement alone never implies consent silently.
+- Withdrawing a contribution stops new publication and may remove future attribution links but cannot retract organization versions already incorporated under the accepted **Contribution license**.
 - A **CommonKit** composes configuration in this precedence order: public base, organization policy, personal kit, project loadout, then target overrides.
 - Organization security policy is a non-overridable floor. Later layers may tighten it but cannot weaken it.
 - A **Loadout** is materialized on one or more **Targets**.
@@ -140,6 +369,41 @@ _Avoid_: Upstream drift, breaking change
 
 - "Toolbox" was the initial metaphor; resolved: the product and domain object are **CommonKit**.
 - "Profile" described a selected subset; resolved: use **Loadout** unless later user research favors a more conventional term.
+- "Profile" is now valid only as **User profile**, the user-owned structured context produced by interview; it does not mean **Loadout**.
+- Organization initiation does not imply organization ownership of personal context; resolved: users own their **User context** and sharing upstream requires explicit publication.
+- MCP scaling was initially framed as local relay versus hosted gateway; resolved: CommonKit uses a hybrid **Capability data plane**, with the device relay as the default endpoint and hosted portals as optional organization adapters.
+- CommonKit-owned accounts versus external identity was initially open; resolved for version 1: GitHub bootstraps **Organization membership**, behind a replaceable identity-provider boundary.
+- Personal-context recovery was initially open; resolved: users receive both an offline recovery key and a password-manager-provisioned encrypted recovery identity, while organizations receive neither.
+- Personal-context encryption granularity was initially open; resolved: use partially encrypted structured files with canonical schema field names visible for reviewable Git history and pre-authorization discovery while acknowledging metadata leakage.
+- Pre-authorization discovery was initially open; resolved: apply existing scope- and purpose-bound **Context grants** automatically, otherwise expose only the descriptor and request just-in-time approval.
+- Just-in-time grant duration was initially open; resolved: approvals persist for the selected project and purpose across sessions until revoked.
+- Eligible agents were initially open; resolved: persistent grants target policy-defined **Agent trust classes**, allowing portability without automatically trusting new runtimes.
+- Agent-class authority was initially open; resolved: organizations define minimum requirements, users select eligible classes per grant, and projects may only narrow them.
+- Personal-context repository ownership was initially open; resolved: each user owns a separate encrypted repository that CommonKit composes locally with the organization's repository.
+- Personal-repository provisioning was initially open; resolved: creation or connection is a user-authorized guided step under the user's GitHub account, never an organization-administered operation.
+- Interview ownership was initially open; resolved: CommonKit supplies a stable core schema and organizations may add visibly namespaced extensions.
+- Required extension questions were initially open; resolved: personal-profile answers are always optional, and genuinely required information belongs in a separate organization-owned onboarding record.
+- Interview experience was initially open; resolved: use an adaptive conversation followed by mandatory structured review before encrypted storage.
+- Core profile breadth was initially open; resolved: capture work-focused context and requested accommodations while excluding broad personal and sensitive-person profiling.
+- Profile learning was initially open; resolved: agents may propose evidence-explained revisions, but only explicit user confirmation changes the profile and raw conversations are not retained by default.
+- Profile review cadence was initially open; resolved: combine material-change prompts with a six-month checkup while allowing user-controlled dismissal.
+- Initial documentation sources were open; resolved: support Git repositories, files, isolated rich-document extraction, and pinned web snapshots with originals and full provenance.
+- Documentation update behavior was open; resolved: detect changes automatically, but require editor review of diffs, extraction warnings, and affected projects before publication.
+- Documentation selection granularity was open; resolved: derive editor-reviewable semantic sections that retain exact provenance to immutable source revisions.
+- Documentation conflict handling was open; resolved: surface both claims with scope and revision, prioritize project relevance without silent override, and require editor resolution.
+- Documentation delivery was open; resolved: inject a compact task-specific brief first, retrieve full sections on demand, and account for both in the context receipt.
+- Initial context selection was open; resolved: use deterministic policy and budget gates with replaceable explainable relevance ranking over eligible candidates only.
+- Mandatory-context overflow was open; resolved: start with descriptors and retrieve full sections during work, while never allowing retrieval deferral to bypass enforceable controls.
+- Deferred-policy enforcement was open; resolved: compile machine-enforceable controls outside the prompt and block operations governed only by human-readable procedures until retrieval.
+- Context-receipt visibility was open; resolved: provide audience-specific views, with complete user-owned references for the user and opaque personal-context participation for the organization.
+- Project-context location was open; resolved: author it beside project artifacts and let the organization kit register, govern, and pin the accepted revision.
+- Existing-project onboarding was open; resolved: discover existing sources and propose an editor-reviewed context map instead of generating or activating content automatically.
+- Project-context publication authority was open; resolved: organization-designated project editors require both repository access and a CommonKit role.
+- Upstream publication form was open; resolved: derive a user-reviewed reusable contribution rather than publishing an exact personal-profile field.
+- Contribution attribution was open; resolved: users choose named, pseudonymous, or anonymous attribution separately for each contribution.
+- Contribution rights were open; resolved: the user retains authorship and explicitly grants the organization a durable license for accepted artifacts.
+- Personal-context deletion was open; resolved: provide bounded deletion, grant revocation, cache removal, and portable tombstones within CommonKit's control while explicitly disclaiming erasure of historical ciphertext decryptable with retained recovery identities, previously exported plaintext, and licensed contributions.
+- Multi-device profile conflicts were open; resolved: merge non-conflicting fields, preserve both same-field revisions, and require explicit user resolution rather than latest-write-wins or CRDT guessing.
 - "Agent package manager" overlapped with CommonKit's initial adapter scope; resolved: package management belongs to the selected **Agent-context provider**, with APM preferred, while CommonKit orchestrates the complete developer environment.
 - APM MCP translation was initially open; resolved: CommonKit reads only APM's documented `dependencies.mcp` manifest shape and isolated staged `.mcp.json`, requires the two representations to agree, normalizes declarations with manifest/lock provenance, rejects ambiguous ownership or unsupported transports, and sends the resulting relay desired state and stable loopback client configuration through CommonKit's confirmation-bound plan. It does not import APM internals or invoke provider-native live apply.
 - GitHub authentication was initially open; resolved for v1: the installed GitHub CLI is the credential broker and repository-provisioning client. OAuth credentials remain outside CommonKit and the kit. A first-party GitHub App/device flow may replace this boundary later without changing portable state.
@@ -147,6 +411,25 @@ _Avoid_: Upstream drift, breaking change
 ## Open — not yet resolved
 
 - Which S3-compatible object-store provider is the default for encrypted snapshots.
+- How context selection, precedence, conflicts, and context budgets work during **Context injection**.
+- Which fields belong in the initial **User profile** interview and which are optional extensions.
+- What review, redaction, withdrawal, and provenance rules govern **Upstream publication**.
+
+## Portable context first-release scope
+
+The first portable-context release delivers the complete private-context loop:
+
+1. Organization and project registration through GitHub-backed membership.
+2. Provenance-preserving organization and project documentation onboarding.
+3. A user-owned, partially encrypted personal-context repository.
+4. The adaptive core profile interview and structured review.
+5. Multi-device encrypted revision synchronization and explicit conflict resolution.
+6. Deterministic task briefs, on-demand context retrieval, and compiled policy enforcement.
+7. Project-and-purpose grants targeting organization-defined agent trust classes.
+8. Audience-specific context receipts, revocation, and bounded deletion.
+9. The persistent device relay as the default capability endpoint.
+
+Generalized upstream contributions and the hosted Cloudflare MCP portal adapter are designed but deferred to the next release.
 
 ## Version 1 contract
 

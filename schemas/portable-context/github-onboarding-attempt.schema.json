@@ -1,0 +1,92 @@
+{
+  "$defs": {
+    "GitHubOnboardingState": {
+      "enum": [
+        "planned",
+        "remote_created",
+        "orphaned",
+        "registering",
+        "registered",
+        "verifying",
+        "completed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "RepositoryRole": {
+      "enum": [
+        "organization_kit",
+        "project_context",
+        "personal_context"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/portable-context/github-onboarding-attempt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "accountNodeId": {
+      "type": "string"
+    },
+    "confirmationDigest": {
+      "type": "string"
+    },
+    "failureCode": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "id": {
+      "type": "string"
+    },
+    "idempotencyKey": {
+      "type": "string"
+    },
+    "planDigest": {
+      "type": "string"
+    },
+    "registrationId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repositoryNodeId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "repositoryRole": {
+      "$ref": "#/$defs/RepositoryRole"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "state": {
+      "$ref": "#/$defs/GitHubOnboardingState"
+    },
+    "updatedAtUnixMs": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "id",
+    "repositoryRole",
+    "accountNodeId",
+    "planDigest",
+    "confirmationDigest",
+    "idempotencyKey",
+    "state",
+    "updatedAtUnixMs"
+  ],
+  "title": "github-onboarding-attempt",
+  "type": "object"
+}

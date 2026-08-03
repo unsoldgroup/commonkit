@@ -1,13 +1,22 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use commonkit_config::{LayerSet, compose_layers, v1_merge_rules};
-use commonkit_contracts::{LayerDocument, LayerKind, SecurityPolicy, assert_no_embedded_secrets};
+use commonkit_contracts::{
+    LayerDocument, LayerKind, SchemaVersion, SecurityPolicy, Sha256Digest, StableId,
+    assert_no_embedded_secrets,
+};
 use commonkit_core::enforce_policy_floor;
+use commonkit_personal_context::{
+    EncryptedRevisionStore, FieldOperation, RevisionBinding, SecretValue,
+    encrypt_revision_for_recipient_strings,
+};
 use commonkit_platform::AppPaths;
 use commonkit_skills::{PromotionPlan, PromotionReceipt, ProviderUpgradeReport, ScheduleKind};
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(
@@ -107,6 +116,79 @@ enum Command {
     Skills {
         #[command(subcommand)]
         command: SkillsCommand,
+    },
+    /// Inspect the work-profile schema or encrypt a confirmed headless revision.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+    /// Search and retrieve authorized context through the local daemon.
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContextCommand {
+    Search {
+        #[arg(long)]
+        session_id: String,
+        query: String,
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
+    Retrieve {
+        #[arg(long)]
+        session_id: String,
+        section_id: String,
+        #[arg(long, default_value_t = 65_536)]
+        max_bytes: u32,
+    },
+    RequestAccess {
+        #[arg(long)]
+        session_id: String,
+        descriptor_id: String,
+        #[arg(long)]
+        purpose: String,
+        #[arg(long, default_value_t = 3_600)]
+        duration_seconds: u32,
+    },
+    InspectReceipt {
+        #[arg(long)]
+        session_id: String,
+        receipt_id: String,
+        #[arg(long, value_parser = ["user", "organization"])]
+        audience: String,
+    },
+    ProposeProfileRevision {
+        #[arg(long)]
+        session_id: String,
+        #[arg(long = "field-id", required = true)]
+        field_ids: Vec<String>,
+        #[arg(long)]
+        rationale: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileCommand {
+    /// Print the closed CommonKit work-profile schema.
+    Schema,
+    /// Encrypt a confirmed JSON object and stage ciphertext for synchronization.
+    Encrypt {
+        #[arg(long)]
+        answers: PathBuf,
+        #[arg(long = "recipient")]
+        recipients: Vec<String>,
+        #[arg(long)]
+        profile_id: String,
+        #[arg(long)]
+        revision_id: String,
+        #[arg(long = "parent-hash")]
+        parent_hashes: Vec<String>,
+        #[arg(long)]
+        confirmed: bool,
     },
 }
 
@@ -791,6 +873,166 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Relay { command } => run_relay(command)?,
         Command::Snapshots { command } => run_snapshots(command)?,
         Command::Skills { command } => run_skills(command)?,
+        Command::Profile { command } => run_profile(command)?,
+        Command::Context { command } => run_context(command)?,
+    }
+    Ok(())
+}
+
+fn run_context(command: ContextCommand) -> Result<(), Box<dyn Error>> {
+    let (path, body) = match command {
+        ContextCommand::Search {
+            session_id,
+            query,
+            limit,
+        } => {
+            if limit == 0 || limit > 100 || query.len() > 1_024 {
+                return Err("context search requires limit 1..=100 and query <= 1024 bytes".into());
+            }
+            (
+                "/control/v1/context/search",
+                json!({"sessionId":session_id,"query":query,"limit":limit}),
+            )
+        }
+        ContextCommand::Retrieve {
+            session_id,
+            section_id,
+            max_bytes,
+        } => {
+            if max_bytes == 0 || max_bytes > 4 * 1024 * 1024 {
+                return Err("context retrieval requires max-bytes 1..=4194304".into());
+            }
+            (
+                "/control/v1/context/sections/retrieve",
+                json!({"sessionId":session_id,"sectionId":section_id,"maxBytes":max_bytes}),
+            )
+        }
+        ContextCommand::RequestAccess {
+            session_id,
+            descriptor_id,
+            purpose,
+            duration_seconds,
+        } => {
+            if duration_seconds == 0 || duration_seconds > 30 * 24 * 60 * 60 {
+                return Err("context access duration must be 1..=2592000 seconds".into());
+            }
+            (
+                "/control/v1/context/access-requests",
+                json!({"sessionId":session_id,"descriptorId":descriptor_id,"purpose":purpose,"durationSeconds":duration_seconds}),
+            )
+        }
+        ContextCommand::InspectReceipt {
+            session_id,
+            receipt_id,
+            audience,
+        } => (
+            "/control/v1/context/receipts/inspect",
+            json!({"sessionId":session_id,"receiptId":receipt_id,"audience":audience}),
+        ),
+        ContextCommand::ProposeProfileRevision {
+            session_id,
+            field_ids,
+            rationale,
+        } => {
+            if field_ids.len() > 64 || rationale.len() > 4_096 {
+                return Err("profile proposal exceeds the local request bound".into());
+            }
+            (
+                "/control/v1/context/profile-revision-proposals",
+                json!({"sessionId":session_id,"fieldIds":field_ids,"rationale":rationale}),
+            )
+        }
+    };
+    print_daemon(daemon_control("POST", path, Some(body), None)?)?;
+    Ok(())
+}
+
+fn run_profile(command: ProfileCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        ProfileCommand::Schema => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &commonkit_contracts::portable_context::core_profile_schema()
+                )?
+            );
+        }
+        ProfileCommand::Encrypt {
+            confirmed: false, ..
+        } => {
+            return Err(
+                "confirmation_required: review every profile value and pass --confirmed".into(),
+            );
+        }
+        ProfileCommand::Encrypt {
+            answers,
+            recipients,
+            profile_id,
+            revision_id,
+            parent_hashes,
+            confirmed: true,
+        } => {
+            if recipients.len() < 3 {
+                return Err("three distinct public recipients are required: device, offline recovery, and password manager".into());
+            }
+            let recipients = recipients
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            if recipients.len() < 3 {
+                return Err("three distinct public recipients are required".into());
+            }
+            let bytes = Zeroizing::new(std::fs::read(&answers)?);
+            if bytes.len() > 1024 * 1024 {
+                return Err("profile answers exceed the local input bound".into());
+            }
+            let answers: BTreeMap<String, String> = serde_json::from_slice(&bytes)?;
+            let schema = commonkit_contracts::portable_context::core_profile_schema();
+            if answers
+                .keys()
+                .any(|field| !schema.fields.contains_key(field))
+            {
+                return Err(
+                    "profile answers contain a field outside the closed core schema".into(),
+                );
+            }
+            let fields = answers
+                .into_iter()
+                .map(|(field, value)| {
+                    Ok((
+                        StableId::parse(field)?,
+                        FieldOperation::Set(SecretValue::from_string(value)),
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, commonkit_contracts::ContractError>>()?;
+            let binding = RevisionBinding {
+                schema_version: SchemaVersion(1),
+                profile_id: StableId::parse(profile_id)?,
+                profile_schema_id: schema.id,
+                profile_schema_version: schema.version,
+                revision_id: StableId::parse(revision_id)?,
+                parent_hashes: parent_hashes
+                    .into_iter()
+                    .map(Sha256Digest::parse)
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            let encrypted = encrypt_revision_for_recipient_strings(
+                binding,
+                fields,
+                &recipients.into_iter().collect::<Vec<_>>(),
+            )?;
+            let paths = AppPaths::discover()?;
+            paths.create_private_roots()?;
+            let store = EncryptedRevisionStore::open(paths.state.join("personal-context/staged"))?;
+            let digest = store.stage(&encrypted)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "revisionId": encrypted.binding.revision_id,
+                    "ciphertextDigest": digest,
+                    "staged": true,
+                }))?
+            );
+        }
     }
     Ok(())
 }

@@ -42,7 +42,11 @@ injected only into the release command; they are never committed or logged.
    Linux, and Windows. It executes `scripts/installed-lifecycle.sh` in an
    isolated scratch directory and records the native platform, architecture,
    commit, result, and binary SHA-256 digests. Then run the signed two-version
-   updater lifecycle on each platform.
+   updater lifecycle on each platform. The qualifier also writes
+   `portable-context-evidence.json`; verify it, then commit it as
+   `docs/evidence/portable-context/<platform>.json` for the exact release
+   revision. Its `repositoryRevision` is SHA-256 of the 40-character commit
+   string, not the Git object ID itself.
 10. Record the platform, architecture, artifact digests, commands, and results
     in the release evidence.
 

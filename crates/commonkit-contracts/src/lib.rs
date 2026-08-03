@@ -10,6 +10,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub mod portable_context;
+
 pub const CONTRACT_VERSION: &str = "1.0";
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -158,7 +160,7 @@ impl StableId {
         let valid_rest = characters.all(|character| {
             character.is_ascii_lowercase()
                 || character.is_ascii_digit()
-                || matches!(character, '_' | '-')
+                || matches!(character, '_' | '-' | '.')
         });
         if valid_length && valid_start && valid_rest {
             Ok(Self(value))

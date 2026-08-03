@@ -5,8 +5,10 @@ mod artifacts;
 mod budget;
 mod chezmoi;
 mod credentials;
+mod documentation;
 mod files;
 mod git_sync;
+mod github_onboarding;
 mod mcp_clients;
 mod native;
 mod pipeline;
@@ -38,10 +40,22 @@ pub use credentials::{
     PlatformSecretCommandRunner, ProcessBwsRunner, ProcessPlatformSecretCommandRunner, SecretValue,
     SensitiveFileError, WindowsCredentialManagerResolver, WindowsCredentialReader,
 };
+pub use documentation::{
+    DOCLING_VERSION, DocumentationIngestionError, DocumentationSectionCandidate,
+    DocumentationSource, IngestionDisposition, IngestionResult, ProjectContextProposal,
+    ProjectDocumentationRole, RichExtractionLimits, RichExtractionPlan, discover_project_context,
+    extract_rich_document, fetch_web_snapshot, ingest_documentation, publish_documentation,
+    validate_resolved_web_addresses,
+};
 pub use files::{FileAdapter, FileAdapterError, FileIntent, ManagedRelativePath};
 pub use git_sync::{
     FastForwardPolicy, GitCommandError, GitCommandOutput, GitCommandRunner, GitRepository,
     GitRevision, GitSyncDisposition, GitSyncError, GitSyncStatus, ProcessGitRunner,
+};
+pub use github_onboarding::{
+    GitHubOnboardingAdapter, GitHubOnboardingError, GitHubRepositoryObservation,
+    GitHubRepositoryPlan, GitHubRepositoryRequest, GitHubTransport, RepositoryApplyDisposition,
+    RepositoryApplyResult,
 };
 pub use mcp_clients::{McpClientMaterializationError, materialize_mcp_client_state};
 pub use native::NativeProvider;

@@ -11,9 +11,14 @@ use serde_json::Value;
 use thiserror::Error;
 use url::Url;
 
+mod local_stdio;
 mod runtime;
 mod transaction;
 mod upstream_http;
+pub use local_stdio::{
+    LocalSecretResolver, LocalStdioError, LocalStdioLimits, LocalStdioProcessManager,
+    LocalStdioUpstream, LocalStdioValidationError, ResolvedSecret,
+};
 pub use runtime::{
     DownstreamRequest, PeerAddress, RelayErrorCode, RelayHealth, RelayRuntime, RuntimeNotification,
     UpstreamError, UpstreamManager,

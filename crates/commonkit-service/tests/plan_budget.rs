@@ -7,8 +7,8 @@ use commonkit_adapters::{ArtifactStore, ContentSensitivity};
 use commonkit_contracts::{OperationKind, PlanBindings, ResourceRef, Risk, Sha256Digest, StableId};
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_service::{
-    ApplyStatus, ControlPlane, ControlToken, EventHub, ExecutionResult, PlanExecutor, ServiceStatus,
-    router_with_control, router_with_control_and_artifacts,
+    ApplyStatus, ControlPlane, ControlToken, EventHub, ExecutionResult, PlanExecutor,
+    ServiceStatus, router_with_control, router_with_control_and_artifacts,
 };
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -40,10 +40,7 @@ impl PlanExecutor for InertExecutor {
 
 /// Builds a plan whose operations write the given (path, content) pairs, and
 /// stores that content in a fresh artifact store.
-fn plan_writing(
-    store: &ArtifactStore,
-    files: &[(&str, &str)],
-) -> commonkit_contracts::Plan {
+fn plan_writing(store: &ArtifactStore, files: &[(&str, &str)]) -> commonkit_contracts::Plan {
     let operations = files
         .iter()
         .enumerate()

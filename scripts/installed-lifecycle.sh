@@ -192,6 +192,31 @@ for _ in $(seq 1 150); do
 done
 test "${restarted:-}" = 1
 
+# Exercise the installed headless profile path. The answer file is local
+# transient input; only its encrypted revision may remain in CommonKit state.
+profile_secret='installed profile plaintext sentinel'
+printf '%s\n' "{\"identity.display_name\":\"$profile_secret\"}" > "$scratch/profile-answers.json"
+"$commonkit" profile schema > "$scratch/profile-schema.json"
+node -e 'const s=require(process.argv[1]);if(Object.keys(s.fields).length!==38)process.exit(1)' "$scratch/profile-schema.json"
+"$commonkit" profile encrypt \
+  --answers "$scratch/profile-answers.json" \
+  --profile-id installed-profile \
+  --revision-id installed-revision \
+  --recipient age1hhdujv6pev30q36uwkqnhep7z6sgzlevx4jtj3hqwpfwkq853yesd4sd3x \
+  --recipient age1eccdk92w98zscva4q372yh4phdl33zl0r5zawhns4hyuug37wfssz6dxea \
+  --recipient age1wdf4dx4artmfxhwhm626qjtsw66spue3yrf59vusvc3q0gnyj59sgp9vs0 \
+  --confirmed > "$scratch/profile-encryption.json"
+node - "$scratch/profile-encryption.json" "$XDG_DATA_HOME/state/personal-context/staged/installed-revision.json" "$profile_secret" <<'JS'
+const fs = require("node:fs");
+const [receiptPath, revisionPath, secret] = process.argv.slice(2);
+const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+if (!receipt.staged || receipt.revisionId !== "installed-revision" ||
+    !receipt.ciphertextDigest?.startsWith("sha256:")) process.exit(1);
+if (fs.readFileSync(receiptPath, "utf8").includes(secret) ||
+    fs.readFileSync(revisionPath, "utf8").includes(secret)) process.exit(1);
+JS
+node -e 'require("node:fs").unlinkSync(process.argv[1])' "$scratch/profile-answers.json"
+
 init_json="$scratch/init.json"
 "$commonkit" init connect \
   --repository owner/installed-fixture \

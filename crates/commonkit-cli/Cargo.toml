@@ -17,6 +17,7 @@ commonkit-adapters = { path = "../commonkit-adapters" }
 commonkit-contracts = { path = "../commonkit-contracts" }
 commonkit-core = { path = "../commonkit-core" }
 commonkit-platform = { path = "../commonkit-platform" }
+commonkit-personal-context = { path = "../commonkit-personal-context" }
 commonkit-reconcile = { path = "../commonkit-reconcile" }
 commonkit-service = { path = "../commonkit-service" }
 commonkit-skills = { path = "../commonkit-skills" }
@@ -24,6 +25,7 @@ serde_json.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc.workspace = true
@@ -34,4 +36,5 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
+age.workspace = true
 tempfile = "3"

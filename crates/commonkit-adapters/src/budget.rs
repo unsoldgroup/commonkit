@@ -100,12 +100,14 @@ impl ContextBudgetLedger {
     /// Always false when no limit is declared: an undeclared budget reports
     /// figures and never blocks.
     pub fn over_limit(&self) -> bool {
-        self.limit.is_some_and(|limit| self.charged_tokens() > limit)
+        self.limit
+            .is_some_and(|limit| self.charged_tokens() > limit)
     }
 
     /// Tokens still available, when a limit is declared.
     pub fn remaining_tokens(&self) -> Option<u64> {
-        self.limit.map(|limit| limit.saturating_sub(self.charged_tokens()))
+        self.limit
+            .map(|limit| limit.saturating_sub(self.charged_tokens()))
     }
 
     /// Measures staged resources into a ledger.
@@ -163,17 +165,17 @@ impl ContextBudgetLedger {
 
             let bytes = store
                 .load_by_digest(&digest)
-                .map_err(|source| BudgetError::Content { path: path.clone(), source })?;
+                .map_err(|source| BudgetError::Content {
+                    path: path.clone(),
+                    source,
+                })?;
 
             let contributions = match role {
                 ContentRole::AlwaysOn => vec![(ContextClass::AlwaysOn, bytes.len() as u64)],
                 ContentRole::Skill => {
                     skill_paths.insert(path.clone());
                     let (router, body) = split_skill(&bytes);
-                    vec![
-                        (ContextClass::Router, router),
-                        (ContextClass::OnDisk, body),
-                    ]
+                    vec![(ContextClass::Router, router), (ContextClass::OnDisk, body)]
                 }
             };
 

@@ -1,10 +1,16 @@
 //! CommonKit composition, policy, and planning primitives.
 
+mod context_resolver;
 mod target;
 
 use std::{collections::BTreeSet, sync::OnceLock};
 
 pub use commonkit_contracts::*;
+pub use context_resolver::{
+    CandidateContext, ContextGrantRule, ContextResolution, ContextResolverError, ContextScope,
+    ReceiptAudience, ReceiptProjection, ReceiptSelection, RuntimeSession, project_receipt,
+    resolve_context,
+};
 use regex::Regex;
 pub use target::{
     CaseSensitivity, OperatingSystem, PlatformFacts, RootAccess, TargetInventory,

@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use commonkit_contracts::*;
 use commonkit_mcp::{
-    ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ControlBackend, ExecutionBackend,
-    ExecutionContext, ProposeSkillCanaryApplyInput, ProposeSkillCanaryRollbackInput,
-    ProposeSkillPromotionInput, ReadInput, RelayReconcileInput, RelayReviewInput,
-    ShowSkillCandidateInput, SkillEvidencePreviewInput, SkillOpportunitiesInput, SubmitTaskInput,
-    TargetConsentInput,
+    ApplyPlanInput, BackendFuture, CommonKitMcp, ConsentInput, ContextSearchInput, ControlBackend,
+    ExecutionBackend, ExecutionContext, ProposeSkillCanaryApplyInput,
+    ProposeSkillCanaryRollbackInput, ProposeSkillPromotionInput, ReadInput, RelayReconcileInput,
+    RelayReviewInput, ShowSkillCandidateInput, SkillEvidencePreviewInput, SkillOpportunitiesInput,
+    SubmitTaskInput, TargetConsentInput,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use serde_json::json;
@@ -98,6 +98,7 @@ fn publishes_stable_initial_tool_names() {
             "commonkit_apply_plan",
             "commonkit_cancel_job",
             "commonkit_compose",
+            "commonkit_context_search",
             "commonkit_credentials_readiness",
             "commonkit_explain",
             "commonkit_export_diagnostics",
@@ -107,17 +108,21 @@ fn publishes_stable_initial_tool_names() {
             "commonkit_get_job",
             "commonkit_get_job_events",
             "commonkit_get_status",
+            "commonkit_inspect_context_receipt",
             "commonkit_list_job_artifacts",
             "commonkit_list_skill_candidates",
             "commonkit_list_skills",
             "commonkit_plan_sync",
             "commonkit_preview_skill_evidence",
+            "commonkit_propose_profile_revision",
             "commonkit_propose_skill_canary_apply",
             "commonkit_propose_skill_canary_rollback",
             "commonkit_propose_skill_promotion",
             "commonkit_relay_reconcile",
             "commonkit_relay_status",
+            "commonkit_request_context_access",
             "commonkit_resume_job",
+            "commonkit_retrieve_context_section",
             "commonkit_retry_job",
             "commonkit_rollback",
             "commonkit_schedule_status",
@@ -137,6 +142,35 @@ fn publishes_stable_initial_tool_names() {
             | "commonkit_apply_skill_promotion"
             | "commonkit_rollback_skill_promotion"
     )));
+}
+
+#[tokio::test]
+async fn context_search_requires_a_bounded_query_and_forwards_the_session_principal() {
+    let backend = Arc::new(FakeBackend::default());
+    let server = CommonKitMcp::new(backend.clone());
+    let invalid = server
+        .context_search(Parameters(ContextSearchInput {
+            session_id: "session-1".into(),
+            query: "context".into(),
+            limit: 101,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(invalid.is_error, Some(true));
+    assert!(backend.posts.lock().unwrap().is_empty());
+
+    server
+        .context_search(Parameters(ContextSearchInput {
+            session_id: "session-1".into(),
+            query: "context".into(),
+            limit: 10,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.posts.lock().unwrap().as_slice(),
+        ["/control/v1/context/search"]
+    );
 }
 
 #[tokio::test]

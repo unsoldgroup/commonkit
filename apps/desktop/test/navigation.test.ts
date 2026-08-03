@@ -5,6 +5,7 @@ import { navigation, navigationForSetup, routeForSetup, routeFromHash } from "..
 test("management navigation covers every v1 operator workflow", () => {
   assert.deepEqual(navigation.map((item) => [item.group, item.route, item.label]), [
     ["Overview", "status", "Status"],
+    ["Context", "profile", "My work profile"],
     ["Operate", "plans", "Changes"],
     ["Operate", "credentials", "Credentials"],
     ["Operate", "snapshots", "Data"],
@@ -14,7 +15,7 @@ test("management navigation covers every v1 operator workflow", () => {
     ["System", "settings", "Settings"],
   ]);
   assert.deepEqual(navigation.map((item) => item.route), [
-    "status", "plans", "credentials", "snapshots",
+    "status", "profile", "plans", "credentials", "snapshots",
     "relay", "schedule", "diagnostics", "settings",
   ]);
 });

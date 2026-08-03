@@ -74,6 +74,35 @@ const evidence = {
   binaries,
 };
 writeFileSync(join(root, "eight-flow-evidence.json"), `${JSON.stringify(evidence, null, 2)}\n`);
+
+// Portable-context support consumes a deliberately narrower, secret-free
+// evidence contract. The revision is the SHA-256 of the exact qualified commit
+// string; callers can reproduce it without trusting mutable Git state.
+const hash = (value) => `sha256:${createHash("sha256").update(value).digest("hex")}`;
+const portablePlatform = {
+  darwin: "mac_os",
+  linux: "linux",
+  win32: "windows",
+}[process.platform];
+if (!portablePlatform) process.exit(2);
+const portableEvidence = {
+  schemaVersion: 1,
+  platform: portablePlatform,
+  architecture: process.arch,
+  repositoryRevision: hash(process.env.COMMONKIT_EVIDENCE_COMMIT),
+  environmentDigest: hash(`${process.platform}\0${process.arch}\0${kernel}\0${process.version}`),
+  providerDigests: {},
+  steps: [{
+    id: "installed-portable-context-lifecycle",
+    outcome: process.env.COMMONKIT_EVIDENCE_RESULT,
+    artifactHash: hash(readFileSync(join(root, "installed-lifecycle.log"))),
+  }],
+  recordedAtUnixMs: Date.now(),
+};
+writeFileSync(
+  join(root, "portable-context-evidence.json"),
+  `${JSON.stringify(portableEvidence, null, 2)}\n`,
+);
 JS
 
 test "$result" = passed

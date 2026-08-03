@@ -12,6 +12,11 @@ import { refreshDesktopState, shouldRunLiveRefresh } from "./live-refresh.ts";
 import { setupCompletion } from "./setup-gate.ts";
 import { withDeadline } from "./async-deadline.ts";
 import { statusPanel } from "./status-panel.ts";
+import { profileInterviewPanel } from "./profile-interview-view.ts";
+import {
+  advanceProfileQuestion, cancelProfileDraft, initialProfileDraft, recoveryRecipients,
+  reviewProfileAnswer,
+} from "./profile-interview-controller.ts";
 
 const app = document.querySelector<HTMLElement>("#app")!;
 let snapshot: DesktopSnapshot | null = null;
@@ -29,11 +34,14 @@ let onboardingState: OnboardingViewState = {
 let setupUnlocked = false;
 let setupCheckFailed = false;
 let reconnectMode = false;
+let profileState = initialProfileDraft();
+const profileId = `profile-${crypto.randomUUID()}`;
 
 function placeholder(route: Route): string {
   const copy: Record<Route, [string, string]> = {
     onboarding: ["Get started", "Connect or create a GitHub-backed kit, then select this machine’s target and loadout."],
     status: ["Status", "Loading the local CommonKit service…"],
+    profile: ["My work profile", "Create and review personal context that is encrypted before synchronization."],
     plans: ["Plan review", "Plans show semantic operations, provenance, risk, and required confirmation before apply."],
     credentials: ["Credential readiness", "CommonKit reports references and readiness here. Secret values never enter this window."],
     snapshots: ["Snapshots", "Review encrypted snapshot history, writer authority, restore plans, and promotions."],
@@ -50,11 +58,12 @@ function render(): void {
   // Live domain refreshes can arrive while a user is typing in the wizard.
   // Preserve the visible form before replacing the DOM so no keystroke is lost.
   captureOnboardingDraft();
+  captureProfileDraft();
   const completion = reconnectMode ? "required" : setupUnlocked ? "complete" : setupCheckFailed ? "required" : setupCompletion(snapshot?.status ?? null, targets);
   const setupComplete = completion === "complete";
   const route = routeForSetup(routeFromHash(location.hash), setupComplete);
   const visibleNavigation = navigationForSetup(setupComplete);
-  const body = completion === "checking" ? `<section class="panel setup-check"><p class="eyebrow">First run</p><h1>Checking this computer…</h1><p>CommonKit is checking whether setup is already complete.</p></section>` : route === "onboarding" ? onboardingPanel(onboardingState) : route === "settings" ? updatePanel(updateState, settingsSnapshot) : route === "status" && snapshot && targets ? statusPanel(snapshot, targets, management, settingsSnapshot) : management && route in management ? managementPanel(route, management) : placeholder(route);
+  const body = completion === "checking" ? `<section class="panel setup-check"><p class="eyebrow">First run</p><h1>Checking this computer…</h1><p>CommonKit is checking whether setup is already complete.</p></section>` : route === "onboarding" ? onboardingPanel(onboardingState) : route === "profile" ? profileInterviewPanel(profileState) : route === "settings" ? updatePanel(updateState, settingsSnapshot) : route === "status" && snapshot && targets ? statusPanel(snapshot, targets, management, settingsSnapshot) : management && route in management ? managementPanel(route, management) : placeholder(route);
   const groups = visibleNavigation.reduce<Record<string, typeof visibleNavigation[number][]>>((result, item) => {
     (result[item.group] ??= []).push(item);
     return result;
@@ -64,9 +73,77 @@ function render(): void {
   ).join("");
   app.innerHTML = `<aside><div class="brand">CommonKit</div><nav aria-label="CommonKit">${navigation}</nav></aside><main>${body}</main>`;
   if (route === "onboarding") bindOnboardingActions();
+  else if (route === "profile") bindProfileActions();
   else if (route === "settings") bindUpdateActions();
   else if (route === "status") bindTargetActions();
   else if (management && route in management) bindManagementActions(route);
+}
+
+function captureProfileDraft(): void {
+  const answer = document.querySelector<HTMLInputElement | HTMLTextAreaElement>("#profile-answer");
+  if (answer) profileState.pendingValue = answer.value;
+  const recipients = document.querySelector<HTMLTextAreaElement>("#profile-recipients");
+  if (recipients) profileState.recipientsText = recipients.value;
+}
+
+function bindProfileActions(): void {
+  document.querySelector<HTMLButtonElement>("#profile-cancel")?.addEventListener("click", () => {
+    cancelProfileDraft(profileState);
+    profileState = initialProfileDraft();
+    profileState.message = "Draft discarded. No profile values were written.";
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#profile-skip")?.addEventListener("click", () => {
+    advanceProfileQuestion(profileState, false);
+    render();
+  });
+  document.querySelector<HTMLFormElement>("#profile-interview-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const value = new FormData(event.currentTarget as HTMLFormElement).get("answer");
+    reviewProfileAnswer(profileState, typeof value === "string" ? value : "");
+    render();
+  });
+  document.querySelector<HTMLButtonElement>("#profile-confirm")?.addEventListener("click", () => {
+    captureProfileDraft();
+    advanceProfileQuestion(profileState, true);
+    render();
+  });
+  document.querySelector<HTMLFormElement>("#profile-recovery-form")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    captureProfileDraft();
+    const recipients = recoveryRecipients(profileState.recipientsText);
+    if (recipients.length < 3) {
+      profileState.message = "Add three distinct public recipients: device, offline recovery, and password manager.";
+      render();
+      return;
+    }
+    profileState.submitting = true;
+    profileState.message = "Encrypting this revision locally…";
+    render();
+    try {
+      await desktopApi.encryptProfileRevision({
+        binding: {
+          schemaVersion: 1,
+          profileId,
+          profileSchemaId: "commonkit-work-profile",
+          profileSchemaVersion: 1,
+          revisionId: `revision-${crypto.randomUUID()}`,
+          parentHashes: [],
+        },
+        recipients,
+        fields: Object.fromEntries(profileState.answers),
+      });
+      profileState.answers.clear();
+      profileState.recipientsText = "";
+      profileState.encrypted = true;
+      profileState.message = "Encrypted revision staged for synchronization.";
+    } catch (error) {
+      profileState.message = errorMessage(error);
+    } finally {
+      profileState.submitting = false;
+      render();
+    }
+  });
 }
 
 function bindTargetActions(): void {

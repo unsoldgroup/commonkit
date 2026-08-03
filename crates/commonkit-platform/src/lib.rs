@@ -1,5 +1,12 @@
 //! Cross-platform local paths and operating-system boundaries.
 
+mod validation_evidence;
+
+pub use validation_evidence::{
+    EvidenceOutcome, NativeValidationError, NativeValidationEvidence, NativeValidationStep,
+    ValidationPlatform, portable_context_support_ready,
+};
+
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 

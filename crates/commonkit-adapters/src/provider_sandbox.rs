@@ -74,6 +74,14 @@ impl<'a> ProviderSandbox<'a> {
         self
     }
 
+    pub(crate) fn limits(&mut self, runtime: Duration, output_bytes: usize) -> &mut Self {
+        self.limits = ProviderLimits {
+            runtime,
+            output_bytes,
+        };
+        self
+    }
+
     pub(crate) fn output(&self) -> Result<Output, ProviderFailure> {
         platform_output(self)
     }
