@@ -468,6 +468,7 @@ dependencies = [
  "clap",
  "commonkit-contracts",
  "commonkit-execution",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

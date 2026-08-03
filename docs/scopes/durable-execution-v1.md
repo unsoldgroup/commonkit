@@ -35,9 +35,29 @@ COMMONKIT_EXECD_OBJECT_ENCRYPTION_KEY='from-secret-provider' \
 commonkit-execd --listen 127.0.0.1:7341 --database /var/lib/commonkit-execd/jobs.db \
   --target /etc/commonkit/execution-target.json --worker-id linux-vps \
   --policy /etc/commonkit/execution-policy.json \
+  --secrets /etc/commonkit/secrets.json \
+  --tasks /etc/commonkit/execution-context.json \
   --workspace-root /var/lib/commonkit-execd/workspaces \
   --object-root /var/lib/commonkit-execd/objects
 ```
+
+Each repository is cached under `--workspace-root` as a bare mirror and each job
+runs in its own detached worktree at the manifest revision, removed when the job
+reaches a terminal state unless `--keep-failed-workspaces` is set. Preparation
+runs after the runtime policy check, so a denied repository is never contacted.
+
+`--secrets` is an operator-rendered JSON object of `env://NAME` to value, refused
+unless it is owner-only. Its keys become the target's `ready_secret_refs`, so
+placement reflects what the target can actually resolve. Without it no manifest
+may declare `secretRefs`.
+
+`--tasks` points at the repository-declared task manifests and turns on GitHub
+commit statuses, which require `env://GITHUB_STATUS_TOKEN` in the secret file. A
+job is matched back to its declared task by repository, workdir, and argv, so no
+job-to-task mapping is persisted. Statuses are posted as `commonkit/<taskId>`,
+namespaced so they cannot collide with another producer's contexts. Posting is
+best effort and retried only on transport failures, 429, and 5xx; GitHub being
+unreachable never changes a job's outcome. CommonKit does not use GitHub Actions.
 
 Back up with the scheduler's online SQLite backup API and copy the resulting database plus encrypted object-store replica. Startup opens WAL mode and `recover_expired` turns abandoned attempts into interrupted attempts and queues policy-permitted retries.
 

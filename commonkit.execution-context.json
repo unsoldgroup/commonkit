@@ -1,0 +1,177 @@
+{
+  "issueId": "USG-51",
+  "plan": "docs/plans/usg-51-ci-on-execution-targets.md",
+  "skills": [],
+  "tasks": {
+    "ci-cargo-test": {
+      "schemaVersion": 1,
+      "repository": "https://github.com/unsoldgroup/commonkit.git",
+      "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
+      "workspaceBundleDigest": null,
+      "argv": ["cargo", "test", "--workspace", "--all-features", "--locked"],
+      "workdir": ".",
+      "secretRefs": [],
+      "timeoutSeconds": 2400,
+      "cancelGraceSeconds": 30,
+      "resources": {
+        "cpuMillis": 8000,
+        "memoryMib": 8192,
+        "diskMib": 20480
+      },
+      "requiredCapabilities": ["ci-linux-x64"],
+      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "retry": {
+        "maxAttempts": 1,
+        "retryableExitCodes": []
+      },
+      "checkpointEnabled": false,
+      "artifacts": {
+        "globs": ["diagnostics/**"],
+        "retentionSeconds": 604800,
+        "maxBytes": 8388608
+      },
+      "networkPolicy": "restricted",
+      "repositoryWrite": false,
+      "browser": null
+    },
+    "ci-cargo-clippy": {
+      "schemaVersion": 1,
+      "repository": "https://github.com/unsoldgroup/commonkit.git",
+      "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
+      "workspaceBundleDigest": null,
+      "argv": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--locked",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "workdir": ".",
+      "secretRefs": [],
+      "timeoutSeconds": 1800,
+      "cancelGraceSeconds": 30,
+      "resources": {
+        "cpuMillis": 8000,
+        "memoryMib": 8192,
+        "diskMib": 20480
+      },
+      "requiredCapabilities": ["ci-linux-x64"],
+      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "retry": {
+        "maxAttempts": 1,
+        "retryableExitCodes": []
+      },
+      "checkpointEnabled": false,
+      "artifacts": {
+        "globs": ["diagnostics/**"],
+        "retentionSeconds": 604800,
+        "maxBytes": 8388608
+      },
+      "networkPolicy": "restricted",
+      "repositoryWrite": false,
+      "browser": null
+    },
+    "ci-pnpm-test": {
+      "schemaVersion": 1,
+      "repository": "https://github.com/unsoldgroup/commonkit.git",
+      "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
+      "workspaceBundleDigest": null,
+      "argv": ["pnpm", "test"],
+      "workdir": ".",
+      "secretRefs": [],
+      "timeoutSeconds": 900,
+      "cancelGraceSeconds": 30,
+      "resources": {
+        "cpuMillis": 4000,
+        "memoryMib": 4096,
+        "diskMib": 10240
+      },
+      "requiredCapabilities": ["ci-linux-x64"],
+      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "retry": {
+        "maxAttempts": 1,
+        "retryableExitCodes": []
+      },
+      "checkpointEnabled": false,
+      "artifacts": {
+        "globs": ["diagnostics/**"],
+        "retentionSeconds": 604800,
+        "maxBytes": 8388608
+      },
+      "networkPolicy": "restricted",
+      "repositoryWrite": false,
+      "browser": null
+    },
+    "ci-desktop-test": {
+      "schemaVersion": 1,
+      "repository": "https://github.com/unsoldgroup/commonkit.git",
+      "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
+      "workspaceBundleDigest": null,
+      "argv": ["pnpm", "--dir", "apps/desktop", "test"],
+      "workdir": ".",
+      "secretRefs": [],
+      "timeoutSeconds": 900,
+      "cancelGraceSeconds": 30,
+      "resources": {
+        "cpuMillis": 4000,
+        "memoryMib": 4096,
+        "diskMib": 10240
+      },
+      "requiredCapabilities": ["ci-linux-x64"],
+      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "retry": {
+        "maxAttempts": 1,
+        "retryableExitCodes": []
+      },
+      "checkpointEnabled": false,
+      "artifacts": {
+        "globs": ["diagnostics/**"],
+        "retentionSeconds": 604800,
+        "maxBytes": 8388608
+      },
+      "networkPolicy": "restricted",
+      "repositoryWrite": false,
+      "browser": null
+    },
+    "ci-desktop-typecheck": {
+      "schemaVersion": 1,
+      "repository": "https://github.com/unsoldgroup/commonkit.git",
+      "repositoryRevision": "9cd2e5d29e599342264ff92f8760e61666325132",
+      "workspaceBundleDigest": null,
+      "argv": ["pnpm", "--dir", "apps/desktop", "typecheck"],
+      "workdir": ".",
+      "secretRefs": [],
+      "timeoutSeconds": 600,
+      "cancelGraceSeconds": 30,
+      "resources": {
+        "cpuMillis": 4000,
+        "memoryMib": 4096,
+        "diskMib": 10240
+      },
+      "requiredCapabilities": ["ci-linux-x64"],
+      "loadoutDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+      "executionProfileDigest": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
+      "retry": {
+        "maxAttempts": 1,
+        "retryableExitCodes": []
+      },
+      "checkpointEnabled": false,
+      "artifacts": {
+        "globs": ["diagnostics/**"],
+        "retentionSeconds": 604800,
+        "maxBytes": 8388608
+      },
+      "networkPolicy": "restricted",
+      "repositoryWrite": false,
+      "browser": null
+    }
+  }
+}
