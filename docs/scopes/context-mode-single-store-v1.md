@@ -85,6 +85,14 @@ both existing stores. Rows are preserved verbatim. No row is dropped.
 - The merge runs while no writer is live. It is a migration step, not a
   reconcile operation, and no adapter performs it.
 
+`scripts/context-mode-merge.mjs` implements this. Measured against the two
+stores on 2026-08-03: 833 databases, 832 disjoint by filename and copied as-is,
+one — `sessions/44dc58e62d613136.db` — unioned. The two stores hold 1,560 and
+1,822 distinct session identifiers and share none, so the union has no losers
+and the collision record is an empty-set safety net rather than a live concern.
+That is a property of today's data, not a guarantee; the merge still refuses to
+run rather than drop a row.
+
 This is the application-level export/import path `CONTEXT.md:189` already
 reserves. It is not binary merging, and it does not generalize: the union is a
 one-time same-machine migration, not a mechanism for combining stores across
