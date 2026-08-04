@@ -845,6 +845,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "commonkit-cli",
+ "commonkit-core",
  "commonkit-platform",
  "minisign-verify",
  "reqwest 0.12.28",

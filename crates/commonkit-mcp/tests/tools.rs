@@ -111,6 +111,7 @@ fn publishes_stable_initial_tool_names() {
             "commonkit_get_execution_targets",
             "commonkit_get_job",
             "commonkit_get_job_events",
+            "commonkit_get_principal",
             "commonkit_get_status",
             "commonkit_list_job_artifacts",
             "commonkit_list_skill_candidates",
@@ -225,6 +226,11 @@ async fn read_tools_return_structured_daemon_data() {
     assert_eq!(
         result.structured_content.expect("structured")["state"],
         "healthy"
+    );
+    let principal = server.get_principal().await.expect("principal");
+    assert_eq!(
+        principal.structured_content.expect("structured")["path"],
+        "/control/v1/principal"
     );
     let inventory = server.list_skills().await.expect("skill inventory");
     assert_eq!(

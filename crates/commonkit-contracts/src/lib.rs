@@ -172,6 +172,42 @@ impl StableId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema)]
+#[serde(transparent)]
+pub struct Principal(String);
+
+impl Principal {
+    pub fn parse(value: impl Into<String>) -> Result<Self, ContractError> {
+        let value = value.into().to_ascii_lowercase();
+        let valid = !value.is_empty()
+            && value.len() <= 39
+            && !value.starts_with('-')
+            && !value.ends_with('-')
+            && !value.contains("--")
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+        if valid {
+            Ok(Self(value))
+        } else {
+            Err(ContractError::InvalidPrincipal)
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for Principal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 impl fmt::Display for StableId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
@@ -1514,6 +1550,8 @@ fn schema_with_id(schema: schemars::Schema, id: &str) -> Result<Value, ContractE
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ContractError {
+    #[error("principal is not a valid GitHub login")]
+    InvalidPrincipal,
     #[error("JSON canonicalization failed")]
     Canonicalization,
     #[error("JSON Schema generation failed")]

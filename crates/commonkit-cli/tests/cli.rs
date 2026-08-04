@@ -46,6 +46,7 @@ fn layer(id: &str, kind: &str, spec: Value) -> Value {
 fn reports_versioned_machine_readable_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
         .arg("status")
+        .env("PATH", "")
         .output()
         .expect("status");
     assert!(output.status.success());

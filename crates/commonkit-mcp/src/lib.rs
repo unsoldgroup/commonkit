@@ -462,6 +462,14 @@ impl CommonKitMcp {
     }
 
     #[tool(
+        name = "commonkit_get_principal",
+        description = "Resolve the acting local CommonKit Principal. Returns null when GitHub CLI authentication is unavailable; this tool never mutates state."
+    )]
+    pub async fn get_principal(&self) -> Result<CallToolResult, ErrorData> {
+        tool_result(self.backend.get("/control/v1/principal").await)
+    }
+
+    #[tool(
         name = "commonkit_export_diagnostics",
         description = "Export schema-bound redacted CommonKit diagnostics. Secret values are never included."
     )]

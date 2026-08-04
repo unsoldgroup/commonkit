@@ -1,10 +1,15 @@
 //! CommonKit composition, policy, and planning primitives.
 
+mod principal;
 mod target;
 
 use std::{collections::BTreeSet, sync::OnceLock};
 
 pub use commonkit_contracts::*;
+pub use principal::{
+    CommandOutput, PrincipalCommandRunner, ProcessPrincipalCommandRunner, github_cli_executable,
+    resolve_principal, resolve_principal_with,
+};
 use regex::Regex;
 pub use target::{
     CaseSensitivity, OperatingSystem, PlatformFacts, RootAccess, TargetInventory,

@@ -24,10 +24,10 @@ use commonkit_adapters::{
 };
 use commonkit_contracts::{
     CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan, PlanBindings,
-    ReceiptState, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
-    assert_no_embedded_secrets, digest_domain_json,
+    Principal, ReceiptState, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, Sha256Digest,
+    StableId, assert_no_embedded_secrets, digest_domain_json,
 };
-use commonkit_core::{PlanDraft, build_plan};
+use commonkit_core::{PlanDraft, build_plan, resolve_principal};
 use commonkit_reconcile::{
     Adapter, PlanStore, PlanStoreError, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
     SkillDeploymentRequest,
@@ -924,6 +924,7 @@ fn router_with_control_and_relay(
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
+        .route("/control/v1/principal", get(get_principal))
         .route("/control/v1/health", get(health))
         .route(
             "/control/v1/domains/reload",
@@ -4369,6 +4370,15 @@ impl BoundServer {
 
 async fn get_status(State(state): State<ApiState>) -> Json<ServiceStatus> {
     Json(state.status.read().await.clone())
+}
+
+async fn get_principal() -> Json<Option<Principal>> {
+    Json(
+        tokio::task::spawn_blocking(resolve_principal)
+            .await
+            .ok()
+            .flatten(),
+    )
 }
 
 async fn get_diagnostics(
