@@ -186,9 +186,11 @@ impl ProfileStore {
 
     pub fn revision(&self) -> Result<u64, ProfileError> {
         self.connection
-            .query_row("SELECT revision FROM profile_meta WHERE singleton = 1", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT revision FROM profile_meta WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
             .map_err(ProfileError::from)
     }
 
@@ -287,16 +289,13 @@ impl ProfileStore {
              ORDER BY rank LIMIT ?3",
         )?;
         let results = statement
-            .query_map(params![expression, view.key(), limit.min(10) as u64], |row| {
-                let category: String = row.get(2)?;
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    category,
-                    row.get(3)?,
-                    row.get(4)?,
-                ))
-            })?
+            .query_map(
+                params![expression, view.key(), limit.min(10) as u64],
+                |row| {
+                    let category: String = row.get(2)?;
+                    Ok((row.get(0)?, row.get(1)?, category, row.get(3)?, row.get(4)?))
+                },
+            )?
             .map(|row| {
                 let (claim_id, topic_key, category, text, revision) = row?;
                 Ok(SearchResult {
@@ -460,17 +459,16 @@ impl ProfileStore {
             .ok_or(ProfileError::SuggestionNotFound)?;
         match decision {
             SuggestionDecision::Reject => {
-                let fingerprint =
-                    suppression_fingerprint(&self.suppression_key, &suggestion.view, &suggestion.claim);
+                let fingerprint = suppression_fingerprint(
+                    &self.suppression_key,
+                    &suggestion.view,
+                    &suggestion.claim,
+                );
                 let transaction = self.connection.transaction()?;
                 transaction.execute(
                     "INSERT OR IGNORE INTO suppressions(fingerprint, category, rejected_at_ms)
                      VALUES(?1, ?2, ?3)",
-                    params![
-                        fingerprint,
-                        suggestion.claim.category.as_str(),
-                        now_ms()
-                    ],
+                    params![fingerprint, suggestion.claim.category.as_str(), now_ms()],
                 )?;
                 transaction.execute("DELETE FROM suggestions WHERE id = ?1", [suggestion_id])?;
                 transaction.commit()?;
@@ -571,9 +569,10 @@ fn validate_claims(claims: &[ClaimInput]) -> Result<(), ProfileError> {
         if claim.topic_key.trim().is_empty()
             || claim.text.trim().is_empty()
             || claim.views.is_empty()
-            || claim.views.iter().any(|view| {
-                view.loadout_id.trim().is_empty() || view.project_id.trim().is_empty()
-            })
+            || claim
+                .views
+                .iter()
+                .any(|view| view.loadout_id.trim().is_empty() || view.project_id.trim().is_empty())
         {
             return Err(ProfileError::InvalidInput("claim"));
         }
@@ -597,23 +596,27 @@ fn load_draft(transaction: &Transaction<'_>, id: &str) -> Result<Draft, ProfileE
             },
         )
         .optional()?
-        .map(|(expected_revision, summary, claims)| -> Result<Draft, ProfileError> {
-            Ok(Draft {
-                id: id.into(),
-                expected_revision,
-                summary,
-                claims: serde_json::from_str(&claims)?,
-            })
-        })
+        .map(
+            |(expected_revision, summary, claims)| -> Result<Draft, ProfileError> {
+                Ok(Draft {
+                    id: id.into(),
+                    expected_revision,
+                    summary,
+                    claims: serde_json::from_str(&claims)?,
+                })
+            },
+        )
         .transpose()?
         .ok_or(ProfileError::DraftNotFound)
 }
 
 fn current_revision(transaction: &Transaction<'_>) -> Result<u64, ProfileError> {
     transaction
-        .query_row("SELECT revision FROM profile_meta WHERE singleton = 1", [], |row| {
-            row.get(0)
-        })
+        .query_row(
+            "SELECT revision FROM profile_meta WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
         .map_err(ProfileError::from)
 }
 
@@ -656,8 +659,8 @@ fn claim_views(
     transaction: &Transaction<'_>,
     claim_id: &str,
 ) -> Result<Vec<ScopedView>, ProfileError> {
-    let mut statement =
-        transaction.prepare("SELECT view_key FROM claim_views WHERE claim_id = ?1 ORDER BY view_key")?;
+    let mut statement = transaction
+        .prepare("SELECT view_key FROM claim_views WHERE claim_id = ?1 ORDER BY view_key")?;
     statement
         .query_map([claim_id], |row| row.get::<_, String>(0))?
         .map(|row| {
@@ -679,7 +682,14 @@ fn suppression_fingerprint(key: &[u8], view: &ScopedView, claim: &ClaimInput) ->
     digest.update(b"\0");
     digest.update(claim.topic_key.trim().to_lowercase());
     digest.update(b"\0");
-    digest.update(claim.text.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase());
+    digest.update(
+        claim
+            .text
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase(),
+    );
     format!("{:x}", digest.finalize())
 }
 

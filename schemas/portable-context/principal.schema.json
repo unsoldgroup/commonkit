@@ -1,0 +1,38 @@
+{
+  "$defs": {
+    "PrincipalKind": {
+      "enum": [
+        "user",
+        "agent_runtime",
+        "service"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/portable-context/principal.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "displayName": {
+      "type": "string"
+    },
+    "kind": {
+      "$ref": "#/$defs/PrincipalKind"
+    },
+    "provider": {
+      "type": "string"
+    },
+    "subjectId": {
+      "description": "Immutable provider identifier, not a mutable login or display name.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "kind",
+    "provider",
+    "subjectId",
+    "displayName"
+  ],
+  "title": "principal",
+  "type": "object"
+}

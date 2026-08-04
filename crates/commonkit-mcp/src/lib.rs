@@ -226,6 +226,47 @@ pub struct ReadInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextSearchInput {
+    pub session_id: String,
+    pub query: String,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextSectionInput {
+    pub session_id: String,
+    pub section_id: String,
+    pub max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextAccessRequestInput {
+    pub session_id: String,
+    pub descriptor_id: String,
+    pub purpose: String,
+    pub duration_seconds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContextReceiptInput {
+    pub session_id: String,
+    pub receipt_id: String,
+    pub audience: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileRevisionProposalInput {
+    pub session_id: String,
+    pub field_ids: Vec<String>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ConsentInput {
     pub confirmed: bool,
     pub confirmation_id: String,
@@ -395,7 +436,10 @@ impl CommonKitMcp {
         Parameters(input): Parameters<AboutMeSearchInput>,
     ) -> Result<CallToolResult, ErrorData> {
         if input.query.trim().is_empty() || input.limit == 0 || input.limit > 10 {
-            return Ok(input_error("invalid_about_me_search", "Query and limit 1-10 are required"));
+            return Ok(input_error(
+                "invalid_about_me_search",
+                "Query and limit 1-10 are required",
+            ));
         }
         tool_result(
             self.backend
@@ -416,7 +460,10 @@ impl CommonKitMcp {
         Parameters(input): Parameters<AboutMeSuggestionInput>,
     ) -> Result<CallToolResult, ErrorData> {
         if input.text.trim().is_empty() || input.evidence_quote.trim().is_empty() {
-            return Ok(input_error("invalid_about_me_suggestion", "Text and direct user evidence are required"));
+            return Ok(input_error(
+                "invalid_about_me_suggestion",
+                "Text and direct user evidence are required",
+            ));
         }
         tool_result(
             self.backend
@@ -459,6 +506,141 @@ impl CommonKitMcp {
     )]
     pub async fn get_status(&self) -> Result<CallToolResult, ErrorData> {
         tool_result(self.backend.get("/control/v1/status").await)
+    }
+
+    #[tool(
+        name = "commonkit_context_search",
+        description = "Search bounded context descriptors. The daemon reauthorizes the runtime session and returns no protected values without a grant."
+    )]
+    pub async fn context_search(
+        &self,
+        Parameters(input): Parameters<ContextSearchInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if input.query.trim().is_empty()
+            || input.query.len() > 256
+            || !(1..=100).contains(&input.limit)
+        {
+            return Ok(input_error(
+                "invalid_input",
+                "query must be 1-256 bytes and limit 1-100",
+            ));
+        }
+        safe_id(&input.session_id)?;
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/context/search",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_retrieve_context_section",
+        description = "Retrieve one authorized context section with a strict response-size bound and per-call daemon reauthorization."
+    )]
+    pub async fn retrieve_context_section(
+        &self,
+        Parameters(input): Parameters<ContextSectionInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !(1..=262_144).contains(&input.max_bytes) {
+            return Ok(input_error("invalid_input", "maxBytes must be 1-262144"));
+        }
+        safe_id(&input.session_id)?;
+        safe_id(&input.section_id)?;
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/context/sections/retrieve",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_request_context_access",
+        description = "Create a just-in-time access request for a visible context descriptor; this never grants access by itself."
+    )]
+    pub async fn request_context_access(
+        &self,
+        Parameters(input): Parameters<ContextAccessRequestInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if input.purpose.trim().is_empty()
+            || input.purpose.len() > 128
+            || !(1..=2_592_000).contains(&input.duration_seconds)
+        {
+            return Ok(input_error(
+                "invalid_input",
+                "invalid purpose or grant duration",
+            ));
+        }
+        safe_id(&input.session_id)?;
+        safe_id(&input.descriptor_id)?;
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/context/access-requests",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_inspect_context_receipt",
+        description = "Inspect an audience-specific redacted context receipt through the daemon."
+    )]
+    pub async fn inspect_context_receipt(
+        &self,
+        Parameters(input): Parameters<ContextReceiptInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if !matches!(input.audience.as_str(), "user" | "organization") {
+            return Ok(input_error(
+                "invalid_input",
+                "audience must be user or organization",
+            ));
+        }
+        safe_id(&input.session_id)?;
+        safe_id(&input.receipt_id)?;
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/context/receipts/inspect",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
+    }
+
+    #[tool(
+        name = "commonkit_propose_profile_revision",
+        description = "Submit an inactive profile revision proposal containing field identifiers and rationale only; never writes profile values."
+    )]
+    pub async fn propose_profile_revision(
+        &self,
+        Parameters(input): Parameters<ProfileRevisionProposalInput>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if input.field_ids.is_empty()
+            || input.field_ids.len() > 38
+            || input.rationale.trim().is_empty()
+            || input.rationale.len() > 1_024
+        {
+            return Ok(input_error(
+                "invalid_input",
+                "invalid profile revision proposal",
+            ));
+        }
+        safe_id(&input.session_id)?;
+        tool_result(
+            self.backend
+                .post(
+                    "/control/v1/context/profile-revision-proposals",
+                    serde_json::to_value(input).unwrap_or(Value::Null),
+                )
+                .await,
+        )
     }
 
     #[tool(

@@ -1,6 +1,4 @@
-use commonkit_about_me::{
-    ClaimCategory, ClaimInput, ProfileStore, ScopedView, SuggestionDecision,
-};
+use commonkit_about_me::{ClaimCategory, ClaimInput, ProfileStore, ScopedView, SuggestionDecision};
 
 fn view(project: &str) -> ScopedView {
     ScopedView {
@@ -49,7 +47,11 @@ fn approved_claims_are_searchable_only_in_their_scoped_view() {
     );
 
     let bytes = std::fs::read(database).unwrap();
-    assert!(!bytes.windows(b"plain language".len()).any(|window| window == b"plain language"));
+    assert!(
+        !bytes
+            .windows(b"plain language".len())
+            .any(|window| window == b"plain language")
+    );
 }
 
 #[cfg(unix)]

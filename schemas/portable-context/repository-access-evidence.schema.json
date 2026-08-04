@@ -1,0 +1,124 @@
+{
+  "$defs": {
+    "AccessLevel": {
+      "enum": [
+        "read",
+        "write",
+        "maintain",
+        "admin"
+      ],
+      "type": "string"
+    },
+    "EvidenceState": {
+      "enum": [
+        "active",
+        "revoked"
+      ],
+      "type": "string"
+    },
+    "Principal": {
+      "additionalProperties": false,
+      "properties": {
+        "displayName": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PrincipalKind"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "subjectId": {
+          "description": "Immutable provider identifier, not a mutable login or display name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "provider",
+        "subjectId",
+        "displayName"
+      ],
+      "type": "object"
+    },
+    "PrincipalKind": {
+      "enum": [
+        "user",
+        "agent_runtime",
+        "service"
+      ],
+      "type": "string"
+    },
+    "RepositoryRole": {
+      "enum": [
+        "organization_kit",
+        "project_context",
+        "personal_context"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/portable-context/repository-access-evidence.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "access": {
+      "$ref": "#/$defs/AccessLevel"
+    },
+    "checkedAtUnixMs": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "expiresAtUnixMs": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "id": {
+      "type": "string"
+    },
+    "principal": {
+      "$ref": "#/$defs/Principal"
+    },
+    "private": {
+      "type": "boolean"
+    },
+    "repositoryName": {
+      "type": "string"
+    },
+    "repositoryNodeId": {
+      "type": "string"
+    },
+    "repositoryOwnerNodeId": {
+      "type": "string"
+    },
+    "repositoryRole": {
+      "$ref": "#/$defs/RepositoryRole"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "state": {
+      "$ref": "#/$defs/EvidenceState"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "id",
+    "principal",
+    "repositoryRole",
+    "repositoryNodeId",
+    "repositoryOwnerNodeId",
+    "repositoryName",
+    "private",
+    "access",
+    "checkedAtUnixMs",
+    "expiresAtUnixMs",
+    "state"
+  ],
+  "title": "repository-access-evidence",
+  "type": "object"
+}

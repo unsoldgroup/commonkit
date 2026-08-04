@@ -27,7 +27,7 @@ use commonkit_contracts::{
     Principal, ReceiptState, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, Sha256Digest,
     StableId, assert_no_embedded_secrets, digest_domain_json,
 };
-use commonkit_core::{PlanDraft, build_plan, resolve_principal};
+use commonkit_core::{PlanDraft, ReceiptAudience, build_plan, resolve_principal};
 use commonkit_reconcile::{
     Adapter, PlanStore, PlanStoreError, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
     SkillDeploymentRequest,
@@ -53,9 +53,16 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio_stream::wrappers::{BroadcastStream, errors::BroadcastStreamRecvError};
 
+mod portable_context_api;
+mod portable_onboarding;
 mod production_domains;
 mod skill_canary;
 mod target_inventory;
+pub use portable_context_api::{
+    ContextAccessRequestRecord, ContextApiError, ContextApiStore, ContextSearchResult,
+    ContextSectionRecord, ProfileRevisionProposalRecord, RetrievedContextSection,
+};
+pub use portable_onboarding::{OnboardingStateStore, OnboardingStoreError};
 pub use production_domains::{
     ProductionDomainError, ProductionDomainRegistry, ProductionSshTarget,
     ProductionSshTransportFactory,
@@ -657,6 +664,7 @@ struct ApiState {
     /// Provider artifact store, present once the daemon has a state directory.
     /// Read-only here: the budget ledger reads planned content by digest.
     artifacts: Option<Arc<ArtifactStore>>,
+    context: Arc<ContextApiStore>,
 }
 
 struct ManagedRelayRuntime {
@@ -841,6 +849,7 @@ pub fn router_with_control(
             skills: None,
             skill_canary: None,
             artifacts: None,
+            context: Arc::new(ContextApiStore::new()),
         },
     )
 }
@@ -869,6 +878,7 @@ pub fn router_with_control_and_artifacts(
             skills: None,
             skill_canary: None,
             artifacts: Some(artifacts),
+            context: Arc::new(ContextApiStore::new()),
         },
     )
 }
@@ -892,6 +902,31 @@ pub fn router_with_skills(
             skills: Some(skills),
             skill_canary: None,
             artifacts: None,
+            context: Arc::new(ContextApiStore::new()),
+        },
+    )
+}
+
+pub fn router_with_context(
+    token: ControlToken,
+    status: Arc<RwLock<ServiceStatus>>,
+    authority: impl Into<String>,
+    events: EventHub,
+    context: Arc<ContextApiStore>,
+) -> Router {
+    let relay_runtime = default_relay_runtime(&token);
+    router_with_control_and_relay(
+        token,
+        status,
+        authority,
+        events,
+        RouterRuntime {
+            control: ControlPlane::new(Arc::new(UnavailableExecutor)),
+            relay_runtime,
+            skills: None,
+            skill_canary: None,
+            artifacts: None,
+            context,
         },
     )
 }
@@ -902,6 +937,7 @@ struct RouterRuntime {
     skills: Option<Arc<SkillEngine>>,
     skill_canary: Option<Arc<skill_canary::SkillCanaryRuntime>>,
     artifacts: Option<Arc<ArtifactStore>>,
+    context: Arc<ContextApiStore>,
 }
 
 fn router_with_control_and_relay(
@@ -921,6 +957,7 @@ fn router_with_control_and_relay(
         skills: runtime.skills,
         skill_canary: runtime.skill_canary,
         artifacts: runtime.artifacts,
+        context: runtime.context,
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
@@ -933,6 +970,23 @@ fn router_with_control_and_relay(
         .route("/control/v1/events", get(get_events))
         .route("/control/v1/events/snapshot", get(get_events_snapshot))
         .route("/control/v1/diagnostics", get(get_diagnostics))
+        .route("/control/v1/context/search", post(context_search))
+        .route(
+            "/control/v1/context/sections/retrieve",
+            post(context_retrieve_section),
+        )
+        .route(
+            "/control/v1/context/access-requests",
+            post(context_request_access),
+        )
+        .route(
+            "/control/v1/context/receipts/inspect",
+            post(context_inspect_receipt),
+        )
+        .route(
+            "/control/v1/context/profile-revision-proposals",
+            post(context_propose_profile_revision),
+        )
         .route("/control/v1/about-me", get(about_me_inspect))
         .route("/control/v1/about-me/summary", get(about_me_summary))
         .route("/control/v1/about-me/drafts", post(about_me_create_draft))
@@ -1049,6 +1103,189 @@ fn router_with_control_and_relay(
         .layer(DefaultBodyLimit::max(1024 * 1024))
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContextSearchRequest {
+    session_id: String,
+    query: String,
+    limit: u32,
+}
+
+async fn context_search(
+    State(state): State<ApiState>,
+    Json(input): Json<ContextSearchRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if input.query.trim().is_empty() || input.query.len() > 256 || !(1..=100).contains(&input.limit)
+    {
+        return Err(ApiError::bad_request("invalid_context_search"));
+    }
+    let results = state
+        .context
+        .search(
+            &input.session_id,
+            &input.query,
+            input.limit as usize,
+            unix_time_ms() as u64,
+        )
+        .map_err(context_api_error)?;
+    Ok(Json(serde_json::json!({"results": results})))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContextRetrieveRequest {
+    session_id: String,
+    section_id: String,
+    max_bytes: u32,
+}
+
+async fn context_retrieve_section(
+    State(state): State<ApiState>,
+    Json(input): Json<ContextRetrieveRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if !(1..=262_144).contains(&input.max_bytes) {
+        return Err(ApiError::bad_request("invalid_context_response_bound"));
+    }
+    let section = state
+        .context
+        .retrieve(
+            &input.session_id,
+            &input.section_id,
+            input.max_bytes as usize,
+            unix_time_ms() as u64,
+        )
+        .map_err(context_api_error)?;
+    Ok(Json(serde_json::to_value(section).map_err(|_| {
+        ApiError::internal("context_response_serialization_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContextAccessRequest {
+    session_id: String,
+    descriptor_id: String,
+    purpose: String,
+    duration_seconds: u32,
+}
+
+async fn context_request_access(
+    State(state): State<ApiState>,
+    Json(input): Json<ContextAccessRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if input.purpose.trim().is_empty()
+        || input.purpose.len() > 128
+        || !(1..=2_592_000).contains(&input.duration_seconds)
+    {
+        return Err(ApiError::bad_request("invalid_context_access_request"));
+    }
+    let purpose = StableId::parse(input.purpose)
+        .map_err(|_| ApiError::bad_request("invalid_context_purpose"))?;
+    let request = state
+        .context
+        .request_access(
+            &input.session_id,
+            &input.descriptor_id,
+            purpose,
+            input.duration_seconds,
+            unix_time_ms() as u64,
+        )
+        .map_err(context_api_error)?;
+    Ok(Json(serde_json::to_value(request).map_err(|_| {
+        ApiError::internal("context_response_serialization_failed")
+    })?))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ContextReceiptRequest {
+    session_id: String,
+    receipt_id: String,
+    audience: String,
+}
+
+async fn context_inspect_receipt(
+    State(state): State<ApiState>,
+    Json(input): Json<ContextReceiptRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let audience = match input.audience.as_str() {
+        "user" => ReceiptAudience::User,
+        "organization" => ReceiptAudience::Organization,
+        _ => return Err(ApiError::bad_request("invalid_receipt_audience")),
+    };
+    let (digest, projection) = state
+        .context
+        .inspect_receipt(
+            &input.session_id,
+            &input.receipt_id,
+            audience,
+            unix_time_ms() as u64,
+        )
+        .map_err(context_api_error)?;
+    Ok(Json(serde_json::json!({
+        "receiptDigest": digest,
+        "projection": projection,
+    })))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProfileRevisionProposalRequest {
+    session_id: String,
+    field_ids: Vec<String>,
+    rationale: String,
+}
+
+async fn context_propose_profile_revision(
+    State(state): State<ApiState>,
+    Json(input): Json<ProfileRevisionProposalRequest>,
+) -> Result<Json<Value>, ApiError> {
+    if input.field_ids.is_empty()
+        || input.field_ids.len() > 38
+        || input.rationale.trim().is_empty()
+        || input.rationale.len() > 1_024
+    {
+        return Err(ApiError::bad_request("invalid_profile_revision_proposal"));
+    }
+    let field_ids = input
+        .field_ids
+        .into_iter()
+        .map(StableId::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| ApiError::bad_request("invalid_profile_field_id"))?;
+    let proposal = state
+        .context
+        .propose_revision(
+            &input.session_id,
+            field_ids,
+            input.rationale,
+            unix_time_ms() as u64,
+        )
+        .map_err(context_api_error)?;
+    Ok(Json(serde_json::to_value(proposal).map_err(|_| {
+        ApiError::internal("context_response_serialization_failed")
+    })?))
+}
+
+fn context_api_error(error: ContextApiError) -> ApiError {
+    match error {
+        ContextApiError::UnknownSession
+        | ContextApiError::UnknownDescriptor
+        | ContextApiError::UnknownSection
+        | ContextApiError::UnknownReceipt => ApiError::not_found("context_record_not_found"),
+        ContextApiError::AccessDenied | ContextApiError::PurposeMismatch => {
+            ApiError::forbidden_code("context_access_denied")
+        }
+        ContextApiError::ResponseTooLarge => {
+            ApiError::bad_request("context_response_bound_exceeded")
+        }
+        ContextApiError::Resolver(_) => ApiError::forbidden("context_session_invalid"),
+        ContextApiError::Unavailable | ContextApiError::Digest | ContextApiError::Contract(_) => {
+            ApiError::internal("context_runtime_failed")
+        }
+    }
 }
 
 async fn domain_reload_preflight(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
@@ -2780,6 +3017,14 @@ impl ApiError {
         }
     }
 
+    fn forbidden_code(code: &'static str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code,
+            message: None,
+        }
+    }
+
     fn conflict(code: &'static str) -> Self {
         Self {
             status: StatusCode::CONFLICT,
@@ -4308,6 +4553,7 @@ impl BoundServer {
                 artifacts: ArtifactStore::open(paths.state.join("provider-artifacts"))
                     .ok()
                     .map(Arc::new),
+                context: Arc::new(ContextApiStore::new()),
             },
         );
         // The listener is bound before provider domains are loaded so its

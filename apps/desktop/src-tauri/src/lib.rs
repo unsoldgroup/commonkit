@@ -1,8 +1,14 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use commonkit_contracts::{Sha256Digest, StableId};
+use commonkit_personal_context::{
+    EncryptedRevisionStore, FieldOperation, ProfileFieldId, RevisionBinding, SecretValue,
+    encrypt_revision_for_recipient_strings,
+};
 use commonkit_cli::about_me_setup::{SetupAnswers, SetupRequest, setup_profile};
 use commonkit_core::{Principal, github_cli_executable};
 use commonkit_platform::AppPaths;
@@ -374,6 +380,60 @@ struct OnboardingDefaults {
     kit_directory: PathBuf,
     target_root: PathBuf,
     computer_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProfileEncryptRequest {
+    binding: RevisionBinding,
+    recipients: Vec<String>,
+    /// `None` represents a signed field deletion. Strings exist only for this
+    /// authorized local encryption command and are consumed into zeroizing memory.
+    fields: BTreeMap<String, Option<String>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProfileEncryptionReceipt {
+    revision_id: StableId,
+    ciphertext_digest: Sha256Digest,
+    staged: bool,
+}
+
+#[tauri::command]
+fn encrypt_profile_revision(
+    request: ProfileEncryptRequest,
+) -> Result<ProfileEncryptionReceipt, DesktopError> {
+    let fields = request
+        .fields
+        .into_iter()
+        .map(|(field_id, value)| {
+            let field_id = ProfileFieldId::parse(field_id).map_err(|_| DesktopError::InvalidInput)?;
+            let operation = value.map_or(FieldOperation::Delete, |value| {
+                FieldOperation::Set(SecretValue::from_string(value))
+            });
+            Ok((field_id, operation))
+        })
+        .collect::<Result<BTreeMap<_, _>, DesktopError>>()?;
+    let revision_id = request.binding.revision_id.clone();
+    let encrypted = encrypt_revision_for_recipient_strings(request.binding, fields, &request.recipients)
+        .map_err(|_| DesktopError::ProfileEncryptionFailed)?;
+    let paths = AppPaths::discover().map_err(|_| DesktopError::ServiceUnavailable)?;
+    let store = EncryptedRevisionStore::open(paths.state.join("personal-context/staged"))
+        .map_err(|_| DesktopError::ProfileEncryptionFailed)?;
+    let ciphertext_digest = store
+        .stage(&encrypted)
+        .map_err(|error| match error {
+            commonkit_personal_context::CryptoError::RevisionCollision => {
+                DesktopError::ProfileRevisionCollision
+            }
+            _ => DesktopError::ProfileEncryptionFailed,
+        })?;
+    Ok(ProfileEncryptionReceipt {
+        revision_id,
+        ciphertext_digest,
+        staged: true,
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -872,6 +932,10 @@ enum DesktopError {
     GithubAuthenticationFailed,
     #[error("CommonKit onboarding failed: {0}")]
     OnboardingFailed(String),
+    #[error("CommonKit could not encrypt the profile revision locally")]
+    ProfileEncryptionFailed,
+    #[error("a different encrypted profile revision already uses this revision ID")]
+    ProfileRevisionCollision,
     #[error("About Me setup could not be completed")]
     AboutMeSetupFailed,
     #[error(transparent)]
@@ -1712,6 +1776,7 @@ pub fn run() {
             onboarding_defaults,
             desktop_settings_snapshot,
             onboarding_initialize,
+            encrypt_profile_revision,
             desktop_management_snapshot,
             desktop_about_me_setup,
             desktop_about_me_decide,
@@ -1778,14 +1843,7 @@ pub fn run() {
             let menu = Menu::with_items(
                 app,
                 &[
-                    &health,
-                    &computer,
-                    &git_sync,
-                    &policy,
-                    &drift,
-                    &relay,
-                    &snapshots,
-                    &open,
+                    &health, &computer, &git_sync, &policy, &drift, &relay, &snapshots, &open,
                     &quit,
                 ],
             )?;

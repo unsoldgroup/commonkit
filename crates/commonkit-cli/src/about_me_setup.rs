@@ -42,11 +42,7 @@ pub fn setup_profile(request: SetupRequest) -> Result<SetupOutcome, SetupError> 
     if !request.approved {
         return Err(SetupError::NotApproved);
     }
-    for value in [
-        &request.loadout_id,
-        &request.project_id,
-        &request.agent_id,
-    ] {
+    for value in [&request.loadout_id, &request.project_id, &request.agent_id] {
         if value.trim().is_empty() {
             return Err(SetupError::InvalidScope);
         }

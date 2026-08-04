@@ -1,11 +1,17 @@
 //! CommonKit composition, policy, and planning primitives.
 
+mod context_resolver;
 mod principal;
 mod target;
 
 use std::{collections::BTreeSet, sync::OnceLock};
 
 pub use commonkit_contracts::*;
+pub use context_resolver::{
+    CandidateContext, ContextGrantRule, ContextResolution, ContextResolverError, ContextScope,
+    ReceiptAudience, ReceiptProjection, ReceiptSelection, RuntimeSession, project_receipt,
+    resolve_context,
+};
 pub use principal::{
     CommandOutput, PrincipalCommandRunner, ProcessPrincipalCommandRunner, github_cli_executable,
     resolve_principal, resolve_principal_with,

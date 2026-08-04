@@ -1,0 +1,63 @@
+{
+  "$defs": {
+    "ProfileFieldDefinition": {
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "fieldType": {
+          "$ref": "#/$defs/ProfileFieldType"
+        },
+        "optional": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "fieldType",
+        "description",
+        "optional"
+      ],
+      "type": "object"
+    },
+    "ProfileFieldType": {
+      "enum": [
+        "string",
+        "string_list"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/portable-context/profile-schema.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "fields": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProfileFieldDefinition"
+      },
+      "type": "object"
+    },
+    "id": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "id",
+    "version",
+    "fields"
+  ],
+  "title": "profile-schema",
+  "type": "object"
+}

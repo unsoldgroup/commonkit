@@ -1,5 +1,6 @@
 export const navigation = [
   { group: "Overview", route: "status", label: "Status" },
+  { group: "Context", route: "profile", label: "My work profile" },
   { group: "Operate", route: "plans", label: "Changes" },
   { group: "Operate", route: "credentials", label: "Credentials" },
   { group: "Operate", route: "snapshots", label: "Data" },

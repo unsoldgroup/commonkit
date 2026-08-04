@@ -44,5 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output.push('\n');
         fs::write(root.join(name), output)?;
     }
+    let portable_root = root.join("portable-context");
+    fs::create_dir_all(&portable_root)?;
+    for entry in commonkit_contracts::portable_context::portable_context_schema_registry() {
+        let mut output = serde_json::to_string_pretty(&entry.schema_value()?)?;
+        output.push('\n');
+        fs::write(
+            portable_root.join(format!("{}.schema.json", entry.name)),
+            output,
+        )?;
+    }
     Ok(())
 }

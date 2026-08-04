@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+use commonkit_about_me::{ClaimCategory, ClaimInput, ProfileStore, ScopedView};
 use commonkit_adapters::{
     ApmProvider, ApmProviderConfig, ArtifactStore, BwsCredentialResolver, ChezmoiProvider,
     ContentSensitivity, CredentialReference, CredentialResolver, DesiredStateProvider,
@@ -17,7 +18,6 @@ use commonkit_adapters::{
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, build_provider_plan,
     materialize_mcp_client_state, validate_ownership,
 };
-use commonkit_about_me::{ClaimCategory, ClaimInput, ProfileStore, ScopedView};
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
     validate_layer_content_digest,
@@ -45,8 +45,9 @@ use thiserror::Error;
 
 use crate::skill_canary::{SkillCanaryConfig, SkillCanaryRuntime};
 use crate::{
-    AboutMeDomain, ApplyStatus, CompositionDomain, CredentialDomain, DomainFailure, ExecutionResult,
-    HeadlessDomainRegistry, PlanExecutor, RelayProviderAuthority, SnapshotDomain, SyncDomain,
+    AboutMeDomain, ApplyStatus, CompositionDomain, CredentialDomain, DomainFailure,
+    ExecutionResult, HeadlessDomainRegistry, PlanExecutor, RelayProviderAuthority, SnapshotDomain,
+    SyncDomain,
 };
 
 #[derive(Deserialize)]
@@ -760,19 +761,21 @@ impl ProductionDomainRegistry {
             .transpose()?;
         let about_me = config
             .about_me
-            .map(|config| -> Result<Arc<dyn AboutMeDomain>, ProductionDomainError> {
-                if !config.database.is_absolute()
-                    || config.loadout_id.trim().is_empty()
-                    || config.project_id.trim().is_empty()
-                {
-                    return Err(ProductionDomainError::UnsafeConfig);
-                }
-                let domain = ProductionAboutMeDomain { config };
-                domain
-                    .store()
-                    .map_err(|_| ProductionDomainError::UnsafeConfig)?;
-                Ok(Arc::new(domain))
-            })
+            .map(
+                |config| -> Result<Arc<dyn AboutMeDomain>, ProductionDomainError> {
+                    if !config.database.is_absolute()
+                        || config.loadout_id.trim().is_empty()
+                        || config.project_id.trim().is_empty()
+                    {
+                        return Err(ProductionDomainError::UnsafeConfig);
+                    }
+                    let domain = ProductionAboutMeDomain { config };
+                    domain
+                        .store()
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    Ok(Arc::new(domain))
+                },
+            )
             .transpose()?;
         let mut target_sync_domains = BTreeMap::new();
         for (id, sync_config) in &sync_configs {

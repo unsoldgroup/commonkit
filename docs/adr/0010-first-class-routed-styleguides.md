@@ -1,7 +1,7 @@
 # ADR 0010: First-class routed styleguides
 
-Status: Accepted  
-Date: 2026-07-30  
+Status: Accepted
+Date: 2026-07-30
 Tracking: USG-59
 
 ## Context

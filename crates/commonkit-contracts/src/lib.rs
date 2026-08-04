@@ -10,6 +10,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+pub mod portable_context;
+
 pub const CONTRACT_VERSION: &str = "1.0";
 pub const SCHEMA_VERSION: u32 = 1;
 

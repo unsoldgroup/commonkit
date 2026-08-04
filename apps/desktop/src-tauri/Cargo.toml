@@ -13,6 +13,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 commonkit-platform = { path = "../../../crates/commonkit-platform" }
 commonkit-cli = { path = "../../../crates/commonkit-cli" }
+commonkit-contracts = { path = "../../../crates/commonkit-contracts" }
+commonkit-personal-context = { path = "../../../crates/commonkit-personal-context" }
 commonkit-core = { path = "../../../crates/commonkit-core" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }

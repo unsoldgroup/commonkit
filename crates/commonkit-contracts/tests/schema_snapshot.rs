@@ -32,6 +32,16 @@ fn checked_in_layer_schema_matches_the_rust_contract() {
     );
 }
 
+#[test]
+fn checked_in_portable_context_schemas_match_the_registry() {
+    for entry in commonkit_contracts::portable_context::portable_context_schema_registry() {
+        assert_schema(
+            &format!("portable-context/{}.schema.json", entry.name),
+            entry.schema_value(),
+        );
+    }
+}
+
 fn assert_schema(
     name: &str,
     generated: Result<serde_json::Value, commonkit_contracts::ContractError>,

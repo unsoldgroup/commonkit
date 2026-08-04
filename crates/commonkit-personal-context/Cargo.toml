@@ -1,0 +1,23 @@
+[package]
+name = "commonkit-personal-context"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+age.workspace = true
+base64.workspace = true
+chacha20poly1305.workspace = true
+commonkit-contracts = { path = "../commonkit-contracts" }
+commonkit-platform = { path = "../commonkit-platform" }
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

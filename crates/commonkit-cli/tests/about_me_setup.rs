@@ -1,5 +1,5 @@
-use commonkit_cli::about_me_setup::{SetupAnswers, SetupRequest, setup_profile};
 use commonkit_about_me::{ProfileStore, ScopedView};
+use commonkit_cli::about_me_setup::{SetupAnswers, SetupRequest, setup_profile};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -63,7 +63,10 @@ fn approved_interview_preserves_config_and_creates_a_private_searchable_profile(
     };
     assert_eq!(store.search(&view, "plain language", 5).unwrap().len(), 1);
     let raw = std::fs::read(&outcome.database_path).unwrap();
-    assert!(!raw.windows("plain language".len()).any(|value| value == b"plain language"));
+    assert!(
+        !raw.windows("plain language".len())
+            .any(|value| value == b"plain language")
+    );
 }
 
 #[test]
