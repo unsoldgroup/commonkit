@@ -26,7 +26,7 @@ fn command(arguments: &[&str]) -> std::process::Output {
 fn daemon_composition_and_durable_diff_have_actionable_absent_daemon_errors() {
     for arguments in [
         vec!["compose"],
-        vec!["explain", "/theme"],
+        vec!["explain", "/contextBudget/maxTotalTokens"],
         vec![
             "diff",
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

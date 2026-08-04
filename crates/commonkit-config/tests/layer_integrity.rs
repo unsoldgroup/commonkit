@@ -9,12 +9,12 @@ fn layer_digest_binds_canonical_content_without_hashing_itself() {
     let mut document = layer(
         "personal",
         LayerKind::PersonalKit,
-        serde_json::json!({"theme": "dark", "nested": {"enabled": true}}),
+        serde_json::json!({"contextBudget": {"maxTotalTokens": 1000}}),
     );
     document.source.content_digest = layer_content_digest(&document).expect("canonical digest");
     validate_layer_content_digest(&document).expect("matching digest");
 
-    document.spec["theme"] = serde_json::json!("light");
+    document.spec["contextBudget"]["maxTotalTokens"] = serde_json::json!(500);
     let error = validate_layer_content_digest(&document)
         .expect_err("a semantic layer change must invalidate its declared digest");
     assert_eq!(

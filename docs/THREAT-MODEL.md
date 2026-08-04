@@ -19,7 +19,8 @@ execution API, not a lifecycle authority.
 - Providers compute in isolated workspaces and never receive a live-target mutation capability.
 - External providers fail closed when the required isolation boundary is unavailable. On macOS, the v1 external-provider paths remain disabled and use supported native resources instead.
 - Plans bind target identity, desired and observed state, policy, provider inputs, ownership, and artifacts.
-- Only adapters mutate targets, after confirmation, with durable preimages and recoverable receipts.
+- Only adapters mutate targets, after confirmation, with recoverable receipts, and with durable preimages wherever the resource type admits them. Package operations admit no preimage: they are additive and converge-forward, and their receipts record the absence of a preimage and the reason explicitly.
+- Package installation executes arbitrary upstream code on the live target, outside CommonKit's isolation boundary, by design. It is gated by an organization-policy allowlist of permitted sources and by consent distinct from ordinary apply. The provider sandbox constrains what *computes desired state*, because that output is consumed as truth; package installation *executes declared operator intent* that was confirmed before apply. Constraining the first and disclaiming the second is deliberate, and is why macOS may refuse external provider execution while still running a package installer on the same host.
 - Recovery verifies plans, artifacts, backups, and receipt chains and never reruns providers or secret resolution.
 - Portable state, plans, receipts, logs, events, diagnostics, Git, and UI never contain secret plaintext.
 - About Me text is encrypted at rest, is never committed to Git, and is returned
@@ -58,6 +59,9 @@ execution API, not a lifecycle authority.
 | Personal-profile disclosure | SQLCipher at rest, separately provisioned key reference, view-scoped queries, bounded results, and content-free access records |
 | False or unwanted memory | Draft review before first publish, evidence-bearing suggestions, rejection suppression, revision checks, and explicit contradiction resolution |
 | Cross-project inference | Server-selected Loadout/project scope; callers cannot request an arbitrary profile view |
+| Malicious package source or tap | Organization-policy allowlist of permitted sources, monotonic across layers; the declared source recorded in the receipt |
+| Rotated or substituted package artifact | Resolved artifact digest recorded in the receipt chain and detected on subsequent verification, rather than blocked at install |
+| Unintended package execution | Consent gate distinct from ordinary apply; converge-forward only, so no silent removal or downgrade |
 
 ## Residual risks
 
@@ -65,6 +69,16 @@ The v1 durable executor relies on a correctly configured TLS/sandbox proxy and
 Linux service account. A public hosted-provider gateway, distributable
 subscription OAuth, multi-worker scheduling, and direct S3 credential handling
 require separate threat reviews before enablement.
+
+A compromised but allowlisted package source can execute arbitrary code as the
+target user during apply. CommonKit records the resolved artifact digest and
+detects the resulting change on subsequent verification, but does not prevent
+the execution. Digests are recorded as evidence rather than enforced as a
+precondition, because upstreams rotate artifacts as routine maintenance while
+the declared version stays put; enforcing them would fail installs for
+legitimate reasons often enough to train operators into overriding the check,
+which is a worse outcome than detection. This residual risk is the accepted
+cost of managing packages at all.
 
 ## Release gate
 
@@ -74,5 +88,6 @@ symlink/reparse attacks, stale plans and fences, revision and idempotency
 conflicts, every crash boundary, secret canaries across all outputs, Git
 trust-state transitions, relay and execution authentication, authorization
 denials, corrupted snapshots and artifacts, desktop capability abuse, worker
-sandbox escape attempts, and update-signature failure on every supported
-platform.
+sandbox escape attempts, update-signature failure, package installation from a
+disallowed source, a rotated package artifact digest, and consent-gate bypass
+attempts, on every supported platform.

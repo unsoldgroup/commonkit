@@ -85,7 +85,9 @@ function assertNoLiveWriters(roots) {
     throw new Error(
       `refusing to merge: ${holders.length} open handle(s) under the source stores.\n  ` +
         [...new Set(holders)].slice(0, 10).join('\n  ') +
-        '\nStop every context-mode writer first.',
+        '\nQuit these Claude Code / Codex sessions first. Merging now would read a' +
+        '\ntorn snapshot. This cannot quit them for you: one of them may be the' +
+        '\nsession you are reading this in.',
     )
   }
 }

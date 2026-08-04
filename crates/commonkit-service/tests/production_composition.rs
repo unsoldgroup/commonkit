@@ -73,7 +73,11 @@ fn production_registry_composes_only_configured_layer_files() {
     let layers = [
         ("public-base", "public_base", json!({})),
         ("organization-policy", "organization_policy", json!({})),
-        ("personal", "personal_kit", json!({"theme": "dark"})),
+        (
+            "personal",
+            "personal_kit",
+            json!({"contextBudget": {"maxTotalTokens": 80}}),
+        ),
     ]
     .map(|(id, kind, spec)| {
         let path = root.join(format!("{id}.json"));
@@ -97,9 +101,14 @@ fn production_registry_composes_only_configured_layer_files() {
     )
     .unwrap();
     let composition = registry.composition.unwrap();
-    assert_eq!(composition.compose().unwrap()["spec"]["theme"], "dark");
     assert_eq!(
-        composition.explain("/theme").unwrap()["winner"]["layerId"],
+        composition.compose().unwrap()["spec"]["contextBudget"]["maxTotalTokens"],
+        80
+    );
+    assert_eq!(
+        composition
+            .explain("/contextBudget/maxTotalTokens")
+            .unwrap()["winner"]["layerId"],
         "personal"
     );
 }
@@ -172,7 +181,7 @@ fn production_registry_uses_schema_merge_rules_and_reports_the_governing_rule() 
         (
             "public-base",
             "public_base",
-            json!({"adapters":[{"id":"codex","enabled":true,"settings":{"sandbox":"workspace"}}]}),
+            json!({"contextBudget":{"maxTotalTokens":100}}),
         ),
         (
             "organization-policy",
@@ -183,7 +192,7 @@ fn production_registry_uses_schema_merge_rules_and_reports_the_governing_rule() 
             "personal",
             "personal_kit",
             json!({
-                "adapters":[{"id":"codex","settings":{"approval":"on-request"}}],
+                "contextBudget":{"maxTotalTokens":80},
                 "securityPolicy": policy(&["github.com"], 3)
             }),
         ),
@@ -212,14 +221,12 @@ fn production_registry_uses_schema_merge_rules_and_reports_the_governing_rule() 
     let composition = registry.composition.unwrap();
 
     let composed = composition.compose().unwrap();
-    assert_eq!(composed["spec"]["adapters"][0]["enabled"], true);
+    assert_eq!(composed["spec"]["contextBudget"]["maxTotalTokens"], 80);
     assert_eq!(
-        composed["spec"]["adapters"][0]["settings"]["approval"],
-        "on-request"
-    );
-    assert_eq!(
-        composition.explain("/adapters").unwrap()["governingRules"],
-        json!(["schema:/adapters:merge_by_id(id)"])
+        composition
+            .explain("/contextBudget/maxTotalTokens")
+            .unwrap()["winner"]["layerId"],
+        "personal"
     );
     assert_eq!(
         composition

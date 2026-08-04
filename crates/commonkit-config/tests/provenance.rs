@@ -10,31 +10,31 @@ fn records_winner_contributions_and_a_reproducible_lockfile() {
         layer(
             "base",
             LayerKind::PublicBase,
-            serde_json::json!({"theme": "light"}),
+            serde_json::json!({"files": [{"path": "base", "source": "base"}]}),
         ),
         layer("org", LayerKind::OrganizationPolicy, serde_json::json!({})),
         layer(
             "personal",
             LayerKind::PersonalKit,
-            serde_json::json!({"theme": "dark"}),
+            serde_json::json!({"files": [{"path": "personal", "source": "personal"}]}),
         ),
         layer(
             "target",
             LayerKind::TargetOverrides,
-            serde_json::json!({"theme": "system"}),
+            serde_json::json!({"files": [{"path": "target", "source": "target"}]}),
         ),
     ])
     .expect("layers");
 
     let result = compose_layers(&set, &MergeRules::new()).expect("composition");
-    assert_eq!(result.spec["theme"], "system");
+    assert_eq!(result.spec["files"][0]["path"], "target");
     assert_eq!(result.trace.state_digest, result.spec_digest);
 
-    let theme = result.trace.entries.get("/theme").expect("theme trace");
-    assert_eq!(theme.winner.layer_id.as_str(), "target");
-    assert_eq!(theme.winner.operation, MergeOperation::Replace);
+    let files = result.trace.entries.get("/files").expect("files trace");
+    assert_eq!(files.winner.layer_id.as_str(), "target");
+    assert_eq!(files.winner.operation, MergeOperation::Replace);
     assert_eq!(
-        theme
+        files
             .contributions
             .iter()
             .map(|entry| entry.layer_id.as_str())
@@ -65,18 +65,15 @@ fn composes_the_complete_five_layer_v1_contract_with_provenance() {
             "base",
             LayerKind::PublicBase,
             serde_json::json!({
-                "theme": "light",
-                "settings": {"editor": {"font": "mono", "size": 12}},
-                "requirements": ["git"],
-                "arguments": ["--base"],
-                "adapters": [{"id": "codex", "enabled": true}]
+                "contextBudget": {"maxTotalTokens": 100},
+                "files": [{"path": "base", "source": "base"}],
+                "capabilities": {"styleguide": {"skillId": "base-writing", "activation": "routed"}}
             }),
         ),
         layer(
             "org",
             LayerKind::OrganizationPolicy,
             serde_json::json!({
-                "requirements": ["secret-scan"],
                 "securityPolicy": {"deniedPaths": ["**/.env"]}
             }),
         ),
@@ -84,57 +81,46 @@ fn composes_the_complete_five_layer_v1_contract_with_provenance() {
             "personal",
             LayerKind::PersonalKit,
             serde_json::json!({
-                "settings": {"editor": {"size": 14}},
-                "requirements": ["git", "node"],
-                "adapters": [{"id": "codex", "settings": {"approval": "on-request"}}]
+                "contextBudget": {"maxTotalTokens": 90},
+                "files": [{"path": "personal", "source": "personal"}]
             }),
         ),
         layer(
             "project",
             LayerKind::ProjectLoadout,
             serde_json::json!({
-                "arguments": ["--project"],
-                "adapters": [{"id": "claude", "enabled": true}]
+                "capabilities": {"styleguide": {"skillId": "project-writing", "activation": "routed"}}
             }),
         ),
         layer(
             "target",
             LayerKind::TargetOverrides,
             serde_json::json!({
-                "theme": "system",
-                "settings": {"platform": "macos"}
+                "contextBudget": {"maxTotalTokens": 80}
             }),
         ),
     ])
     .expect("complete layer set");
 
     let result = compose_layers(&set, &v1_merge_rules()).expect("five-layer composition");
-    assert_eq!(result.spec["theme"], "system");
-    assert_eq!(result.spec["settings"]["editor"]["font"], "mono");
-    assert_eq!(result.spec["settings"]["editor"]["size"], 14);
-    assert_eq!(result.spec["settings"]["platform"], "macos");
+    assert_eq!(result.spec["contextBudget"]["maxTotalTokens"], 80);
+    assert_eq!(result.spec["files"][0]["path"], "personal");
+    assert_eq!(result.spec["securityPolicy"]["deniedPaths"][0], "**/.env");
     assert_eq!(
-        result.spec["requirements"],
-        serde_json::json!(["git", "secret-scan", "node"])
+        result.spec["capabilities"]["styleguide"]["skillId"],
+        "project-writing"
     );
-    assert_eq!(result.spec["arguments"], serde_json::json!(["--project"]));
-    assert_eq!(result.spec["adapters"][0]["enabled"], true);
-    assert_eq!(
-        result.spec["adapters"][0]["settings"]["approval"],
-        "on-request"
-    );
-    assert_eq!(result.spec["adapters"][1]["id"], "claude");
     assert_eq!(
         result
             .trace
             .entries
-            .get("/theme")
-            .expect("theme provenance")
+            .get("/files")
+            .expect("files provenance")
             .contributions
             .iter()
             .map(|entry| entry.layer_id.as_str())
             .collect::<Vec<_>>(),
-        vec!["base", "target"]
+        vec!["base", "personal"]
     );
     assert_eq!(result.lock.layers.len(), 5);
 }
