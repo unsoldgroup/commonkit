@@ -43,6 +43,8 @@ enum Command {
     },
     /// Report local runtime paths and contract versions.
     Status,
+    /// Resolve the acting local Principal through the CommonKit daemon.
+    Principal,
     /// Install and manage the unattended per-user CommonKit daemon.
     Daemon {
         #[command(subcommand)]
@@ -753,6 +755,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     "cacheDirectory": paths.cache,
                 }))?
             );
+        }
+        Command::Principal => {
+            print_daemon(daemon_control("GET", "/control/v1/principal", None, None)?)?
         }
         Command::Daemon { command } => run_daemon_lifecycle(command)?,
         Command::Targets { command } => {

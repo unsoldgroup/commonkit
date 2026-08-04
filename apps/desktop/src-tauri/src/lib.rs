@@ -10,6 +10,7 @@ use commonkit_personal_context::{
     encrypt_revision_for_recipient_strings,
 };
 use commonkit_cli::about_me_setup::{SetupAnswers, SetupRequest, setup_profile};
+use commonkit_core::{Principal, github_cli_executable};
 use commonkit_platform::AppPaths;
 use serde::{Deserialize, Serialize};
 use tauri::image::Image;
@@ -34,108 +35,6 @@ struct RuntimeBinaryLayout {
     target_helper: PathBuf,
 }
 
-const GITHUB_OUTPUT_LIMIT: usize = 16 * 1024;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GithubCommand {
-    AuthStatus,
-    CurrentUser,
-    Login,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GithubCommandFailure {
-    Unavailable,
-    Failed,
-}
-
-trait GithubCommandRunner {
-    fn run(&mut self, command: GithubCommand) -> Result<Vec<u8>, GithubCommandFailure>;
-}
-
-#[derive(Debug, Default)]
-struct ProcessGithubCommandRunner;
-
-fn github_command_arguments(command: GithubCommand) -> &'static [&'static str] {
-    match command {
-        GithubCommand::AuthStatus => &["auth", "status", "--hostname", "github.com"],
-        GithubCommand::CurrentUser => &["api", "--hostname", "github.com", "user"],
-        GithubCommand::Login => &[
-            "auth",
-            "login",
-            "--hostname",
-            "github.com",
-            "--git-protocol",
-            "https",
-            "--web",
-            "--clipboard",
-            "--skip-ssh-key",
-        ],
-    }
-}
-
-impl GithubCommandRunner for ProcessGithubCommandRunner {
-    fn run(&mut self, command: GithubCommand) -> Result<Vec<u8>, GithubCommandFailure> {
-        let executable = github_cli_executable()?;
-        let mut process = Command::new(executable);
-        process
-            .args(github_command_arguments(command))
-            .stdin(Stdio::null());
-        if command == GithubCommand::Login {
-            process.stdout(Stdio::null()).stderr(Stdio::null());
-        } else {
-            process.stderr(Stdio::null());
-        }
-        let output = process
-            .output()
-            .map_err(|_| GithubCommandFailure::Unavailable)?;
-        if !output.status.success() || output.stdout.len() > GITHUB_OUTPUT_LIMIT {
-            return Err(GithubCommandFailure::Failed);
-        }
-        Ok(output.stdout)
-    }
-}
-
-fn github_cli_executable() -> Result<PathBuf, GithubCommandFailure> {
-    github_cli_candidates(std::env::var_os("PATH"))
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .ok_or(GithubCommandFailure::Unavailable)
-}
-
-fn github_cli_candidates(path: Option<std::ffi::OsString>) -> Vec<PathBuf> {
-    let executable = format!("gh{}", std::env::consts::EXE_SUFFIX);
-    let mut candidates = path
-        .as_deref()
-        .map(std::env::split_paths)
-        .into_iter()
-        .flatten()
-        .map(|directory| directory.join(&executable))
-        .collect::<Vec<_>>();
-    #[cfg(target_os = "macos")]
-    candidates.extend([
-        PathBuf::from("/opt/homebrew/bin/gh"),
-        PathBuf::from("/usr/local/bin/gh"),
-    ]);
-    #[cfg(target_os = "linux")]
-    candidates.extend([
-        PathBuf::from("/usr/bin/gh"),
-        PathBuf::from("/usr/local/bin/gh"),
-        PathBuf::from("/snap/bin/gh"),
-        PathBuf::from("/home/linuxbrew/.linuxbrew/bin/gh"),
-    ]);
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(root) = std::env::var_os("ProgramFiles") {
-            candidates.push(PathBuf::from(root).join("GitHub CLI/gh.exe"));
-        }
-        if let Some(root) = std::env::var_os("LOCALAPPDATA") {
-            candidates.push(PathBuf::from(root).join("GitHub CLI/gh.exe"));
-        }
-    }
-    candidates
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "camelCase")]
 enum GithubAuthStatus {
@@ -143,56 +42,13 @@ enum GithubAuthStatus {
     Authenticated { login: String, method: &'static str },
 }
 
-fn github_auth_status_with(
-    runner: &mut dyn GithubCommandRunner,
-) -> Result<GithubAuthStatus, DesktopError> {
-    match runner.run(GithubCommand::AuthStatus) {
-        Ok(_) => {}
-        Err(GithubCommandFailure::Failed) => return Ok(GithubAuthStatus::SignedOut),
-        Err(GithubCommandFailure::Unavailable) => return Err(DesktopError::GithubCliUnavailable),
-    }
-    let bytes = runner
-        .run(GithubCommand::CurrentUser)
-        .map_err(github_command_error)?;
-    if bytes.len() > GITHUB_OUTPUT_LIMIT {
-        return Err(DesktopError::GithubAuthenticationFailed);
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|_| DesktopError::GithubAuthenticationFailed)?;
-    let login = value
-        .get("login")
-        .and_then(serde_json::Value::as_str)
-        .filter(|login| valid_github_login(login))
-        .ok_or(DesktopError::GithubAuthenticationFailed)?;
-    Ok(GithubAuthStatus::Authenticated {
-        login: login.to_owned(),
-        method: "githubCli",
-    })
-}
-
-fn valid_github_login(login: &str) -> bool {
-    !login.is_empty()
-        && login.len() <= 39
-        && !login.starts_with('-')
-        && !login.ends_with('-')
-        && login
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-}
-
-fn github_auth_login_with(
-    runner: &mut dyn GithubCommandRunner,
-) -> Result<GithubAuthStatus, DesktopError> {
-    runner
-        .run(GithubCommand::Login)
-        .map_err(github_command_error)?;
-    github_auth_status_with(runner)
-}
-
-fn github_command_error(error: GithubCommandFailure) -> DesktopError {
-    match error {
-        GithubCommandFailure::Unavailable => DesktopError::GithubCliUnavailable,
-        GithubCommandFailure::Failed => DesktopError::GithubAuthenticationFailed,
+fn github_auth_status_from(principal: Option<Principal>) -> GithubAuthStatus {
+    match principal {
+        Some(principal) => GithubAuthStatus::Authenticated {
+            login: principal.as_str().to_owned(),
+            method: "githubCli",
+        },
+        None => GithubAuthStatus::SignedOut,
     }
 }
 
@@ -818,7 +674,7 @@ fn onboarding_initialize(
 ) -> Result<serde_json::Value, DesktopError> {
     let _ = onboarding_arguments(&request)?;
     if request.mode == "create" {
-        let status = github_auth_status_with(&mut ProcessGithubCommandRunner)?;
+        let status = github_auth_status_from(tauri::async_runtime::block_on(client.principal())?);
         authorize_github_repository(&request.mode, &request.repository, &status)?;
     }
     use commonkit_cli::onboarding::{
@@ -921,6 +777,17 @@ impl ServiceClient {
     async fn status(&self) -> Result<ServiceStatus, DesktopError> {
         Ok(self
             .request(reqwest::Method::GET, "/status")
+            .await?
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    async fn principal(&self) -> Result<Option<Principal>, DesktopError> {
+        Ok(self
+            .request(reqwest::Method::GET, "/principal")
             .await?
             .send()
             .await?
@@ -1089,19 +956,45 @@ impl Serialize for DesktopError {
 }
 
 #[tauri::command]
-async fn github_auth_status() -> Result<GithubAuthStatus, DesktopError> {
-    tauri::async_runtime::spawn_blocking(|| {
-        github_auth_status_with(&mut ProcessGithubCommandRunner)
-    })
-    .await
-    .map_err(|_| DesktopError::GithubAuthenticationFailed)?
+async fn github_auth_status(
+    client: tauri::State<'_, ServiceClient>,
+) -> Result<GithubAuthStatus, DesktopError> {
+    Ok(github_auth_status_from(client.principal().await?))
 }
 
 #[tauri::command]
-async fn github_auth_login() -> Result<GithubAuthStatus, DesktopError> {
-    tauri::async_runtime::spawn_blocking(|| github_auth_login_with(&mut ProcessGithubCommandRunner))
-        .await
-        .map_err(|_| DesktopError::GithubAuthenticationFailed)?
+async fn github_auth_login(
+    client: tauri::State<'_, ServiceClient>,
+) -> Result<GithubAuthStatus, DesktopError> {
+    let succeeded = tauri::async_runtime::spawn_blocking(|| {
+        let executable = github_cli_executable()?;
+        Command::new(executable)
+            .args([
+                "auth",
+                "login",
+                "--hostname",
+                "github.com",
+                "--git-protocol",
+                "https",
+                "--web",
+                "--clipboard",
+                "--skip-ssh-key",
+            ])
+            .stdin(Stdio::null())
+            .status()
+            .map(|status| status.success())
+    })
+    .await
+    .map_err(|_| DesktopError::GithubAuthenticationFailed)?
+    .map_err(|_| DesktopError::GithubCliUnavailable)?;
+    if !succeeded {
+        return Err(DesktopError::GithubAuthenticationFailed);
+    }
+    let status = github_auth_status_from(client.principal().await?);
+    match status {
+        GithubAuthStatus::Authenticated { .. } => Ok(status),
+        GithubAuthStatus::SignedOut => Err(DesktopError::GithubAuthenticationFailed),
+    }
 }
 
 #[tauri::command]
@@ -2025,109 +1918,6 @@ pub fn run() {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
-    struct FakeGithubRunner {
-        calls: Vec<GithubCommand>,
-        responses: Vec<Result<Vec<u8>, GithubCommandFailure>>,
-    }
-
-    impl GithubCommandRunner for FakeGithubRunner {
-        fn run(&mut self, command: GithubCommand) -> Result<Vec<u8>, GithubCommandFailure> {
-            self.calls.push(command);
-            self.responses.remove(0)
-        }
-    }
-
-    #[test]
-    fn github_status_returns_only_the_authenticated_login_from_fixed_commands() {
-        let mut runner = FakeGithubRunner {
-            responses: vec![
-                Ok(Vec::new()),
-                Ok(br#"{"login":"al-unsoldgroup"}"#.to_vec()),
-            ],
-            ..Default::default()
-        };
-
-        let status = github_auth_status_with(&mut runner).unwrap();
-
-        assert_eq!(
-            status,
-            GithubAuthStatus::Authenticated {
-                login: "al-unsoldgroup".into(),
-                method: "githubCli",
-            }
-        );
-        assert_eq!(
-            runner.calls,
-            vec![GithubCommand::AuthStatus, GithubCommand::CurrentUser]
-        );
-        let serialized = serde_json::to_string(&status).unwrap();
-        assert!(!serialized.to_ascii_lowercase().contains("token"));
-    }
-
-    #[test]
-    fn github_login_uses_the_browser_flow_then_rechecks_the_account() {
-        let mut runner = FakeGithubRunner {
-            responses: vec![
-                Ok(Vec::new()),
-                Ok(Vec::new()),
-                Ok(br#"{"login":"al-unsoldgroup"}"#.to_vec()),
-            ],
-            ..Default::default()
-        };
-
-        let status = github_auth_login_with(&mut runner).unwrap();
-
-        assert!(matches!(status, GithubAuthStatus::Authenticated { .. }));
-        assert_eq!(
-            runner.calls,
-            vec![
-                GithubCommand::Login,
-                GithubCommand::AuthStatus,
-                GithubCommand::CurrentUser,
-            ]
-        );
-    }
-
-    #[test]
-    fn github_commands_are_bound_to_github_dot_com_and_fixed_arguments() {
-        assert_eq!(
-            github_command_arguments(GithubCommand::AuthStatus),
-            ["auth", "status", "--hostname", "github.com"]
-        );
-        assert_eq!(
-            github_command_arguments(GithubCommand::CurrentUser),
-            ["api", "--hostname", "github.com", "user"]
-        );
-        assert_eq!(
-            github_command_arguments(GithubCommand::Login),
-            [
-                "auth",
-                "login",
-                "--hostname",
-                "github.com",
-                "--git-protocol",
-                "https",
-                "--web",
-                "--clipboard",
-                "--skip-ssh-key",
-            ]
-        );
-    }
-
-    #[test]
-    fn github_cli_discovery_keeps_fixed_executable_names_and_path_order() {
-        let path = std::env::join_paths([PathBuf::from("/first"), PathBuf::from("/second")])
-            .expect("portable path list");
-        let candidates = github_cli_candidates(Some(path));
-        let executable = format!("gh{}", std::env::consts::EXE_SUFFIX);
-
-        assert_eq!(candidates[0], PathBuf::from("/first").join(&executable));
-        assert_eq!(candidates[1], PathBuf::from("/second").join(executable));
-        #[cfg(target_os = "macos")]
-        assert!(candidates.contains(&PathBuf::from("/opt/homebrew/bin/gh")));
-    }
-
     #[test]
     fn onboarding_defaults_are_computed_natively_without_webview_path_permissions() {
         let paths = AppPaths::from_roots("/private/config", "/private/data", "/private/cache")
@@ -2155,61 +1945,6 @@ mod tests {
             error.to_string(),
             "CommonKit onboarding failed: kit, configuration, state, and target roots must not overlap"
         );
-    }
-
-    #[test]
-    fn github_status_distinguishes_signed_out_from_an_unavailable_cli() {
-        let mut signed_out = FakeGithubRunner {
-            responses: vec![Err(GithubCommandFailure::Failed)],
-            ..Default::default()
-        };
-        assert_eq!(
-            github_auth_status_with(&mut signed_out).unwrap(),
-            GithubAuthStatus::SignedOut
-        );
-
-        let mut unavailable = FakeGithubRunner {
-            responses: vec![Err(GithubCommandFailure::Unavailable)],
-            ..Default::default()
-        };
-        assert!(matches!(
-            github_auth_status_with(&mut unavailable),
-            Err(DesktopError::GithubCliUnavailable)
-        ));
-    }
-
-    #[test]
-    fn github_status_rejects_untrusted_identity_output_without_echoing_it() {
-        let mut runner = FakeGithubRunner {
-            responses: vec![
-                Ok(Vec::new()),
-                Ok(br#"{"login":"bad/name","credential":"sensitive-provider-output"}"#.to_vec()),
-            ],
-            ..Default::default()
-        };
-
-        let error = github_auth_status_with(&mut runner)
-            .unwrap_err()
-            .to_string();
-
-        assert_eq!(
-            error,
-            "GitHub authentication failed; retry sign-in from CommonKit"
-        );
-        assert!(!error.contains("sensitive-provider-output"));
-    }
-
-    #[test]
-    fn github_status_rejects_oversized_identity_output() {
-        let mut runner = FakeGithubRunner {
-            responses: vec![Ok(Vec::new()), Ok(vec![b'x'; GITHUB_OUTPUT_LIMIT + 1])],
-            ..Default::default()
-        };
-
-        assert!(matches!(
-            github_auth_status_with(&mut runner),
-            Err(DesktopError::GithubAuthenticationFailed)
-        ));
     }
 
     #[test]
