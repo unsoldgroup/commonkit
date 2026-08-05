@@ -11,6 +11,7 @@ mod git_sync;
 mod github_onboarding;
 mod mcp_clients;
 mod native;
+mod packages;
 mod pipeline;
 mod planning;
 mod provider;
@@ -59,6 +60,11 @@ pub use github_onboarding::{
 };
 pub use mcp_clients::{McpClientMaterializationError, materialize_mcp_client_state};
 pub use native::NativeProvider;
+pub use packages::{
+    PackageBackendEvidence, PackageCommandError, PackageCommandOutput, PackageCommandRunner,
+    PackageDriftEntry, PackageDriftReport, PackageDriftState, PackageObserver,
+    ProcessPackageCommandRunner, parse_backend_output,
+};
 pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutput};
 pub use planning::{
     ProviderPlanError, ProviderPlanRequest, ProviderResourcePlanner, build_provider_plan,

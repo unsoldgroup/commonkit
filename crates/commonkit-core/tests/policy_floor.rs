@@ -1,9 +1,52 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use commonkit_core::{PolicyViolation, SecurityPolicy, StableId, enforce_policy_floor};
+use commonkit_contracts::{PackageDeclaration, PackageManager};
+use commonkit_core::{
+    PolicyViolation, SecurityPolicy, StableId, enforce_package_source_policy, enforce_policy_floor,
+};
 
 fn id(value: &str) -> StableId {
     StableId::parse(value).expect("ID")
+}
+
+#[test]
+fn package_source_must_belong_to_the_effective_allowlist() {
+    let package = PackageDeclaration {
+        id: id("ripgrep"),
+        version: "14.1.1".into(),
+        manager: PackageManager::Homebrew,
+        source: id("untrusted_tap"),
+    };
+    let mut policy = SecurityPolicy::default();
+    policy.allowlists.insert(
+        id("package_sources"),
+        BTreeSet::from(["homebrew_core".into()]),
+    );
+
+    assert!(matches!(
+        enforce_package_source_policy(&policy, &package),
+        Err(PolicyViolation::PackageSourceNotAllowed { .. })
+    ));
+}
+
+#[test]
+fn later_policy_cannot_widen_package_sources() {
+    let mut organization = SecurityPolicy::default();
+    organization.allowlists.insert(
+        id("package_sources"),
+        BTreeSet::from(["homebrew_core".into()]),
+    );
+    let mut effective = organization.clone();
+    effective
+        .allowlists
+        .get_mut(&id("package_sources"))
+        .expect("package source allowlist")
+        .insert("untrusted_tap".into());
+
+    assert!(matches!(
+        enforce_policy_floor(&organization, &effective),
+        Err(PolicyViolation::AllowlistWidened { name }) if name == id("package_sources")
+    ));
 }
 
 fn organization_policy() -> SecurityPolicy {

@@ -39,6 +39,7 @@ fn accepts_exactly_the_supported_v1_fields() {
                 "maxTotalTokens": 1000
             },
             "files": [{"path":"home/editor.conf","source":"portable/editor.conf"}],
+            "packages": [{"id":"ripgrep","version":"14.1.1","manager":"homebrew","source":"homebrew_core"}],
             "securityPolicy": {
                 "deniedPaths": [],
                 "requiredControls": {},
@@ -55,6 +56,27 @@ fn accepts_exactly_the_supported_v1_fields() {
     );
 
     LayerSet::new(vec![public, organization]).expect("supported v1 layer fields");
+}
+
+#[test]
+fn rejects_malformed_packages_before_composition() {
+    let public = layer(
+        "public",
+        LayerKind::PublicBase,
+        serde_json::json!({
+            "packages": [{"id":"node","version":"^24","manager":"fnm","source":"nodejs_org"}]
+        }),
+    );
+    let organization = layer(
+        "organization",
+        LayerKind::OrganizationPolicy,
+        serde_json::json!({}),
+    );
+
+    assert!(matches!(
+        LayerSet::new(vec![public, organization]),
+        Err(LayerSetError::InvalidPackagesDeclaration(_))
+    ));
 }
 
 #[test]

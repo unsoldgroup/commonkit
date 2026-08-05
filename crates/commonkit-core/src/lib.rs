@@ -297,8 +297,32 @@ pub fn enforce_policy_floor(
     Ok(())
 }
 
+/// Enforces the effective package-source allowlist for an observe-only declaration.
+pub fn enforce_package_source_policy(
+    policy: &SecurityPolicy,
+    package: &commonkit_contracts::PackageDeclaration,
+) -> Result<(), PolicyViolation> {
+    let key = StableId::parse("package_sources").expect("static stable ID");
+    if policy
+        .allowlists
+        .get(&key)
+        .is_none_or(|sources| !sources.contains(package.source.as_str()))
+    {
+        return Err(PolicyViolation::PackageSourceNotAllowed {
+            package: package.id.clone(),
+            source_id: package.source.clone(),
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PolicyViolation {
+    #[error("package {package} source is not permitted: {source_id}")]
+    PackageSourceNotAllowed {
+        package: StableId,
+        source_id: StableId,
+    },
     #[error("organization denial was removed: {value}")]
     DenialRemoved { value: String },
     #[error("required organization control was weakened: {control}")]

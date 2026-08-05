@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use commonkit_contracts::{
     CommonKitLock, ContractError, Contribution, LayerDocument, LayerKind, LockedLayer,
-    MergeOperation, ProvenanceTrace, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
-    StyleguideBinding, StyleguideDescriptor, StyleguideSelection, TraceEntry, V1_LAYER_SPEC_FIELDS,
-    canonical_json, digest_domain_json, digest_json,
+    MergeOperation, PackageDeclaration, ProvenanceTrace, SCHEMA_VERSION, SchemaVersion,
+    Sha256Digest, StableId, StyleguideBinding, StyleguideDescriptor, StyleguideSelection,
+    TraceEntry, V1_LAYER_SPEC_FIELDS, canonical_json, digest_domain_json, digest_json,
 };
 use serde_json::{Map, Value};
 use thiserror::Error;
@@ -84,6 +84,15 @@ fn validate_v1_spec(spec: &Value) -> Result<(), LayerSetError> {
     {
         serde_json::from_value::<StyleguideSelection>(styleguide.clone())
             .map_err(|error| LayerSetError::InvalidStyleguideSelection(error.to_string()))?;
+    }
+    if let Some(packages) = object.get("packages") {
+        let declarations = serde_json::from_value::<Vec<PackageDeclaration>>(packages.clone())
+            .map_err(|error| LayerSetError::InvalidPackagesDeclaration(error.to_string()))?;
+        for declaration in declarations {
+            declaration
+                .validate()
+                .map_err(|error| LayerSetError::InvalidPackagesDeclaration(error.to_string()))?;
+        }
     }
     Ok(())
 }
@@ -283,6 +292,8 @@ pub enum LayerSetError {
     },
     #[error("invalid styleguide selection: {0}")]
     InvalidStyleguideSelection(String),
+    #[error("invalid packages declaration: {0}")]
+    InvalidPackagesDeclaration(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,6 +366,12 @@ pub fn v1_merge_rules() -> MergeRules {
     MergeRules::new()
         .with_strategy("/securityPolicy/deniedPaths", MergeStrategy::SetUnion)
         .with_strategy("/capabilities/styleguide", MergeStrategy::Replace)
+        .with_strategy(
+            "/packages",
+            MergeStrategy::MergeById {
+                id_key: "id".into(),
+            },
+        )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

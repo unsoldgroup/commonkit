@@ -42,6 +42,25 @@ fn checked_in_portable_context_schemas_match_the_registry() {
     }
 }
 
+#[test]
+fn layer_schema_exposes_only_supported_v1_spec_fields() {
+    let schema = commonkit_contracts::layer_schema().expect("generated layer schema");
+    let properties = schema["properties"]["spec"]["properties"]
+        .as_object()
+        .expect("spec properties");
+
+    assert_eq!(
+        properties.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            "capabilities",
+            "contextBudget",
+            "files",
+            "packages",
+            "securityPolicy"
+        ]
+    );
+}
+
 fn assert_schema(
     name: &str,
     generated: Result<serde_json::Value, commonkit_contracts::ContractError>,

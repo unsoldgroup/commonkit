@@ -10,6 +10,17 @@
       ],
       "type": "string"
     },
+    "PackageManager": {
+      "description": "A package/toolchain backend supported by read-only package observation.",
+      "enum": [
+        "homebrew",
+        "apt",
+        "fnm",
+        "nvm",
+        "rustup"
+      ],
+      "type": "string"
+    },
     "SourceMetadata": {
       "additionalProperties": false,
       "properties": {
@@ -61,6 +72,38 @@
         "capabilities": true,
         "contextBudget": true,
         "files": true,
+        "packages": {
+          "items": {
+            "additionalProperties": false,
+            "description": "An exact, observe-only package declaration.\n\n`id` is the stable merge and report identity, `version` is an exact pin,\n`manager` selects the fixed read-only query backend, and `source` is matched\nagainst `securityPolicy.allowlists.package_sources`.",
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,62}$"
+              },
+              "manager": {
+                "$ref": "#/$defs/PackageManager"
+              },
+              "source": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_-]{0,62}$"
+              },
+              "version": {
+                "type": "string",
+                "pattern": "^(?!.*[\\s*^~<>=,|]).+$"
+              }
+            },
+            "required": [
+              "id",
+              "version",
+              "manager",
+              "source"
+            ],
+            "title": "PackageDeclaration",
+            "type": "object"
+          },
+          "type": "array"
+        },
         "securityPolicy": true
       },
       "type": "object"

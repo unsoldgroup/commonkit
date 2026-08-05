@@ -20,12 +20,13 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use commonkit_adapters::{
     ArtifactStore, ContextBudgetLedger, CredentialReadinessInspector, CredentialReference,
-    FileAdapter, LocalCredentialReadinessInspector, MaterializedState, ProviderCapability,
+    FileAdapter, LocalCredentialReadinessInspector, MaterializedState, PackageDriftReport,
+    PackageObserver, ProcessPackageCommandRunner, ProviderCapability,
 };
 use commonkit_contracts::{
-    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Plan, PlanBindings,
-    Principal, ReceiptState, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, Sha256Digest,
-    StableId, assert_no_embedded_secrets, digest_domain_json,
+    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, PackageDeclaration,
+    Plan, PlanBindings, Principal, ReceiptState, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion,
+    SecurityPolicy, Sha256Digest, StableId, assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, ReceiptAudience, build_plan, resolve_principal};
 use commonkit_reconcile::{
@@ -2770,7 +2771,9 @@ async fn target_verify(
         .control
         .target_sync_domain(&target)
         .map_err(ApiError::from)?;
-    safe_domain_result(domain.verify(request))
+    let Json(mut report) = safe_domain_result(domain.verify(request))?;
+    attach_package_report(&state, &mut report)?;
+    Ok(Json(report))
 }
 
 async fn target_git_inspect(
@@ -3674,7 +3677,9 @@ async fn verify_target(
         .sync
         .clone()
         .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
-    safe_domain_result(domain.verify(request))
+    let Json(mut report) = safe_domain_result(domain.verify(request))?;
+    attach_package_report(&state, &mut report)?;
+    Ok(Json(report))
 }
 
 async fn rollback_run(
@@ -4614,8 +4619,66 @@ impl BoundServer {
     }
 }
 
-async fn get_status(State(state): State<ApiState>) -> Json<ServiceStatus> {
-    Json(state.status.read().await.clone())
+async fn get_status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let mut status = serde_json::to_value(state.status.read().await.clone())
+        .map_err(|_| ApiError::internal("serialization"))?;
+    attach_package_report(&state, &mut status)?;
+    Ok(Json(status))
+}
+
+fn attach_package_report(state: &ApiState, value: &mut Value) -> Result<(), ApiError> {
+    let Some(report) = composed_package_report(state)? else {
+        return Ok(());
+    };
+    value
+        .as_object_mut()
+        .ok_or_else(|| ApiError::internal("invalid_observation_response"))?
+        .insert(
+            "packageDrift".into(),
+            serde_json::to_value(report).map_err(|_| ApiError::internal("serialization"))?,
+        );
+    Ok(())
+}
+
+/// Observes packages directly from the composed loadout without materializing
+/// provider resources or creating plan operations.
+fn composed_package_report(state: &ApiState) -> Result<Option<PackageDriftReport>, ApiError> {
+    let domain = state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .composition
+        .clone();
+    let Some(domain) = domain else {
+        return Ok(None);
+    };
+    let composed = domain
+        .compose()
+        .map_err(|_| ApiError::unavailable_code("composition_unavailable"))?;
+    let spec = composed.get("spec").unwrap_or(&composed);
+    let declarations = spec
+        .get("packages")
+        .cloned()
+        .map(serde_json::from_value::<Vec<PackageDeclaration>>)
+        .transpose()
+        .map_err(|_| ApiError::internal("invalid_packages_declaration"))?
+        .unwrap_or_default();
+    if declarations.is_empty() {
+        return Ok(None);
+    }
+    let policy = spec
+        .get("securityPolicy")
+        .cloned()
+        .map(serde_json::from_value::<SecurityPolicy>)
+        .transpose()
+        .map_err(|_| ApiError::internal("invalid_security_policy"))?
+        .unwrap_or_default();
+    Ok(Some(
+        PackageObserver::new(ProcessPackageCommandRunner).observe(&declarations, &policy),
+    ))
 }
 
 async fn get_principal() -> Json<Option<Principal>> {

@@ -829,9 +829,56 @@ pub struct LayerDocument {
     pub spec: Value,
 }
 
+/// A package/toolchain backend supported by read-only package observation.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageManager {
+    Homebrew,
+    Apt,
+    Fnm,
+    Nvm,
+    Rustup,
+}
+
+/// An exact, observe-only package declaration.
+///
+/// `id` is the stable merge and report identity, `version` is an exact pin,
+/// `manager` selects the fixed read-only query backend, and `source` is matched
+/// against `securityPolicy.allowlists.package_sources`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageDeclaration {
+    pub id: StableId,
+    pub version: String,
+    pub manager: PackageManager,
+    pub source: StableId,
+}
+
+impl PackageDeclaration {
+    pub fn validate(&self) -> Result<(), ContractError> {
+        if self.version.is_empty()
+            || self.version.contains(char::is_whitespace)
+            || self
+                .version
+                .chars()
+                .any(|character| "*^~<>=,|".contains(character))
+        {
+            return Err(ContractError::InvalidPackageDeclaration);
+        }
+        Ok(())
+    }
+}
+
 /// Closed top-level vocabulary for a CommonKit v1 layer.
-pub const V1_LAYER_SPEC_FIELDS: &[&str] =
-    &["capabilities", "contextBudget", "files", "securityPolicy"];
+pub const V1_LAYER_SPEC_FIELDS: &[&str] = &[
+    "capabilities",
+    "contextBudget",
+    "files",
+    "packages",
+    "securityPolicy",
+];
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1412,6 +1459,34 @@ pub struct BrowserShard {
 pub fn layer_schema() -> Result<Value, ContractError> {
     let mut schema = serde_json::to_value(schema_for!(LayerDocument))
         .map_err(|_| ContractError::SchemaGeneration)?;
+    let mut package_schema = serde_json::to_value(schema_for!(PackageDeclaration))
+        .map_err(|_| ContractError::SchemaGeneration)?;
+    if let Some(package_defs) = package_schema
+        .as_object_mut()
+        .and_then(|value| value.remove("$defs"))
+        .and_then(|value| value.as_object().cloned())
+    {
+        schema
+            .pointer_mut("/$defs")
+            .and_then(Value::as_object_mut)
+            .ok_or(ContractError::SchemaGeneration)?
+            .extend(package_defs);
+    }
+    package_schema
+        .as_object_mut()
+        .ok_or(ContractError::SchemaGeneration)?
+        .remove("$schema");
+    for (field, pattern) in [
+        ("id", r"^[a-z][a-z0-9_-]{0,62}$"),
+        ("source", r"^[a-z][a-z0-9_-]{0,62}$"),
+        ("version", r"^(?!.*[\s*^~<>=,|]).+$"),
+    ] {
+        package_schema
+            .pointer_mut(&format!("/properties/{field}"))
+            .and_then(Value::as_object_mut)
+            .ok_or(ContractError::SchemaGeneration)?
+            .insert("pattern".into(), Value::String(pattern.into()));
+    }
     let object = schema
         .as_object_mut()
         .ok_or(ContractError::SchemaGeneration)?;
@@ -1422,13 +1497,18 @@ pub fn layer_schema() -> Result<Value, ContractError> {
     let spec = schema
         .pointer_mut("/properties/spec")
         .ok_or(ContractError::SchemaGeneration)?;
+    let mut spec_properties = V1_LAYER_SPEC_FIELDS
+        .iter()
+        .map(|field| ((*field).to_owned(), Value::Bool(true)))
+        .collect::<Map<String, Value>>();
+    spec_properties.insert(
+        "packages".into(),
+        serde_json::json!({"type": "array", "items": package_schema}),
+    );
     *spec = serde_json::json!({
         "type": "object",
         "additionalProperties": false,
-        "properties": V1_LAYER_SPEC_FIELDS
-            .iter()
-            .map(|field| ((*field).to_owned(), Value::Bool(true)))
-            .collect::<Map<String, Value>>()
+        "properties": spec_properties
     });
     for (path, pattern) in [
         ("/properties/id", r"^[a-z][a-z0-9_-]{0,62}$"),
@@ -1580,6 +1660,8 @@ pub enum ContractError {
     MissingSkillTarget,
     #[error("styleguide descriptor fields must be non-empty and provenance must use an HTTP URL")]
     InvalidStyleguideDescriptor,
+    #[error("package versions must be non-empty exact pins without whitespace or range syntax")]
+    InvalidPackageDeclaration,
     #[error("optimization limits must be positive")]
     InvalidOptimizationLimits,
     #[error("unsupported SkillOpt provider version or compatibility contract")]

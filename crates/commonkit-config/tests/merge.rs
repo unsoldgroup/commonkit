@@ -71,6 +71,25 @@ fn later_styleguide_layers_replace_the_complete_selection() {
 }
 
 #[test]
+fn package_declarations_merge_by_identity() {
+    let base = serde_json::json!({"packages": [
+        {"id":"node","version":"22.0.0","manager":"fnm","source":"nodejs_org"},
+        {"id":"ripgrep","version":"14.1.0","manager":"homebrew","source":"homebrew_core"}
+    ]});
+    let overlay = serde_json::json!({"packages": [
+        {"id":"node","version":"24.0.0","manager":"fnm","source":"nodejs_org"}
+    ]});
+
+    assert_eq!(
+        merge_specs(&base, &overlay, &v1_merge_rules()).expect("package merge"),
+        serde_json::json!({"packages": [
+            {"id":"node","version":"24.0.0","manager":"fnm","source":"nodejs_org"},
+            {"id":"ripgrep","version":"14.1.0","manager":"homebrew","source":"homebrew_core"}
+        ]})
+    );
+}
+
+#[test]
 fn v1_rules_merge_all_supported_fields() {
     let base = serde_json::json!({
         "securityPolicy": {"deniedPaths": ["**/.env"]},
