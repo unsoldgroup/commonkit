@@ -3,72 +3,107 @@
 Tracking: USG-95
 
 context-mode is a project-memory system CommonKit does not own. This scope makes
-its storage a managed resource: one store per target, written by one process,
-declared as target state, and reconciled by `commonkitd`. It changes nothing
-inside context-mode itself. Twelve decisions (USG-96 through USG-107) are framed
-here; each sub-issue records its resolution against the invariants below.
+its storage a managed resource: one store per target, at a path CommonKit
+declares rather than one that resolves by default, inventoried, observed, and
+snapshotted. It changes nothing inside context-mode itself. Thirteen decisions
+(USG-96 through USG-108) are recorded here, each resolved against the invariants
+below.
 
 ## Destination
 
-One context-mode store per **Target**, written by every agent runtime on that
-target through a single writer, at a path CommonKit declares rather than one
-that resolves by default. The store is machine-local mutable state. It is
-inventoried, observed, and snapshotted. It is never portable configuration and
-never enters Git.
+One context-mode store per **Target**, written by the agent runtimes on that
+target, at a declared path. The store is machine-local mutable state. It is
+never portable configuration and never enters Git.
 
 ## Measured state
 
-Measured 2026-08-03 on the macOS target:
+Measured 2026-08-03, corrected 2026-08-05 after the decisions below were
+verified against the running system. Several claims in the original framing were
+wrong; they are stated here in corrected form because later sections depend on
+them.
 
-- `~/.claude/context-mode` — 369 MB, written by Claude Code through the plugin over stdio.
-- `~/.codex/context-mode` — 631 MB, written by Codex and by the shared HTTP server on `127.0.0.1:3766`.
+- `~/.claude/context-mode` — 369 MB, written by Claude Code through the plugin's
+  stdio server. This is the only live writer.
+- `~/.codex/context-mode` — 631 MB. Not written by Codex: Codex's context-mode
+  plugin is disabled (`~/.codex/config.toml`, `enabled = false` for both the
+  plugin and its MCP server). Written historically by the shared HTTP service on
+  `127.0.0.1:3766`, which has no registered clients and is kept alive only by
+  launchd.
 
-Four facts constrain everything that follows.
+Five facts constrain everything that follows.
 
-`CONTEXT_MODE_DATA_DIR` already exists in the 1.0.169 bundle and resolves `~`.
-Relocating a store requires no upstream change. This scope is about what happens
-around that lever, not the lever.
+**The storage lever is `CONTEXT_MODE_DIR`, not `CONTEXT_MODE_DATA_DIR`.** The
+MCP server resolves its store root from `CONTEXT_MODE_DIR`, which must be an
+absolute path, is ignored when blank, does not expand `~`, and throws when
+relative. It yields `<CONTEXT_MODE_DIR>/sessions` and
+`<CONTEXT_MODE_DIR>/content`. `CONTEXT_MODE_DATA_DIR` is read only by the
+adapters and hooks, expands `~`, and yields
+`<CONTEXT_MODE_DATA_DIR>/context-mode/sessions`. The two therefore take
+different values to name the same store, and setting only one splits the server
+and the pruning hook across two different stores. Relocating a store still needs
+no upstream change.
 
-Claude has both transports registered simultaneously —
-`mcp__plugin_context-mode_context-mode__*` over stdio writing `~/.claude`, and
-`mcp__context-mode-shared__*` over HTTP 3766 writing `~/.codex`. Which store
-receives a write is an accident of which tool name the model picks.
+**Store keys are context-mode's, not CommonKit's.** A store filename is the
+first sixteen hex characters of SHA-256 over the case-folded absolute project
+directory, applied to both `sessions/<key>.db` and `content/<key>.db`. A
+`__<hash>` suffix is an eight-character hash of the current linked git worktree
+root, added when it differs from the main worktree. The plugin already keys
+projects and worktrees correctly.
 
-Store filenames hash `CONTEXT_MODE_PROJECT_DIR`, not the runtime. Both stores
-contain `sessions/44dc58e62d613136.db` with different content, 1.7 MB against
-361 MB. The name collides; the bytes do not.
+**The collapse came from one long-lived shared process, not from a variable.**
+The 3766 shim defaults the project directory to `$HOME` when unset, and its
+launchd job pins the same value; but a shared HTTP server has no per-session
+working directory, so any long-lived shared process collapses every project into
+one key regardless of what the variable says. The plugin's per-session stdio
+child inherits the session's directory and does not.
 
-Every repository collapses into one home-directory project hash, which is why a
-single session database reached 361 MB. The store move does not fix this.
+**The evidence of that collapse.** The stdio store holds 61 distinct project
+keys across 60 database files, largest ~13 MB. The 3766 store holds 2 project
+directories across 2 files, one of them 361 MB with 1,815 sessions. The 361 MB
+is mostly one large corpus indexing run, not many repositories mashed together.
+
+**Retention already ships.** context-mode caps session events at 1,000 per
+session, deletes sessions older than 7 days from its SessionStart hook, and
+deletes content databases and indexed sources older than 14 days when the server
+first opens a content store. The 361 MB store grew because pruning is driven by
+the Claude SessionStart hook, which never ran for the HTTP service. This is an
+unpruned-writer gap, not a missing-retention gap.
 
 ## Invariants
 
-- One authoritative writer per store. CommonKit's v1 contract already states
-  this for every database (`CONTEXT.md:189`), and the promotion machinery that
-  enforces it exists (`crates/commonkit-snapshots/src/lib.rs:232`, `:1006`).
+- One authoritative writing **target** per store. The rule is target-scoped, not
+  process-scoped: `CONTEXT.md:468` states it alongside cross-machine
+  portability, and the machinery keys authority by target
+  (`SnapshotDatabase.target_id`,
+  `crates/commonkit-service/src/production_domains.rs:293`;
+  `PortableAuthorityRecord`, `crates/commonkit-snapshots/src/lib.rs:244`;
+  `AuthorityStore`, `:232`).
 - The store is mutable state, never portable configuration. It does not enter
-  Git, a plan, a receipt, or a diagnostic bundle (`CONTEXT.md:185`).
+  Git, a plan, a receipt, or a diagnostic bundle (`CONTEXT.md:464`).
 - Reconciliation never destroys captured memory. A plan rollback restores
   configuration; it does not rewind the store.
 - Absence is a finding. A store path that resolves by default rather than by
   declaration is drift, not success.
-- CommonKit observes the store. It does not read its contents.
+- CommonKit observes the store's declaration. It does not read its contents and
+  does not measure its size.
 
 ## Canonical store
 
-The canonical store is `~/.local/share/context-mode/`, the path
-`docs/HEADLESS-DOMAINS.md:105` already assumes. It sits outside both `~/.claude`
-and `~/.codex`.
+The canonical store is `/Users/astemarie/.local/share/context-mode` on the macOS
+target. It sits outside `~/.claude`, `~/.codex`, and `~/.agents`, and no
+component of its path is a symlink.
 
-That placement is deliberate and load-bearing: `~/.claude`, `~/.codex`, and
-`~/.agents` are a symlink farm CommonKit cannot adopt today, because absolute
-symlink targets are rejected and pre-existing symlinks are not traversed during
-inspection (dogfood inventory G2, `crates/commonkit-adapters/src/resources.rs:98-140`).
-A store outside both trees routes around G2 rather than waiting on it.
+The store move is **not gated on G2** (USG-104). G2 is narrower than it reads:
+CommonKit rejects a symlink when it appears in a declared path's own ancestors
+or leaf, never as a property of the surrounding tree
+(`crates/commonkit-adapters/src/resources.rs:98-140`). A store outside the
+agent-config trees routes around G2 rather than waiting on it. That is why this
+path was chosen.
 
 ## Merge authority
 
-Resolved: **union, collisions recorded** (USG-96, decided 2026-08-03).
+Resolved: **union, collisions recorded** (USG-96, decided 2026-08-03, applied
+2026-08-05).
 
 The canonical store is produced by a one-time, offline, schema-aware merge of
 both existing stores. Rows are preserved verbatim. No row is dropped.
@@ -85,142 +120,211 @@ both existing stores. Rows are preserved verbatim. No row is dropped.
 - The merge runs while no writer is live. It is a migration step, not a
   reconcile operation, and no adapter performs it.
 
-`scripts/context-mode-merge.mjs` implements this. Measured against the two
-stores on 2026-08-03: 833 databases, 832 disjoint by filename and copied as-is,
-one — `sessions/44dc58e62d613136.db` — unioned. The two stores hold 1,560 and
-1,822 distinct session identifiers and share none, so the union has no losers
-and the collision record is an empty-set safety net rather than a live concern.
-That is a property of today's data, not a guarantee; the merge still refuses to
-run rather than drop a row.
+`scripts/context-mode-merge.mjs` implements it and
+`scripts/context-mode-apply-merge.sh` drives it. Applied 2026-08-05: 858
+databases written, 857 disjoint by filename and copied as-is, one —
+`sessions/44dc58e62d613136.db` — unioned. Zero session-identifier collisions, so
+the union had no losers and the collision record is an empty-set safety net.
+That is a property of the data, not a guarantee; the merge still refuses to run
+rather than drop a row.
 
-This is the application-level export/import path `CONTEXT.md:189` already
+This is the application-level export/import path `CONTEXT.md:468` already
 reserves. It is not binary merging, and it does not generalize: the union is a
-one-time same-machine migration, not a mechanism for combining stores across
-targets. Nothing in this scope permits a cross-target merge.
+one-time same-machine migration, never a mechanism for combining stores across
+targets.
 
-**Precondition on value, not correctness.** Because store keys hash
-`CONTEXT_MODE_PROJECT_DIR` and every repository currently collapses to one
-home-directory hash, the union carries that collapsed key into the canonical
-store verbatim. The merge is correct regardless. It is only worth what the keys
-are worth, and re-keying is separate work tracked outside this scope.
+**Precondition on value, not correctness.** The merged store carries the
+collapsed home-directory bucket from the 3766 store verbatim. The merge is
+correct regardless. It is only worth what its keys are worth (USG-108).
 
 ## Writer and transport
 
-The shared HTTP server on `127.0.0.1:3766` becomes the sole writer (USG-97).
-Both agent-runtime plugins become clients of it. No exception is granted to the
-one-authoritative-writer rule, and no multi-process SQLite locking mode is
-relied on to make three writers safe.
+Claude keeps exactly one context-mode transport (USG-98, resolved 2026-08-05).
+The remote SSE registration — `https://ctx.unsold.group/sse`, a cloudflared
+tunnel to a context-mode server on the VPS writing VPS-local stores — was
+removed along with its allow rules, so it is **absent**, not deprioritized. A
+transport that merely ranks lower still writes whenever the model picks its tool
+name.
 
-Claude keeps exactly one context-mode transport (USG-98). The stdio plugin
-registration becomes **absent**, not deprioritized. A registered transport that
-ranks lower still writes whenever the model picks its tool name, so removal is
-the only state that holds.
+The writer is the plugin's stdio server, and the 3766 service is decommissioned
+rather than promoted (USG-97, default revised). Promoting it was rejected on
+three grounds: it reverses USG-98; a shared HTTP server has no per-session
+working directory, so it cannot key projects correctly at all; and it has no
+registered clients, while still opening `~/.codex/context-mode` on start.
+
+The stdio server is one process **per session**, so the one-authoritative-writer
+rule is granted an explicit process-level exception. It is safe rather than
+lucky: every database is opened `journal_mode = WAL`, `synchronous = NORMAL`,
+`busy_timeout = 30000`, with three write retries and `locking_mode = EXCLUSIVE`
+explicitly prohibited. Same-host multi-process WAL with a busy timeout is the
+supported SQLite configuration for concurrent writers; writes serialize, readers
+never block, and every concurrent writer is the same runtime at the same version
+against the same schema. The invariant holds because it is target-scoped: one
+authoritative writing target per store, many same-runtime processes within it.
+Availability is bounded — sustained contention can still end in `SQLITE_BUSY`.
+
+The writer choice carries a retention constraint (USG-102): the authoritative
+writer must host context-mode's SessionStart hook, because that hook is what
+prunes sessions. A future transport change that drops the hook silently disables
+pruning, which is exactly how the 361 MB store grew.
 
 ## Declaration and adoption
 
-`CONTEXT_MODE_DATA_DIR` is declared as target state (USG-99). It is set on the
-3766 service's environment through the existing `ServiceSpec { environment }`
-field, not through a dotfile. Once the writer is collapsed to that one service,
-no other process needs the variable, which keeps the declaration clear of the
-shell-environment gap (dogfood inventory G7). A store path that is unset, so
-that the per-runtime default wins by omission, is reported as drift.
+The store path is declared as target state (USG-99, mechanism revised). Both
+variables are declared together, at every writer spawn point, because they name
+the same store with different values:
 
-The store needs no new adapter (USG-100). It is a `files` concern (the directory)
-plus a `service` concern (the environment), and both adapters ship today. G5 —
-inert layer fields — is closed **for this case only**; the other twelve fields
-named in the dogfood inventory remain inert and remain dangerous.
+```
+CONTEXT_MODE_DIR=/Users/astemarie/.local/share/context-mode
+CONTEXT_MODE_DATA_DIR=/Users/astemarie/.local/share
+```
 
-Two unrelated things are named `databases`, and this scope uses only the second.
-The layer spec field (`schemas/layer.schema.json:66`,
-`crates/commonkit-contracts/src/lib.rs:802`) is accepted, merged, and consumed by
-nothing. The runtime snapshot configuration
-(`crates/commonkit-service/src/production_domains.rs:290-303`) is wired end to
-end and already carries a context-mode row.
+`ServiceSpec { environment }` is **not** the mechanism. The field exists and is
+digested (`crates/commonkit-adapters/src/service_lifecycle.rs:21`, `:25`), but no
+production `ServiceBackend` exists: `install_argv` emits a literal
+`"<definition>"` placeholder for every backend (`:60`, `:70`), and the
+repository's one plist renderer
+(`crates/commonkit-cli/src/daemon_lifecycle.rs:135`) is hardcoded to
+`commonkitd`'s own label and emits no `EnvironmentVariables` key. `services` is
+no longer a layer field at all. The declaration is therefore a `files` resource
+on the file that carries the environment into the agent runtime, which is the
+same gap G7 already describes.
+
+Omission is drift. The relevant predicate is *absent*, not *empty*: the target
+file carries no `env` key at all today.
+
+The store needs no new adapter (USG-100). The question the ticket asked has been
+overtaken: the `databases` layer field no longer exists. `V1_LAYER_SPEC_FIELDS`
+is now `capabilities`, `contextBudget`, `files`, `packages`, `securityPolicy`
+(`crates/commonkit-contracts/src/lib.rs:875-881`), the layer schema no longer
+declares `databases`, and G5 is recorded closed repo-wide rather than for this
+case. Nothing here reopens it. The outcome is the one the scope wanted and the
+reason is stronger: the store is machine-local mutable state, and mutable state
+is never layer-declared data, so a `databases` layer adapter would not have
+served it even when the field existed.
+
+The store directory is a `files` concern and ships today as
+`FilesystemIntent::Directory`
+(`crates/commonkit-adapters/src/resources.rs:170-181`).
+
+The surviving `databases` is the runtime snapshot configuration
+(`crates/commonkit-service/src/production_domains.rs:293`), which is wired end to
+end and is a daemon configuration surface, not a layer field.
 
 ## The store as a resource
 
-The store is inventoried at the **target override** layer (USG-101). It is
-machine-local mutable state; the personal kit is Git-backed, and the store must
-never reach Git.
+The store is inventoried at the **target override** layer as a single `files`
+Directory resource at the canonical path, mode `0700`, `exact: false` (USG-101).
+`exact: false` matters: CommonKit owns the directory's existence and mode, never
+its contents. The personal kit is Git-backed (`CONTEXT.md:464`) and `$delete` is
+registered nowhere (dogfood inventory G6), so anything landed in the personal
+kit could never later be removed from one machine.
 
 Stores are per-target by definition (USG-103). The VPS runs its own
-`context-mode-server` against its own store, and that store stays its own.
-Snapshot and restore move a store between machines as an operator act; they do
-not synchronize project memory, and no reconcile carries memory across targets.
+`context-mode-server` against its own store, and that store stays its own. Each
+target's store is a distinct `DatabaseId` — `context-mode-local`,
+`context-mode-vps` — never one identifier shared across targets. Snapshot and
+restore move a store between machines as an operator act; they do not
+synchronize project memory, and no reconcile carries memory across targets.
 
 ## Retention and observation
 
-context-mode prunes its own store. CommonKit observes size and does not delete
-(USG-102).
+context-mode owns retention and CommonKit never deletes (USG-102, thresholds
+revised).
 
-Store size is a verify observation with a warning threshold — not a failure, and
-never a reconcile-time deletion. Starting values, tunable: warn above 1 GB total,
-sessions older than 90 days eligible for pruning. Scheduled pruning is deferred;
-there is no scheduler adapter (dogfood inventory G9), and reconcile is the wrong
-place for it because reconcile does not destroy captured memory.
+The recorded horizons are context-mode's shipped ones — 1,000 events per
+session, 7 days for sessions, 14 days for content databases and indexed sources
+— not figures CommonKit invents, enforces, or could keep in step. Pruning is
+neither reconcile-time nor scheduled; it is driven by the writer's own
+SessionStart hook, which is why the writer must host it.
 
-Unbounded and unobserved is the failure this replaces. One session database
-reached 361 MB before anyone looked.
+Store size is **not** a verify assertion, permanently in v1 rather than
+deferred. `Adapter::verify` returns `Result<(), AdapterFailure>` and has no
+warning channel, so a size observation could only be a pass or a hard failure,
+and a large store is neither wrong nor a reason to fail a plan.
 
 ## Snapshot and rollback
 
-The store participates in mutable-state snapshots and is excluded from plan
-rollback (USG-106).
+The store is excluded from plan rollback, and the exclusion is **declared**
+rather than inherited from filesystem behaviour (USG-106, default revised).
+
+Rollback restores configuration — the declared store path and the environment
+that carries it — and never removes the store directory or its contents. The
+exclusion cannot rest on current behaviour: `restore_preimage_in` calls
+`remove_entry_in` unconditionally before every branch, and `remove_entry_in` is
+a non-recursive `remove_dir`, so today a rollback touching a populated store
+directory fails `ENOTEMPTY` rather than declining. Failing is safer than
+deleting, but it is an accident, not a contract. This scope makes it explicit:
+rollback leaves a populated managed directory in place and reports success.
 
 Snapshot is operator-initiated and explicit: consistent SQLite export, integrity
 check, client-side encryption, upload, and a content-addressed descriptor in
-portable state — the path the existing `snapshots.databases` row already
-describes. Rollback is plan-scoped and leaves the store untouched. Reverting a
-bad reconcile restores configuration and never rewinds memory captured after the
-plan applied.
+portable state. A `snapshots.databases` row names one database file, and the
+store is a directory of many, so one row is not the whole store.
 
 ## First reconcile
 
-A fresh target has no store, and that is correct (USG-107). First reconcile
-creates the directory, declares the path, and starts the writer. The store is
-empty, nothing is seeded, and an empty store is a verify **pass** rather than a
-warning. A fresh machine with no project memory is not in drift.
+A fresh target has no project memory store, and that is correct (USG-107).
+
+First reconcile creates the store directory as a non-exact `files` Directory
+resource and publishes the two environment variables. It does **not** start a
+writer: the stdio writer is spawned per session by the agent runtime, and
+`commonkitd` never owns its lifecycle. The store is empty, nothing is seeded,
+and an empty store is a verify **pass** rather than a warning. A fresh machine
+with no project memory is not in drift.
+
+Ordering is the real fresh-target hazard, not emptiness. Store paths are derived
+from the environment, so a session that starts before the declaration is applied
+writes to the default path and silently creates a second store.
 
 ## Terminology
 
 USG-105 lands the terms in `CONTEXT.md`. This scope proposes one glossary entry
 and one boundary statement.
 
-**Project memory store**: A target-local, per-target database holding indexed
-project content and session memory for one agent-context tool, written by a
-single authoritative writer and never carried in portable state.
+**Project memory store**: A target-local database holding indexed project
+content and session memory for one agent-context tool, at a path CommonKit
+declares, observed and snapshotted as mutable state and never carried in
+portable state.
 _Avoid_: Cache, index, knowledge base
 
-The boundary: an **About Me Profile** is owner memory, separately encrypted, with
-its own writer (ADR 0010). A project memory store is project memory, is not
+The entry deliberately does not claim a single authoritative writing process;
+the writer is per-session and the invariant is target-scoped.
+
+The boundary: an **About Me Profile** is owner memory, separately encrypted,
+with its own writer (ADR 0010). A project memory store is project memory, is not
 encrypted by CommonKit, and holds no owner claims. Project memory is never
 **Scope**-shareable — it is target-local mutable state and its contents are
 unredacted.
 
 ## Explicit v1 limits
 
-No upstream context-mode change; `CONTEXT_MODE_DATA_DIR` is used as it ships. No
-project re-keying. No cross-target project-memory sync. No new adapter for the
-`databases` layer field, and G5 stays open for its other twelve fields. No
-scheduled pruning. No content-level inspection, redaction, search, or export of
-store contents by CommonKit. No merge of stores belonging to different targets.
+No upstream context-mode change; `CONTEXT_MODE_DIR` and `CONTEXT_MODE_DATA_DIR`
+are used as they ship. No project re-keying: the key definition belongs to
+context-mode and the collapsed home-directory bucket stays as a legacy bucket
+(USG-108). No cross-target project-memory sync and no merge of stores belonging
+to different targets. No new adapter for the `databases` layer field; G5 stays
+open for its other fields. No scheduled pruning. No CommonKit-side store size
+metric, threshold, or alarm. No content-level inspection, redaction, search, or
+export of store contents by CommonKit.
 
 ## Implementation start gate
 
-- USG-96 is resolved and its merge invariants are recorded on the issue.
+- USG-96 is resolved and its merge invariants are recorded on the issue. Done.
 - The union merge tool exists, is re-runnable, and has produced a merged store
-  plus collision records from copies of both live stores.
+  plus collision records from copies of both live stores. Done 2026-08-05.
+- The 3766 launchd service is unloaded before the source stores are archived,
+  because it opens `~/.codex/context-mode` on start.
 - Both source stores are archived read-only and their digests recorded before
   any writer is repointed.
-- Claude's stdio context-mode registration is removed, not merely reordered.
+- Claude's remote SSE registration is removed, not merely reordered. Done
+  2026-08-05 — note this is the inverse of the original gate, which assumed the
+  stdio registration would be the one removed.
 
 ## Defaults still requiring confirmation
 
-Flow 1 is resolved. These carry recommended defaults and remain open until their
-sub-issue records a resolution.
-
-1. Retention thresholds — 1 GB warning, 90-day session eligibility (USG-102).
-2. Whether closing G5 for this case is recorded as a permanent boundary or a
-   deferral until a `databases` adapter exists (USG-100).
-3. Whether the archived source stores are retained indefinitely or expire
+1. Whether the archived source stores are retained indefinitely or expire
    (USG-96).
+2. Whether the declaration mechanism stays a `files` resource on an
+   agent-runtime settings file, or waits for a production `ServiceBackend` that
+   can materialize `ServiceSpec { environment }` (USG-99).

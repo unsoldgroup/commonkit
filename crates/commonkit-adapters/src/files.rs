@@ -1223,11 +1223,43 @@ fn apply_intent_in(
     }
 }
 
+fn directory_has_entries(parent: &Dir, leaf: &Path) -> Result<bool, std::io::Error> {
+    let directory = open_dir_component_nofollow(parent, leaf)?;
+    Ok(directory.entries()?.next().is_some())
+}
+
 fn restore_preimage_in(
     parent: &Dir,
     leaf: &Path,
     preimage: &ResourcePreimage,
 ) -> Result<(), std::io::Error> {
+    // A managed directory can hold contents CommonKit never created. A project
+    // memory store is the motivating case: rollback restores the directory's
+    // declaration, never its contents. Removal is non-recursive, so without
+    // this the rollback would fail ENOTEMPTY rather than decline -- safe by
+    // accident, and only until someone made it recursive.
+    let populated_directory = match parent.symlink_metadata(leaf) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            directory_has_entries(parent, leaf)?
+        }
+        _ => false,
+    };
+    if populated_directory {
+        return match preimage {
+            ResourcePreimage::Directory { mode } => {
+                let directory = open_dir_component_nofollow(parent, leaf)?;
+                set_directory_mode(&directory, *mode)
+            }
+            ResourcePreimage::Absent => Ok(()),
+            ResourcePreimage::Symlink { .. } | ResourcePreimage::File { .. } => {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::DirectoryNotEmpty,
+                    "refusing to replace a populated managed directory during rollback",
+                ))
+            }
+        };
+    }
+
     remove_entry_in(parent, leaf)?;
     match preimage {
         ResourcePreimage::Absent => Ok(()),

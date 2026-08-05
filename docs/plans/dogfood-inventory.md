@@ -137,7 +137,8 @@ kit or target overrides.
 | SSH client config | `~/.ssh/config` | — | — | — | **Denied.** `is_forbidden_path` bans `~/.ssh` structurally. |
 | Per-repo bundles | 7 repos under `~/code/` | project_loadout | native | `files` | Replaces `sync-repo-skills`. Fixes the dangling-link bug it has today. |
 | LaunchAgents | 13 plists, 10 owned, all loaded | target_overrides | native | `service` | `ServiceSpec` covers name/exec/args/env/startMode, which is enough to pin Node per service. No field-level plist ownership. |
-| Local MCP stack | mail-index 3765, context-mode 3766, posthog 3767 | target_overrides | native | `service` + `mcp-relay` | |
+| Local MCP stack | mail-index 3765, posthog 3767 | target_overrides | native | `service` + `mcp-relay` | context-mode 3766 decommissioned by USG-97: zero registered clients, and a shared long-lived server cannot key projects per session. |
+| context-mode store | `~/.local/share/context-mode` | target_overrides | native | `files` (Directory, `exact: false`, mode 0700) | USG-95/USG-101. CommonKit owns existence and mode, never contents. Path declared via `CONTEXT_MODE_DIR` plus `CONTEXT_MODE_DATA_DIR`. |
 
 ### VPS
 

@@ -232,6 +232,54 @@ fn unspecified_file_mode_updates_and_rolls_back_an_existing_directory_with_its_m
     fs::remove_dir_all(root).expect("cleanup");
 }
 
+// A project memory store is a managed directory whose contents CommonKit never
+// created. Rollback restores the directory's declaration, never its contents,
+// so a populated directory survives instead of failing ENOTEMPTY.
+#[test]
+fn rollback_leaves_a_populated_managed_directory_and_its_contents_in_place() {
+    let root = temporary_directory("rollback-populated-directory");
+    let target = root.join("target");
+    let state = root.join("state");
+    let managed_path = target.join("store");
+    fs::create_dir_all(&target).expect("target root");
+
+    let provider = ArtifactStore::open(root.join("provider-artifacts")).expect("provider store");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register_materialized_resource(
+            id("memory-store"),
+            FilesystemIntent::Directory {
+                path: NormalizedManagedPath::parse("store").expect("path"),
+                mode: Some(FileMode::parse(0o700).expect("mode")),
+                exact: false,
+            },
+            &provider,
+        )
+        .expect("directory creation");
+
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("apply");
+    assert!(managed_path.is_dir());
+
+    // The writer fills the store after the plan applied.
+    let captured = managed_path.join("sessions.db");
+    fs::write(&captured, b"captured memory\n").expect("writer output");
+
+    drop(adapter);
+    let mut adapter = FileAdapter::open(&target, &state).expect("fresh rollback adapter");
+    adapter
+        .rollback(&operation)
+        .expect("rollback declines rather than failing on a populated directory");
+
+    assert!(managed_path.is_dir(), "store directory survives rollback");
+    assert_eq!(
+        fs::read(&captured).expect("captured bytes survive rollback"),
+        b"captured memory\n"
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
 fn assert_adapter_did_not_read(state: &std::path::Path, forbidden: &[u8]) {
     let artifacts = state.join("artifacts");
     if !artifacts.exists() {

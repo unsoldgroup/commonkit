@@ -134,6 +134,10 @@ _Avoid_: Prompt log, plaintext transcript
 An audience-specific projection of a **Context receipt** that reveals only the sources and decisions its viewer is authorized to inspect.
 _Avoid_: Shared audit log, full prompt trace
 
+**Project memory store**:
+A target-local database holding indexed project content and session memory for one agent-context tool, at a path CommonKit declares, observed and snapshotted as mutable state and never carried in portable state.
+_Avoid_: Cache, index, knowledge base
+
 **Organization membership**:
 The GitHub-backed association and role that authorizes a user to access an **Organization CommonKit** in version 1.
 _Avoid_: CommonKit account, repository collaborator
@@ -463,6 +467,8 @@ _Avoid_: Share, invite, copy
 - Database adapters create consistent, integrity-checked, encrypted snapshots in S3-compatible object storage. Git records only snapshot descriptors and content hashes.
 - Version 1 uses one authoritative writer per database. Cross-machine database portability is snapshot and restore, not binary merging; multi-writer synchronization requires a later application-level export/import model.
 - An **About Me Profile** is stored in a dedicated encrypted SQLite database with one writer; context-mode and Engram remain project-memory systems.
+- CommonKit owns a **Project memory store**'s declared path, directory, and environment, never its contents, schema, keys, or retention. An **About Me Profile** is owner memory and is encrypted by CommonKit; a **Project memory store** is project memory, is not encrypted by CommonKit, and holds no **Claims**.
+- A **Project memory store** is per-**Target** and is never **Scope**-shareable. Cross-machine movement is operator-initiated snapshot and restore, never reconciliation, and never a merge of stores belonging to different targets.
 - Memory is never shared across **Scopes**. There is no team **About Me Profile**; shared team knowledge is Git-owned reviewable content circulated by **Grant** (ADR 0020).
 - A **Scoped View** controls disclosure by Loadout and trusted project. Organization policy may narrow access but never broaden it.
 - Agents may create **Suggestions**, but only direct user edits or explicit contradiction clarifications create approved **Claims**.
