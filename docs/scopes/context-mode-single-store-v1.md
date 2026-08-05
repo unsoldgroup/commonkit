@@ -117,6 +117,11 @@ both existing stores. Rows are preserved verbatim. No row is dropped.
   retained read-only until the merged store passes verification, then archived.
 - The merge is idempotent and re-runnable. Running it twice against the same
   sources produces the same store and the same collision records.
+- Re-runnable holds only while the destination is a staging directory. Once a
+  writer is pointed at it the merge refuses, because rebuilding from the sources
+  would discard everything captured since. `--force` overrides for a deliberate
+  discard. A `-wal` newer than the manifest is what marks it live: these stores
+  are WAL, so a live writer leaves the database file itself untouched.
 - The merge runs while no writer is live. It is a migration step, not a
   reconcile operation, and no adapter performs it.
 

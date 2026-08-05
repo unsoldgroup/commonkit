@@ -13,6 +13,7 @@
 //   node scripts/context-mode-merge.mjs --source ~/.claude/context-mode \
 //        --source ~/.codex/context-mode --out ~/.local/share/context-mode
 //   node scripts/context-mode-merge.mjs ... --apply     # write (default is dry run)
+//   node scripts/context-mode-merge.mjs ... --apply --force   # rebuild a live destination
 //   node scripts/context-mode-merge.mjs --selftest
 
 import { DatabaseSync } from 'node:sqlite'
@@ -35,12 +36,13 @@ const SESSION_TABLES = [
 ]
 
 function parseArgs(argv) {
-  const out = { sources: [], out: null, apply: false, selftest: false }
+  const out = { sources: [], out: null, apply: false, force: false, selftest: false }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--source') out.sources.push(path.resolve(expand(argv[++i])))
     else if (a === '--out') out.out = path.resolve(expand(argv[++i]))
     else if (a === '--apply') out.apply = true
+    else if (a === '--force') out.force = true
     else if (a === '--selftest') out.selftest = true
     else throw new Error(`unknown argument: ${a}`)
   }
@@ -185,7 +187,31 @@ function plan(sources, outRoot) {
   return actions
 }
 
-function run({ sources, out, apply }) {
+// True when the destination holds a database written after the manifest that
+// produced it — i.e. a writer has been pointed at it and it is no longer a
+// staging directory.
+//
+// The -wal and -shm siblings matter more than the database itself here: these
+// stores are WAL, so a live writer's changes sit in the -wal file and the main
+// file's mtime does not move until checkpoint. Watching only *.db would let a
+// destination that has been live for hours pass as staging.
+function destinationIsLive(out) {
+  const manifest = path.join(out, 'merge-manifest.json')
+  if (!fs.existsSync(manifest)) return false
+  const mergedAt = fs.statSync(manifest).mtimeMs
+  for (const sub of SUBDIRS) {
+    for (const f of listDbs(out, sub)) {
+      for (const suffix of ['', '-wal', '-shm']) {
+        const candidate = path.join(out, sub, `${f}${suffix}`)
+        if (!fs.existsSync(candidate)) continue
+        if (fs.statSync(candidate).mtimeMs > mergedAt) return true
+      }
+    }
+  }
+  return false
+}
+
+function run({ sources, out, apply, force }) {
   if (sources.length < 2) throw new Error('need at least two --source stores')
   for (const s of sources) if (!fs.existsSync(s)) throw new Error(`source store not found: ${s}`)
   if (!out) throw new Error('need --out')
@@ -205,15 +231,35 @@ function run({ sources, out, apply }) {
   for (const a of merged) {
     console.log(`  union ${a.sub}/${a.file}: base=${label(a.base)} incoming=${a.incoming.map(label).join(',')}`)
   }
+  const live = destinationIsLive(out)
   if (!apply) {
     console.log('\ndry run. re-run with --apply to write.')
+    if (live) {
+      console.log('WARNING: the destination has been written since it was merged. --apply would discard that.')
+    }
     return { collisions: [], actions }
+  }
+
+  // Once agents are pointed at the destination it stops being a staging area:
+  // the merge rebuilds every database from the sources, so a re-run after
+  // cutover would silently discard everything captured since. Refuse instead.
+  if (live && !force) {
+    throw new Error(
+      `refusing to merge: ${out} has been written since it was merged.\n` +
+        'It is a live store now, not a staging directory, and this rebuilds every\n' +
+        'database from the sources — everything captured since would be lost.\n' +
+        'Pass --force only if you genuinely mean to discard it.',
+    )
   }
 
   const manifest = { generatedFrom: [], databases: [], collisions: [] }
   for (const s of sources) manifest.generatedFrom.push({ label: label(s), path: s })
 
   for (const sub of SUBDIRS) fs.mkdirSync(path.join(out, sub), { recursive: true })
+  // Drop the old manifest before rewriting any database. An interrupted run
+  // would otherwise leave databases newer than a stale manifest, and the retry
+  // would be refused as "live" when it is merely half-finished.
+  fs.rmSync(path.join(out, 'merge-manifest.json'), { force: true })
 
   for (const a of actions) {
     // Rebuilt from the sources every run, so a re-run of the same inputs
@@ -320,6 +366,36 @@ function selftest() {
       JSON.stringify(second.databases.map(d => d.merged.sha256)),
     're-run produces identical databases',
   )
+
+  // Once a writer has been pointed at the destination, a re-run would rebuild
+  // it from the sources and discard everything captured since.
+  const live = path.join(out, 'sessions/shared.db')
+  fs.utimesSync(live, new Date(), new Date(Date.now() + 60_000))
+  let refused = false
+  try {
+    run({ sources: [A, B], out, apply: true })
+  } catch (e) {
+    refused = /has been written since it was merged/.test(e.message)
+  }
+  assert(refused, 'refuses to rebuild a destination that has been written since the merge')
+
+  // --force overrides the refusal. Throws loudly through the top-level handler
+  // if it ever stops doing so.
+  fs.utimesSync(live, new Date(), new Date(Date.now() + 60_000))
+  run({ sources: [A, B], out, apply: true, force: true })
+
+  // A -wal newer than the manifest is the real post-cutover signal, since WAL
+  // writes leave the main database file untouched until checkpoint.
+  fs.utimesSync(path.join(out, 'merge-manifest.json'), new Date(), new Date())
+  fs.writeFileSync(`${live}-wal`, 'pending write')
+  fs.utimesSync(`${live}-wal`, new Date(), new Date(Date.now() + 60_000))
+  let refusedOnWal = false
+  try {
+    run({ sources: [A, B], out, apply: true })
+  } catch (e) {
+    refusedOnWal = /has been written since it was merged/.test(e.message)
+  }
+  assert(refusedOnWal, 'a -wal newer than the manifest marks the destination live')
 
   fs.rmSync(tmp, { recursive: true, force: true })
   console.log(process.exitCode ? '\nselftest FAILED' : '\nselftest passed')
