@@ -4,7 +4,7 @@ import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { findForbiddenDescendant, RSYNC_EXCLUDES, SyncEngine } from '../src/sync.mjs'
+import { findForbiddenDescendant, RSYNC_DEREFERENCE, RSYNC_EXCLUDES, SyncEngine } from '../src/sync.mjs'
 
 test('detects forbidden paths recursively before rsync', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'commonkit-test-'))
@@ -13,6 +13,33 @@ test('detects forbidden paths recursively before rsync', () => {
     fs.writeFileSync(path.join(root, 'skill', 'secrets', 'token.txt'), 'not-a-real-secret')
     assert.equal(path.basename(findForbiddenDescendant(root)), 'secrets')
     assert.ok(RSYNC_EXCLUDES.includes('secrets/'))
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('scans through symlinked directories, which rsync dereferences', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'commonkit-test-'))
+  try {
+    const outside = path.join(root, 'outside', 'skill', 'secrets')
+    fs.mkdirSync(outside, { recursive: true })
+    fs.writeFileSync(path.join(outside, 'token.txt'), 'not-a-real-secret')
+    const tree = path.join(root, 'tree')
+    fs.mkdirSync(tree)
+    fs.symlinkSync(path.join(root, 'outside', 'skill'), path.join(tree, 'skill'))
+    assert.equal(RSYNC_DEREFERENCE, '--copy-links')
+    assert.equal(path.basename(findForbiddenDescendant(tree)), 'secrets')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('terminates on symlink cycles inside a managed tree', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'commonkit-test-'))
+  try {
+    fs.mkdirSync(path.join(root, 'skill'))
+    fs.symlinkSync(root, path.join(root, 'skill', 'loop'))
+    assert.equal(findForbiddenDescendant(root), null)
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }

@@ -19,6 +19,12 @@ export const RSYNC_EXCLUDES = [
   'Cookies', 'Local Storage/', 'Singleton*', '*secret*.json',
 ]
 
+// Managed trees may contain symlinked entries that point outside the tree (a
+// skill directory linked into an upstream checkout, for example). The target
+// has no such checkout, so links are dereferenced into real content on the way
+// over. Inspect and apply must both pass this or they disagree about drift.
+export const RSYNC_DEREFERENCE = '--copy-links'
+
 function digest(content) {
   return crypto.createHash('sha256').update(content).digest('hex')
 }
@@ -34,13 +40,33 @@ function baseKind(kind) {
 export function findForbiddenDescendant(root) {
   const ignoredTrees = new Set(['node_modules', '.venv', '__pycache__'])
   const stack = [root]
+  // Symlinked directories are dereferenced by the sync, so their content ships
+  // and must be scanned too. Track resolved paths to terminate on link cycles.
+  const visited = new Set()
   while (stack.length) {
     const directory = stack.pop()
-    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+    let resolved
+    try {
+      resolved = fs.realpathSync(directory)
+    } catch {
+      continue
+    }
+    if (visited.has(resolved)) continue
+    visited.add(resolved)
+    let entries
+    try {
+      entries = fs.readdirSync(directory, { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const entry of entries) {
       const candidate = path.join(directory, entry.name)
-      if (entry.isDirectory() && ignoredTrees.has(entry.name)) continue
+      const isDirectory = entry.isSymbolicLink()
+        ? fs.statSync(candidate, { throwIfNoEntry: false })?.isDirectory() === true
+        : entry.isDirectory()
+      if (isDirectory && ignoredTrees.has(entry.name)) continue
       if (isForbiddenPath(candidate)) return candidate
-      if (entry.isDirectory() && !entry.isSymbolicLink()) stack.push(candidate)
+      if (isDirectory) stack.push(candidate)
     }
   }
   return null
@@ -124,7 +150,7 @@ export class SyncEngine {
   }
 
   treeStatus(operation) {
-    const args = ['-ain', '--delete']
+    const args = ['-ain', RSYNC_DEREFERENCE, '--delete']
     for (const pattern of RSYNC_EXCLUDES) args.push('--exclude', pattern)
     args.push('-e', 'ssh -o BatchMode=yes', `${operation.source}/`, `${this.config.host}:${operation.target}/`)
     const result = local('rsync', args)
@@ -290,7 +316,7 @@ export class SyncEngine {
     const mkdir = ssh(this.config.host, `install -d -m 0755 ${shellQuote(operation.target)}`)
     if (mkdir.status !== 0) throw new Error(mkdir.stderr.trim())
     const backupDirectory = `${this.backupRoot}${operation.target}`
-    const args = ['-a', '--delete-delay', '--backup', `--backup-dir=${backupDirectory}`]
+    const args = ['-a', RSYNC_DEREFERENCE, '--delete-delay', '--backup', `--backup-dir=${backupDirectory}`]
     for (const pattern of RSYNC_EXCLUDES) args.push('--exclude', pattern)
     args.push('-e', 'ssh -o BatchMode=yes', `${operation.source}/`, `${this.config.host}:${operation.target}/`)
     const result = local('rsync', args)
