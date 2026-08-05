@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# rtest — sync the current worktree and run a pnpm command on Hostinger.
+set -euo pipefail
+
+vps=${RTEST_VPS:-root@72.60.44.157}
+key=${RTEST_SSH_KEY:-$HOME/.ssh/id_ed25519}
+worker=${RTEST_WORKER:-/root/bin/commonkit-rtest-worker}
+lock_root=${RTEST_LOCK_ROOT:-/tmp}
+
+root=$(git rev-parse --show-toplevel) || {
+  printf '%s\n' "rtest: not in a git worktree" >&2
+  exit 64
+}
+
+if (( $# == 0 )); then
+  command_args=(pnpm test)
+else
+  command_args=("$@")
+fi
+
+if [[ ${command_args[0]} != pnpm ]]; then
+  printf '%s\n' "rtest: only pnpm commands are allowed" >&2
+  exit 64
+fi
+
+name=$(basename "$root")
+safe_name=${name//[^A-Za-z0-9._-]/-}
+if command -v sha256sum >/dev/null 2>&1; then
+  root_hash=$(printf '%s' "$root" | sha256sum | cut -c1-12)
+else
+  root_hash=$(printf '%s' "$root" | shasum -a 256 | cut -c1-12)
+fi
+remote="/root/rtest/${safe_name}-${root_hash}"
+lock="${lock_root}/rtest-${root_hash}.lock"
+
+if ! mkdir "$lock" 2>/dev/null; then
+  printf '%s\n' "rtest: a run is already in flight for this worktree" >&2
+  exit 75
+fi
+trap 'rmdir "$lock" 2>/dev/null' EXIT INT TERM
+
+printf '%s\n' "rtest: ${name} → ${vps}:${remote}"
+rsync -az --delete \
+  --rsync-path="mkdir -p '${remote}' && rsync" \
+  -e "ssh -i ${key} -o BatchMode=yes -o ConnectTimeout=10" \
+  --exclude='.git/' --exclude='node_modules/' --exclude='.env*' --exclude='*.log' \
+  --exclude='/dist/' --exclude='/build/' --exclude='/.next/' --exclude='/.wrangler/' \
+  --exclude='/coverage/' --exclude='/playwright-report/' --exclude='/test-results/' \
+  --exclude='/.turbo/' --exclude='.build/' --exclude='target/' \
+  --exclude='src-tauri/binaries/' --exclude='.cache/' \
+  "${root}/" "${vps}:${remote}/"
+
+printf '%s\0' "${command_args[@]}" | \
+  ssh -i "$key" -o BatchMode=yes -o ConnectTimeout=10 "$vps" "$worker" "$remote"
