@@ -61,7 +61,7 @@ test("every operator screen states its objective before exposing controls", () =
 
   for (const [route, value] of Object.entries(fixtures)) {
     const html = managementPanel(route as keyof typeof fixtures, { [route]: value });
-    assert.match(html, /class="screen-objective"/);
+    assert.match(html, /class="brief"/);
   }
 });
 

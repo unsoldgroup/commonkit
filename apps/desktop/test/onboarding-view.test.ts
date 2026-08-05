@@ -15,27 +15,26 @@ function state(overrides: Partial<OnboardingViewState> = {}): OnboardingViewStat
 
 test("signed-out onboarding starts with one understandable GitHub action", () => {
   const html = onboardingPanel(state());
-  assert.match(html, /Welcome to CommonKit/);
-  assert.match(html, /Sign in with GitHub/);
+  assert.match(html, /Connect GitHub/);
   assert.match(html, /private repository/i);
   assert.doesNotMatch(html, /Kit directory|Loadout|Managed target root|Materialize|Provider/);
 });
 
 test("wizard shows four steps and marks only the current step", () => {
   const html = onboardingPanel(state({ step: 2, auth: { state: "authenticated", login: "astemarie" } }));
-  assert.equal((html.match(/<li/g) ?? []).length, 4);
+  assert.equal((html.match(/<li[\s>]/g) ?? []).length, 4);
   assert.equal((html.match(/aria-current="step"/g) ?? []).length, 1);
-  assert.match(html, /Set up this computer/);
-  assert.match(html, /Project settings profile/);
-  assert.match(html, /Computer-specific override/);
+  assert.match(html, /This computer/);
+  assert.match(html, /Project layer/);
+  assert.match(html, /Station layer/);
   assert.match(html, /name="projectLoadout"/);
   assert.match(html, /name="targetOverride"/);
 });
 
 test("authenticated setup uses plain language and hides implementation details", () => {
   const html = onboardingPanel(state({ auth: { state: "authenticated", login: "astemarie" } }));
-  assert.match(html, /Signed in as <strong>astemarie<\/strong>/);
-  assert.match(html, /Create a new private setup/);
+  assert.match(html, /astemarie/);
+  assert.match(html, /New kit/);
   assert.doesNotMatch(html, /Kit directory|Loadout|Managed target root|Materialize|Provider/);
 });
 
@@ -43,7 +42,7 @@ test("import step keeps provider details collapsed and pinned", () => {
   const apm = defaultOnboardingDraft();
   apm.provider = "apm";
   const html = onboardingPanel(state({ step: 3, auth: { state: "authenticated", login: "astemarie" }, draft: apm }));
-  assert.match(html, /Bring in existing settings/);
+  assert.match(html, /Existing settings/);
   assert.match(html, /<details/);
   assert.match(html, /value="0.25.0"/);
   assert.match(html, /apmLockfile/);
@@ -55,9 +54,9 @@ test("review explains safety and escapes every user-controlled value", () => {
   draft.repositoryName = `<script>alert(1)</script>`;
   draft.computerName = `mac"><img src=x>`;
   const html = onboardingPanel(state({ step: 4, auth: { state: "authenticated", login: "astemarie" }, draft }));
-  assert.match(html, /Managed settings are not applied yet/);
-  assert.match(html, /save this setup locally/i);
-  assert.match(html, /Prepare setup preview/);
+  assert.match(html, /Nothing is applied by this step/);
+  assert.match(html, /saves the setup locally/i);
+  assert.match(html, /Prepare plan/);
   assert.doesNotMatch(html, /<script>|<img/);
 });
 

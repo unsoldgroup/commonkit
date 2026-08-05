@@ -1,5 +1,8 @@
 import { escapeHtml } from "./html.ts";
 import { stableComputerId } from "./onboarding-controller.ts";
+import { icon } from "./icons.ts";
+import { SIX_PACK, sixPackMarkup } from "./instruments.ts";
+import { lampIcon } from "./icons.ts";
 
 export type OnboardingProvider = "native" | "apm" | "chezmoi";
 export type OnboardingStep = 1 | 2 | 3 | 4;
@@ -62,115 +65,189 @@ export function defaultOnboardingDraft(): OnboardingDraft {
   };
 }
 
-const steps = ["GitHub", "This computer", "Existing settings", "Review"] as const;
+/* The start sequence. Numbers carry real order here: each item gates the next. */
+const SEQUENCE = ["Identity", "Station", "Source", "Arm"] as const;
 
 export function onboardingPanel(state: OnboardingViewState): string {
-  const progress = `<ol class="setup-progress" aria-label="Setup progress">${steps.map((label, index) => {
+  const sequence = SEQUENCE.map((label, index) => {
     const number = index + 1;
-    return `<li${state.step === number ? ` aria-current="step"` : ""}><span>${number}</span>${label}</li>`;
-  }).join("")}</ol>`;
-  const content = state.step === 1 ? githubStep(state) : state.step === 2 ? computerStep(state) : state.step === 3 ? importStep(state) : reviewStep(state);
-  const message = state.message
-    ? `<p class="onboarding-result" role="status" aria-live="polite">${escapeHtml(state.message)}</p>`
-    : `<p class="onboarding-result" role="status" aria-live="polite"></p>`;
-  return `<section class="panel onboarding-panel" aria-busy="${state.submitting}">
-    <p class="eyebrow">Get started</p><h1>Welcome to CommonKit</h1>
-    <p class="setup-intro">Set up this computer in a few guided steps. CommonKit saves the setup locally, then shows a preview before applying managed settings.</p>
-    ${progress}${content}${message}</section>`;
+    const status = number < state.step ? "done" : number === state.step ? "active" : "pending";
+    const mark = status === "done" ? "SET" : status === "active" ? "◂ NOW" : "";
+    return `<li data-state="${status}"${status === "active" ? ' aria-current="step"' : ""}><i>${String(number).padStart(2, "0")}</i>${label}<em>${mark}</em></li>`;
+  }).join("");
+
+  const body = state.step === 1 ? identityStep(state)
+    : state.step === 2 ? stationStep(state)
+    : state.step === 3 ? sourceStep(state)
+    : armStep(state);
+
+  return `<section class="startup" aria-busy="${state.submitting}">
+    <div class="startup-side">
+      <ol class="sequence" aria-label="Start sequence">${sequence}</ol>
+      <p class="hint">No telemetry. This computer is not registered, so every instrument is unpowered.</p>
+      ${sixPackMarkup(SIX_PACK, true)}
+    </div>
+    <div>
+      <div class="placard"><h1 id="setup-heading" tabindex="-1">${headline(state.step)}</h1><span>Step ${state.step} of 4</span></div>
+      ${setupLamps(state)}
+      ${body}
+      <p class="status-line" role="status" aria-live="polite">${escapeHtml(state.message)}</p>
+    </div>
+  </section>`;
 }
 
-function githubStep({ auth, draft }: OnboardingViewState): string {
-  const authBlock = auth.state === "authenticated"
-    ? `<div class="auth-card auth-connected"><span class="auth-dot" aria-hidden="true"></span><div><small>GitHub connected</small><p>Signed in as <strong>${escapeHtml(auth.login)}</strong></p></div></div>`
-    : `<div class="auth-card"><div><h3>Keep your setup private and portable</h3><p>CommonKit stores configuration—not passwords—in a private repository on GitHub so your computers can stay in sync.</p></div><button type="button" class="primary" id="github-sign-in" ${auth.state === "checking" || auth.state === "authenticating" ? "disabled" : ""}>${auth.state === "authenticating" ? "Opening GitHub…" : "Sign in with GitHub"}</button>${auth.state === "error" ? `<p class="form-error" role="alert">${escapeHtml(auth.message)}</p>` : ""}</div>`;
-  if (auth.state !== "authenticated") return `<div class="setup-step"><h2 id="setup-heading" tabindex="-1">Connect GitHub</h2>${authBlock}</div>`;
-  return `<form id="onboarding-form" class="setup-step" data-step="1">
-    <h2 id="setup-heading" tabindex="-1">Choose your starting point</h2>${authBlock}
-    <fieldset class="choice-grid"><legend class="sr-only">Starting point</legend>
-      ${choice("mode", "create", "Create a new private setup", "Start fresh and let CommonKit create the private repository.", draft.mode === "create")}
-      ${choice("mode", "connect", "Connect an existing setup", "Use a CommonKit repository you already have.", draft.mode === "connect")}
-    </fieldset>
-    ${draft.mode === "create"
-      ? field("repositoryName", "Name your setup", draft.repositoryName, "For example, commonkit. GitHub will keep it private.")
-      : field("repository", "GitHub repository", draft.repository, "For example, your-name/commonkit.")}
-    <div class="setup-actions"><button class="primary" type="submit">Continue</button></div>
+/* The promise stays on screen through the whole sequence, not just at the end. */
+function setupLamps(state: OnboardingViewState): string {
+  const connected = state.auth.state === "authenticated";
+  const lamps: Array<[string, "live" | "caution"]> = [
+    [connected ? "GitHub connected" : "GitHub not connected", connected ? "live" : "caution"],
+    ["Not registered", "caution"],
+    ["Nothing applied", "caution"],
+  ];
+  return `<div class="annunciator" style="margin-bottom:18px">${lamps
+    .map(([text, tone]) => `<p class="lamp" data-state="${tone}">${lampIcon(tone)}<span>${text}</span></p>`)
+    .join("")}</div>`;
+}
+
+function headline(step: OnboardingStep): string {
+  return step === 1 ? "Identity" : step === 2 ? "Station" : step === 3 ? "Source" : "Arm";
+}
+
+function identityStep({ auth, draft }: OnboardingViewState): string {
+  if (auth.state !== "authenticated") {
+    return `<div class="plate-block">
+      <div class="plate-head"><h2>GitHub</h2><span>${auth.state === "checking" ? "Checking" : "Signed out"}</span></div>
+      <div class="plate-body">
+        <p>CommonKit keeps your configuration, never your passwords, in a private repository on GitHub so every computer can start from the same setup.</p>
+        <p>Sign-in runs through the GitHub CLI. Your token stays in its native credential store and never reaches this window.</p>
+        ${auth.state === "error" ? `<p class="hint bad" role="alert">${escapeHtml(auth.message)}</p>` : ""}
+      </div>
+    </div>
+    <div class="plate-block"><div class="plate-head"><h3>After you connect</h3><span>Three steps</span></div><div class="plate-body"><dl class="readout">
+      <dt>Station</dt><dd>Name this computer and pick the one folder CommonKit may manage.</dd>
+      <dt>Source</dt><dd>Start empty, or read an APM or chezmoi setup you already keep.</dd>
+      <dt>Arm</dt><dd>Review everything, then prepare a plan. Nothing is applied.</dd>
+    </dl></div></div>
+    <div class="controls split" style="margin-top:16px"><span></span>
+      <button type="button" class="engage" id="github-sign-in" ${auth.state === "checking" || auth.state === "authenticating" ? "disabled" : ""}>${auth.state === "authenticating" ? "Waiting for GitHub" : "Connect GitHub"}</button>
+    </div>`;
+  }
+  return `<form id="onboarding-form" data-step="1">
+    <div class="plate-block">
+      <div class="plate-head"><h2>GitHub</h2><span>${escapeHtml(auth.login)}</span></div>
+      <div class="plate-body">
+        <fieldset class="selector two"><legend class="sr-only">Starting point</legend>
+          ${option("mode", "create", "New kit", "CommonKit creates the private repository for you.", draft.mode === "create")}
+          ${option("mode", "connect", "Existing kit", "Connect a CommonKit repository you already have.", draft.mode === "connect")}
+        </fieldset>
+        ${draft.mode === "create"
+          ? textField("repositoryName", "Repository name", draft.repositoryName, `Created private as ${escapeHtml(auth.login)}/${escapeHtml(draft.repositoryName || "commonkit")}.`)
+          : textField("repository", "Repository", draft.repository, "Owner and name, for example your-account/commonkit.")}
+      </div>
+    </div>
+    ${actions("Continue", false)}
   </form>`;
 }
 
-function computerStep({ draft }: OnboardingViewState): string {
-  const computerId = stableComputerId(draft.computerName);
-  return `<form id="onboarding-form" class="setup-step" data-step="2">
-    <h2 id="setup-heading" tabindex="-1">Set up this computer</h2>
-    <p>Give this computer a recognizable name and choose where to try CommonKit.</p>
-    ${field("computerName", "Computer name", draft.computerName, `CommonKit will save this machine as “${computerId}”.`)}
-    ${field("targetRoot", "Folder to manage", draft.targetRoot, "For a safe first test, choose an empty folder. CommonKit previews every change before applying it.", true)}
-    <label class="safe-choice"><input type="checkbox" id="safe-test-folder" ${draft.targetRoot.endsWith("/CommonKitManaged") ? "checked" : ""}> Use a safe test folder first</label>
-    <details class="advanced"><summary>Advanced local settings</summary>
-      ${field("kitDirectory", "Local setup folder", draft.kitDirectory, "Where CommonKit keeps its private Git checkout on this computer.", true)}
-      ${field("loadout", "Settings profile ID", draft.loadout, "The portable profile selected for this computer.")}
-      ${optionalField("projectLoadout", "Project settings profile", draft.projectLoadout, "Optional project-specific layer applied after your personal profile.")}
-      ${optionalField("targetOverride", "Computer-specific override", draft.targetOverride, "Optional final layer for this computer only.")}
-    </details>
-    ${actions(true, "Continue")}
+function stationStep({ draft }: OnboardingViewState): string {
+  return `<form id="onboarding-form" data-step="2">
+    <div class="plate-block">
+      <div class="plate-head"><h2>This computer</h2><span>${escapeHtml(stableComputerId(draft.computerName))}</span></div>
+      <div class="plate-body">
+        <p>Name this machine and choose the folder CommonKit is allowed to manage.</p>
+        ${textField("computerName", "Station name", draft.computerName, `Recorded as ${escapeHtml(stableComputerId(draft.computerName))}.`)}
+        ${textField("targetRoot", "Managed root", draft.targetRoot, "Everything CommonKit writes stays inside this folder. An empty one is the safest first run.", "dir")}
+        <label class="toggle"><input type="checkbox" id="safe-test-folder" ${draft.targetRoot.endsWith("/CommonKitManaged") ? "checked" : ""}> Use a separate test folder</label>
+        <details class="aux"><summary>Local paths and layers</summary><div class="aux-body">
+          ${textField("kitDirectory", "Kit checkout", draft.kitDirectory, "Where the private Git checkout lives on this computer.", "dir")}
+          ${textField("loadout", "Loadout", draft.loadout, "The portable profile this computer composes from.")}
+          ${textField("projectLoadout", "Project layer", draft.projectLoadout, "Optional. Applied after the personal loadout.", false, false)}
+          ${textField("targetOverride", "Station layer", draft.targetOverride, "Optional. The final layer, this computer only.", false, false)}
+        </div></details>
+      </div>
+    </div>
+    ${actions("Continue")}
   </form>`;
 }
 
-function importStep({ draft }: OnboardingViewState): string {
-  return `<form id="onboarding-form" class="setup-step" data-step="3">
-    <h2 id="setup-heading" tabindex="-1">Bring in existing settings</h2>
-    <p>Start empty for the first test, or import settings you already manage elsewhere.</p>
-    <fieldset class="choice-grid"><legend class="sr-only">Settings source</legend>
-      ${choice("provider", "native", "Start with CommonKit", "Begin with an empty, portable setup.", draft.provider === "native")}
-      ${choice("provider", "apm", "Import an APM setup", "Use an existing APM manifest and lockfile.", draft.provider === "apm")}
-      ${choice("provider", "chezmoi", "Import a chezmoi setup", "Use an existing chezmoi source directory.", draft.provider === "chezmoi")}
-    </fieldset>
-    ${providerDetails(draft)}
-    ${actions(true, "Review setup")}
+function sourceStep({ draft }: OnboardingViewState): string {
+  return `<form id="onboarding-form" data-step="3">
+    <div class="plate-block">
+      <div class="plate-head"><h2>Existing settings</h2><span>${draft.provider === "native" ? "None" : draft.provider === "apm" ? "APM 0.25.0" : "chezmoi 2.70.4"}</span></div>
+      <div class="plate-body">
+        <p>Start empty, or bring in a setup you already manage. Providers only compute desired state; CommonKit still owns every change to this machine.</p>
+        <fieldset class="selector three"><legend class="sr-only">Settings source</legend>
+          ${option("provider", "native", "Empty", "Begin with a clean portable kit.", draft.provider === "native")}
+          ${option("provider", "apm", "APM", "Read an existing manifest and lockfile.", draft.provider === "apm")}
+          ${option("provider", "chezmoi", "chezmoi", "Read an existing source directory.", draft.provider === "chezmoi")}
+        </fieldset>
+        ${providerDetails(draft)}
+      </div>
+    </div>
+    ${actions("Continue")}
   </form>`;
 }
 
-function reviewStep({ auth, draft, submitting }: OnboardingViewState): string {
+function armStep({ auth, draft, submitting }: OnboardingViewState): string {
   const login = auth.state === "authenticated" ? auth.login : "";
   const repository = draft.mode === "create" ? `${login}/${draft.repositoryName}` : draft.repository;
-  const imported = draft.provider === "native" ? "Start with an empty CommonKit setup" : draft.provider === "apm" ? "Import APM settings" : "Import chezmoi settings";
-  return `<form id="onboarding-form" class="setup-step" data-step="4">
-    <h2 id="setup-heading" tabindex="-1">Review before creating</h2>
-    <dl class="review-list"><dt>Private repository</dt><dd>${escapeHtml(repository)}</dd><dt>Local folder</dt><dd>${escapeHtml(draft.kitDirectory)}</dd><dt>Computer ID</dt><dd>${escapeHtml(stableComputerId(draft.computerName))}</dd><dt>Folder to manage</dt><dd>${escapeHtml(draft.targetRoot)}</dd><dt>Personal profile</dt><dd>${escapeHtml(draft.loadout)}</dd>${draft.projectLoadout ? `<dt>Project profile</dt><dd>${escapeHtml(draft.projectLoadout)}</dd>` : ""}${draft.targetOverride ? `<dt>Computer override</dt><dd>${escapeHtml(draft.targetOverride)}</dd>` : ""}<dt>Existing settings</dt><dd>${escapeHtml(imported)}</dd></dl>
-    <div class="safety-note"><strong>Managed settings are not applied yet.</strong><p>CommonKit will save this setup locally and prepare a preview for you to review first.</p></div>
-    <label class="consent"><input name="publishRegistration" type="checkbox" value="true" ${draft.publishRegistration ? "checked" : ""} required> <span><strong>Save this computer to the private repository</strong><small>This lets your other computers discover it. CommonKit will create and push a registration commit.</small></span></label>
-    ${actions(true, submitting ? "Preparing preview…" : "Prepare setup preview", submitting)}
+  const source = draft.provider === "native" ? "Empty kit" : draft.provider === "apm" ? "APM import" : "chezmoi import";
+  return `<form id="onboarding-form" data-step="4">
+    <div class="plate-block">
+      <div class="plate-head"><h2>Before arming</h2><span>Read-only</span></div>
+      <div class="plate-body">
+        <dl class="readout">
+          <dt>Repository</dt><dd>${escapeHtml(repository)}</dd>
+          <dt>Kit checkout</dt><dd>${escapeHtml(draft.kitDirectory)}</dd>
+          <dt>Station</dt><dd>${escapeHtml(stableComputerId(draft.computerName))}</dd>
+          <dt>Managed root</dt><dd>${escapeHtml(draft.targetRoot)}</dd>
+          <dt>Loadout</dt><dd>${escapeHtml(draft.loadout)}</dd>
+          ${draft.projectLoadout ? `<dt>Project layer</dt><dd>${escapeHtml(draft.projectLoadout)}</dd>` : ""}
+          ${draft.targetOverride ? `<dt>Station layer</dt><dd>${escapeHtml(draft.targetOverride)}</dd>` : ""}
+          <dt>Source</dt><dd>${escapeHtml(source)}</dd>
+        </dl>
+      </div>
+    </div>
+    <div class="notice caution" style="margin-top:16px">${icon.caution()}<p><strong>Nothing is applied by this step.</strong> CommonKit saves the setup locally and prepares a plan. The managed root is not touched until you review that plan and confirm it.</p></div>
+    <label class="guard" style="margin-top:16px"><input name="publishRegistration" type="checkbox" value="true" ${draft.publishRegistration ? "checked" : ""} required>
+      <span><strong>Publish this station to the repository</strong><small>Creates and pushes a registration commit so your other computers can find this one. This is the only step here that writes to GitHub.</small></span></label>
+    ${actions(submitting ? "Preparing plan" : "Prepare plan", true, submitting)}
   </form>`;
 }
 
 function providerDetails(draft: OnboardingDraft): string {
-  if (draft.provider === "native") return `<details class="advanced"><summary>Advanced provider details</summary><p>CommonKit’s built-in provider will create an empty portable setup. No external program is required.</p></details>`;
-  if (draft.provider === "apm") return `<details class="advanced"><summary>Advanced provider details</summary>
-    ${field("providerExecutable", "APM executable", draft.providerExecutable, "Pinned APM 0.25.0", true)}
-    ${field("apmManifest", "Manifest path", draft.apmManifest, "Relative to your setup folder.", true)}
-    ${field("apmLockfile", "Lockfile path", draft.apmLockfile, "Relative to your setup folder.", true)}
-    ${field("apmPolicy", "Package policy path", draft.apmPolicy, "Relative to your setup folder.", true)}
-    <input name="providerVersion" type="hidden" value="0.25.0"></details>`;
-  return `<details class="advanced"><summary>Advanced provider details</summary>
-    ${field("providerExecutable", "chezmoi executable", draft.providerExecutable, "Pinned chezmoi 2.70.4", true)}
-    ${field("chezmoiSource", "Source directory", draft.chezmoiSource, "Relative to your setup folder.", true)}
-    ${field("chezmoiConfig", "Config path", draft.chezmoiConfig, "Relative to your setup folder.", true)}
-    <input name="providerVersion" type="hidden" value="2.70.4"></details>`;
+  if (draft.provider === "native") return "";
+  const fields = draft.provider === "apm"
+    ? `${textField("providerExecutable", "APM executable", draft.providerExecutable, "Version 0.25.0 is verified before use.", "file")}
+       ${textField("apmManifest", "Manifest", draft.apmManifest, "Relative to the kit checkout.", "file")}
+       ${textField("apmLockfile", "Lockfile", draft.apmLockfile, "Relative to the kit checkout.", "file")}
+       ${textField("apmPolicy", "Package policy", draft.apmPolicy, "Relative to the kit checkout.", "file")}
+       <input name="providerVersion" type="hidden" value="0.25.0">`
+    : `${textField("providerExecutable", "chezmoi executable", draft.providerExecutable, "Version 2.70.4 is verified before use.", "file")}
+       ${textField("chezmoiSource", "Source directory", draft.chezmoiSource, "Relative to the kit checkout.", "dir")}
+       ${textField("chezmoiConfig", "Config", draft.chezmoiConfig, "Relative to the kit checkout.", "file")}
+       <input name="providerVersion" type="hidden" value="2.70.4">`;
+  return `<details class="aux" open><summary>Provider paths</summary><div class="aux-body">${fields}</div></details>`;
 }
 
-function choice(name: string, value: string, title: string, detail: string, checked: boolean): string {
-  return `<label class="choice-card"><input type="radio" name="${name}" value="${value}" ${checked ? "checked" : ""}><span><strong>${title}</strong><small>${detail}</small></span></label>`;
+function option(name: string, value: string, title: string, detail: string, checked: boolean): string {
+  return `<label class="switch"><input type="radio" name="${name}" value="${value}" ${checked ? "checked" : ""}><strong>${title}</strong><small>${detail}</small></label>`;
 }
 
-function field(name: string, label: string, value: string, help: string, picker = false): string {
+/** `picker`: false, "dir" for a folder, or "file" for an executable. */
+function textField(name: string, label: string, value: string, hint: string, picker: false | "dir" | "file" = false, required = true): string {
   const id = `onboarding-${name}`;
-  return `<label class="setup-field" for="${id}"><span>${label}</span><input id="${id}" name="${name}" value="${escapeHtml(value)}" required aria-describedby="${id}-help">${picker ? `<button type="button" class="secondary picker" data-pick${name === "targetRoot" || name === "kitDirectory" ? "-directory" : ""}="${name}" aria-label="Choose ${escapeHtml(label)}">Choose</button>` : ""}<small id="${id}-help">${help}</small></label>`;
+  const control = `<input id="${id}" name="${name}" value="${escapeHtml(value)}"${required ? " required" : ""} aria-describedby="${id}-hint">`;
+  const attribute = picker === "dir" ? `data-pick-directory="${name}"` : `data-pick="${name}"`;
+  const inner = picker
+    ? `<div class="field-row">${control}<button type="button" class="standby" ${attribute}>Browse</button></div>`
+    : control;
+  return `<label class="field" for="${id}"><span>${label}${required ? "" : " <small>optional</small>"}</span>${inner}<small class="hint" id="${id}-hint">${hint}</small></label>`;
 }
 
-function optionalField(name: string, label: string, value: string, help: string): string {
-  const id = `onboarding-${name}`;
-  return `<label class="setup-field" for="${id}"><span>${label} <small>(optional)</small></span><input id="${id}" name="${name}" value="${escapeHtml(value)}" aria-describedby="${id}-help"><small id="${id}-help">${help}</small></label>`;
-}
-
-function actions(back: boolean, next: string, disabled = false): string {
-  return `<div class="setup-actions">${back ? `<button class="secondary" type="button" id="setup-back">Back</button>` : ""}<button class="primary" type="submit" ${disabled ? "disabled" : ""}>${next}</button></div>`;
+function actions(next: string, back = true, disabled = false): string {
+  return `<div class="controls split" style="margin-top:16px">
+    ${back ? `<button class="standby" type="button" id="setup-back">Back</button>` : "<span></span>"}
+    <button class="engage" type="submit"${disabled ? " disabled" : ""}>${next}</button>
+  </div>`;
 }

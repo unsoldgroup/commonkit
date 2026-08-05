@@ -16,6 +16,6 @@ test("desktop window opens at a useful management size", async () => {
 test("desktop shell uses a full-height sidebar and independently scrolling content", async () => {
   const css = await readFile(new URL("src/style.css", root), "utf8");
   assert.match(css, /#app\s*\{[^}]*height:\s*100(?:dvh|vh)/s);
-  assert.match(css, /aside\s*\{[^}]*height:\s*100(?:dvh|vh)/s);
-  assert.match(css, /main\s*\{[^}]*overflow-y:\s*auto/s);
+  assert.match(css, /\.rail\s*\{[^}]*height:\s*100(?:dvh|vh)/s);
+  assert.match(css, /\.deck\s*\{[^}]*overflow-y:\s*auto/s);
 });

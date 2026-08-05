@@ -204,7 +204,7 @@ test("credential provisioning reviews a redacted plan before applying its exact 
     frontend.indexOf('document.querySelector("#credential-verify")'),
   );
   const plan = flow.indexOf("credentialPlan([id])");
-  const review = flow.indexOf("window.confirm", plan);
+  const review = flow.indexOf("confirmAction", plan);
   const apply = flow.indexOf("credentialApply(plan.planId", review);
   assert.ok(plan >= 0 && review > plan && apply > review);
   assert.match(api, /credentialApply:\s*\(planId: string/);
