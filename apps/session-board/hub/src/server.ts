@@ -42,6 +42,8 @@ export interface HubOptions {
   webDistPath?: string;
   now?: () => Date;
   push?: { publicKey: string; sender: PushSender };
+  /** Resolves the Cloudflare Access identity on a request, or undefined when there is none. */
+  access?: (request: Request) => Promise<string | undefined>;
 }
 
 export interface HubServer {
@@ -322,6 +324,18 @@ export function startHub(options: HubOptions): HubServer {
     }
   };
 
+  /**
+   * A browser session authenticated by Cloudflare Access carries a signed assertion instead of a
+   * shared token, so it never needs to be prompted. The bearer token stays for machine callers
+   * (the hook posts decisions without a browser session) and as the fallback when Access is not
+   * configured. Both are checked; either one is sufficient.
+   */
+  const authorized = async (request: Request) => {
+    const token = bearerToken(request);
+    if (token && secureEqual(token, options.actionToken)) return true;
+    return Boolean(options.access && (await options.access(request)));
+  };
+
   const server = Bun.serve<ReporterSocketData>({
     hostname: options.hostname ?? "127.0.0.1",
     port: options.port ?? 0,
@@ -354,8 +368,7 @@ export function startHub(options: HubOptions): HubServer {
       }
 
       if (url.pathname === "/push/subscriptions" && request.method === "POST") {
-        const token = bearerToken(request);
-        if (!token || !secureEqual(token, options.actionToken)) return json({ error: "unauthorized" }, 401);
+        if (!(await authorized(request))) return json({ error: "unauthorized" }, 401);
         let subscription: PushSubscription;
         try {
           subscription = parsePushSubscription(await request.json());
@@ -411,8 +424,7 @@ export function startHub(options: HubOptions): HubServer {
 
       const decisionMatch = /^\/actions\/([^/]+)\/decision$/.exec(url.pathname);
       if (decisionMatch && request.method === "POST") {
-        const token = bearerToken(request);
-        if (!token || !secureEqual(token, options.actionToken)) return json({ error: "unauthorized" }, 401);
+        if (!(await authorized(request))) return json({ error: "unauthorized" }, 401);
         const actionId = decodeURIComponent(decisionMatch[1]);
         const action = actions.get(actionId);
         const reporter = action ? reporters.get(action.sessionRef.machineId) : undefined;

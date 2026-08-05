@@ -68,6 +68,10 @@ umask 077
   [[ -z ${SESSION_BOARD_VAPID_PUBLIC:-} ]] || printf 'SESSION_BOARD_VAPID_PUBLIC=%s\n' "$(systemd_quote "$SESSION_BOARD_VAPID_PUBLIC")"
   [[ -z ${SESSION_BOARD_VAPID_PRIVATE:-} ]] || printf 'SESSION_BOARD_VAPID_PRIVATE=%s\n' "$(systemd_quote "$SESSION_BOARD_VAPID_PRIVATE")"
   [[ -z ${SESSION_BOARD_VAPID_SUBJECT:-} ]] || printf 'SESSION_BOARD_VAPID_SUBJECT=%s\n' "$(systemd_quote "$SESSION_BOARD_VAPID_SUBJECT")"
+  # Both or neither: the hub refuses to start with only one, because a half-configured Access
+  # setup silently leaves browser sessions on the action-token prompt.
+  [[ -z ${SESSION_BOARD_ACCESS_TEAM_DOMAIN:-} ]] || printf 'SESSION_BOARD_ACCESS_TEAM_DOMAIN=%s\n' "$(systemd_quote "$SESSION_BOARD_ACCESS_TEAM_DOMAIN")"
+  [[ -z ${SESSION_BOARD_ACCESS_AUD:-} ]] || printf 'SESSION_BOARD_ACCESS_AUD=%s\n' "$(systemd_quote "$SESSION_BOARD_ACCESS_AUD")"
   printf 'SESSION_BOARD_HOST=%s\n' "$(systemd_quote '127.0.0.1')"
   printf 'SESSION_BOARD_PORT=%s\n' "$(systemd_quote "$HUB_PORT")"
 } >"$ENV_FILE"

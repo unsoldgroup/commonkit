@@ -83,9 +83,7 @@ function render() {
 async function loadState() { const response = await fetch("/state", { cache: "no-store" }); if (!response.ok) throw new Error("State unavailable"); snapshot = await response.json(); updatedAt = Date.now(); render(); }
 async function loadDecisions() { const response = await fetch("/decisions", { cache: "no-store" }); if (!response.ok) throw new Error("Decisions unavailable"); decisions = (await response.json()).records; render(); }
 async function decide(id: string, verdict: Verdict, steer?: string) {
-  const auth = await actionToken(true);
-  if (!auth) return;
-  const response = await fetch(`/actions/${encodeURIComponent(id)}/decision`, { method: "POST", headers: { Authorization: `Bearer ${auth}`, "Content-Type": "application/json" }, body: JSON.stringify({ verdict, ...(steer ? { steer } : {}) }) });
+  const response = await authorizedFetch(`/actions/${encodeURIComponent(id)}/decision`, { method: "POST", body: JSON.stringify({ verdict, ...(steer ? { steer } : {}) }) });
   if (!response.ok) throw new Error((await response.json()).error ?? "Decision failed");
 }
 async function loadTail(session: Session) {
@@ -120,13 +118,26 @@ function renderPushToggle() {
 function pushSupported() {
   return "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 }
-async function actionToken(promptUser: boolean) {
-  let auth = token();
-  if (!auth && promptUser) {
-    auth = prompt("Board action token") ?? "";
-    if (auth) localStorage.setItem("session-board-token", auth);
-  }
-  return auth;
+/**
+ * Try the request without asking for anything first. Behind Cloudflare Access the
+ * CF_Authorization cookie rides along on a same-origin request, so that first attempt succeeds
+ * and the prompt never appears. The token prompt survives only as the fallback for a hub reached
+ * without Access in front of it, and only after the hub has actually answered 401.
+ */
+async function authorizedFetch(path: string, init: RequestInit, promptOnUnauthorized = true) {
+  const send = (auth: string) => fetch(path, {
+    ...init,
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json", ...(auth ? { Authorization: `Bearer ${auth}` } : {}) },
+  });
+  const response = await send(token());
+  if (response.status !== 401 || !promptOnUnauthorized) return response;
+  localStorage.removeItem("session-board-token");
+  const auth = prompt("Board action token") ?? "";
+  if (!auth) return response;
+  const retried = await send(auth);
+  if (retried.ok) localStorage.setItem("session-board-token", auth);
+  return retried;
 }
 async function refreshPushState() {
   if (!pushSupported()) { pushState = "off"; renderPushToggle(); return; }
@@ -146,19 +157,12 @@ async function enablePush(promptForToken: boolean) {
   localStorage.setItem(pushOfferedKey, "1");
   const permission = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
   if (permission !== "granted") { await refreshPushState(); return; }
-  const auth = await actionToken(promptForToken);
-  if (!auth) { await refreshPushState(); return; }
   const registration = await navigator.serviceWorker.ready;
   const subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: decodeVapidPublicKey(vapidPublicKey) });
-  const response = await fetch("/push/subscriptions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${auth}`, "Content-Type": "application/json" },
-    body: JSON.stringify(subscription),
-  });
+  const response = await authorizedFetch("/push/subscriptions", { method: "POST", body: JSON.stringify(subscription) }, promptForToken);
   if (!response.ok) {
     await subscription.unsubscribe();
-    if (response.status === 401) localStorage.removeItem("session-board-token");
-    throw new Error(response.status === 401 ? "Push needs a valid board action token" : "Could not enable push notifications");
+    throw new Error(response.status === 401 ? "Push needs a Cloudflare Access sign-in or a board action token" : "Could not enable push notifications");
   }
   await refreshPushState();
 }

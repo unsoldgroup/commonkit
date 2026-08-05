@@ -100,7 +100,41 @@ Every verdict comes from a human tap. Failures and timeouts return no decision a
 
 The hub records human decisions for seven days in `data/decisions.json`. The board's Decisions tab reads them from `GET /decisions`; older records are removed as new decisions are appended.
 
-The tailnet is the read boundary. `GET /state`, `GET /events`, `GET /sessions/:id/tail`, `GET /decisions`, and the VAPID public-key read are tokenless. Mutating endpoints are token-gated: decisions and push subscription registration require the board action bearer token, while reporter writes use that Target's reporter token.
+The tailnet is the read boundary. `GET /state`, `GET /events`, `GET /sessions/:id/tail`, `GET /decisions`, and the VAPID public-key read are tokenless. Mutating endpoints are gated: decisions and push subscription registration require either a verified Cloudflare Access identity or the board action bearer token, while reporter writes use that Target's reporter token.
+
+### Cloudflare Access sign-in
+
+A browser session authenticated by Cloudflare Access carries a signed
+`Cf-Access-Jwt-Assertion` header and is never prompted for a token. Machine
+callers — the reporter and the permission hook — keep their bearer tokens, so
+neither needs an Access service token.
+
+The hub verifies the assertion cryptographically against the team JWKS rather
+than trusting the header's presence. This matters because Caddy still serves
+the hub on the tailnet IP, so a tailnet peer could otherwise forge the header.
+
+Set both variables together, or neither. The hub refuses to start with only one,
+because a half-configured Access setup silently leaves browser sessions on the
+token prompt:
+
+- `SESSION_BOARD_ACCESS_TEAM_DOMAIN` — for example `unsold.cloudflareaccess.com`
+- `SESSION_BOARD_ACCESS_AUD` — the Access application's audience tag
+
+Operator steps, all outside this repository:
+
+1. Add a `cloudflared` ingress rule for the board hostname pointing at
+   `http://127.0.0.1:8787`, alongside the existing rules in
+   `/etc/cloudflared/config.yml`.
+2. Change the board DNS record from a dns-only A record pointing at the tailnet
+   IP to a **proxied** CNAME for the tunnel. Access cannot see traffic that never
+   reaches the Cloudflare edge, which is why the dns-only record must go.
+3. Create the Access application for the board hostname with a **One-time PIN by
+   email** policy, and copy its audience tag into `SESSION_BOARD_ACCESS_AUD`.
+4. Add an Access **Bypass** rule for `/reporter` so reporter WebSocket traffic is
+   unaffected.
+
+Until those steps are done the variables should stay unset, and the board keeps
+its existing bearer-token behaviour.
 
 ## Push subscriptions
 

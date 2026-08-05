@@ -9,6 +9,7 @@
   },
   "dependencies": {
     "@commonkit/session-board-protocol": "workspace:*",
+    "jose": "^6.1.0",
     "web-push": "^3.6.7"
   },
   "engines": {

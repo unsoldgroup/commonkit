@@ -554,4 +554,76 @@ describe("board hub", () => {
     expect(await fetch(`${hub.url}/assets/app.js`).then((response) => response.text())).toContain("ready");
     expect((await fetch(`${hub.url}/%2e%2e/%2e%2e/secret.txt`)).status).toBe(404);
   });
+
+  test("accepts a decision from a verified Cloudflare Access identity without a bearer token", async () => {
+    hub = startHub({
+      reporterTokens: { studio: "studio-secret" },
+      actionToken: "board-secret",
+      access: async (request) =>
+        request.headers.get("Cf-Access-Jwt-Assertion") === "valid-assertion"
+          ? "al@unsold.group"
+          : undefined,
+    });
+    const reporter = await openReporter();
+    reporter.send(JSON.stringify({ type: "stateSnapshot", machine, sessions: [], pendingActions: [] }));
+    reporter.send(JSON.stringify({ type: "actionOpened", action }));
+    await eventually(() => expect(hub!.latestEventId).toBe(2));
+
+    const response = await fetch(`${hub.url}/actions/${action.id}/decision`, {
+      method: "POST",
+      headers: { "Cf-Access-Jwt-Assertion": "valid-assertion", "Content-Type": "application/json" },
+      body: JSON.stringify({ verdict: "allow" }),
+    });
+
+    expect(response.status).toBe(200);
+    reporter.close();
+  });
+
+  test("rejects an unverified Access assertion, so a tailnet peer cannot forge the header", async () => {
+    hub = startHub({
+      reporterTokens: { studio: "studio-secret" },
+      actionToken: "board-secret",
+      access: async (request) =>
+        request.headers.get("Cf-Access-Jwt-Assertion") === "valid-assertion"
+          ? "al@unsold.group"
+          : undefined,
+    });
+
+    const forged = await fetch(`${hub.url}/actions/action-1/decision`, {
+      method: "POST",
+      headers: { "Cf-Access-Jwt-Assertion": "forged", "Content-Type": "application/json" },
+      body: JSON.stringify({ verdict: "allow" }),
+    });
+    const absent = await fetch(`${hub.url}/actions/action-1/decision`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ verdict: "allow" }),
+    });
+
+    expect(forged.status).toBe(401);
+    expect(absent.status).toBe(401);
+  });
+
+  test("keeps the bearer token path working when Access is not configured", async () => {
+    hub = startHub({ reporterTokens: { studio: "studio-secret" }, actionToken: "board-secret" });
+    const reporter = await openReporter();
+    reporter.send(JSON.stringify({ type: "stateSnapshot", machine, sessions: [], pendingActions: [] }));
+    reporter.send(JSON.stringify({ type: "actionOpened", action }));
+    await eventually(() => expect(hub!.latestEventId).toBe(2));
+
+    const accepted = await fetch(`${hub.url}/actions/${action.id}/decision`, {
+      method: "POST",
+      headers: { Authorization: "Bearer board-secret", "Content-Type": "application/json" },
+      body: JSON.stringify({ verdict: "allow" }),
+    });
+    const rejected = await fetch(`${hub.url}/actions/${action.id}/decision`, {
+      method: "POST",
+      headers: { Authorization: "Bearer wrong", "Content-Type": "application/json" },
+      body: JSON.stringify({ verdict: "allow" }),
+    });
+
+    expect(accepted.status).toBe(200);
+    expect(rejected.status).toBe(401);
+    reporter.close();
+  });
 });
