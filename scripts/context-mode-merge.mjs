@@ -63,10 +63,13 @@ const listDbs = (root, sub) => {
   return fs.readdirSync(dir).filter(f => f.endsWith('.db')).sort()
 }
 
-// A live writer makes every read inconsistent, so refuse rather than merge a
-// torn snapshot. `lsof +D` is the only portable-enough check here; a missing
-// lsof is treated as "cannot prove it is safe".
-function assertNoLiveWriters(roots) {
+// Report writers holding a source store. This is no longer a refusal: every
+// database is copied with VACUUM INTO, which takes an internally consistent
+// snapshot through a read transaction even while a writer is active. Databases
+// are snapshotted one at a time, so the result is per-database consistent
+// rather than a single instant across the whole store -- which is what project
+// memory needs, since each project's database stands alone.
+function reportLiveWriters(roots) {
   const holders = []
   for (const root of roots) {
     let out = ''
@@ -75,31 +78,57 @@ function assertNoLiveWriters(roots) {
     } catch (e) {
       // lsof exits non-zero when nothing matches, which is the good case.
       if (e.status === 1 && !e.stdout) continue
-      if (e.code === 'ENOENT') throw new Error('lsof not found; cannot prove no writer is live')
+      if (e.code === 'ENOENT') return // no lsof, nothing to report; snapshots are safe regardless
       out = e.stdout || ''
     }
     for (const line of out.split('\n').slice(1)) {
       const cols = line.trim().split(/\s+/)
-      if (cols.length > 1) holders.push(`${cols[0]}(${cols[1]}) ${cols[cols.length - 1]}`)
+      if (cols.length > 1) holders.push(cols[1])
     }
   }
-  if (holders.length) {
-    throw new Error(
-      `refusing to merge: ${holders.length} open handle(s) under the source stores.\n  ` +
-        [...new Set(holders)].slice(0, 10).join('\n  ') +
-        '\nQuit these Claude Code / Codex sessions first. Merging now would read a' +
-        '\ntorn snapshot. This cannot quit them for you: one of them may be the' +
-        '\nsession you are reading this in.',
+  const pids = [...new Set(holders)]
+  if (pids.length) {
+    console.log(
+      `note: ${pids.length} process(es) are writing the source stores (pid ${pids.slice(0, 6).join(', ')}).\n` +
+        '      Each database is snapshotted consistently, so this is safe. Sessions\n' +
+        '      still running will keep writing to the old store until they restart.',
     )
   }
 }
 
+const sqlQuote = value => `'${value.replace(/'/g, "''")}'`
+
+// Copy a database the only way that is correct for WAL: let SQLite write the
+// snapshot. A plain file copy takes the database file without its -wal, and
+// everything committed since the last checkpoint lives in that -wal -- so a
+// file copy silently loses recent rows whenever a writer is live or a process
+// exited without closing cleanly. VACUUM INTO reads through a read transaction,
+// captures WAL content, and is deterministic for identical input.
+function snapshotDatabase(source, dest) {
+  fs.rmSync(dest, { force: true })
+  let db
+  try {
+    db = new DatabaseSync(source, { readOnly: true })
+    db.exec(`VACUUM INTO ${sqlQuote(dest)}`)
+    return 'snapshot'
+  } catch (error) {
+    // Not a database SQLite will open (corrupt, or mid-write with no -shm to
+    // attach). A file copy is worse but better than dropping it entirely.
+    fs.rmSync(dest, { force: true })
+    fs.copyFileSync(source, dest)
+    console.log(`  WARNING: ${path.basename(source)} copied byte-for-byte, not snapshotted: ${error.message}`)
+    return 'copied'
+  } finally {
+    db?.close()
+  }
+}
+
 function openReadable(file) {
-  // Copy first: attaching a WAL database creates a -shm beside it, which would
-  // mutate a source store.
+  // Snapshot rather than attach: attaching a WAL database creates a -shm beside
+  // it, which would mutate a source store.
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ctxmerge-'))
   const copy = path.join(tmp, path.basename(file))
-  fs.copyFileSync(file, copy)
+  snapshotDatabase(file, copy)
   return { db: new DatabaseSync(copy), cleanup: () => fs.rmSync(tmp, { recursive: true, force: true }) }
 }
 
@@ -218,7 +247,7 @@ function run({ sources, out, apply, force }) {
 
   // Planning only lists filenames, so it is safe while agents are running. Only
   // --apply reads database contents and needs a quiet store.
-  if (apply) assertNoLiveWriters(sources)
+  if (apply) reportLiveWriters(sources)
 
   const label = root => path.basename(path.dirname(root)) || path.basename(root)
   const actions = plan(sources, out)
@@ -264,8 +293,7 @@ function run({ sources, out, apply, force }) {
   for (const a of actions) {
     // Rebuilt from the sources every run, so a re-run of the same inputs
     // produces the same destination.
-    fs.rmSync(a.dest, { force: true })
-    fs.copyFileSync(path.join(a.base, a.sub, a.file), a.dest)
+    snapshotDatabase(path.join(a.base, a.sub, a.file), a.dest)
     const record = {
       file: `${a.sub}/${a.file}`,
       base: { label: label(a.base), sha256: sha256(path.join(a.base, a.sub, a.file)), bytes: fs.statSync(path.join(a.base, a.sub, a.file)).size },
@@ -366,6 +394,20 @@ function selftest() {
       JSON.stringify(second.databases.map(d => d.merged.sha256)),
     're-run produces identical databases',
   )
+
+  // Rows committed but not yet checkpointed live in the -wal, which a file copy
+  // does not take. Hold the source open so its WAL stays uncheckpointed.
+  const walSource = new DatabaseSync(path.join(A, 'sessions/shared.db'))
+  walSource.exec("PRAGMA journal_mode=WAL")
+  for (let i = 0; i < 400; i++) {
+    walSource.prepare('INSERT INTO session_meta VALUES (?, ?)').run(`wal-${i}`, '/p/wal')
+  }
+  run({ sources: [A, B], out, apply: true })
+  const walCheck = new DatabaseSync(path.join(out, 'sessions/shared.db'), { readOnly: true })
+  const walRows = walCheck.prepare("SELECT COUNT(*) c FROM session_meta WHERE session_id LIKE 'wal-%'").get().c
+  walCheck.close()
+  walSource.close()
+  assert(walRows === 400, `uncheckpointed WAL rows are captured, got ${walRows} of 400`)
 
   // Once a writer has been pointed at the destination, a re-run would rebuild
   // it from the sources and discard everything captured since.

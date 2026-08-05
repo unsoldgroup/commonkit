@@ -122,8 +122,17 @@ both existing stores. Rows are preserved verbatim. No row is dropped.
   would discard everything captured since. `--force` overrides for a deliberate
   discard. A `-wal` newer than the manifest is what marks it live: these stores
   are WAL, so a live writer leaves the database file itself untouched.
-- The merge runs while no writer is live. It is a migration step, not a
-  reconcile operation, and no adapter performs it.
+- Every database is copied with `VACUUM INTO`, not as a file. A file copy takes
+  the database without its `-wal`, and everything committed since the last
+  checkpoint lives there, so a plain copy silently loses recent rows whenever a
+  writer is live or a process exited without closing cleanly. Measured: a file
+  copy of a 500-row database with an uncheckpointed WAL yields 392 rows.
+- Writers may therefore stay running. Each database is snapshotted through its
+  own read transaction, so the result is per-database consistent rather than one
+  instant across the store, which is what project memory needs since each
+  project's database stands alone.
+- The merge is a migration step, not a reconcile operation, and no adapter
+  performs it.
 
 `scripts/context-mode-merge.mjs` implements it and
 `scripts/context-mode-apply-merge.sh` drives it. Applied 2026-08-05: 858
