@@ -174,6 +174,78 @@ The design must now answer, in addition to the decisions below:
   filter today. If CommonKit selects which chunks to carry, scope can become a
   real boundary — which is the cheapest available answer to decision 2 below.
 
+## Scope of work
+
+Five phases. Each lands independently and is verifiable on its own; none
+requires the next to be useful. Phase 0 is a hard prerequisite — the rest rests
+on facts it establishes, and two of them are currently unproven.
+
+### Phase 0 — Prerequisites and spikes
+
+Nothing here ships a feature. It closes the unknowns the design depends on.
+
+| Deliverable | Acceptance |
+|---|---|
+| The context-mode drift finding is closed | Every writer resolves to the declared store, verified from a clean session on both Claude Code and Codex; the legacy directories receive no new writes over a full working day |
+| `engram sync --import` idempotency is proven | A chunk applied twice produces no duplicate observations and no error, demonstrated on a copy of the live database, with the result recorded on the issue |
+| Chunk format is characterised | Written note covering chunk naming, manifest structure, whether chunks are append-only in practice, and what an out-of-order import does |
+| Project identity is decided | A rule that resolves the same subject on two machines, given engram keys projects by repository basename and two repos here already share the name `commonkit` |
+
+**If import is not idempotent, stop.** A scheduler driving a non-idempotent
+import corrupts memory quietly, and the phase plan below changes shape.
+
+### Phase 1 — Chunks as a CommonKit resource
+
+Model an engram chunk set as something CommonKit can declare, inventory,
+verify and reconcile, without reading chunk contents.
+
+Acceptance: `commonkit status` reports the chunk set for a declared project;
+a missing or extra chunk is reported as drift; nothing in the path reads or
+decompresses a chunk payload; the existing invariant that CommonKit does not
+inspect store contents is demonstrably intact.
+
+### Phase 2 — Transport between two targets
+
+Carry chunks between two targets belonging to one owner. This is the tracer
+bullet: the smallest thing that proves the whole idea.
+
+Acceptance: an observation saved on device A is searchable on device B after a
+sync, with no manual `engram` command run on either side; a target that cannot
+reach the other degrades to a Reconciliation-reported no-op per ADR 0014, not a
+failed apply; the receipt records what moved.
+
+Cadence is decided here, informed by Phase 0. `engram --watch` may make
+CommonKit-side scheduling unnecessary.
+
+### Phase 3 — Scope becomes a boundary
+
+Make engram's `scope` field gate transport, so `personal` observations do not
+travel. Today scope is a query filter and 0 of 1,162 observations use
+`personal`, so this phase includes deciding who sets it and when.
+
+Acceptance: an observation written with `scope: personal` is never carried to
+another target; the classification rule is documented; existing observations
+are migrated or consciously left as `project` with that choice recorded.
+
+### Phase 4 — The team boundary
+
+Extend from one owner's devices to several people, mapping onto ADR 0016: team
+scopes in a shared repository, personal kits private. This is where revocation
+and the `session_summary` question must be answered rather than deferred.
+
+Acceptance: a Grant confers access to a team scope's chunks; withdrawing it
+produces a defined, documented outcome for already-materialized chunks;
+`session_summary` has a resolved disposition — shared, redacted, or
+personal-only.
+
+### Sequencing note
+
+Phases 0 to 2 deliver cross-device sync for one person, which is immediately
+useful and carries no confidentiality risk, since every target is the owner's.
+Phase 3 is the gate before anything reaches a second person. Phase 4 should not
+begin until Phase 3 holds, because a team boundary built over a decorative
+scope field is a boundary in name only.
+
 ## Explicitly out of scope
 
 No context-mode changes beyond closing the drift finding above. No upstream
