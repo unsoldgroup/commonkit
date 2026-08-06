@@ -15,8 +15,8 @@ use commonkit_platform::AppPaths;
 use serde::{Deserialize, Serialize};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
-use tauri::{Manager, WindowEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, Rect, WindowEvent};
 use tauri_plugin_autostart::ManagerExt as AutostartExt;
 use tauri_plugin_updater::UpdaterExt;
 use thiserror::Error;
@@ -250,6 +250,7 @@ struct ManagementSnapshot {
     relay: serde_json::Value,
     schedule: serde_json::Value,
     diagnostics: serde_json::Value,
+    skills: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -849,7 +850,7 @@ fn target_apply_route(target_id: &str, plan_id: &str) -> Result<String, DesktopE
 }
 
 #[cfg(test)]
-fn management_routes() -> [(&'static str, &'static str); 7] {
+fn management_routes() -> [(&'static str, &'static str); 8] {
     [
         ("about_me", "/about-me"),
         ("plans", "/compose"),
@@ -858,6 +859,7 @@ fn management_routes() -> [(&'static str, &'static str); 7] {
         ("relay", "/relay"),
         ("schedule", "/schedule"),
         ("diagnostics", "/diagnostics"),
+        ("skills", "/skills"),
     ]
 }
 
@@ -1113,6 +1115,10 @@ async fn desktop_management_snapshot(
         .json(reqwest::Method::GET, "/diagnostics", None)
         .await
         .unwrap_or_else(unavailable);
+    let skills = client
+        .json(reqwest::Method::GET, "/skills", None)
+        .await
+        .unwrap_or_else(unavailable);
     Ok(ManagementSnapshot {
         about_me,
         plans,
@@ -1121,6 +1127,7 @@ async fn desktop_management_snapshot(
         relay,
         schedule,
         diagnostics,
+        skills,
     })
 }
 
@@ -1655,10 +1662,82 @@ fn hide_main_window(window: &tauri::Window) -> Result<(), String> {
     Ok(())
 }
 
+/// The menu-bar panel. A native menu cannot draw the instrument face, so the tray icon
+/// hangs this always-on-top popover instead. It stays read-only: open, or quit.
+const TRAY_PANEL: &str = "tray-panel";
+
+/// macOS dismisses the panel by blurring it before the tray click arrives; without this
+/// the same click that closed the panel would immediately reopen it.
+#[derive(Default)]
+struct TrayPanelDismissal(Mutex<Option<Instant>>);
+
+fn build_tray_panel(app: &tauri::AppHandle) -> Result<(), String> {
+    tauri::WebviewWindowBuilder::new(
+        app,
+        TRAY_PANEL,
+        tauri::WebviewUrl::App("tray.html".into()),
+    )
+    .title("CommonKit")
+    .inner_size(360.0, 520.0)
+    .resizable(false)
+    .decorations(false)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .visible(false)
+    .focused(false)
+    .build()
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn hide_tray_panel(window: &tauri::Window) -> Result<(), String> {
+    window.hide().map_err(|error| error.to_string())
+}
+
+/// Anchor the panel under the tray icon the click reported, then show it.
+fn toggle_tray_panel(app: &tauri::AppHandle, rect: Rect) -> Result<(), String> {
+    let Some(window) = app.get_webview_window(TRAY_PANEL) else {
+        return Ok(());
+    };
+    if window.is_visible().unwrap_or(false) {
+        return window.hide().map_err(|error| error.to_string());
+    }
+    let dismissed = app
+        .state::<TrayPanelDismissal>()
+        .0
+        .lock()
+        .ok()
+        .and_then(|at| *at)
+        .is_some_and(|at| at.elapsed() < Duration::from_millis(250));
+    if dismissed {
+        return Ok(());
+    }
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let anchor = rect.position.to_physical::<f64>(scale);
+    let icon = rect.size.to_physical::<f64>(scale);
+    let size = window.outer_size().map_err(|error| error.to_string())?;
+    let left = anchor.x + icon.width / 2.0 - f64::from(size.width) / 2.0;
+    window
+        .set_position(tauri::PhysicalPosition::new(
+            left.round() as i32,
+            (anchor.y + icon.height).round() as i32,
+        ))
+        .map_err(|error| error.to_string())?;
+    window.show().map_err(|error| error.to_string())?;
+    window.set_focus().map_err(|error| error.to_string())
+}
+
 fn report_window_lifecycle_error(action: &str, result: Result<(), String>) {
     if let Err(error) = result {
         eprintln!("CommonKit could not {action}: {error}");
     }
+}
+
+/// The panel's only other control, and the same action the tray menu's Quit performs.
+#[tauri::command]
+fn quit_commonkit(app: tauri::AppHandle) {
+    app.state::<ServiceSupervisor>().stop();
+    app.exit(0);
 }
 
 async fn refresh_tray(app: tauri::AppHandle) {
@@ -1799,7 +1878,8 @@ pub fn run() {
             set_autostart,
             check_for_update,
             install_update,
-            show_main_window
+            show_main_window,
+            quit_commonkit
         ])
         .setup(move |app| {
             #[cfg(target_os = "macos")]
@@ -1847,8 +1927,11 @@ pub fn run() {
                     &quit,
                 ],
             )?;
+            app.manage(TrayPanelDismissal::default());
+            build_tray_panel(app.handle()).map_err(std::io::Error::other)?;
             TrayIconBuilder::new()
                 .menu(&menu)
+                .show_menu_on_left_click(false)
                 .tooltip("CommonKit")
                 .icon(Image::from_bytes(include_bytes!("../icons/tray-ck.png"))?)
                 .icon_as_template(true)
@@ -1864,6 +1947,20 @@ pub fn run() {
                         app.exit(0);
                     }
                     _ => {}
+                })
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        rect,
+                        ..
+                    } = event
+                    {
+                        report_window_lifecycle_error(
+                            "show the status panel",
+                            toggle_tray_panel(tray.app_handle(), rect),
+                        );
+                    }
                 })
                 .build(app)?;
             let start_minimized = std::env::args().any(|arg| arg == "--minimized");
@@ -1896,11 +1993,23 @@ pub fn run() {
             });
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            WindowEvent::CloseRequested { api, .. } if window.label() == TRAY_PANEL => {
+                api.prevent_close();
+                report_window_lifecycle_error("hide the status panel", hide_tray_panel(window));
+            }
+            WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 report_window_lifecycle_error("hide the main window", hide_main_window(window));
             }
+            // The panel is a popover: losing focus dismisses it, as a menu would.
+            WindowEvent::Focused(false) if window.label() == TRAY_PANEL => {
+                if let Ok(mut dismissed) = window.state::<TrayPanelDismissal>().0.lock() {
+                    *dismissed = Some(Instant::now());
+                }
+                report_window_lifecycle_error("hide the status panel", hide_tray_panel(window));
+            }
+            _ => {}
         })
         .build(tauri::generate_context!())
         .expect("failed to build CommonKit desktop")
@@ -2108,6 +2217,7 @@ mod tests {
                 ("relay", "/relay"),
                 ("schedule", "/schedule"),
                 ("diagnostics", "/diagnostics"),
+                ("skills", "/skills"),
             ]
         );
     }

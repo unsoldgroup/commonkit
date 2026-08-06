@@ -30,6 +30,7 @@ export interface ManagementSnapshot {
   relay: unknown;
   schedule: unknown;
   diagnostics: unknown;
+  skills?: unknown;
 }
 
 export interface TargetRecord {

@@ -628,6 +628,51 @@ details.aux[open] > summary { border-bottom: 1px solid var(--rule); color: var(-
   .annunciator { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
 }
 
+/* ── Menu-bar panel: the same plate, hung under the tray icon ──────────────────── */
+
+.tray {
+  display: grid;
+  min-width: 0;
+  grid-template-rows: auto auto auto 1fr;
+  gap: 10px;
+  height: 100dvh;
+  padding: 11px 12px 12px;
+  border: 1px solid var(--bezel);
+  border-radius: 6px;
+  background:
+    radial-gradient(130% 70% at 50% -10%, #171c22 0%, rgb(11 13 15 / 0%) 60%),
+    linear-gradient(180deg, #0d1013 0%, #090b0d 100%);
+  overflow: hidden;
+}
+.tray-head { display: flex; align-items: center; gap: 8px; padding-bottom: 9px; border-bottom: 1px solid var(--rule); }
+.tray-head svg { display: block; }
+.tray-head b {
+  font: 800 13px/1 "Saira Condensed", "B612", sans-serif;
+  letter-spacing: .17em;
+  text-transform: uppercase;
+}
+.tray-head span {
+  margin-left: auto;
+  font: 700 8.5px/1 "B612", sans-serif;
+  letter-spacing: .14em;
+  text-transform: uppercase;
+  color: var(--lum-faint);
+}
+/* Five instruments across three columns: two rows, the odd one reading left. */
+.tray .sixpack.is-rail { grid-template-columns: repeat(3, minmax(0, 1fr)); justify-content: stretch; gap: 6px; }
+.tray .sixpack.is-rail .instrument { min-width: 0; padding: 7px 5px 6px; gap: 5px; }
+.tray .sixpack.is-rail .dial { max-width: 68px; }
+.tray .sixpack.is-rail .tag { min-height: 22px; padding: 3px 4px; font-size: 7.5px; }
+.tray .annunciator { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; align-content: start; }
+.tray .lamp { padding: 6px 8px; gap: 6px; grid-template-columns: 14px 1fr; font-size: 8.5px; letter-spacing: .1em; }
+.tray .controls {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: end;
+  gap: 8px;
+}
+.tray .engage, .tray .standby { min-height: 34px; padding: 0 12px; font-size: 10px; letter-spacing: .12em; }
+
 @media (prefers-reduced-motion: reduce) {
   /* Needles still move to the truth; they simply arrive without the sweep. */
   :root { --sweep: 1ms; }

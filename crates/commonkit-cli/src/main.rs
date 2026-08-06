@@ -744,6 +744,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Command::Status => {
             let paths = AppPaths::discover()?;
+            // The desktop panel and the CLI must answer the same questions, or the
+            // only way to observe CommonKit is to look at pixels and describe them.
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -753,6 +755,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     "configDirectory": paths.config,
                     "stateDirectory": paths.state,
                     "cacheDirectory": paths.cache,
+                    "channels": panel_channels(),
                 }))?
             );
         }
@@ -1776,6 +1779,77 @@ fn nonce(prefix: &str) -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |value| value.as_nanos());
     format!("{prefix}-{}-{now}", std::process::id())
+}
+
+/// Every channel the desktop panel renders, answered from read-only endpoints.
+///
+/// `status` must keep working with the daemon down, so each channel degrades to a
+/// stated reason rather than failing the command. Channels the service does not
+/// publish say so; none of them guesses, which is the same rule the panel's
+/// instruments follow when they render NO SIGNAL.
+fn panel_channels() -> Value {
+    let read = |path: &str| daemon_control("GET", path, None, None).ok();
+
+    let service = match read("/control/v1/status") {
+        None => json!({ "unavailable": "the local CommonKit daemon is not reachable" }),
+        Some(status) => {
+            // A state that was never checked is not a state. Report the service's
+            // own claim, but never present it as an observation.
+            let checked = status
+                .get("lastDriftCheckUnixMs")
+                .is_some_and(|value| !value.is_null());
+            json!({
+                "reachable": true,
+                "drift": if checked { status.get("state").cloned().unwrap_or(Value::Null) } else { json!("unchecked") },
+                "serviceReported": status.get("state").cloned().unwrap_or(Value::Null),
+                "everChecked": checked,
+                "lastDriftCheckUnixMs": status.get("lastDriftCheckUnixMs").cloned().unwrap_or(Value::Null),
+            })
+        }
+    };
+
+    let devices = match read("/control/v1/targets") {
+        None => json!({ "unavailable": "the local CommonKit daemon is not reachable" }),
+        Some(targets) => {
+            let known = targets
+                .get("targets")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            let selected = targets
+                .get("selected")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            json!({ "known": known, "selected": selected })
+        }
+    };
+
+    let mcp_servers = match read("/control/v1/relay") {
+        None => json!({ "unavailable": "the local CommonKit daemon is not reachable" }),
+        Some(relay) => json!({
+            "configured": relay.get("configured").cloned().unwrap_or(Value::Null),
+            "servers": relay.get("servers").cloned().unwrap_or(Value::Null),
+        }),
+    };
+
+    let skills = match read("/control/v1/skills") {
+        None => {
+            json!({ "unavailable": "the local CommonKit daemon does not publish skill inventory" })
+        }
+        Some(skills) => json!({
+            "count": skills.as_array().map_or(0, Vec::len),
+        }),
+    };
+
+    json!({
+        "service": service,
+        "devices": devices,
+        "mcpServers": mcp_servers,
+        // Planning is a POST that produces a plan; reporting it here would mean
+        // creating one as a side effect of asking a question.
+        "plan": { "unavailable": "run `commonkit sync` to create and inspect a plan" },
+        "skills": skills,
+        "agentSessions": { "unavailable": "the service publishes no relay.sessions channel yet" },
+    })
 }
 
 fn daemon_control(

@@ -56,4 +56,5 @@ export const desktopApi = {
   checkForUpdate: () => invoke<UpdateSummary | null>("check_for_update"),
   installUpdate: (expectedVersion: string, confirmed: boolean) => invoke<void>("install_update", { expectedVersion, confirmed }),
   showWindow: () => invoke<void>("show_main_window"),
+  quit: () => invoke<void>("quit_commonkit"),
 };

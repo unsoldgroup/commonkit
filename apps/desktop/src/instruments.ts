@@ -30,14 +30,19 @@ export interface InstrumentSpec {
   fullScale?: number;
 }
 
+/* One canonical panel. The menu bar and the main window read the same six
+ * instruments in the same order, so a glance at either says the same thing. */
 export const SIX_PACK: readonly InstrumentSpec[] = [
   { id: "skills",   tag: "Skills",       kind: "counter",  source: "kit.skills",       fullScale: 40 },
   { id: "servers",  tag: "MCP Servers",  kind: "rose",     source: "relay.servers",    fullScale: 12 },
-  { id: "tools",    tag: "Tools",        kind: "counter",  source: "kit.tools",        fullScale: 60 },
+  { id: "plan",     tag: "Plan",         kind: "rate",     source: "plans.operations", fullScale: 24 },
+  { id: "devices",  tag: "Devices",      kind: "counter",  source: "targets.selected", fullScale: 8 },
   { id: "agents",   tag: "Agent Sessions", kind: "activity", source: "relay.sessions", fullScale: 8 },
   { id: "drift",    tag: "Drift",        kind: "attitude", source: "status.state" },
-  { id: "plan",     tag: "Plan",         kind: "rate",     source: "plans.operations", fullScale: 24 },
 ];
+
+/** The menu bar shows the whole panel, not a subset. */
+export const TRAY_PACK = SIX_PACK;
 
 /** A channel the daemon does not publish yet. Unpowered, never fabricated. */
 export function noSignal(what: string): Reading {

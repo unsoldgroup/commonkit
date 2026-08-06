@@ -8,7 +8,7 @@ import { defaultOnboardingDraft, onboardingPanel, type OnboardingViewState } fro
 import { applyOnboardingValues, onboardingRequest } from "./onboarding-controller.ts";
 import { ask, message, open } from "@tauri-apps/plugin-dialog";
 import { assertPlanTarget, convergenceTarget } from "./target-selection.ts";
-import { refreshDesktopState, shouldRunLiveRefresh } from "./live-refresh.ts";
+import { checkForDesktopUpdate, refreshDesktopState, shouldRunLiveRefresh } from "./live-refresh.ts";
 import { setupCompletion } from "./setup-gate.ts";
 import { withDeadline } from "./async-deadline.ts";
 import { statusPanel } from "./status-panel.ts";
@@ -117,7 +117,7 @@ function render(): void {
 
 function driveInstruments(): void {
   if (!app.querySelector("[data-instrument]")) return;
-  for (const [spec, reading] of readPanel(snapshot, management)) driveInstrument(app, spec, reading);
+  for (const [spec, reading] of readPanel(snapshot, management, targets)) driveInstrument(app, spec, reading);
 }
 
 /** A background poll must never yank the field the user is typing into. */
@@ -326,12 +326,7 @@ function bindUpdateActions(): void {
   document.querySelector<HTMLButtonElement>("#check-update")?.addEventListener("click", async () => {
     updateState = { kind: "checking" };
     render();
-    try {
-      const update = await desktopApi.checkForUpdate();
-      updateState = update ? { kind: "available", update } : { kind: "current" };
-    } catch (error) {
-      updateState = { kind: "error", message: errorMessage(error) };
-    }
+    updateState = await checkForDesktopUpdate(desktopApi);
     render();
   });
   document.querySelector<HTMLButtonElement>("#install-update")?.addEventListener("click", async () => {
@@ -548,6 +543,10 @@ async function initializeSetupGate(): Promise<void> {
   render();
 }
 void initializeSetupGate();
+void checkForDesktopUpdate(desktopApi).then((state) => {
+  updateState = state;
+  render();
+});
 let refreshRunning = false;
 async function refreshLiveState(): Promise<void> {
   if (refreshRunning) return;
