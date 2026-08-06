@@ -130,11 +130,49 @@ are about **confidentiality and ownership**, not plumbing.
    way it owns the context-mode store declaration? That is the natural fit and
    would make enrolment observable and reconcilable.
 
-## Scope decision from the owner
+## Scope decisions from the owner
 
-First customer: **both one person's several machines and a team, designed
-together** (decided 2026-08-06). So the confidentiality model must be present
-from v1; a device-only design that defers it is rejected.
+**First customer**: both one person's several machines and a team, designed
+together (2026-08-06). The confidentiality model must therefore be present from
+v1; a device-only design that defers it is rejected.
+
+**Transport**: engram stays **local on every device, and CommonKit syncs the
+chunks periodically** (2026-08-06). Rejected: `engram cloud serve`, which would
+put a second authority beside CommonKit and duplicate the target, credential
+and reconciliation machinery CommonKit already owns. Also rejected: manual git
+commit of `.engram/`, which works but is per-repository, unscheduled, and
+cannot carry anything across projects.
+
+This choice fits CommonKit better than it first appears, for a specific reason:
+**a chunk is a portable artifact, not the live store.** `engram sync` emits
+compressed JSONL chunks with a manifest; the SQLite database never moves. So
+CommonKit can carry chunks as content-addressed resources without reading them,
+which keeps the v1 invariant — CommonKit observes declarations and does not
+inspect store contents — intact rather than broken.
+
+It also inherits the right failure mode. Under ADR 0014 an edge whose content
+the grantee's target cannot read is an unresolved edge that Reconciliation
+reports, degrading to a no-op rather than a failed apply. Chunk transport is
+exactly that shape.
+
+The design must now answer, in addition to the decisions below:
+
+- **What CommonKit models a chunk set as.** A managed resource with a declared
+  path, a snapshot, or a new artifact kind? Chunks are append-only and
+  content-addressed, which none of the existing resource kinds assume.
+- **Cadence and trigger.** Scheduled, on session end, on commit, or on
+  reconcile? Note engram ships `--watch` with a minimum one-minute interval,
+  which may remove the need for CommonKit to schedule anything itself.
+- **Direction and authority.** v1 requires one authoritative writing target per
+  store. Periodic bidirectional chunk exchange has many writers by
+  construction, so either that invariant is replaced or chunks are declared not
+  to be the store.
+- **Import is not idempotent by assumption.** `engram sync --import` must be
+  verified safe to re-run against already-applied chunks before any scheduler
+  drives it.
+- **Whether the personal scope gates transport.** engram's `scope` is a query
+  filter today. If CommonKit selects which chunks to carry, scope can become a
+  real boundary — which is the cheapest available answer to decision 2 below.
 
 ## Explicitly out of scope
 
