@@ -1,15 +1,67 @@
 # CommonKit
 
-CommonKit is a cross-platform desired-state runtime for complete developer
-environments. It composes a public base, a non-overridable organization
-security floor, a personal kit, a project loadout, and target overrides; then
-it inspects, plans, applies, verifies, and can roll back changes on local and
-SSH targets.
+**Your best development setup, everywhere.**
 
-CommonKit is not an agent-package manager or a dotfile engine. Version-pinned
-providers compute normalized desired resources in isolation. CommonKit alone
-owns target policy, mutation, receipts, verification, recovery, services,
-credentials, the persistent MCP relay, and mutable-state snapshots.
+CommonKit carries the context that makes your coding agents effective across
+agents, machines, projects, and colleagues. Version your proven instructions,
+skills, tools, policies, and personal working context once. Compose the right
+subset for each target, preview the change, and apply it with a receipt.
+
+Your context stays useful when you move from Claude to Codex, from a laptop to
+a remote host, or from solo work to a shared team repository. CommonKit keeps
+the source portable while adapters translate it into each agent's native
+configuration.
+
+[Explore CommonKit](https://unsoldgroup.github.io/commonkit/) ·
+[Read the Unsold.Group case study](docs/case-study-unsold-group.md) ·
+[Install from npm](#clean-machine-source-install)
+
+## Context should travel
+
+Agent setups usually become trapped in one tool or machine. A useful skill
+lives in one agent's directory. Project conventions sit in a prompt nobody
+else has. A remote worker starts without the judgment available on the laptop.
+New colleagues rebuild the same setup by hand.
+
+CommonKit gives that context an owned, versioned path:
+
+```text
+organization policy + personal kit + project loadout + target overrides
+                                ↓
+                    inspect → plan → apply → verify
+                                ↓
+                  Claude · Codex · Mac · Linux · SSH
+```
+
+- **Across agents:** one source can materialize into each agent's native
+  instructions, skills, hooks, plugins, and MCP declarations.
+- **Across machines:** the same loadout can reconcile local and SSH targets
+  without treating machine-specific state as portable truth.
+- **Across projects:** project context travels beside the code and composes
+  with the user's own kit.
+- **Across colleagues:** an Organization CommonKit supplies shared policy and
+  capabilities while each person's private context remains independently
+  owned.
+
+CommonKit is a cross-platform desired-state runtime, not an agent-package
+manager or a dotfile engine. Version-pinned providers compute normalized
+desired resources in isolation. CommonKit owns target policy, mutation,
+receipts, verification, recovery, services, credential references, the
+persistent MCP relay, and mutable-state snapshots.
+
+## Proven in the kit we carry
+
+Unsold.Group has inventoried the working kit it is bringing under CommonKit:
+52 active skills, a 130-skill library, 14 reusable agents, seven specialist
+development personas, project bundles, local services, and credential
+references across a macOS workstation and a Linux VPS.
+
+That does not make every task literally 100 times faster. It removes the
+repeated setup, missing context, and environment drift that prevent a small
+team from compounding its best work. The case study shows what travels today,
+what stays target-specific, and which gaps CommonKit still reports honestly.
+
+[See how Unsold.Group carries its kit →](docs/case-study-unsold-group.md)
 
 Durable remote jobs and browser benchmark shards are handled by the Rust
 `commonkit-execd` service. Remote Claude/Codex sessions receive repository-declared
