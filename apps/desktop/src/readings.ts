@@ -1,11 +1,12 @@
 /* Maps live daemon state onto the six instruments.
  *
- * Channels the daemon publishes today: relay.servers, plans.operations, status.state.
+ * Channels the daemon publishes today: relay.servers, plans.operations, status.state,
+ * targets.selected.
  * Channels the six-pack is wired for but the daemon does not expose yet:
  * kit.skills, kit.tools, relay.sessions. Those instruments stay unpowered until the
  * service publishes them; none of them guesses. */
 
-import type { DesktopSnapshot, ManagementSnapshot } from "./contracts.ts";
+import type { DesktopSnapshot, ManagementSnapshot, TargetInventorySnapshot } from "./contracts.ts";
 import { SIX_PACK, countReading, noSignal, type InstrumentSpec, type Reading } from "./instruments.ts";
 
 type RecordValue = Record<string, unknown>;
@@ -62,13 +63,30 @@ function planReading(management: ManagementSnapshot | null, fullScale: number): 
   };
 }
 
+/** Stations answer for themselves: the inventory the service returned, nothing inferred. */
+function devicesReading(targets: TargetInventorySnapshot | null, fullScale: number): Reading {
+  if (!targets) return noSignal("Devices");
+  const known = targets.targets.length;
+  const selected = targets.selected.filter((id) => targets.targets.some((target) => target.id === id)).length;
+  return {
+    fraction: Math.min(known / fullScale, 1),
+    readout: `${selected}/${known}`,
+    signal: known > 0 ? "live" : "cold",
+    spoken: known > 0 ? `${known} devices known, ${selected} selected.` : "No devices are registered.",
+  };
+}
+
 export function readPanel(
   snapshot: DesktopSnapshot | null,
   management: ManagementSnapshot | null,
+  targets: TargetInventorySnapshot | null = null,
+  specs: readonly InstrumentSpec[] = SIX_PACK,
 ): Array<[InstrumentSpec, Reading]> {
   const relay = record(management?.relay);
-  return SIX_PACK.map((spec) => {
+  return specs.map((spec) => {
     switch (spec.id) {
+      case "devices":
+        return [spec, devicesReading(targets, spec.fullScale ?? 1)];
       case "servers":
         return [spec, countReading(management ? counted(relay, "servers", "upstreams") : null, spec.fullScale ?? 1, "MCP servers")];
       case "drift":
@@ -76,9 +94,15 @@ export function readPanel(
       case "plan":
         return [spec, planReading(management, spec.fullScale ?? 1)];
       case "skills":
-        return [spec, noSignal("Skills")];
-      case "tools":
-        return [spec, noSignal("Tools")];
+        return [spec, countReading(
+          management
+            ? Array.isArray(management.skills)
+              ? management.skills.length
+              : counted(record(management.skills), "skills", "items")
+            : null,
+          spec.fullScale ?? 1,
+          "skills",
+        )];
       default:
         return [spec, noSignal("Agent sessions")];
     }

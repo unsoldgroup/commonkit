@@ -1,4 +1,5 @@
 import type { SetupCompletion } from "./setup-gate.ts";
+import type { UpdateSummary, UpdateUiState } from "./updater-view.ts";
 
 export interface DesktopState<S = unknown, M = unknown, T = unknown> {
   snapshot: S;
@@ -10,6 +11,17 @@ export interface RefreshApi<S = unknown, M = unknown, T = unknown> {
   snapshot(): Promise<S>;
   managementSnapshot(): Promise<M>;
   targets(): Promise<T>;
+}
+
+export async function checkForDesktopUpdate(
+  api: { checkForUpdate(): Promise<UpdateSummary | null> },
+): Promise<UpdateUiState> {
+  try {
+    const update = await api.checkForUpdate();
+    return update ? { kind: "available", update } : { kind: "current" };
+  } catch (error) {
+    return { kind: "error", message: error instanceof Error ? error.message : String(error) };
+  }
 }
 
 export function shouldRunLiveRefresh(

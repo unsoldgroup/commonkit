@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CommonKit</title></head>
+  <body>
+    <!--
+      The menu bar reading of the same panel: five instruments — skills, MCP, plans,
+      devices, agents — the annunciator underneath, and two controls. A native NSMenu
+      cannot carry the instrument face, so the tray opens this popover instead. It
+      stays read-only: open the window, or quit.
+    -->
+    <div id="panel" class="tray"></div>
+    <script type="module" src="/src/tray-panel.ts"></script>
+  </body>
+</html>

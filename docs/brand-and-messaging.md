@@ -7,8 +7,9 @@
 **Audience:** AI-native developers and small engineering teams using multiple
 coding agents across local machines, remote hosts, and projects.
 
-**Problem:** Agent capabilities drift. Developers repeatedly rebuild skills,
-instructions, hooks, tools, policies, and credentials for each environment.
+**Problem:** Valuable working context becomes trapped in one agent, machine, or
+person. Developers repeatedly rebuild skills, instructions, hooks, tools,
+policies, and credential references for each environment.
 
 **Promise:** Your best development setup, everywhere.
 
@@ -17,13 +18,15 @@ password managers, and MCP infrastructure; it does not position against them.
 
 ## Message hierarchy
 
-1. **Start capable.** Carry proven agent capabilities to every target.
-2. **Improve continuously.** Produce evidence-backed skill improvements from
+1. **Carry context.** Move proven working context across agents, machines,
+   projects, and colleagues.
+2. **Start capable.** Give every selected target the right capabilities.
+3. **Improve continuously.** Produce evidence-backed skill improvements from
    evaluations and approved, redacted usage evidence.
-3. **Benefit everywhere.** Approve an improvement once and reconcile it across
+4. **Benefit everywhere.** Approve an improvement once and reconcile it across
    targets.
-4. **Stay in control.** Preview, approve, verify, and recover.
-5. **Provision secrets safely.** Keep values out of portable configuration and
+5. **Stay in control.** Preview, approve, verify, and recover.
+6. **Provision secrets safely.** Keep values out of portable configuration and
    resolve references through a password-manager provider.
 
 The first three benefits lead. Governance and safety substantiate the promise.
@@ -37,12 +40,28 @@ The first three benefits lead. Governance and safety substantiate the promise.
 ### Short description
 
 > CommonKit gives every coding agent your proven skills, tools, and guardrails.
-> Improve them from real use. Review what works, then apply it everywhere.
+> Carry them across machines, projects, and colleagues. Improve them from real
+> use, review what works, then apply it everywhere.
 
 ### One-line description
 
 > Version, improve, and safely apply your coding-agent setup across every
 > project and machine.
+
+### Portability line
+
+> Your judgment is the asset. Agent files are delivery formats.
+
+Supporting explanation: CommonKit owns normalized, versioned intent. Adapters
+render the native configuration supported agents and targets expect.
+
+### Case-study line
+
+> The kit Unsold.Group carries to ship 100x.
+
+Use “100x” as a direction for cumulative team leverage, not as a measured or
+universal speed claim. Pair it with observed kit inventory and explain that the
+gain comes from removing repeated setup, context gaps, and configuration drift.
 
 ### Improvement loop
 
@@ -143,13 +162,13 @@ nostalgia. Use it selectively for status, actions, and proof.
 
 ## Reader journey
 
-1. Recognize the cost of fragmented agent setups.
-2. Understand the promise: one capable setup everywhere.
-3. See the capability, improvement, consistency, control, and secret-provisioning
+1. Recognize the cost of context trapped in one agent, machine, or person.
+2. Understand the promise: working context travels without losing ownership.
+3. See portability across agents, machines, projects, and colleagues.
+4. See the capability, improvement, consistency, control, and secret-provisioning
    benefits.
-4. Understand define → preview → apply → verify.
-5. Verify the safety limits and provider boundaries.
-6. Confirm product fit and current availability.
-7. See a real multi-target example.
+5. Understand define → preview → apply → verify.
+6. Verify the safety limits and provider boundaries.
+7. See the real Unsold.Group multi-target case study.
 8. Configure one target and run a dry reconciliation.
 9. Follow links into architecture, threat model, and provider details.

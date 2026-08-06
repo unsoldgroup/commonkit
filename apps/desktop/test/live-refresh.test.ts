@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { refreshDesktopState, shouldRunLiveRefresh } from "../src/live-refresh.ts";
+import { checkForDesktopUpdate, refreshDesktopState, shouldRunLiveRefresh } from "../src/live-refresh.ts";
 
 test("background refresh retries readiness but pauses during active onboarding", () => {
   assert.equal(shouldRunLiveRefresh(false, "checking"), true);
@@ -32,4 +32,20 @@ test("a transient domain failure preserves the last known state", async () => {
   assert.equal(result.snapshot, previous.snapshot);
   assert.deepEqual(result.management.plans, { operation: { state: "done" } });
   assert.equal(result.targets, previous.targets);
+});
+
+test("startup update checks surface a newer signed build without installing it", async () => {
+  let checks = 0;
+  const state = await checkForDesktopUpdate({
+    checkForUpdate: async () => {
+      checks += 1;
+      return { currentVersion: "0.1.0", version: "0.2.0", notes: "Real status channels", publishedAt: null };
+    },
+  });
+
+  assert.equal(checks, 1);
+  assert.deepEqual(state, {
+    kind: "available",
+    update: { currentVersion: "0.1.0", version: "0.2.0", notes: "Real status channels", publishedAt: null },
+  });
 });

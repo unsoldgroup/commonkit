@@ -30,7 +30,7 @@ export function statusPanel(
     ? new Date(snapshot.status.lastDriftCheckUnixMs).toLocaleString()
     : "Never";
   // A wall of dials is not a screen-reader experience; the panel also reads aloud.
-  const spoken = readPanel(snapshot, management)
+  const spoken = readPanel(snapshot, management, targets)
     .map(([spec, reading]) => `${spec.tag}: ${reading.spoken}`)
     .join(" ");
 
@@ -46,7 +46,7 @@ export function statusPanel(
     <div class="placard"><h1>${escapeHtml(view.heading)}</h1><span>${escapeHtml(station)}</span></div>
     <p class="brief">${escapeHtml(view.detail)}</p>
     ${sixPackMarkup()}
-    <p class="hint" style="margin:10px 0 20px">Skills, tools and agent sessions are unpowered: the local service does not publish those channels yet, so CommonKit shows no reading rather than a guess.</p>
+    <p class="hint" style="margin:10px 0 20px">Skills and agent sessions are unpowered: the local service does not publish those channels yet, so CommonKit shows no reading rather than a guess.</p>
     <p class="sr-only" role="status" aria-live="polite">${escapeHtml(spoken)}</p>
     ${annunciatorMarkup(snapshot, management, true)}
     <div class="controls" style="margin:16px 0 0"><a class="engage" href="#plans" style="display:grid;place-items:center;text-decoration:none">Review changes</a></div>
