@@ -1,0 +1,3 @@
+# Use APM as the preferred agent-context provider
+
+CommonKit orchestrates complete developer environments across local and remote targets rather than competing as an agent package manager. A version-pinned APM CLI is the preferred provider for resolving, locking, auditing, and compiling agent context; CommonKit stages its output and applies it through CommonKit's own plan, receipt, verification, and rollback machinery. APM policy and lockfiles own the package plane, while CommonKit policy and lockfiles own the target and runtime plane; narrow native Claude and Codex adapters may remain as optional fallback or migration paths.

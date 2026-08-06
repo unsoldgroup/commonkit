@@ -1,0 +1,11 @@
+{
+  "allowedRepositories": [
+    "https://github.com/example/project.git",
+    "https://github.com/unsoldgroup/commonkit.git"
+  ],
+  "maxCpuMillis": 8000,
+  "maxMemoryMib": 16384,
+  "maxDiskMib": 40960,
+  "allowNetwork": true,
+  "allowRepositoryWrite": true
+}

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "ci-linux-x64",
+  "operatingSystem": "linux",
+  "architecture": "x86_64",
+  "machineClass": "vps-8core-32gb",
+  "isolationLevel": "systemd-scope-with-bubblewrap",
+  "comparability": "Results are comparable only with other attempts recorded under this exact profile digest. This profile pins where a job runs, never what toolchain it runs (ADR 0010)."
+}

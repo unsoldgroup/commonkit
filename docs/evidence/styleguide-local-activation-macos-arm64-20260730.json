@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "platform": "macos",
+  "architecture": "arm64",
+  "lifecycle": "experimental",
+  "targetId": "al-macbook",
+  "kitRevision": "4d2509bd53cadf1f7ffb2ab15a844979cb9eb382",
+  "loadoutDigest": "sha256:8a0bf2a5a5fe0981e3c25d2962cf45bf721eb9408c38507d824b0c99b4ad9570",
+  "activationPlanId": "sha256:4c1c5d09373a944a995885d71b91118803d4dfb91a7e628bb9b1b0dab8c7ca37",
+  "convergedPlanId": "sha256:e96797c8a75e86b6237de9aeaba2ebf14ad0ce00299a6102df4bd648d86a948c",
+  "providerInputsDigest": "sha256:c62701a435c6ea1e436616f953304799a1c9e3c2439cf7836bae85780eb056e7",
+  "skillDigest": "sha256:92b721d0af1d1fc98696a4a8cbbb6ecff618ca84beedcf8d2a0bde7a57dfe6fc",
+  "managedOutputs": [
+    "agent-context/.agents/skills/technical-writing/SKILL.md",
+    "agent-context/.agents/skills/technical-writing/PROVENANCE.md",
+    "agent-context/.claude/skills/technical-writing/SKILL.md",
+    "agent-context/.claude/skills/technical-writing/PROVENANCE.md"
+  ],
+  "operationCountAfterApply": 0,
+  "verified": true,
+  "daemon": {
+    "backend": "launchd",
+    "installed": true,
+    "running": true
+  },
+  "providerExecution": {
+    "packageCompilationAndAudit": "pinned APM 0.25.0 native evidence",
+    "localMaterialization": "native provider fallback",
+    "reason": "macOS external-provider execution fails closed without a proven isolation helper"
+  }
+}

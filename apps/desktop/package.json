@@ -1,0 +1,27 @@
+{
+  "name": "@commonkit/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc && vite build",
+    "dev": "vite",
+    "icons": "tauri icon src-tauri/icons/app-icon.svg",
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.4.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.0",
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0"
+  }
+}

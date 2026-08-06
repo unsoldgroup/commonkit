@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# CommonKit-managed Hostinger runner for structured, resource-bounded pnpm jobs.
+set -euo pipefail
+
+workspace_root=${RTEST_WORKSPACE_ROOT:-/root/rtest}
+workspace=${1:-}
+workspace_name=${workspace##*/}
+if [[ ! $workspace_name =~ ^[A-Za-z0-9._-]+$ ]] || [[ ! -d $workspace ]]; then
+  printf 'commonkit-rtest-worker: invalid workspace\n' >&2
+  exit 64
+fi
+canonical_root=$(realpath "$workspace_root")
+canonical_workspace=$(realpath "$workspace")
+if [[ $canonical_workspace != "$canonical_root"/* ]]; then
+  printf 'commonkit-rtest-worker: invalid workspace\n' >&2
+  exit 64
+fi
+
+command_args=()
+while IFS= read -r -d '' argument; do
+  command_args+=("$argument")
+done
+
+if (( ${#command_args[@]} == 0 )); then
+  command_args=(pnpm test)
+fi
+if [[ ${command_args[0]} != pnpm ]]; then
+  printf 'commonkit-rtest-worker: only pnpm commands are allowed\n' >&2
+  exit 64
+fi
+
+lock_file=${RTEST_LOCK_FILE:-/root/rtest/.vitest.lock}
+mkdir -p "$(dirname "$lock_file")"
+exec 9>"$lock_file"
+if ! flock -w 1800 9; then
+  printf 'commonkit-rtest-worker: timed out waiting for the remote test slot\n' >&2
+  exit 75
+fi
+
+systemd-run --user --quiet --wait --collect --pipe \
+  -p MemoryMax=8G \
+  -p MemorySwapMax=2G \
+  -p CPUQuota=600% \
+  --setenv NODE_OPTIONS=--max-old-space-size=6144 \
+  --working-directory "$canonical_workspace" \
+  /usr/bin/env bash -c \
+  'corepack pnpm install --frozen-lockfile --prefer-offline --config.strictDepBuilds=false >/dev/null && exec "$@"' \
+  bash "${command_args[@]}"

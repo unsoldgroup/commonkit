@@ -1,0 +1,14 @@
+{
+  "id": "skillopt",
+  "version": "0.2.0",
+  "adapterContract": "skillopt-sleep-v1",
+  "source": "pypi",
+  "packageDigest": "sha256:818db802507c6f82553fd24c75aa70c953ab0a712647f60e68e4595052c4b150",
+  "capabilities": [
+    "json-report",
+    "reviewed-tasks",
+    "staged-skill"
+  ],
+  "sourceRevision": "e4ea6a6771e797ef820cdd8bfea64c57e0481065"
+}
+

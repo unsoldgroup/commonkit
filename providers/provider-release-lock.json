@@ -1,0 +1,24 @@
+{
+  "apm": {
+    "version": "0.25.0",
+    "linux-x86_64": {
+      "asset": "apm-linux-x86_64.tar.gz",
+      "sha256": "7a4281ef915e9609f8841eced19285bf2dcf702862302171f7e893c30e1b3244"
+    },
+    "windows-x86_64": {
+      "asset": "apm-windows-x86_64.zip",
+      "sha256": "1d9b3b44ffe031c331f4dfe33694bbb80d10d16165ca053110b96dbeb7365943"
+    }
+  },
+  "chezmoi": {
+    "version": "2.70.4",
+    "linux-x86_64": {
+      "asset": "chezmoi-linux-amd64",
+      "sha256": "f9e5c2822356f4e96f94442efc5cb5ef35df2a06f7f06b6315dbdac0dbaf22a3"
+    },
+    "windows-x86_64": {
+      "asset": "chezmoi-windows-amd64.exe",
+      "sha256": "531e4b3d1f0814c4e962cd1a380bd4ea85f97aee5cc81ee27eea551339380ff7"
+    }
+  }
+}

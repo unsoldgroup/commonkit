@@ -1,0 +1,1 @@
+{"main-window":{"identifier":"main-window","description":"Minimal management-window access; control API credentials remain native-only.","local":true,"windows":["main"],"permissions":["core:window:allow-close","dialog:allow-open"]}}

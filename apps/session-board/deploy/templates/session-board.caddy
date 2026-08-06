@@ -1,0 +1,4 @@
+https://@@DOMAIN@@ {
+	tls /etc/caddy/certs/session-board/fullchain.pem /etc/caddy/certs/session-board/key.pem
+	reverse_proxy 127.0.0.1:@@HUB_PORT@@
+}

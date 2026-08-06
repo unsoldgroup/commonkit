@@ -1,0 +1,32 @@
+{
+  "$id": "https://schemas.commonkit.dev/v1/commonkit.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A CommonKit layer, lock, plan, receipt, diagnostic, error, provenance, or skill lifecycle document.",
+  "oneOf": [
+    {
+      "$ref": "layer.schema.json"
+    },
+    {
+      "$ref": "commonkit-lock.schema.json"
+    },
+    {
+      "$ref": "plan.schema.json"
+    },
+    {
+      "$ref": "receipt.schema.json"
+    },
+    {
+      "$ref": "diagnostics.schema.json"
+    },
+    {
+      "$ref": "error.schema.json"
+    },
+    {
+      "$ref": "provenance.schema.json"
+    },
+    {
+      "$ref": "skills.schema.json"
+    }
+  ],
+  "title": "CommonKit v1 public contracts"
+}

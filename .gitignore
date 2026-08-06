@@ -1,0 +1,21 @@
+commonkit.json
+node_modules/
+/target/
+dist/
+dist-harness/
+.build/
+**/.build/
+*.log
+*.tmp
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Personal and team context belongs in separate private repositories.
+.engram/
+
+apps/session-board/hub/data/
+
+# Impeccable design iteration screenshots are regenerable artifacts
+.impeccable/shots/

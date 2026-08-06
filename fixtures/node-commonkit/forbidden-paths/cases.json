@@ -1,0 +1,21 @@
+[
+  { "path": "/root/.codex/auth.json", "forbidden": true },
+  { "path": "/root/.config/gh/hosts.yml", "forbidden": true },
+  { "path": "/root/.config/orca/orchestration.db", "forbidden": true },
+  { "path": "/root/.config/orca/orchestration.db-wal", "forbidden": true },
+  { "path": "/root/.claude/context-mode/sessions/abc.db", "forbidden": true },
+  { "path": "/root/.config/orca/orca-e2ee-keypair.json", "forbidden": true },
+  { "path": "/root/.env", "forbidden": true },
+  { "path": "/root/x/credentials.enc", "forbidden": true },
+  { "path": "/root/x/client_secret.json", "forbidden": true },
+  { "path": "/root/x/token_cache.json", "forbidden": true },
+  { "path": "/root/x/.encryption_key", "forbidden": true },
+  { "path": "/root/x/id_ed25519.key", "forbidden": true },
+  { "path": "/root/x/state_5.sqlite", "forbidden": true },
+  { "path": "/root/x/secrets/token.txt", "forbidden": true },
+  { "path": "/root/.codex/rules/default.rules", "forbidden": false },
+  { "path": "/root/.config/orca/orchestration.schema.sql", "forbidden": false },
+  { "path": "/root/x/state_machine.sqlite.schema", "forbidden": false },
+  { "path": "/root/x/secretary/notes.txt", "forbidden": false },
+  { "path": "/root/x/public.pem.txt", "forbidden": false }
+]

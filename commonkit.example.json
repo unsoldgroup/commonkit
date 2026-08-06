@@ -1,0 +1,18 @@
+{
+  "host": "dev-host",
+  "remoteHome": "/home/developer",
+  "service": "orca-server.service",
+  "orcaInstallRoot": "/opt/orca/squashfs-root",
+  "contextMode": {
+    "enabled": true,
+    "localContent": "${HOME}/.claude/context-mode/content",
+    "remoteContent": "/home/developer/.claude/context-mode/content"
+  },
+  "requiredCommands": ["node", "git", "gh", "bws", "claude", "codex", "linearis", "orca", "pnpm", "rsync", "sqlite3", "jq"],
+  "bootstrap": {
+    "pnpm": ["corepack", "enable", "pnpm"]
+  },
+  "pluginPolicy": "exact",
+  "serviceSecrets": ["GITHUB_TOKEN", "BWS_ACCESS_TOKEN", "LINEAR_API_TOKEN"],
+  "bwsSecrets": {}
+}

@@ -1,0 +1,22 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 3764, "path": "/mcp" },
+  "servers": [
+    {
+      "id": "posthog",
+      "name": "PostHog",
+      "description": "Product analytics",
+      "category": "analytics",
+      "enabled": true,
+      "mode": "posthog-cli",
+      "remote": {
+        "type": "streamable_http",
+        "url": "https://mcp.posthog.com/mcp",
+        "headers": { "Authorization": "env:POSTHOG_TOKEN" }
+      },
+      "envFile": null,
+      "cache": { "toolsTtlMs": 900000, "autoRefreshMs": 900000 },
+      "menu": null,
+      "managedBy": "common_kit"
+    }
+  ]
+}

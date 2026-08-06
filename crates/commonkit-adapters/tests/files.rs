@@ -1,0 +1,599 @@
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use commonkit_adapters::{FileAdapter, FileIntent, ManagedRelativePath};
+use commonkit_contracts::{OperationPhase, PlanBindings, ReceiptState, Sha256Digest, StableId};
+use commonkit_core::{PlanDraft, build_plan};
+use commonkit_reconcile::{Adapter, ReceiptJournal, ReceiptStore, ReconcileOutcome, Reconciler};
+use sha2::{Digest, Sha256};
+
+fn temporary_directory(test: &str) -> PathBuf {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!("commonkit-{test}-{}-{nonce}", std::process::id()))
+}
+
+fn digest(bytes: &[u8]) -> Sha256Digest {
+    let digest = Sha256::digest(bytes);
+    Sha256Digest::parse(format!("sha256:{digest:x}")).expect("digest")
+}
+
+fn bindings() -> PlanBindings {
+    PlanBindings {
+        target_identity_digest: digest(b"target"),
+        composed_loadout_digest: digest(b"loadout"),
+        provider_inputs_digest: digest(b"inputs"),
+        ownership_map_digest: digest(b"ownership"),
+        artifact_set_digest: digest(b"artifacts"),
+    }
+}
+
+fn intent(path: &str, content: &[u8], expected_before: Option<Sha256Digest>) -> FileIntent {
+    FileIntent {
+        id: StableId::parse("managed-config").expect("id"),
+        path: ManagedRelativePath::parse(path).expect("path"),
+        content: content.to_vec(),
+        expected_before,
+    }
+}
+
+#[cfg(unix)]
+fn assert_state_excludes_bytes(state: &std::path::Path, forbidden: &[u8]) {
+    fn visit(path: &std::path::Path, forbidden: &[u8]) {
+        for entry in fs::read_dir(path).expect("read adapter state") {
+            let entry = entry.expect("state entry");
+            let kind = entry.file_type().expect("state entry type");
+            if kind.is_dir() {
+                visit(&entry.path(), forbidden);
+            } else if kind.is_file() {
+                assert_ne!(
+                    fs::read(entry.path()).expect("state file"),
+                    forbidden,
+                    "outside bytes entered durable adapter state"
+                );
+            }
+        }
+    }
+    visit(state, forbidden);
+}
+
+#[cfg(unix)]
+fn substitute_legacy_path(
+    target: &std::path::Path,
+    outside: &std::path::Path,
+    displaced: &std::path::Path,
+    substitution: &str,
+) {
+    use std::os::unix::fs::symlink;
+
+    match substitution {
+        "root" => {
+            fs::rename(target, displaced).expect("displace root");
+            symlink(outside, target).expect("substitute root");
+        }
+        "ancestor" => {
+            fs::rename(target.join("config"), displaced).expect("displace ancestor");
+            symlink(outside, target.join("config")).expect("substitute ancestor");
+        }
+        "leaf" => {
+            fs::remove_file(target.join("config/settings")).expect("remove leaf");
+            symlink(outside.join("settings"), target.join("config/settings"))
+                .expect("substitute leaf");
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_register_rejects_root_ancestor_and_leaf_substitution_without_importing_outside_bytes() {
+    const OUTSIDE: &[u8] = b"outside registration sentinel";
+    for substitution in ["root", "ancestor", "leaf"] {
+        let root = temporary_directory(&format!("legacy-register-{substitution}"));
+        let target = root.join("target");
+        let state = root.join("state");
+        let outside = root.join("outside");
+        let displaced = root.join("displaced");
+        fs::create_dir_all(target.join("config")).expect("target");
+        fs::create_dir_all(outside.join("config")).expect("outside");
+        fs::write(target.join("config/settings"), b"inside before").expect("inside");
+        fs::write(outside.join("settings"), OUTSIDE).expect("outside");
+        fs::write(outside.join("config/settings"), OUTSIDE).expect("outside root");
+        let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+
+        substitute_legacy_path(&target, &outside, &displaced, substitution);
+        adapter
+            .register(intent("config/settings", b"managed", Some(digest(OUTSIDE))))
+            .expect_err("substituted path must fail registration closed");
+
+        assert_eq!(
+            fs::read(outside.join("settings")).expect("outside"),
+            OUTSIDE
+        );
+        assert_state_excludes_bytes(&state, OUTSIDE);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_prepare_rejects_root_ancestor_and_leaf_substitution_without_backing_up_outside_bytes() {
+    const OUTSIDE: &[u8] = b"outside prepare sentinel";
+    for substitution in ["root", "ancestor", "leaf"] {
+        let root = temporary_directory(&format!("legacy-prepare-{substitution}"));
+        let target = root.join("target");
+        let state = root.join("state");
+        let outside = root.join("outside");
+        let displaced = root.join("displaced");
+        fs::create_dir_all(target.join("config")).expect("target");
+        fs::create_dir_all(outside.join("config")).expect("outside");
+        fs::write(target.join("config/settings"), b"inside before").expect("inside");
+        fs::write(outside.join("settings"), OUTSIDE).expect("outside");
+        fs::write(outside.join("config/settings"), OUTSIDE).expect("outside root");
+        let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+        let operation = adapter
+            .register(intent(
+                "config/settings",
+                b"managed",
+                Some(digest(b"inside before")),
+            ))
+            .expect("operation");
+
+        substitute_legacy_path(&target, &outside, &displaced, substitution);
+        adapter
+            .prepare(&operation)
+            .expect_err("substituted path must fail prepare closed");
+
+        assert_eq!(
+            fs::read(outside.join("settings")).expect("outside"),
+            OUTSIDE
+        );
+        assert_state_excludes_bytes(&state, OUTSIDE);
+        assert!(
+            !state
+                .join("backups")
+                .read_dir()
+                .expect("backups")
+                .any(|entry| entry.is_ok()),
+            "failed prepare must not persist a backup"
+        );
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+}
+
+#[cfg(unix)]
+fn assert_legacy_substitution_fails_closed(phase: &str, substitution: &str) {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary_directory(&format!("legacy-{phase}-{substitution}-substitution"));
+    let target = root.join("target");
+    let state = root.join("state");
+    let outside = root.join("outside");
+    let displaced = root.join("displaced");
+    fs::create_dir_all(target.join("config")).expect("target");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("settings"), b"outside sentinel").expect("outside sentinel");
+    let managed_path = if substitution == "root" {
+        "settings"
+    } else {
+        "config/settings"
+    };
+
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register(intent(managed_path, b"managed", None))
+        .expect("operation");
+    adapter.prepare(&operation).expect("prepare");
+    if phase == "rollback" {
+        adapter
+            .apply(&operation)
+            .expect("apply before rollback race");
+    }
+
+    match substitution {
+        "root" => {
+            fs::rename(&target, &displaced).expect("displace root");
+            symlink(&outside, &target).expect("substitute root");
+        }
+        "ancestor" => {
+            fs::rename(target.join("config"), &displaced).expect("displace ancestor");
+            symlink(&outside, target.join("config")).expect("substitute ancestor");
+        }
+        "leaf" => {
+            if phase == "rollback" {
+                fs::remove_file(target.join(managed_path)).expect("remove applied leaf");
+            }
+            symlink(outside.join("settings"), target.join(managed_path)).expect("substitute leaf");
+        }
+        _ => unreachable!(),
+    }
+
+    let error = if phase == "apply" {
+        adapter.apply(&operation)
+    } else {
+        adapter.rollback(&operation)
+    }
+    .expect_err("substitution must fail closed");
+    assert!(
+        matches!(
+            error.code.as_str(),
+            "unsafe_path" | "preimage_changed" | "rollback_preimage_changed"
+        ),
+        "unexpected error code: {}",
+        error.code
+    );
+    assert_eq!(
+        fs::read(outside.join("settings")).expect("outside sentinel"),
+        b"outside sentinel"
+    );
+
+    if target
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        fs::remove_file(&target).expect("remove substituted root");
+    }
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn rejects_absolute_traversal_windows_and_git_paths() {
+    for path in [
+        "",
+        "/etc/passwd",
+        "../outside",
+        "a/../outside",
+        "C:\\secret",
+        ".git/config",
+    ] {
+        assert!(ManagedRelativePath::parse(path).is_err(), "accepted {path}");
+    }
+    assert!(ManagedRelativePath::parse("agents/config.json").is_ok());
+}
+
+#[test]
+fn creates_verifies_and_removes_a_managed_file_on_rollback() {
+    let root = temporary_directory("file-create");
+    let target = root.join("target");
+    let state = root.join("state");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register(intent("nested/config.json", b"{\"enabled\":true}\n", None))
+        .expect("operation");
+
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("apply");
+    adapter.verify(&operation).expect("verify");
+    assert_eq!(
+        fs::read(target.join("nested/config.json")).expect("file"),
+        b"{\"enabled\":true}\n"
+    );
+    adapter.rollback(&operation).expect("rollback");
+    assert!(!target.join("nested/config.json").exists());
+
+    drop(adapter);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_replaces_an_existing_file_atomically_and_restores_it() {
+    let root = temporary_directory("windows-atomic-replacement");
+    let target = root.join("target");
+    let state = root.join("state");
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("settings"), b"before").expect("preimage");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register(intent("settings", b"after", Some(digest(b"before"))))
+        .expect("operation");
+
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("atomic replace");
+    assert_eq!(
+        fs::read(target.join("settings")).expect("applied"),
+        b"after"
+    );
+    adapter
+        .rollback(&operation)
+        .expect("atomic rollback replace");
+    assert_eq!(
+        fs::read(target.join("settings")).expect("restored"),
+        b"before"
+    );
+    drop(adapter);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_rejects_a_reparse_ancestor_without_outside_mutation() {
+    use std::os::windows::fs::symlink_dir;
+
+    let root = temporary_directory("windows-reparse-ancestor");
+    let target = root.join("target");
+    let state = root.join("state");
+    let outside = root.join("outside");
+    let displaced = root.join("displaced");
+    fs::create_dir_all(target.join("config")).expect("target");
+    fs::create_dir_all(&outside).expect("outside");
+    fs::write(outside.join("settings"), b"outside sentinel").expect("sentinel");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register(intent("config/settings", b"managed", None))
+        .expect("operation");
+    adapter.prepare(&operation).expect("prepare");
+    fs::rename(target.join("config"), &displaced).expect("displace ancestor");
+    if let Err(error) = symlink_dir(&outside, target.join("config")) {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            drop(adapter);
+            fs::remove_dir_all(root).expect("cleanup unsupported symlink environment");
+            return;
+        }
+        panic!("create reparse ancestor: {error}");
+    }
+
+    let error = adapter.apply(&operation).expect_err("must fail closed");
+    assert!(matches!(
+        error.code.as_str(),
+        "unsafe_path" | "preimage_changed"
+    ));
+    assert_eq!(
+        fs::read(outside.join("settings")).expect("outside sentinel"),
+        b"outside sentinel"
+    );
+    drop(adapter);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_apply_rejects_root_ancestor_and_leaf_substitution() {
+    for substitution in ["root", "ancestor", "leaf"] {
+        assert_legacy_substitution_fails_closed("apply", substitution);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn legacy_rollback_rejects_root_ancestor_and_leaf_substitution() {
+    for substitution in ["root", "ancestor", "leaf"] {
+        assert_legacy_substitution_fails_closed("rollback", substitution);
+    }
+}
+
+#[test]
+fn restores_the_exact_preimage_and_rejects_changes_after_planning() {
+    let root = temporary_directory("file-update");
+    let target = root.join("target");
+    let state = root.join("state");
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("config.txt"), b"before").expect("preimage");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register(intent("config.txt", b"after", Some(digest(b"before"))))
+        .expect("operation");
+
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("apply");
+    adapter.verify(&operation).expect("verify");
+    adapter.rollback(&operation).expect("rollback");
+    assert_eq!(
+        fs::read(target.join("config.txt")).expect("file"),
+        b"before"
+    );
+
+    fs::write(target.join("config.txt"), b"changed externally").expect("drift");
+    assert_eq!(
+        adapter.prepare(&operation).expect_err("must reject").code,
+        "preimage_changed"
+    );
+    drop(adapter);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn rejects_literal_secrets_in_portable_file_content() {
+    let root = temporary_directory("file-secret");
+    let mut adapter =
+        FileAdapter::open(&root.join("target"), &root.join("state")).expect("adapter");
+    assert!(
+        adapter
+            .register(intent("config.txt", b"API_KEY=literal-secret", None))
+            .is_err()
+    );
+    drop(adapter);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn a_fresh_process_recovers_an_applied_file_without_reconstructing_the_provider() {
+    let root = temporary_directory("file-fresh-process-recovery");
+    let target = root.join("target");
+    let adapter_state = root.join("adapter-state");
+    let receipt_state = root.join("receipts");
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("config.txt"), b"before").expect("preimage");
+
+    let operation = {
+        let mut adapter = FileAdapter::open(&target, &adapter_state).expect("first process");
+        let operation = adapter
+            .register(intent("config.txt", b"after", Some(digest(b"before"))))
+            .expect("operation");
+        adapter.prepare(&operation).expect("prepare");
+        adapter.apply(&operation).expect("apply");
+        operation
+    };
+    assert_eq!(
+        fs::read(target.join("config.txt")).expect("applied"),
+        b"after"
+    );
+
+    let plan = build_plan(PlanDraft {
+        target_id: StableId::parse("local-target").expect("target ID"),
+        desired_digest: digest(b"desired"),
+        observed_digest: digest(b"observed"),
+        policy_digest: digest(b"policy"),
+        bindings: bindings(),
+        operations: vec![operation.clone()],
+    })
+    .expect("plan");
+    let run_id = StableId::parse("run-file-crash").expect("run ID");
+    let store = ReceiptStore::open(&receipt_state).expect("receipt store");
+    let mut journal = ReceiptJournal::new(
+        run_id.clone(),
+        plan.id.clone(),
+        plan.target_id.clone(),
+        plan.desired_digest.clone(),
+        plan.observed_digest.clone(),
+        plan.policy_digest.clone(),
+        plan.bindings.clone(),
+    )
+    .expect("journal");
+    store.persist(&journal).expect("initial checkpoint");
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+        .expect("prepared checkpoint");
+    store.persist(&journal).expect("persist prepared state");
+    journal
+        .transition(ReceiptState::Applying)
+        .expect("applying checkpoint");
+    store.persist(&journal).expect("persist applying state");
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::ApplyStarted, None)
+        .expect("apply-started checkpoint");
+    store
+        .persist(&journal)
+        .expect("persist apply-started state");
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Applied, None)
+        .expect("applied checkpoint");
+    store.persist(&journal).expect("persist crash state");
+
+    let fresh_adapter = FileAdapter::open(&target, &adapter_state).expect("fresh process");
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(fresh_adapter)];
+    let outcome = Reconciler::with_store(&store)
+        .recover_run(run_id.clone(), &plan, &mut adapters)
+        .expect("recover from durable plan and receipt");
+
+    assert_eq!(outcome, ReconcileOutcome::RolledBack);
+    assert_eq!(
+        fs::read(target.join("config.txt")).expect("restored preimage"),
+        b"before"
+    );
+    assert_eq!(
+        store.load(run_id).expect("receipt").receipt().state,
+        ReceiptState::RolledBack
+    );
+    drop(adapters);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn a_fresh_process_recovers_when_the_target_changed_before_applied_was_recorded() {
+    let root = temporary_directory("file-apply-checkpoint-crash");
+    let target = root.join("target");
+    let adapter_state = root.join("adapter-state");
+    let receipt_state = root.join("receipts");
+    fs::create_dir_all(&target).expect("target");
+    fs::write(target.join("config.txt"), b"before").expect("preimage");
+
+    let mut first_process = FileAdapter::open(&target, &adapter_state).expect("first process");
+    let operation = first_process
+        .register(intent("config.txt", b"after", Some(digest(b"before"))))
+        .expect("operation");
+    let plan = build_plan(PlanDraft {
+        target_id: StableId::parse("local-target").expect("target ID"),
+        desired_digest: digest(b"desired"),
+        observed_digest: digest(b"observed"),
+        policy_digest: digest(b"policy"),
+        bindings: bindings(),
+        operations: vec![operation.clone()],
+    })
+    .expect("plan");
+    let run_id = StableId::parse("run-apply-checkpoint-crash").expect("run ID");
+    let store = ReceiptStore::open(&receipt_state).expect("receipt store");
+    let mut journal = ReceiptJournal::new(
+        run_id.clone(),
+        plan.id.clone(),
+        plan.target_id.clone(),
+        plan.desired_digest.clone(),
+        plan.observed_digest.clone(),
+        plan.policy_digest.clone(),
+        plan.bindings.clone(),
+    )
+    .expect("journal");
+    store.persist(&journal).expect("initial checkpoint");
+    first_process.prepare(&operation).expect("prepare");
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+        .expect("prepared checkpoint");
+    store.persist(&journal).expect("persist prepared state");
+    journal
+        .transition(ReceiptState::Applying)
+        .expect("applying checkpoint");
+    store.persist(&journal).expect("persist applying state");
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::ApplyStarted, None)
+        .expect("apply-started checkpoint");
+    store
+        .persist(&journal)
+        .expect("persist apply-started state");
+
+    first_process.apply(&operation).expect("target mutation");
+    drop(first_process);
+    assert_eq!(
+        fs::read(target.join("config.txt")).expect("applied"),
+        b"after"
+    );
+
+    let fresh_adapter = FileAdapter::open(&target, &adapter_state).expect("fresh process");
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(fresh_adapter)];
+    let outcome = Reconciler::with_store(&store)
+        .recover_run(run_id, &plan, &mut adapters)
+        .expect("recover mutation whose completion checkpoint was interrupted");
+
+    assert_eq!(outcome, ReconcileOutcome::RolledBack);
+    assert_eq!(
+        fs::read(target.join("config.txt")).expect("restored preimage"),
+        b"before"
+    );
+    drop(adapters);
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn a_fresh_adapter_rejects_a_mutation_descriptor_not_bound_to_the_operation() {
+    let root = temporary_directory("file-descriptor-tamper");
+    let target = root.join("target");
+    let state = root.join("state");
+    let operation = FileAdapter::open(&target, &state)
+        .expect("adapter")
+        .register(intent("config.txt", b"content", None))
+        .expect("operation");
+    let descriptor = fs::read_dir(state.join("operations"))
+        .expect("operation records")
+        .next()
+        .expect("record")
+        .expect("entry")
+        .path();
+    let original = fs::read_to_string(&descriptor).expect("descriptor");
+    let tampered = original.replace(
+        "\"sensitivity\":\"portable\"",
+        "\"sensitivity\":\"local_sensitive\"",
+    );
+    assert_ne!(tampered, original, "fixture must alter the descriptor");
+    fs::write(descriptor, tampered).expect("tamper descriptor");
+
+    let mut fresh = FileAdapter::open(&target, &state).expect("fresh adapter");
+    assert_eq!(
+        fresh.apply(&operation).expect_err("tamper must fail").code,
+        "operation_payload_mismatch"
+    );
+    assert!(!target.join("config.txt").exists());
+    drop(fresh);
+    fs::remove_dir_all(root).expect("cleanup");
+}

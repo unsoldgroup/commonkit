@@ -1,0 +1,23 @@
+{
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 3764,
+    "mcpPath": "/mcp"
+  },
+  "servers": [
+    {
+      "id": "posthog",
+      "name": "PostHog",
+      "enabled": true,
+      "mode": "posthog-cli",
+      "remote": {
+        "type": "streamable_http",
+        "url": "https://mcp.posthog.com/mcp"
+      },
+      "envFile": "~/.config/mcp-local-relay/posthog.env",
+      "cache": {
+        "toolsTtlMs": 900000
+      }
+    }
+  ]
+}

@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#090b10"><meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Session Board</title><link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg"><link rel="stylesheet" href="/styles.css">
+</head><body>
+  <header><div><p class="eyebrow">COMMONKIT · TARGETS</p><h1>Session Board</h1></div><div class="header-tools"><button id="push-toggle" class="push-toggle off" type="button" aria-label="Push notifications off" aria-pressed="false" title="Push notifications off">🔔</button><button id="new-group">New group</button><div class="freshness"><span id="stale" hidden>Updates stale</span><span id="updated">Connecting…</span></div></div></header>
+  <main><section id="groups" class="groups" aria-label="Session groups"></section><aside><div class="queue-title"><div class="tabs" role="tablist"><button class="active" data-tab="queue" role="tab">Action queue</button><button data-tab="decisions" role="tab">Decisions</button></div><span id="queue-count">0</span></div><div id="queue"></div></aside></main>
+  <dialog id="drawer"><button class="close" aria-label="Close">×</button><div id="drawer-content"></div></dialog>
+  <div id="toast" role="status" aria-live="polite"></div><script type="module" src="/assets/app.js"></script>
+</body></html>

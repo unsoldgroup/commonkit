@@ -1,0 +1,35 @@
+{
+  "name": "@alunsoldgroup/commonkit",
+  "version": "0.1.0",
+  "description": "Portable, layered developer capabilities and policy across machines, projects, and coding agents",
+  "type": "module",
+  "bin": {
+    "commonkit": "bin/commonkit-native.mjs",
+    "commonkitd": "bin/commonkit-native.mjs",
+    "commonkit-target-helper": "bin/commonkit-native.mjs"
+  },
+  "files": [
+    "bin/commonkit-native.mjs"
+  ],
+  "optionalDependencies": {
+    "commonkit-darwin-arm64": "workspace:0.1.0",
+    "commonkit-linux-x64": "workspace:0.1.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "license": "MIT",
+  "author": "Unsold Group (https://unsold.group)",
+  "homepage": "https://github.com/unsoldgroup/commonkit#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/unsoldgroup/commonkit.git",
+    "directory": "packages/commonkit-npm"
+  },
+  "bugs": {
+    "url": "https://github.com/unsoldgroup/commonkit/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

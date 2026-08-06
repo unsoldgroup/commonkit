@@ -1,0 +1,82 @@
+{
+  "$defs": {
+    "JobState": {
+      "enum": [
+        "queued",
+        "assigned",
+        "preparing",
+        "running",
+        "checkpointing",
+        "succeeded",
+        "failed",
+        "canceled",
+        "interrupted"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/execution-receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifactIds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "attemptId": {
+      "type": "string"
+    },
+    "checkpointIds": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "exitCode": {
+      "format": "int32",
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "finishedAtUnixMs": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "jobId": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "startedAtUnixMs": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "state": {
+      "$ref": "#/$defs/JobState"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "jobId",
+    "attemptId",
+    "state",
+    "artifactIds",
+    "checkpointIds"
+  ],
+  "title": "ExecutionReceipt",
+  "type": "object"
+}

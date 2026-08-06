@@ -1,0 +1,11 @@
+# Import skills by context budget; re-distill by retention map
+
+CommonKit admits imported skills through human review against a per-Loadout **Context budget**, not through automated evaluation. Import stages an upstream source in isolation, records its upstream reference and revision as provenance, measures the always-on and router text it would add, and flags overlap with installed skills. A human approves, merges, or rejects. Exceeding the budget forces an explicit eviction choice rather than silent growth.
+
+This deliberately does not reuse the SkillOpt evaluation gate that already exists in this repository. Requiring an evaluation suite before a skill may be imported puts case authoring in front of a five-minute acquisition, which suppresses import entirely. Evaluation remains the right gate for *improving* a skill CommonKit already owns; an admitted skill enters that path afterward with no new machinery. The accepted cost is that a mediocre imported skill can occupy budget until usage evidence or evaluation removes it.
+
+**Distillation** is a lossy rewrite and therefore forks the local artifact from upstream. Re-pulling is a three-way merge, not a replacement. To make scheduled upstream checks affordable, distillation emits a **Retention map**: the upstream source chunked by markdown section, each section digested and marked kept or dropped, with kept content bound to where it landed. This is the same provenance artifact needed to trace any distilled line back to its origin, so it serves two flows at one cost.
+
+Scheduled read-only checks classify an upstream revision against that map. An identical source digest is a no-op. Changes confined to dropped sections advance the recorded revision silently, which keeps README, example, and changelog churn from reaching a human. Changes touching or removing kept sections, and additions matching no known digest or heading, are **Material changes** that notify a human and queue re-distillation. Section matching resolves by body digest before heading so that a rename with an unchanged body stays silent.
+
+Materiality is section-granular, so a typographical fix inside a kept section is classified material and notifies. This is accepted for the first version because the common path stays free of model inference. Model triage narrowing the material set is the upgrade path.

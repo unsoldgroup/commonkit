@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CommonKit — Brand directions</title>
+  <style>
+    * { box-sizing: border-box; }
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #e8e9e5; color: #171816; }
+    button { font: inherit; }
+    .review-bar { position: sticky; top: 0; z-index: 20; display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 14px 22px; background: rgba(247,248,245,.94); border-bottom: 1px solid #c8cbc4; backdrop-filter: blur(16px); }
+    .review-bar strong { letter-spacing: -.02em; }
+    .review-bar span { color: #62665e; font-size: 13px; }
+    .tabs { display: flex; gap: 6px; overflow-x: auto; }
+    .tabs button { border: 1px solid #c8cbc4; background: transparent; padding: 8px 12px; border-radius: 999px; cursor: pointer; white-space: nowrap; color: #555950; }
+    .tabs button.active { background: #171816; color: white; border-color: #171816; }
+    .intro { max-width: 1180px; margin: 0 auto; padding: 54px 24px 28px; display: grid; grid-template-columns: minmax(0, 1fr) minmax(280px, .62fr); gap: 48px; align-items: end; }
+    .intro h1 { font-size: clamp(38px, 6vw, 76px); letter-spacing: -.065em; line-height: .92; margin: 0; max-width: 760px; }
+    .intro p { color: #60645c; line-height: 1.55; margin: 0; max-width: 520px; }
+    .directions { max-width: 1180px; margin: 0 auto; padding: 20px 24px 80px; }
+    .direction { display: none; border-radius: 24px; overflow: hidden; box-shadow: 0 24px 80px rgba(20,24,18,.14); }
+    .direction.active { display: block; }
+    .meta { display: grid; grid-template-columns: 1fr auto; gap: 20px; align-items: center; padding: 18px 22px; font-size: 13px; }
+    .meta strong { display: block; font-size: 16px; margin-bottom: 2px; }
+    .meta p { margin: 0; opacity: .68; }
+    .tag { border: 1px solid currentColor; border-radius: 999px; padding: 7px 10px; opacity: .7; white-space: nowrap; }
+    .site { min-height: 720px; }
+    .nav, .hero, .benefits { max-width: 1080px; margin: 0 auto; }
+    .nav { display: flex; justify-content: space-between; align-items: center; padding: 24px 26px; }
+    .wordmark { font-weight: 800; letter-spacing: -.04em; }
+    .navlinks { display: flex; align-items: center; gap: 22px; font-size: 13px; }
+    .navlinks a { color: inherit; text-decoration: none; opacity: .68; }
+    .navlinks .nav-cta { opacity: 1; padding: 9px 13px; border-radius: 8px; }
+    .hero { padding: 86px 26px 66px; }
+    .eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .hero h2 { font-size: clamp(48px, 7vw, 92px); letter-spacing: -.07em; line-height: .91; max-width: 850px; margin: 24px 0; }
+    .hero-copy { font-size: clamp(17px, 2vw, 21px); line-height: 1.52; max-width: 690px; opacity: .72; }
+    .actions { display: flex; flex-wrap: wrap; gap: 11px; margin-top: 32px; }
+    .btn { border: 1px solid currentColor; padding: 12px 16px; text-decoration: none; color: inherit; font-weight: 700; font-size: 14px; border-radius: 8px; }
+    .loop { margin-top: 72px; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid; border-bottom: 1px solid; }
+    .loop div { padding: 18px 10px 18px 0; font-size: 13px; font-weight: 700; position: relative; }
+    .loop div:not(:last-child)::after { content: "→"; position: absolute; right: 12px; opacity: .42; }
+    .benefits { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); padding: 0 26px 74px; gap: 12px; }
+    .benefit { min-width: 0; padding: 22px; border: 1px solid; border-radius: 14px; }
+    .benefit small { display: block; margin-bottom: 34px; opacity: .48; font-family: ui-monospace, monospace; }
+    .benefit h3 { margin: 0 0 9px; letter-spacing: -.03em; font-size: 20px; }
+    .benefit p { margin: 0; line-height: 1.5; opacity: .65; font-size: 14px; }
+
+    /* A — Precision Instrument */
+    .precision .meta { background: #dfe6ff; color: #172a71; }
+    .precision .site { background: #f7f7f3; color: #171916; }
+    .precision .nav-cta, .precision .btn.primary { background: #2457ff; color: white; border-color: #2457ff; }
+    .precision .eyebrow { color: #2457ff; }
+    .precision .loop, .precision .benefit { border-color: #d6d8d1; }
+    .precision .benefit:nth-child(2) { background: #2457ff; color: white; border-color: #2457ff; }
+
+    /* B — Terminal Native */
+    .terminal .meta { background: #17251d; color: #9df5b6; }
+    .terminal .site { background: #08110c; color: #d7f9df; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .terminal .wordmark { letter-spacing: -.06em; }
+    .terminal .hero { padding-top: 74px; }
+    .terminal .hero h2 { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #f1fff3; }
+    .terminal .nav-cta, .terminal .btn.primary { color: #08110c; background: #77f397; border-color: #77f397; }
+    .terminal .eyebrow { color: #77f397; }
+    .terminal .hero-copy { color: #acd8b7; }
+    .terminal .loop, .terminal .benefit { border-color: #24412d; }
+    .terminal .benefit { border-radius: 2px; background: #0d1911; }
+    .terminal .benefit small { color: #77f397; }
+
+    /* C — Technical Editorial */
+    .editorial .meta { background: #f2d9c7; color: #6b2b0f; }
+    .editorial .site { background: #f2ece2; color: #201d18; }
+    .editorial .nav { border-bottom: 1px solid #cfc5b7; }
+    .editorial .wordmark { font-family: Georgia, serif; font-style: italic; font-size: 22px; }
+    .editorial .hero { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(250px, .7fr); gap: 46px; }
+    .editorial .hero h2 { font-family: Georgia, "Times New Roman", serif; font-weight: 500; letter-spacing: -.055em; line-height: .92; }
+    .editorial .hero-side { align-self: end; padding-bottom: 10px; }
+    .editorial .eyebrow { color: #bb3c12; }
+    .editorial .nav-cta, .editorial .btn.primary { color: #fff9ef; background: #bb3c12; border-color: #bb3c12; }
+    .editorial .loop, .editorial .benefit { border-color: #cfc5b7; }
+    .editorial .loop { grid-column: 1 / -1; }
+    .editorial .benefit { border-radius: 0; border-width: 1px 0 0; padding-left: 0; }
+    .editorial .benefit:nth-child(2) { border-left: 1px solid #cfc5b7; border-right: 1px solid #cfc5b7; padding-left: 22px; }
+
+    @media (max-width: 760px) {
+      .review-bar { align-items: flex-start; flex-direction: column; }
+      .intro { grid-template-columns: 1fr; gap: 20px; }
+      .navlinks a:not(.nav-cta) { display: none; }
+      .hero { padding-top: 56px; }
+      .loop { grid-template-columns: 1fr; }
+      .loop div { border-bottom: 1px solid; }
+      .loop div:not(:last-child)::after { content: "↓"; }
+      .benefits { grid-template-columns: 1fr; }
+      .editorial .hero { grid-template-columns: 1fr; gap: 10px; }
+      .editorial .benefit:nth-child(2) { border-left: 0; border-right: 0; padding-left: 0; }
+    }
+  </style>
+</head>
+<body>
+  <header class="review-bar">
+    <div><strong>CommonKit brand directions</strong><br><span>Same message. Three visual systems.</span></div>
+    <nav class="tabs" aria-label="Brand directions">
+      <button class="active" data-target="precision">01 Precision</button>
+      <button data-target="terminal">02 Terminal</button>
+      <button data-target="editorial">03 Editorial</button>
+    </nav>
+  </header>
+
+  <section class="intro">
+    <h1>Choose the feeling before we polish the page.</h1>
+    <p>Compare the hierarchy, typography, color, and product posture. The copy is intentionally held constant. Recommendation: Precision Instrument.</p>
+  </section>
+
+  <main class="directions">
+    <section class="direction precision active" id="precision">
+      <header class="meta"><div><strong>01 — Precision Instrument</strong><p>Calm, capable, product-led. The recommended direction.</p></div><span class="tag">Recommended</span></header>
+      <div class="site">
+        <nav class="nav"><div class="wordmark">CommonKit</div><div class="navlinks"><a href="#">How it works</a><a href="#">Docs</a><a class="nav-cta" href="#">View on GitHub</a></div></nav>
+        <section class="hero">
+          <div class="eyebrow"><i class="dot"></i> Portable agent infrastructure</div>
+          <h2>Your best development setup, everywhere.</h2>
+          <p class="hero-copy">Give every coding agent your proven skills, tools, and guardrails. Improve them from real use. Review what works, then apply it everywhere.</p>
+          <div class="actions"><a class="btn primary" href="#">Get started</a><a class="btn" href="#">See how it works</a></div>
+          <div class="loop"><div>Use</div><div>Learn</div><div>Review</div><div>Improve once</div><div>Benefit everywhere</div></div>
+        </section>
+        <section class="benefits">
+          <article class="benefit"><small>01 / CAPABILITY</small><h3>Start capable</h3><p>Carry proven instructions, skills, hooks, and tools into every target.</p></article>
+          <article class="benefit"><small>02 / IMPROVEMENT</small><h3>Keep getting better</h3><p>Turn evidence from real work into reviewed skill improvements.</p></article>
+          <article class="benefit"><small>03 / CONTROL</small><h3>Change safely</h3><p>Preview drift, approve changes, verify results, and recover.</p></article>
+        </section>
+      </div>
+    </section>
+
+    <section class="direction terminal" id="terminal">
+      <header class="meta"><div><strong>02 — Terminal Native</strong><p>Operational, direct, and built for power users.</p></div><span class="tag">Most technical</span></header>
+      <div class="site">
+        <nav class="nav"><div class="wordmark">commonkit_</div><div class="navlinks"><a href="#">/concepts</a><a href="#">/docs</a><a class="nav-cta" href="#">$ install</a></div></nav>
+        <section class="hero">
+          <div class="eyebrow"><i class="dot"></i> status: ready</div>
+          <h2>Your best development setup, everywhere.</h2>
+          <p class="hero-copy">Give every coding agent your proven skills, tools, and guardrails. Improve them from real use. Review what works, then apply it everywhere.</p>
+          <div class="actions"><a class="btn primary" href="#">commonkit init</a><a class="btn" href="#">read the docs →</a></div>
+          <div class="loop"><div>use()</div><div>learn()</div><div>review()</div><div>improve(1)</div><div>apply(all)</div></div>
+        </section>
+        <section class="benefits">
+          <article class="benefit"><small>[01] CAPABILITY</small><h3>Start capable</h3><p>Carry proven instructions, skills, hooks, and tools into every target.</p></article>
+          <article class="benefit"><small>[02] IMPROVEMENT</small><h3>Keep getting better</h3><p>Turn evidence from real work into reviewed skill improvements.</p></article>
+          <article class="benefit"><small>[03] CONTROL</small><h3>Change safely</h3><p>Preview drift, approve changes, verify results, and recover.</p></article>
+        </section>
+      </div>
+    </section>
+
+    <section class="direction editorial" id="editorial">
+      <header class="meta"><div><strong>03 — Technical Editorial</strong><p>Thoughtful, distinctive, and less conventional for infrastructure.</p></div><span class="tag">Most expressive</span></header>
+      <div class="site">
+        <nav class="nav"><div class="wordmark">CommonKit</div><div class="navlinks"><a href="#">Principles</a><a href="#">Documentation</a><a class="nav-cta" href="#">Get CommonKit</a></div></nav>
+        <section class="hero">
+          <div><div class="eyebrow"><i class="dot"></i> A shared standard for agentic development</div><h2>Your best development setup, everywhere.</h2></div>
+          <div class="hero-side"><p class="hero-copy">Give every coding agent your proven skills, tools, and guardrails. Improve them from real use. Review what works, then apply it everywhere.</p><div class="actions"><a class="btn primary" href="#">Get started</a><a class="btn" href="#">Our approach</a></div></div>
+          <div class="loop"><div>Use</div><div>Learn</div><div>Review</div><div>Improve once</div><div>Benefit everywhere</div></div>
+        </section>
+        <section class="benefits">
+          <article class="benefit"><small>Principle one</small><h3>Start capable</h3><p>Carry proven instructions, skills, hooks, and tools into every target.</p></article>
+          <article class="benefit"><small>Principle two</small><h3>Keep getting better</h3><p>Turn evidence from real work into reviewed skill improvements.</p></article>
+          <article class="benefit"><small>Principle three</small><h3>Change safely</h3><p>Preview drift, approve changes, verify results, and recover.</p></article>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const buttons = document.querySelectorAll('[data-target]');
+    const directions = document.querySelectorAll('.direction');
+    for (const button of buttons) {
+      button.addEventListener('click', () => {
+        for (const item of buttons) item.classList.toggle('active', item === button);
+        for (const direction of directions) direction.classList.toggle('active', direction.id === button.dataset.target);
+      });
+    }
+  </script>
+</body>
+</html>

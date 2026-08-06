@@ -1,0 +1,28 @@
+#!/bin/zsh
+# Compact memory report for the local development machine.
+set -euo pipefail
+
+memory_pressure | awk '/System-wide memory free percentage/ { print "memory_free=" $NF }'
+
+ps -axo rss=,command= | awk '
+BEGIN { node=agent=orca=watch=0; nc=ac=oc=wc=0 }
+{
+  rss=$1; line=$0
+  if (line ~ /[n]ode |[n]ode$/) { node+=rss; nc++ }
+  if (line ~ /[c]odex( |$)|[c]laude( |$)/) { agent+=rss; ac++ }
+  if (line ~ /[O]rca\.app/) { orca+=rss; oc++ }
+  if (line ~ /(next dev|vite|tsx watch|tsc --watch|wrangler dev)/) { watch+=rss; wc++ }
+}
+END {
+  printf "node=%d_processes %.2f_GiB_RSS\n", nc, node/1048576
+  printf "agents=%d_processes %.2f_GiB_RSS\n", ac, agent/1048576
+  printf "orca=%d_processes %.2f_GiB_RSS\n", oc, orca/1048576
+  printf "watchers=%d_processes %.2f_GiB_RSS\n", wc, watch/1048576
+  if (ac > 4) printf "warning=more_than_4_agent_processes\n"
+}'
+
+print "largest_node_and_agent_processes:"
+ps -axo rss=,pid=,etime=,command= | \
+  awk '$0 ~ /[n]ode |[c]odex( |$)|[c]laude( |$)/ { print }' | \
+  sort -nr | head -12
+

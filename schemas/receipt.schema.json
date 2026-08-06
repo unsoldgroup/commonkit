@@ -1,0 +1,183 @@
+{
+  "$defs": {
+    "OperationPhase": {
+      "enum": [
+        "prepared",
+        "prepare_failed",
+        "apply_started",
+        "applied",
+        "apply_failed",
+        "verified",
+        "verify_failed",
+        "rolled_back",
+        "rollback_failed"
+      ],
+      "type": "string"
+    },
+    "OperationProgress": {
+      "additionalProperties": false,
+      "properties": {
+        "failureCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/OperationPhase"
+        }
+      },
+      "required": [
+        "operationId",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "PlanBindings": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactSetDigest": {
+          "type": "string"
+        },
+        "composedLoadoutDigest": {
+          "type": "string"
+        },
+        "ownershipMapDigest": {
+          "type": "string"
+        },
+        "providerInputsDigest": {
+          "type": "string"
+        },
+        "targetIdentityDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "targetIdentityDigest",
+        "composedLoadoutDigest",
+        "providerInputsDigest",
+        "ownershipMapDigest",
+        "artifactSetDigest"
+      ],
+      "type": "object"
+    },
+    "ReceiptState": {
+      "enum": [
+        "prepared",
+        "applying",
+        "verifying",
+        "succeeded",
+        "recovery_required",
+        "rolling_back",
+        "rolled_back",
+        "rollback_failed",
+        "canceled"
+      ],
+      "type": "string"
+    },
+    "ReceiptTransition": {
+      "additionalProperties": false,
+      "properties": {
+        "entryDigest": {
+          "type": "string"
+        },
+        "previousDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progressDigest": {
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/ReceiptState"
+        }
+      },
+      "required": [
+        "sequence",
+        "state",
+        "progressDigest",
+        "entryDigest"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bindings": {
+      "$ref": "#/$defs/PlanBindings"
+    },
+    "contractVersion": {
+      "type": "string"
+    },
+    "desiredDigest": {
+      "type": "string"
+    },
+    "observedDigest": {
+      "type": "string"
+    },
+    "operationProgress": {
+      "items": {
+        "$ref": "#/$defs/OperationProgress"
+      },
+      "type": "array"
+    },
+    "planId": {
+      "type": "string"
+    },
+    "policyDigest": {
+      "type": "string"
+    },
+    "receiptId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "state": {
+      "$ref": "#/$defs/ReceiptState"
+    },
+    "targetId": {
+      "type": "string"
+    },
+    "transitions": {
+      "items": {
+        "$ref": "#/$defs/ReceiptTransition"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "receiptId",
+    "runId",
+    "planId",
+    "targetId",
+    "desiredDigest",
+    "observedDigest",
+    "policyDigest",
+    "bindings",
+    "state",
+    "operationProgress",
+    "transitions"
+  ],
+  "title": "RunReceipt",
+  "type": "object"
+}

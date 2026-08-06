@@ -1,0 +1,15 @@
+{
+  "id": "search",
+  "name": "Search",
+  "category": "Local search",
+  "remote": {
+    "type": "streamable_http",
+    "url": "https://your-search-mcp.example.com/mcp",
+    "headers": {
+      "Authorization": "Bearer replace-me"
+    }
+  },
+  "cache": {
+    "toolsTtlMs": 300000
+  }
+}

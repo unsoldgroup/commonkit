@@ -1,0 +1,37 @@
+{
+  "format": "skillopt_sleep.tasks.v1",
+  "project": "commonkit-provider-contract",
+  "transcript_source": "synthetic",
+  "n_sessions": 0,
+  "target_skill_path": "",
+  "reviewed": true,
+  "commonkit": {
+    "skillId": "contract-fixture",
+    "campaignId": "provider-contract",
+    "suiteDigest": "sha256:441b280fee317839802de9768353550be4f655bdb0529cc99b279f8a67cd6d2e",
+    "trainDigest": "sha256:116f54c41d0405dbb10e7b04ebc31e262a5b8c85c1233fcf36eaee344d91ae58",
+    "validationDigest": "sha256:98c41dcd20b86b86830ec0794559835614458ceaae0f0ec77a3ed1cd3a1f7d55"
+  },
+  "tasks": [
+    {
+      "id": "wrap-train",
+      "project": "commonkit-provider-contract",
+      "intent": "Return the answer wrapped in answer tags",
+      "reference_kind": "exact",
+      "reference": "forty two",
+      "tags": ["rule:wrap-answer"],
+      "split": "train",
+      "origin": "real"
+    },
+    {
+      "id": "wrap-validation",
+      "project": "commonkit-provider-contract",
+      "intent": "Return the answer wrapped in answer tags",
+      "reference_kind": "exact",
+      "reference": "validation",
+      "tags": ["rule:wrap-answer"],
+      "split": "val",
+      "origin": "real"
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[Unit]
+Description=CommonKit Session Board hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@@REPO_DIR@@
+EnvironmentFile=%h/.config/commonkit/session-board/hub.env
+ExecStart=@@BUN_BIN@@ run apps/session-board/hub/src/main.ts
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/commonkit/session-board @@REPO_DIR@@/apps/session-board/hub/data
+
+[Install]
+WantedBy=default.target

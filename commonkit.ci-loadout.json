@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "ci-linux-x64",
+  "description": "What a target must have materialized before it may claim the ci-linux-x64 capability. Its digest is what a declared task pins, so a target that drifts from this list stops placing instead of producing results that are not comparable.",
+  "toolchain": {
+    "rust": "stable",
+    "rustComponents": [
+      "clippy",
+      "rustfmt"
+    ],
+    "node": ">=24",
+    "packageManager": "pnpm@10.28.2",
+    "bun": "1.3"
+  },
+  "requiredCommands": [
+    "bun",
+    "bwrap",
+    "cargo",
+    "cc",
+    "git",
+    "node",
+    "pnpm",
+    "rustc",
+    "systemd-run"
+  ]
+}

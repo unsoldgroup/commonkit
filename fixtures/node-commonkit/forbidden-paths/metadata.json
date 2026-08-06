@@ -1,0 +1,8 @@
+{
+  "fixtureVersion": 1,
+  "sourceCommit": "57a085e",
+  "behavior": "plan/forbidden-paths",
+  "contract": "preserved",
+  "platform": "portable",
+  "normalization": []
+}

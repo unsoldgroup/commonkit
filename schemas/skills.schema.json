@@ -1,0 +1,764 @@
+{
+  "$defs": {
+    "CandidateState": {
+      "enum": [
+        "staged",
+        "rejected",
+        "approvable",
+        "approved",
+        "promoted",
+        "superseded"
+      ],
+      "type": "string"
+    },
+    "ContentSensitivity": {
+      "enum": [
+        "portable",
+        "local_sensitive"
+      ],
+      "type": "string"
+    },
+    "EvaluationCaseManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "caseIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "contentDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "contentDigest",
+        "caseIds"
+      ],
+      "type": "object"
+    },
+    "EvaluationMetric": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "maximumHeldOutRegressionBasisPoints": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "minimumImprovementBasisPoints": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requiredCaseIds": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "id",
+        "minimumImprovementBasisPoints",
+        "maximumHeldOutRegressionBasisPoints",
+        "requiredCaseIds"
+      ],
+      "type": "object"
+    },
+    "EvaluationOutcome": {
+      "enum": [
+        "passed",
+        "failed"
+      ],
+      "type": "string"
+    },
+    "EvaluationReceipt": {
+      "additionalProperties": false,
+      "properties": {
+        "baselineBasisPoints": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "candidateBasisPoints": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "costMicros": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "harness": {
+          "$ref": "#/$defs/HarnessLock"
+        },
+        "heldOutBaselineBasisPoints": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "heldOutCandidateBasisPoints": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "requiredCases": {
+          "additionalProperties": {
+            "$ref": "#/$defs/EvaluationOutcome"
+          },
+          "type": "object"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scorerDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "baselineBasisPoints",
+        "candidateBasisPoints",
+        "heldOutBaselineBasisPoints",
+        "heldOutCandidateBasisPoints",
+        "requiredCases",
+        "costMicros",
+        "harness",
+        "scorerDigest"
+      ],
+      "type": "object"
+    },
+    "EvidenceConsent": {
+      "enum": [
+        "local_only",
+        "approved_for_provider",
+        "approved_portable"
+      ],
+      "type": "string"
+    },
+    "EvidenceEnvelope": {
+      "additionalProperties": false,
+      "properties": {
+        "consent": {
+          "$ref": "#/$defs/EvidenceConsent"
+        },
+        "contentBytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "contentDigest": {
+          "type": "string"
+        },
+        "createdAtUnixMs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "id": {
+          "type": "string"
+        },
+        "redactionReportDigest": {
+          "type": "string"
+        },
+        "retention": {
+          "$ref": "#/$defs/EvidenceRetention"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/ContentSensitivity"
+        },
+        "skillId": {
+          "type": "string"
+        },
+        "sourceKind": {
+          "$ref": "#/$defs/EvidenceSourceKind"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "skillId",
+        "sourceKind",
+        "contentDigest",
+        "contentBytes",
+        "sensitivity",
+        "redactionReportDigest",
+        "consent",
+        "retention",
+        "createdAtUnixMs"
+      ],
+      "type": "object"
+    },
+    "EvidenceRetention": {
+      "additionalProperties": false,
+      "properties": {
+        "deleteAfterUnixMs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "deleteAfterUnixMs"
+      ],
+      "type": "object"
+    },
+    "EvidenceSourceKind": {
+      "enum": [
+        "manual_failure",
+        "claude_session",
+        "codex_session",
+        "evaluation_case"
+      ],
+      "type": "string"
+    },
+    "HarnessLock": {
+      "additionalProperties": false,
+      "properties": {
+        "environmentDigest": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "version",
+        "environmentDigest"
+      ],
+      "type": "object"
+    },
+    "ModelLock": {
+      "additionalProperties": false,
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "model"
+      ],
+      "type": "object"
+    },
+    "OptimizationLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "maximumCases": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximumCostMicros": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "maximumEdits": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timeoutSeconds": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maximumCases",
+        "maximumEdits",
+        "timeoutSeconds",
+        "maximumCostMicros"
+      ],
+      "type": "object"
+    },
+    "ProviderLock": {
+      "additionalProperties": false,
+      "properties": {
+        "adapterContract": {
+          "type": "string"
+        },
+        "capabilities": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "id": {
+          "type": "string"
+        },
+        "packageDigest": {
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/ProviderSource"
+        },
+        "sourceRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "adapterContract",
+        "source",
+        "packageDigest",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "ProviderSource": {
+      "enum": [
+        "pypi",
+        "container"
+      ],
+      "type": "string"
+    },
+    "SkillCandidate": {
+      "additionalProperties": false,
+      "properties": {
+        "candidateBytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "candidateDigest": {
+          "type": "string"
+        },
+        "candidateSensitivity": {
+          "$ref": "#/$defs/ContentSensitivity"
+        },
+        "configurationDigest": {
+          "type": "string"
+        },
+        "evaluation": {
+          "$ref": "#/$defs/EvaluationReceipt"
+        },
+        "id": {
+          "type": "string"
+        },
+        "inputDigests": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "manifestDigest": {
+          "type": "string"
+        },
+        "optimizationHistoryDigest": {
+          "type": "string"
+        },
+        "optimizer": {
+          "$ref": "#/$defs/ModelLock"
+        },
+        "parentSkillDigest": {
+          "type": "string"
+        },
+        "patchDigest": {
+          "type": "string"
+        },
+        "policyPassed": {
+          "type": "boolean"
+        },
+        "provider": {
+          "$ref": "#/$defs/ProviderLock"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/CandidateState"
+        },
+        "target": {
+          "$ref": "#/$defs/ModelLock"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "manifestDigest",
+        "parentSkillDigest",
+        "provider",
+        "optimizer",
+        "target",
+        "configurationDigest",
+        "inputDigests",
+        "candidateDigest",
+        "candidateBytes",
+        "candidateSensitivity",
+        "patchDigest",
+        "evaluation",
+        "optimizationHistoryDigest",
+        "policyPassed",
+        "state"
+      ],
+      "type": "object"
+    },
+    "SkillDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "lifecycle": {
+          "$ref": "#/$defs/SkillLifecycle"
+        },
+        "package": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sourceDigest": {
+          "type": "string"
+        },
+        "sourcePath": {
+          "type": "string"
+        },
+        "targets": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "id",
+        "sourcePath",
+        "sourceDigest",
+        "targets",
+        "lifecycle"
+      ],
+      "type": "object"
+    },
+    "SkillEvaluationSuite": {
+      "additionalProperties": false,
+      "properties": {
+        "harness": {
+          "$ref": "#/$defs/HarnessLock"
+        },
+        "heldOut": {
+          "$ref": "#/$defs/EvaluationCaseManifest"
+        },
+        "id": {
+          "type": "string"
+        },
+        "metric": {
+          "$ref": "#/$defs/EvaluationMetric"
+        },
+        "rubricDigest": {
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skillId": {
+          "type": "string"
+        },
+        "train": {
+          "$ref": "#/$defs/EvaluationCaseManifest"
+        },
+        "validation": {
+          "$ref": "#/$defs/EvaluationCaseManifest"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "skillId",
+        "train",
+        "validation",
+        "heldOut",
+        "rubricDigest",
+        "harness",
+        "metric"
+      ],
+      "type": "object"
+    },
+    "SkillLifecycle": {
+      "enum": [
+        "active",
+        "library",
+        "experimental",
+        "retired"
+      ],
+      "type": "string"
+    },
+    "SkillOptimizationManifest": {
+      "additionalProperties": false,
+      "properties": {
+        "evidenceDigests": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "type": "string"
+        },
+        "limits": {
+          "$ref": "#/$defs/OptimizationLimits"
+        },
+        "optimizer": {
+          "$ref": "#/$defs/ModelLock"
+        },
+        "policyDigest": {
+          "type": "string"
+        },
+        "provider": {
+          "$ref": "#/$defs/ProviderLock"
+        },
+        "repositoryRevision": {
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skill": {
+          "$ref": "#/$defs/SkillDescriptor"
+        },
+        "suiteDigest": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/ModelLock"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "skill",
+        "suiteDigest",
+        "evidenceDigests",
+        "provider",
+        "optimizer",
+        "target",
+        "limits",
+        "policyDigest",
+        "repositoryRevision"
+      ],
+      "type": "object"
+    },
+    "StyleguideActivation": {
+      "enum": [
+        "routed"
+      ],
+      "type": "string"
+    },
+    "StyleguideBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "descriptorDigest": {
+          "type": "string"
+        },
+        "evaluationSuiteDigest": {
+          "type": "string"
+        },
+        "packageLockDigest": {
+          "type": "string"
+        },
+        "packageManifestDigest": {
+          "type": "string"
+        },
+        "retentionMapDigest": {
+          "type": "string"
+        },
+        "selection": {
+          "$ref": "#/$defs/StyleguideSelection"
+        }
+      },
+      "required": [
+        "selection",
+        "descriptorDigest",
+        "packageManifestDigest",
+        "packageLockDigest",
+        "evaluationSuiteDigest",
+        "retentionMapDigest"
+      ],
+      "type": "object"
+    },
+    "StyleguideDescriptor": {
+      "additionalProperties": false,
+      "properties": {
+        "evaluationSuite": {
+          "type": "string"
+        },
+        "evaluationSuiteDigest": {
+          "type": "string"
+        },
+        "exclusions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "exportedSkill": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "modes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "package": {
+          "$ref": "#/$defs/StyleguidePackageProvenance"
+        },
+        "proseScopes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "retentionMapDigest": {
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "upstreamRevision": {
+          "type": "string"
+        },
+        "upstreamUrl": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "id",
+        "exportedSkill",
+        "modes",
+        "proseScopes",
+        "exclusions",
+        "evaluationSuite",
+        "evaluationSuiteDigest",
+        "upstreamUrl",
+        "upstreamRevision",
+        "retentionMapDigest",
+        "package"
+      ],
+      "type": "object"
+    },
+    "StyleguidePackageProvenance": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "lockDigest": {
+          "type": "string"
+        },
+        "manifestDigest": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "manifestDigest",
+        "lockDigest"
+      ],
+      "type": "object"
+    },
+    "StyleguideSelection": {
+      "additionalProperties": false,
+      "properties": {
+        "activation": {
+          "$ref": "#/$defs/StyleguideActivation"
+        },
+        "skillId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "skillId",
+        "activation"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v1/skills.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "candidate": {
+      "$ref": "#/$defs/SkillCandidate"
+    },
+    "descriptor": {
+      "$ref": "#/$defs/SkillDescriptor"
+    },
+    "evidence": {
+      "$ref": "#/$defs/EvidenceEnvelope"
+    },
+    "manifest": {
+      "$ref": "#/$defs/SkillOptimizationManifest"
+    },
+    "styleguideBinding": {
+      "$ref": "#/$defs/StyleguideBinding"
+    },
+    "styleguideDescriptor": {
+      "$ref": "#/$defs/StyleguideDescriptor"
+    },
+    "suite": {
+      "$ref": "#/$defs/SkillEvaluationSuite"
+    }
+  },
+  "required": [
+    "descriptor",
+    "styleguideDescriptor",
+    "styleguideBinding",
+    "suite",
+    "manifest",
+    "candidate",
+    "evidence"
+  ],
+  "title": "SkillLifecycleSchema",
+  "type": "object"
+}

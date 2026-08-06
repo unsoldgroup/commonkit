@@ -1,0 +1,4 @@
+commonkit-*
+commonkitd-*
+commonkit-target-helper-*
+!.gitignore
