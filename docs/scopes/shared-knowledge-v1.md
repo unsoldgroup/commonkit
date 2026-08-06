@@ -57,25 +57,51 @@ engram is the durable, typed, already-shareable knowledge system.
 This is the material with team value: why a thing was built the way it was,
 what broke and why, what was decided and rejected.
 
-**Sharing already partly exists.** `engram.db` carries `sync_chunks`,
-`sync_enrolled_projects`, `sync_apply_deferred` and `cloud_upgrade_state`. This
-repository tracks `.engram/` (`chunks/`, `manifest.json`) in Git — committed,
-not ignored, most recently at `00dde8c`. So the transport question is largely
-answered: knowledge rides in the repository it is about, and any clone gets it.
+**Sharing already partly exists, by two separate mechanisms.**
 
-That is the same shape ADR 0014 gives everything else: git owns content.
+*Git transport, working today.* This repository tracks `.engram/` (`chunks/`,
+`manifest.json`) — committed, not ignored. `engram sync` exports project-scoped
+chunks; `engram sync --import` applies them. Knowledge rides in the repository
+it is about and any clone gets it, which is the same shape ADR 0014 gives
+everything else: git owns content. Per-project, no infrastructure, and it
+cannot share anything across repositories.
+
+*Cloud transport, unconfigured.* `engram cloud serve` runs a Postgres-backed
+server with a dashboard and an audit log. Clients point at it with `engram
+cloud config`, enrol a project, and run `engram sync --cloud --project X`.
+`engram cloud status` currently reports **not configured**. This is the only
+path that gives organization-level sharing across repositories and people.
+
+Its server-side controls matter to the design, because they are the
+confidentiality levers that already exist:
+
+| Variable | Role |
+|---|---|
+| `ENGRAM_CLOUD_ALLOWED_PROJECTS` | required allowlist; `*` allows everything |
+| `ENGRAM_CLOUD_TOKEN` + `ENGRAM_JWT_SECRET` | authenticated mode |
+| `ENGRAM_CLOUD_ADMIN` | separate admin dashboard token |
+| `ENGRAM_CLOUD_HOST` | bind host, defaults to `127.0.0.1` |
+
+A deployment that sets the allowlist to `*` answers this brief's open question
+by default, and answers it badly: every `session_summary` would be published to
+everyone enrolled. The allowlist is per **project**, not per scope, so it
+cannot by itself separate personal from team material.
 
 ## What is therefore actually missing
 
 The transport exists. The unsolved parts are the ones ADR 0016 raises, and they
 are about **confidentiality and ownership**, not plumbing.
 
-1. **Personal versus team observations.** Every observation currently lands in
-   one store and, if the project is enrolled, one repository. ADR 0016 puts
-   team scopes in a shared repository and personal kits in private ones,
-   precisely because Git access control is repository-level. There is no
-   personal/team distinction on an observation today. What marks one, and who
-   decides — the author at write time, or a policy on the project?
+1. **Personal versus team observations.** engram already carries a `scope`
+   column, and both the CLI and the MCP tools accept `project` or `personal`
+   at write time. Measured today: 1,158 `project`, 4 `global`, 0 `personal` —
+   so the mechanism exists and is effectively unused. The decision is therefore
+   not "what marks one" but **who sets it and when**: the author at write time
+   (the current design, and nobody uses it), or a policy on the project that
+   classifies automatically. Note ADR 0016 puts team scopes in a shared
+   repository and personal kits in private ones because Git access control is
+   repository-level — so engram's scope must map onto a repository boundary to
+   mean anything for confidentiality, not merely filter a query.
 
 2. **`session_summary` is the risky type.** 188 of them. A session summary is a
    narrative of what someone did, in their words, and is closest to owner
