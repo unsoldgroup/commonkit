@@ -75,10 +75,68 @@ pub struct InitResult {
     pub target: String,
     pub headless_config: PathBuf,
     pub first_plan_id: Sha256Digest,
+    pub agent_plugin_clients: Vec<String>,
 }
 
 pub trait CommandRunner {
     fn run(&self, program: &str, arguments: &[OsString]) -> Result<String, OnboardingError>;
+}
+
+pub fn register_agent_plugin_marketplace(
+    kit_directory: &Path,
+    repository: &str,
+    runner: &dyn CommandRunner,
+) -> Result<Vec<String>, OnboardingError> {
+    let marketplace_path = kit_directory.join(".claude-plugin/marketplace.json");
+    if !marketplace_path.is_file() {
+        return Ok(Vec::new());
+    }
+    let marketplace: serde_json::Value = serde_json::from_slice(&fs::read(&marketplace_path)?)?;
+    let marketplace_name = marketplace["name"]
+        .as_str()
+        .ok_or(OnboardingError::InvalidPluginMarketplace)?;
+    let plugin = marketplace["plugins"]
+        .as_array()
+        .and_then(|plugins| {
+            plugins
+                .iter()
+                .find(|plugin| plugin["name"] == "commonkit-kit")
+        })
+        .ok_or(OnboardingError::InvalidPluginMarketplace)?;
+    let plugin_name = plugin["name"]
+        .as_str()
+        .ok_or(OnboardingError::InvalidPluginMarketplace)?;
+    let source = plugin["source"]
+        .as_str()
+        .ok_or(OnboardingError::InvalidPluginMarketplace)?;
+    let plugin_root = kit_directory.join(source.trim_start_matches("./"));
+    for hook_manifest in [
+        plugin_root.join("hooks/hooks.json"),
+        plugin_root.join(".codex-plugin/hooks.json"),
+    ] {
+        if !hook_manifest.is_file() {
+            return Err(OnboardingError::MissingPluginHookManifest(hook_manifest));
+        }
+    }
+
+    let selector = format!("{plugin_name}@{marketplace_name}");
+    let mut installed = Vec::new();
+    for (client, install_verb) in [("claude", "install"), ("codex", "add")] {
+        let marketplace_result = runner.run(
+            client,
+            &os_args(["plugin", "marketplace", "add", repository]),
+        );
+        if matches!(
+            marketplace_result,
+            Err(OnboardingError::ToolUnavailable { .. })
+        ) {
+            continue;
+        }
+        marketplace_result?;
+        runner.run(client, &os_args(["plugin", install_verb, &selector]))?;
+        installed.push(client.to_owned());
+    }
+    Ok(installed)
 }
 
 pub struct ProcessRunner {
@@ -150,7 +208,9 @@ pub fn initialize(
     validate_absolute_destination(&request.config_directory)?;
     validate_absolute_destination(&request.state_directory)?;
     validate_distinct_roots(request)?;
-    if let Some(recovered) = recover_incomplete_onboarding(request, runner)? {
+    if let Some(mut recovered) = recover_incomplete_onboarding(request, runner)? {
+        recovered.agent_plugin_clients =
+            register_agent_plugin_marketplace(&request.kit_directory, &request.repository, runner)?;
         return Ok(recovered);
     }
     if request.mode == InitMode::Create {
@@ -355,6 +415,8 @@ pub fn initialize(
         };
     }
     runtime.commit()?;
+    let agent_plugin_clients =
+        register_agent_plugin_marketplace(&request.kit_directory, &request.repository, runner)?;
     transaction.finish()?;
     let headless_config = request.config_directory.join("headless.json");
     let result = InitResult {
@@ -366,6 +428,7 @@ pub fn initialize(
         target: target.to_string(),
         headless_config,
         first_plan_id,
+        agent_plugin_clients,
     };
     if let Some(cleanup) = checkout_cleanup.as_mut() {
         cleanup.disarm();
@@ -876,6 +939,7 @@ fn recover_incomplete_onboarding_with_sync(
             target: request.target.clone(),
             headless_config,
             first_plan_id,
+            agent_plugin_clients: Vec::new(),
         }));
     }
 
@@ -2253,6 +2317,10 @@ pub enum OnboardingError {
     NonUtf8ProviderInput(PathBuf),
     #[error("provider import changed while it was copied; retry from a stable source")]
     ImportDigestMismatch,
+    #[error("plugin marketplace manifest is missing the commonkit-kit declaration")]
+    InvalidPluginMarketplace,
+    #[error("commonkit-kit is missing a required client hook manifest: {0}")]
+    MissingPluginHookManifest(PathBuf),
     #[error("required tool {tool} is unavailable: {detail}")]
     ToolUnavailable { tool: String, detail: String },
     #[error(

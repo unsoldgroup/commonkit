@@ -5,11 +5,55 @@ use std::path::Path;
 
 use commonkit_cli::onboarding::{
     CommandRunner, InitMode, InitRequest, OnboardingError, ProcessRunner, ProviderSelection,
-    initialize,
+    initialize, register_agent_plugin_marketplace,
 };
 use commonkit_contracts::LayerDocument;
 use std::ffi::OsString;
 use std::process::Command;
+
+#[test]
+fn plugin_marketplace_registration_installs_claude_and_codex_hooks() {
+    let temporary = tempfile::tempdir().unwrap();
+    let kit = temporary.path().join("kit");
+    let bin = temporary.path().join("bin");
+    let log = temporary.path().join("commands.log");
+    std::fs::create_dir_all(kit.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(kit.join("plugin/hooks")).unwrap();
+    std::fs::create_dir_all(kit.join("plugin/.codex-plugin")).unwrap();
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(
+        kit.join(".claude-plugin/marketplace.json"),
+        r#"{"name":"commonkit","plugins":[{"name":"commonkit-kit","source":"./plugin"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(kit.join("plugin/hooks/hooks.json"), "{}").unwrap();
+    std::fs::write(kit.join("plugin/.codex-plugin/hooks.json"), "{}").unwrap();
+    for tool in ["claude", "codex"] {
+        test_support::write_tool(
+            &bin,
+            tool,
+            &format!(
+                "printf '%s %s\\n' '{}' \"$*\" >> '{}'\n",
+                tool,
+                log.display()
+            ),
+        );
+    }
+
+    let installed = register_agent_plugin_marketplace(
+        &kit,
+        "al-unsoldgroup/commonkit",
+        &ProcessRunner::new(&bin),
+    )
+    .unwrap();
+
+    assert_eq!(installed, vec!["claude", "codex"]);
+    let commands = std::fs::read_to_string(log).unwrap();
+    assert!(commands.contains("claude plugin marketplace add al-unsoldgroup/commonkit"));
+    assert!(commands.contains("claude plugin install commonkit-kit@commonkit"));
+    assert!(commands.contains("codex plugin marketplace add al-unsoldgroup/commonkit"));
+    assert!(commands.contains("codex plugin add commonkit-kit@commonkit"));
+}
 
 fn request(root: &Path, mode: InitMode, repository: &str) -> InitRequest {
     InitRequest {

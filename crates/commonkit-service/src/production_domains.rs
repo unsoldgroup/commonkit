@@ -1554,6 +1554,14 @@ impl ProductionSyncDomain {
                     | GitSyncDisposition::Diverged
             )
         {
+            eprintln!(
+                "commonkitd: provider repository {} is not at the configured revision: \
+                 configured {}, head {}, disposition {:?}",
+                config.source.repository.display(),
+                config.source.revision,
+                status.revision.as_str(),
+                status.disposition
+            );
             return Err(DomainFailure::OperationFailed);
         }
         let artifacts = ArtifactStore::open(&self.config.provider_artifacts)
