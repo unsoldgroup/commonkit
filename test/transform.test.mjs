@@ -6,7 +6,7 @@ import { assertNoEmbeddedSecrets, mergeClaudeSettings, renderCodexConfig, render
 test('merges owned Claude keys while preserving VPS-only settings', () => {
   const local = {
     permissions: { allow: ['Bash(git *)'] },
-    hooks: { Stop: [{ hooks: [{ type: 'command', command: '/Users/al/bin/stop' }] }] },
+    hooks: { Stop: [{ hooks: [{ type: 'command', command: '/Users/developer/bin/stop' }] }] },
     enabledPlugins: { 'linear@example': true },
     effortLevel: 'high',
     theme: 'dark',
@@ -19,7 +19,7 @@ test('merges owned Claude keys while preserving VPS-only settings', () => {
     remote: { defaultEnvironmentId: 'vps' },
   }
 
-  assert.deepEqual(mergeClaudeSettings(local, remote, { localHome: '/Users/al', remoteHome: '/root' }), {
+  assert.deepEqual(mergeClaudeSettings(local, remote, { localHome: '/Users/developer', remoteHome: '/root' }), {
     permissions: { allow: ['Bash(git *)'] },
     hooks: { Stop: [{ hooks: [{ type: 'command', command: '/root/bin/stop' }] }] },
     enabledPlugins: { 'linear@example': true },
@@ -30,8 +30,8 @@ test('merges owned Claude keys while preserving VPS-only settings', () => {
 })
 
 test('renders portable Codex config without copying hook trust state', () => {
-  const source = `approval_policy = "on-request"\nsandbox_mode = "workspace-write"\nlast_updated = "machine timestamp"\ncommand = "/Users/al/bin/hook"\n\n[marketplaces.local]\nsource_type = "local"\nsource = "/Users/al/.tmp/marketplace"\n\n[hooks.state."/Users/al/hook:permission_request:0:0"]\napproved = true\n\n[mcp_servers.shared]\ncommand = "/Users/al/bin/server"\n\n[mcp_servers.shared.env]\nAPI_KEY = "literal-secret-value"\nSAFE_MODE = "true"\n`
-  const rendered = renderCodexConfig(source, { localHome: '/Users/al', remoteHome: '/root' })
+  const source = `approval_policy = "on-request"\nsandbox_mode = "workspace-write"\nlast_updated = "machine timestamp"\ncommand = "/Users/developer/bin/hook"\n\n[marketplaces.local]\nsource_type = "local"\nsource = "/Users/developer/.tmp/marketplace"\n\n[hooks.state."/Users/developer/hook:permission_request:0:0"]\napproved = true\n\n[mcp_servers.shared]\ncommand = "/Users/developer/bin/server"\n\n[mcp_servers.shared.env]\nAPI_KEY = "literal-secret-value"\nSAFE_MODE = "true"\n`
+  const rendered = renderCodexConfig(source, { localHome: '/Users/developer', remoteHome: '/root' })
 
   assert.match(rendered, /approval_policy = "on-request"/)
   assert.match(rendered, /command = "\/root\/bin\/hook"/)
@@ -46,9 +46,9 @@ test('renders portable Codex config without copying hook trust state', () => {
 })
 
 test('renders JSON hook paths for the selected Codex home', () => {
-  const source = JSON.stringify({ command: '/Users/al/.codex/plugins/cache/hook.mjs' })
+  const source = JSON.stringify({ command: '/Users/developer/.codex/plugins/cache/hook.mjs' })
   const rendered = renderPortableJson(source, {
-    localHome: '/Users/al',
+    localHome: '/Users/developer',
     remoteHome: '/root',
     codexHome: '/root/.config/orca/codex-runtime-home/home',
   })

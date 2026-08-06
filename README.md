@@ -16,6 +16,10 @@ configuration.
 [Read the Unsold.Group case study](docs/case-study-unsold-group.md) ·
 [Install from npm](#clean-machine-source-install)
 
+![CommonKit 0.2.0 status panel showing observed skills, devices, agent sessions, and an explicitly unchecked drift state.](docs/assets/commonkit-status-0.2.0.webp)
+
+_Verified installed state on macOS; the local target name is anonymized for publication._
+
 ## Context should travel
 
 Agent setups usually become trapped in one tool or machine. A useful skill

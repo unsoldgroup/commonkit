@@ -141,7 +141,7 @@ test('resolves upgrade command from package manager', () => {
     command: 'npm',
     args: ['install', '-g', 'mcp-local-relay@latest'],
   });
-  assert.deepEqual(resolveUpgradeCommand(undefined, undefined, '/Users/al/Library/pnpm/mcp-local-relayctl'), {
+  assert.deepEqual(resolveUpgradeCommand(undefined, undefined, '/Users/developer/Library/pnpm/mcp-local-relayctl'), {
     command: 'pnpm',
     args: ['add', '-g', 'mcp-local-relay@latest'],
   });

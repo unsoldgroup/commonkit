@@ -1,6 +1,6 @@
 {
   "name": "commonkit-linux-x64",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "CommonKit native Rust runtime for Linux x64",
   "license": "MIT",
   "author": "Unsold Group (https://unsold.group)",

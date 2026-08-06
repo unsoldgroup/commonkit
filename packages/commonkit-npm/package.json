@@ -1,6 +1,6 @@
 {
   "name": "@alunsoldgroup/commonkit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Portable, layered developer capabilities and policy across machines, projects, and coding agents",
   "type": "module",
   "bin": {
@@ -12,8 +12,8 @@
     "bin/commonkit-native.mjs"
   ],
   "optionalDependencies": {
-    "commonkit-darwin-arm64": "workspace:0.1.0",
-    "commonkit-linux-x64": "workspace:0.1.0"
+    "commonkit-darwin-arm64": "workspace:0.2.0",
+    "commonkit-linux-x64": "workspace:0.2.0"
   },
   "engines": {
     "node": ">=24"

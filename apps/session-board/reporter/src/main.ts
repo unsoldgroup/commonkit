@@ -5,6 +5,7 @@ import { HubClient } from "./hub-client.js";
 import { FallbackStateSource, OrcaCliPollingStateSource, OrcaWebSocketStateSource } from "./state-source.js";
 import { TailReader } from "./tail.js";
 import { OrcaSteerer } from "./steer.js";
+import { writeLocalSessionSnapshot } from "./local-snapshot.js";
 
 const config = await loadConfig();
 let client: HubClient;
@@ -40,7 +41,10 @@ const gates = new GatePoller(config.machineId, (actions) => client.setActions(ac
 
 client.start();
 hook.start();
-await Promise.all([source.start((sessions) => client.setSessions(sessions)), gates.start()]);
+await Promise.all([source.start(async (sessions) => {
+  client.setSessions(sessions);
+  await writeLocalSessionSnapshot(config.localSnapshotPath, sessions);
+}), gates.start()]);
 
 async function shutdown() {
   gates.stop();

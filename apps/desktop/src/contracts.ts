@@ -12,9 +12,24 @@ export interface ServiceStatus {
   lastDriftErrorCode: string | null;
 }
 
+export type PanelChannelState = "available" | "empty" | "unchecked" | "unavailable" | "stale";
+export interface PanelChannel {
+  state: PanelChannelState;
+  value?: number;
+  source: string;
+  observedAtUnixMs: number;
+  reason?: string;
+}
+export interface PanelSnapshot {
+  contractVersion: "commonkit.panel/v1";
+  observedAtUnixMs: number;
+  channels: Record<string, PanelChannel>;
+}
+
 export interface CapabilityState { id: string; ready: boolean; detail: string; }
 export interface DesktopSnapshot {
   status: ServiceStatus;
+  panel?: PanelSnapshot;
   capabilities: CapabilityState[];
   lastEventId: number | null;
   events: Array<{ id?: number; event?: string; data?: unknown }>;

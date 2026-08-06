@@ -1790,6 +1790,12 @@ fn nonce(prefix: &str) -> String {
 fn panel_channels() -> Value {
     let read = |path: &str| daemon_control("GET", path, None, None).ok();
 
+    if let Some(panel) = read("/control/v1/panel") {
+        if let Some(channels) = panel.get("channels") {
+            return channels.clone();
+        }
+    }
+
     let service = match read("/control/v1/status") {
         None => json!({ "unavailable": "the local CommonKit daemon is not reachable" }),
         Some(status) => {

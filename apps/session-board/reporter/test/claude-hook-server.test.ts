@@ -52,7 +52,7 @@ describe("responseForDecision", () => {
 
 describe("describePermission", () => {
   test("shows the bash command with project context", () => {
-    expect(describePermission("Bash", { command: "rm -rf build" }, "/Users/al/code/commonkit"))
+    expect(describePermission("Bash", { command: "rm -rf build" }, "/Users/developer/code/commonkit"))
       .toBe("[commonkit] rm -rf build");
   });
 

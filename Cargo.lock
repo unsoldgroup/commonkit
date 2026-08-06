@@ -485,7 +485,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "commonkit-about-me"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-adapters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cap-std",
  "commonkit-contracts",
@@ -522,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "clap",
@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "serde_json",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-contracts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "schemars",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "regex",
@@ -582,7 +582,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-execd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -602,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-execution"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "commonkit-contracts",
@@ -619,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "commonkit-contracts",
@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-personal-context"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "base64",
@@ -654,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-platform"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "directories",
@@ -667,7 +667,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-reconcile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "commonkit-core",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "commonkit-core",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -729,7 +729,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-skills"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-adapters",
  "commonkit-contracts",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-snapshots"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "rand 0.9.5",

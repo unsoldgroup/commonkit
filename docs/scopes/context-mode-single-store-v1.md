@@ -89,7 +89,7 @@ unpruned-writer gap, not a missing-retention gap.
 
 ## Canonical store
 
-The canonical store is `/Users/astemarie/.local/share/context-mode` on the macOS
+The canonical store is `/Users/developer/.local/share/context-mode` on the macOS
 target. It sits outside `~/.claude`, `~/.codex`, and `~/.agents`, and no
 component of its path is a symlink.
 
@@ -189,8 +189,8 @@ variables are declared together, at every writer spawn point, because they name
 the same store with different values:
 
 ```
-CONTEXT_MODE_DIR=/Users/astemarie/.local/share/context-mode
-CONTEXT_MODE_DATA_DIR=/Users/astemarie/.local/share
+CONTEXT_MODE_DIR=/Users/developer/.local/share/context-mode
+CONTEXT_MODE_DATA_DIR=/Users/developer/.local/share
 ```
 
 `ServiceSpec { environment }` is **not** the mechanism. The field exists and is

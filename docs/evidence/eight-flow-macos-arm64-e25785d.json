@@ -3,7 +3,7 @@
   "commit": "e25785d021a469f555c51258df9f51889372cbd8",
   "platform": "darwin",
   "architecture": "arm64",
-  "kernel": "Darwin Alexs-MacBook-Air.local 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:27:52 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T8112 arm64",
+  "kernel": "Darwin public-mac.local 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:27:52 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T8112 arm64",
   "nodeVersion": "v25.5.0",
   "result": "passed",
   "command": "scripts/installed-lifecycle.sh <isolated-scratch> <installed-bin>",

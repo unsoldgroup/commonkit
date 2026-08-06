@@ -29,11 +29,11 @@ fn evidence_is_redacted_previewed_and_persisted_as_local_sensitive() {
     let root = directory();
     let engine = SkillEngine::open(root.join("repository"), root.join("state")).expect("engine");
     let input =
-        b"failure: token=super-secret-value\npath=/Users/al/private/project\nkeep=this detail\n";
+        b"failure: token=super-secret-value\npath=/Users/developer/private/project\nkeep=this detail\n";
 
     let preview = engine.preview_evidence(input).expect("preview");
     assert!(!preview.redacted.contains("super-secret-value"));
-    assert!(!preview.redacted.contains("/Users/al/private/project"));
+    assert!(!preview.redacted.contains("/Users/developer/private/project"));
     assert!(preview.redacted.contains("keep=this detail"));
     assert_eq!(preview.findings.len(), 2);
 

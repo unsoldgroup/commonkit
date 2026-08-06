@@ -24,5 +24,5 @@
     "claudeSourceParity": "passed",
     "codexSourceParity": "passed"
   },
-  "command": "APM_BIN=/Users/astemarie/.local/bin/apm pnpm --filter @commonkit/styleguide test:apm"
+  "command": "APM_BIN=/Users/developer/.local/bin/apm pnpm --filter @commonkit/styleguide test:apm"
 }

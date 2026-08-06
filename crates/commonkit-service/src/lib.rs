@@ -90,11 +90,44 @@ pub struct ServiceStatus {
     pub contract_version: String,
     pub schema_version: u32,
     pub runtime_version: String,
+    pub build_revision: String,
+    pub daemon_binary_sha256: String,
+    pub panel_contract_version: String,
     pub state: OverallState,
     pub active_target: Option<String>,
     pub active_loadout: Option<String>,
     pub last_drift_check_unix_ms: Option<u128>,
     pub last_drift_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PanelChannelState {
+    Available,
+    Empty,
+    Unchecked,
+    Unavailable,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PanelChannel {
+    pub state: PanelChannelState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<u64>,
+    pub source: String,
+    pub observed_at_unix_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PanelSnapshot {
+    pub contract_version: String,
+    pub observed_at_unix_ms: u128,
+    pub channels: BTreeMap<String, PanelChannel>,
 }
 
 impl Default for ServiceStatus {
@@ -104,6 +137,11 @@ impl Default for ServiceStatus {
             contract_version: CONTRACT_VERSION.into(),
             schema_version: SCHEMA_VERSION,
             runtime_version: env!("CARGO_PKG_VERSION").into(),
+            build_revision: option_env!("COMMONKIT_BUILD_REVISION")
+                .unwrap_or("development")
+                .into(),
+            daemon_binary_sha256: current_binary_sha256(),
+            panel_contract_version: "commonkit.panel/v1".into(),
             state: OverallState::Offline,
             active_target: None,
             active_loadout: None,
@@ -111,6 +149,18 @@ impl Default for ServiceStatus {
             last_drift_error_code: None,
         }
     }
+}
+
+fn current_binary_sha256() -> String {
+    use sha2::{Digest, Sha256};
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
+        .unwrap_or_else(|| {
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .into()
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -666,6 +716,7 @@ struct ApiState {
     /// Read-only here: the budget ledger reads planned content by digest.
     artifacts: Option<Arc<ArtifactStore>>,
     context: Arc<ContextApiStore>,
+    session_snapshot_path: Option<PathBuf>,
 }
 
 struct ManagedRelayRuntime {
@@ -851,6 +902,7 @@ pub fn router_with_control(
             skill_canary: None,
             artifacts: None,
             context: Arc::new(ContextApiStore::new()),
+            session_snapshot_path: None,
         },
     )
 }
@@ -880,6 +932,7 @@ pub fn router_with_control_and_artifacts(
             skill_canary: None,
             artifacts: Some(artifacts),
             context: Arc::new(ContextApiStore::new()),
+            session_snapshot_path: None,
         },
     )
 }
@@ -904,6 +957,7 @@ pub fn router_with_skills(
             skill_canary: None,
             artifacts: None,
             context: Arc::new(ContextApiStore::new()),
+            session_snapshot_path: None,
         },
     )
 }
@@ -928,6 +982,7 @@ pub fn router_with_context(
             skill_canary: None,
             artifacts: None,
             context,
+            session_snapshot_path: None,
         },
     )
 }
@@ -939,6 +994,7 @@ struct RouterRuntime {
     skill_canary: Option<Arc<skill_canary::SkillCanaryRuntime>>,
     artifacts: Option<Arc<ArtifactStore>>,
     context: Arc<ContextApiStore>,
+    session_snapshot_path: Option<PathBuf>,
 }
 
 fn router_with_control_and_relay(
@@ -959,9 +1015,11 @@ fn router_with_control_and_relay(
         skill_canary: runtime.skill_canary,
         artifacts: runtime.artifacts,
         context: runtime.context,
+        session_snapshot_path: runtime.session_snapshot_path,
     };
     Router::new()
         .route("/control/v1/status", get(get_status))
+        .route("/control/v1/panel", get(get_panel))
         .route("/control/v1/principal", get(get_principal))
         .route("/control/v1/health", get(health))
         .route(
@@ -4507,7 +4565,10 @@ impl BoundServer {
             },
         ));
         let skill_canary = production_domains.skill_canary.clone();
-        let skills = skill_canary.as_ref().map(|runtime| runtime.engine());
+        let skills = skill_canary
+            .as_ref()
+            .map(|runtime| runtime.engine())
+            .or_else(|| configured_plugin_skill_engine(&paths.config.join("headless.json"), &paths.state));
         if let Some(targets) = production_domains.targets.clone() {
             control.set_target_inventory(targets);
         }
@@ -4559,6 +4620,7 @@ impl BoundServer {
                     .ok()
                     .map(Arc::new),
                 context: Arc::new(ContextApiStore::new()),
+                session_snapshot_path: Some(paths.state.join("session-board-sessions.json")),
             },
         );
         // The listener is bound before provider domains are loaded so its
@@ -4619,11 +4681,230 @@ impl BoundServer {
     }
 }
 
+fn configured_plugin_skill_engine(config_path: &Path, state: &Path) -> Option<Arc<SkillEngine>> {
+    let bytes = std::fs::read(config_path).ok()?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return None;
+    }
+    let config: Value = serde_json::from_slice(&bytes).ok()?;
+    let repository = config
+        .pointer("/sync/providerPipeline/source/repository")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)?;
+    if !repository.is_absolute() {
+        return None;
+    }
+    SkillEngine::open_plugin_repository(repository, state.join("skills"))
+        .ok()
+        .map(Arc::new)
+}
+
 async fn get_status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
     let mut status = serde_json::to_value(state.status.read().await.clone())
         .map_err(|_| ApiError::internal("serialization"))?;
     attach_package_report(&state, &mut status)?;
     Ok(Json(status))
+}
+
+fn panel_channel(
+    state: PanelChannelState,
+    value: Option<u64>,
+    source: &str,
+    observed_at_unix_ms: u128,
+    reason: Option<&str>,
+) -> PanelChannel {
+    PanelChannel {
+        state,
+        value,
+        source: source.into(),
+        observed_at_unix_ms,
+        reason: reason.map(str::to_owned),
+    }
+}
+
+async fn get_panel(State(state): State<ApiState>) -> Result<Json<PanelSnapshot>, ApiError> {
+    let observed_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ApiError::internal("clock_unavailable"))?
+        .as_millis();
+    let status = state.status.read().await.clone();
+    let mut channels = BTreeMap::new();
+
+    let drift = match status.last_drift_check_unix_ms {
+        None => panel_channel(
+            PanelChannelState::Unchecked,
+            None,
+            "driftScheduler",
+            observed_at_unix_ms,
+            Some("never_checked"),
+        ),
+        Some(checked_at) => panel_channel(
+            PanelChannelState::Available,
+            Some(u64::from(status.state != OverallState::Healthy)),
+            "driftScheduler",
+            checked_at,
+            status.last_drift_error_code.as_deref(),
+        ),
+    };
+    channels.insert("drift".into(), drift);
+
+    let plan_count = state
+        .control
+        .inner
+        .plans
+        .read()
+        .expect("plan lock")
+        .len() as u64;
+    channels.insert(
+        "changes".into(),
+        panel_channel(
+            if plan_count == 0 {
+                PanelChannelState::Empty
+            } else {
+                PanelChannelState::Available
+            },
+            Some(plan_count),
+            "planStore",
+            observed_at_unix_ms,
+            None,
+        ),
+    );
+    channels.insert(
+        "credentials".into(),
+        panel_channel(
+            PanelChannelState::Empty,
+            Some(0),
+            "credentialReferences",
+            observed_at_unix_ms,
+            None,
+        ),
+    );
+    let devices = match state.control.targets() {
+        Ok((targets, _selected)) => panel_channel(
+            if targets.is_empty() {
+                PanelChannelState::Empty
+            } else {
+                PanelChannelState::Available
+            },
+            Some(targets.len() as u64),
+            "targetInventory",
+            observed_at_unix_ms,
+            None,
+        ),
+        Err(_) => panel_channel(
+            PanelChannelState::Unavailable,
+            None,
+            "targetInventory",
+            observed_at_unix_ms,
+            Some("target_inventory_unavailable"),
+        ),
+    };
+    channels.insert("devices".into(), devices);
+
+    let skills = match state.skills.as_ref() {
+        Some(engine) => match engine.inventory() {
+            Ok(inventory) => panel_channel(
+                if inventory.is_empty() {
+                    PanelChannelState::Empty
+                } else {
+                    PanelChannelState::Available
+                },
+                Some(inventory.len() as u64),
+                "skillInventory",
+                observed_at_unix_ms,
+                None,
+            ),
+            Err(_) => panel_channel(
+                PanelChannelState::Unavailable,
+                None,
+                "skillInventory",
+                observed_at_unix_ms,
+                Some("skill_inventory_failed"),
+            ),
+        },
+        None => panel_channel(
+            PanelChannelState::Unavailable,
+            None,
+            "skillInventory",
+            observed_at_unix_ms,
+            Some("skills_unavailable"),
+        ),
+    };
+    channels.insert("skills".into(), skills);
+
+    let mcp = match get_relay_status().await {
+        Ok(Json(relay)) => {
+            let count = relay.get("servers").and_then(Value::as_u64).unwrap_or(0);
+            panel_channel(
+                if count == 0 {
+                    PanelChannelState::Empty
+                } else {
+                    PanelChannelState::Available
+                },
+                Some(count),
+                "relayStatus",
+                observed_at_unix_ms,
+                None,
+            )
+        }
+        Err(_) => panel_channel(
+            PanelChannelState::Unavailable,
+            None,
+            "relayStatus",
+            observed_at_unix_ms,
+            Some("relay_status_unavailable"),
+        ),
+    };
+    channels.insert("mcpServers".into(), mcp);
+    let agent_sessions = match state
+        .session_snapshot_path
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+    {
+        Some(snapshot)
+            if snapshot.get("contractVersion").and_then(Value::as_str)
+                == Some("commonkit.agent-sessions/v1") =>
+        {
+            let observed = snapshot
+                .get("observedAtUnixMs")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .unwrap_or(0);
+            let count = snapshot
+                .get("sessions")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len) as u64;
+            panel_channel(
+                if observed_at_unix_ms.saturating_sub(observed) > 10_000 {
+                    PanelChannelState::Stale
+                } else if count == 0 {
+                    PanelChannelState::Empty
+                } else {
+                    PanelChannelState::Available
+                },
+                Some(count),
+                "sessionBoardReporter",
+                observed,
+                (observed_at_unix_ms.saturating_sub(observed) > 10_000)
+                    .then_some("session_snapshot_stale"),
+            )
+        }
+        _ => panel_channel(
+            PanelChannelState::Unavailable,
+            None,
+            "sessionBoardReporter",
+            observed_at_unix_ms,
+            Some("session_source_unconfigured"),
+        ),
+    };
+    channels.insert("agentSessions".into(), agent_sessions);
+
+    Ok(Json(PanelSnapshot {
+        contract_version: "commonkit.panel/v1".into(),
+        observed_at_unix_ms,
+        channels,
+    }))
 }
 
 fn attach_package_report(state: &ApiState, value: &mut Value) -> Result<(), ApiError> {

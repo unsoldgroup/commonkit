@@ -64,7 +64,7 @@ The tool should return text JSON:
       "id": "open_index",
       "label": "Open Index Folder",
       "systemImage": "folder",
-      "url": "file:///Users/al/.local/state/mail-index"
+      "url": "file:///Users/developer/.local/state/mail-index"
     }
   ]
 }
@@ -138,7 +138,7 @@ Menu actions may include a small `view` payload for at-a-glance data. The status
         "id": "open_full_ledger",
         "label": "Open Full Ledger",
         "systemImage": "arrow.up.forward.app",
-        "url": "file:///Users/al/code/insurance-corpus/eval/batch/codex-ledger.jsonl"
+        "url": "file:///Users/developer/code/insurance-corpus/eval/batch/codex-ledger.jsonl"
       }
     ]
   }

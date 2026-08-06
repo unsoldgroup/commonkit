@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 
-const required = ["TAURI_UPDATER_PUBLIC_KEY", "COMMONKIT_UPDATE_ENDPOINT"];
+const required = ["TAURI_UPDATER_PUBLIC_KEY", "COMMONKIT_UPDATE_ENDPOINT", "COMMONKIT_BUILD_REVISION"];
 if (process.env.RUNNER_OS === "Windows") {
   required.push("WINDOWS_CERTIFICATE_THUMBPRINT", "WINDOWS_TIMESTAMP_URL");
 }
@@ -19,6 +19,9 @@ if (missing.length) {
   const updateEndpoint = process.env.COMMONKIT_UPDATE_ENDPOINT.trim();
   if (!updateEndpoint.startsWith("https://")) {
     throw new Error("COMMONKIT_UPDATE_ENDPOINT must use HTTPS");
+  }
+  if (!/^[0-9a-f]{40}$/.test(process.env.COMMONKIT_BUILD_REVISION.trim())) {
+    throw new Error("COMMONKIT_BUILD_REVISION must be a full lowercase Git revision");
   }
   config.plugins ??= {};
   config.plugins.updater = {

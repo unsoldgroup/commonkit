@@ -42,16 +42,16 @@ fn plugin_marketplace_registration_installs_claude_and_codex_hooks() {
 
     let installed = register_agent_plugin_marketplace(
         &kit,
-        "al-unsoldgroup/commonkit",
+        "example-user/commonkit",
         &ProcessRunner::new(&bin),
     )
     .unwrap();
 
     assert_eq!(installed, vec!["claude", "codex"]);
     let commands = std::fs::read_to_string(log).unwrap();
-    assert!(commands.contains("claude plugin marketplace add al-unsoldgroup/commonkit"));
+    assert!(commands.contains("claude plugin marketplace add example-user/commonkit"));
     assert!(commands.contains("claude plugin install commonkit-kit@commonkit"));
-    assert!(commands.contains("codex plugin marketplace add al-unsoldgroup/commonkit"));
+    assert!(commands.contains("codex plugin marketplace add example-user/commonkit"));
     assert!(commands.contains("codex plugin add commonkit-kit@commonkit"));
 }
 

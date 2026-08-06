@@ -28,7 +28,7 @@ nav a { color: var(--muted); text-decoration: none; font-size: .92rem; }
 nav a:hover { color: var(--text); }
 
 main { overflow: hidden; }
-.hero, .section, .case-study, .cta { width: min(calc(100% - 2rem), var(--max)); margin-inline: auto; }
+.hero, .section, .product-proof, .case-study, .cta { width: min(calc(100% - 2rem), var(--max)); margin-inline: auto; }
 .hero { min-height: calc(100vh - 84px); display: grid; align-content: center; justify-items: center; text-align: center; padding: 6rem 0 5rem; position: relative; }
 .hero::before { content: ""; position: absolute; width: 720px; height: 720px; background: radial-gradient(circle, rgba(119,243,151,.12), transparent 66%); top: -17rem; pointer-events: none; }
 .eyebrow, .kicker { color: var(--accent); font: 700 .75rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing: .14em; text-transform: uppercase; }
@@ -49,6 +49,15 @@ h1 span { color: var(--accent); }
 .terminal-bar strong { margin-left: auto; font: 500 .72rem/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
 pre { margin: 0; padding: 1.5rem; overflow-x: auto; color: var(--text); font: 500 .82rem/1.9 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .muted { color: #6d9d78; } .accent { color: var(--accent); }
+
+.product-proof { padding: 3rem 0 8rem; }
+.product-proof .section-heading { margin-inline: auto; text-align: center; }
+.product-proof .section-heading > p:last-child { margin-inline: auto; }
+.product-frame { margin: 0; padding: .55rem; background: #050b07; border: 1px solid var(--border); box-shadow: 0 28px 90px rgba(0,0,0,.4); }
+.product-frame picture, .product-frame img { display: block; width: 100%; }
+.product-frame img { height: auto; background: #080d0f; }
+.product-frame figcaption { display: flex; justify-content: space-between; gap: 2rem; padding: .85rem .55rem .3rem; color: var(--muted); font: 500 .72rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.product-frame figcaption span:first-child { color: var(--accent); white-space: nowrap; }
 
 .section { padding: 8rem 0; }
 .section-heading { max-width: 760px; margin-bottom: 3.5rem; }
@@ -89,6 +98,9 @@ footer p { margin: 0; }
   .hero { min-height: auto; padding-top: 5rem; }
   .hero::before { width: 430px; height: 430px; }
   .portability-grid, .case-study, .boundary { grid-template-columns: 1fr; }
+  .product-proof { padding-bottom: 6rem; }
+  .product-frame { margin-inline: -1rem; border-left: 0; border-right: 0; }
+  .product-frame figcaption { flex-direction: column; gap: .3rem; }
   .case-study { gap: 3rem; padding: 2rem; }
   .boundary { gap: 1rem; }
   .process-list li { grid-template-columns: 1fr; gap: .25rem; }

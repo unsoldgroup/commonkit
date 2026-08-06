@@ -8,6 +8,7 @@ interface FileConfig {
   machineId?: string;
   machineName?: string;
   hookPort?: number;
+  localSnapshotPath?: string;
 }
 
 export interface ReporterConfig {
@@ -16,6 +17,17 @@ export interface ReporterConfig {
   machineId: string;
   machineName: string;
   hookPort: number;
+  localSnapshotPath: string;
+}
+
+function defaultSnapshotPath(): string {
+  if (process.platform === "darwin") {
+    return join(homedir(), "Library/Application Support/com.unsoldgroup.CommonKit/state/session-board-sessions.json");
+  }
+  if (process.platform === "win32") {
+    return join(process.env.LOCALAPPDATA ?? homedir(), "CommonKit/state/session-board-sessions.json");
+  }
+  return join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "commonkit/session-board-sessions.json");
 }
 
 export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<ReporterConfig> {
@@ -34,5 +46,6 @@ export async function loadConfig(env: NodeJS.ProcessEnv = process.env): Promise<
     machineId: env.SESSION_BOARD_MACHINE_ID ?? file.machineId ?? hostname(),
     machineName: env.SESSION_BOARD_MACHINE_NAME ?? file.machineName ?? hostname(),
     hookPort: Number(env.SESSION_BOARD_HOOK_PORT ?? file.hookPort ?? 47821),
+    localSnapshotPath: env.SESSION_BOARD_LOCAL_SNAPSHOT_PATH ?? file.localSnapshotPath ?? defaultSnapshotPath(),
   };
 }

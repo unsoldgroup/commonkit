@@ -4,9 +4,9 @@ import test from 'node:test'
 import { buildPlan, isForbiddenPath } from '../src/plan.mjs'
 
 test('plans both the shell and Orca Codex homes', () => {
-  const plan = buildPlan({ home: '/Users/al', remoteHome: '/root' })
+  const plan = buildPlan({ home: '/Users/developer', remoteHome: '/root' })
   const agentsTargets = plan
-    .filter((operation) => operation.source === '/Users/al/.codex/AGENTS.md')
+    .filter((operation) => operation.source === '/Users/developer/.codex/AGENTS.md')
     .map((operation) => operation.target)
 
   assert.deepEqual(agentsTargets, [
@@ -34,7 +34,7 @@ test('never plans credentials or live runtime databases', () => {
   ]
 
   for (const path of forbidden) assert.equal(isForbiddenPath(path), true, path)
-  for (const operation of buildPlan({ home: '/Users/al', remoteHome: '/root' })) {
+  for (const operation of buildPlan({ home: '/Users/developer', remoteHome: '/root' })) {
     assert.equal(isForbiddenPath(operation.source), false, operation.source)
     assert.equal(isForbiddenPath(operation.target), false, operation.target)
   }

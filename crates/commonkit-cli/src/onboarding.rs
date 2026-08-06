@@ -52,7 +52,7 @@ pub struct InitRequest {
     pub mode: InitMode,
     pub repository: String,
     pub kit_directory: PathBuf,
-    /// The personal-kit layer ID. Retains the historical `loadout` name for compatibility.
+    /// The persondemo-kit layer ID. Retains the historical `loadout` name for compatibility.
     pub loadout: String,
     pub project_loadout: Option<String>,
     pub target_override: Option<String>,

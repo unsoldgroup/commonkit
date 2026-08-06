@@ -213,10 +213,6 @@ final class RelayStatusModel: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
-    func openCorpusLedger() {
-        NSWorkspace.shared.open(URL(filePath: "/Users/astemarie/code/insurance-corpus/eval/batch/codex-ledger.jsonl"))
-    }
-
     func openCorpusFailures() {
         NSWorkspace.shared.open(URL(string: "http://127.0.0.1:3768/failures")!)
     }

@@ -14,9 +14,11 @@
 #   ./provision-execd-host.sh all
 set -euo pipefail
 
-host_ip=${COMMONKIT_EXECD_PUBLIC_IP:-72.60.44.157}
-host_name=${COMMONKIT_EXECD_PUBLIC_NAME:-exec}
-zone_name=${COMMONKIT_EXECD_ZONE:-unsold.cloud}
+host_ip=${COMMONKIT_EXECD_PUBLIC_IP:?Set COMMONKIT_EXECD_PUBLIC_IP}
+host_name=${COMMONKIT_EXECD_PUBLIC_NAME:?Set COMMONKIT_EXECD_PUBLIC_NAME}
+zone_name=${COMMONKIT_EXECD_ZONE:?Set COMMONKIT_EXECD_ZONE}
+github_token_secret_key=${COMMONKIT_GITHUB_TOKEN_SECRET_KEY:?Set COMMONKIT_GITHUB_TOKEN_SECRET_KEY}
+cloudflare_token_secret_key=${COMMONKIT_CLOUDFLARE_TOKEN_SECRET_KEY:?Set COMMONKIT_CLOUDFLARE_TOKEN_SECRET_KEY}
 
 secret() {
   bws secret list | jq -r --arg key "$1" '.[] | select(.key==$key) | .value' | head -1
@@ -24,9 +26,9 @@ secret() {
 
 provision_credentials() {
   local token
-  token=$(secret GITHUB_TOKEN)
+  token=$(secret "$github_token_secret_key")
   if [[ -z "$token" ]]; then
-    echo "GITHUB_TOKEN is not in Bitwarden Secrets Manager" >&2
+    echo "Configured GitHub token is not in Bitwarden Secrets Manager" >&2
     exit 1
   fi
   umask 077
@@ -40,9 +42,9 @@ provision_credentials() {
 
 provision_dns() {
   local token zone existing
-  token=$(secret cloudflare/SECURITY_REMEDIATION_TOKEN)
+  token=$(secret "$cloudflare_token_secret_key")
   if [[ -z "$token" ]]; then
-    echo "cloudflare/SECURITY_REMEDIATION_TOKEN is not in Bitwarden Secrets Manager" >&2
+    echo "Configured Cloudflare token is not in Bitwarden Secrets Manager" >&2
     exit 1
   fi
   zone=$(curl -sS -H "Authorization: Bearer $token" \
@@ -75,9 +77,9 @@ provision_tls() {
   local cert_root=${COMMONKIT_EXECD_CERT_ROOT:-/etc/caddy/certs/execution-api}
   local vhost=${COMMONKIT_EXECD_VHOST:-/etc/caddy/Caddyfile.d/execution-api.caddy}
   local token
-  token=$(secret cloudflare/SECURITY_REMEDIATION_TOKEN)
+  token=$(secret "$cloudflare_token_secret_key")
   if [[ -z "$token" ]]; then
-    echo "cloudflare/SECURITY_REMEDIATION_TOKEN is not in Bitwarden Secrets Manager" >&2
+    echo "Configured Cloudflare token is not in Bitwarden Secrets Manager" >&2
     exit 1
   fi
   install -d -m 0755 "$cert_root"

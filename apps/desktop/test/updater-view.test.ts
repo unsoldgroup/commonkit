@@ -33,10 +33,10 @@ test("settings explains this computer and exposes launch-at-login controls", () 
     { kind: "idle" },
     {
       autostart: true,
-      configDirectory: "/Users/al/Library/Application Support/CommonKit",
-      stateDirectory: "/Users/al/Library/Application Support/CommonKit/state",
+      configDirectory: "/Users/developer/Library/Application Support/CommonKit",
+      stateDirectory: "/Users/developer/Library/Application Support/CommonKit/state",
       repository: "https://github.com/al/commonkit.git",
-      targetRoot: "/Users/al/CommonKitManaged",
+      targetRoot: "/Users/developer/CommonKitManaged",
     },
   );
 

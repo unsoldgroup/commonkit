@@ -45,6 +45,7 @@ test("release inputs are validated before packaging", async () => {
   assert.match(release, /verify-release-assets\.mjs/);
   assert.match(validator, /TAURI_UPDATER_PUBLIC_KEY/);
   assert.match(validator, /COMMONKIT_UPDATE_ENDPOINT/);
+  assert.match(validator, /COMMONKIT_BUILD_REVISION/);
   assert.match(validator, /process\.exitCode = 1/);
   assert.match(validator, /COMMONKIT_UPDATE_ENDPOINT must use HTTPS/);
 });

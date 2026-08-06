@@ -36,7 +36,7 @@ pinned external SkillOpt
 
 SkillOpt computes candidates; it never mutates active skills, promotes source, compiles agent packages, schedules itself, or mutates a target. Canonical skill source is `.agents/skills/<name>/SKILL.md`; `.claude/skills` is a delivery symlink. Dataset approval, candidate adoption, and merge remain explicit human actions. A Claude `SessionEnd` hook may record freshness only; it must not harvest, evaluate, spend budget, or adopt. Codex has no equivalent hook in v1.
 
-The WIP reference implementation is branch `al-unsoldgroup/skillopt`, commit `fc7de87`, tracked by `USG-48`. It is explicitly not merge-ready. Its stricter partial fixes must be preserved, but integration proceeds by classified, reviewed changes rather than merging the branch wholesale. The six release blockers are: canonical-source enforcement, independent held-out evidence, corpus binding, real cross-platform provider isolation, fresh Git/policy revalidation, and authenticated verified canary rollback. See `docs/plans/skillopt-v1-integration.md`.
+The WIP reference implementation is branch `example-user/skillopt`, commit `fc7de87`, tracked by `USG-48`. It is explicitly not merge-ready. Its stricter partial fixes must be preserved, but integration proceeds by classified, reviewed changes rather than merging the branch wholesale. The six release blockers are: canonical-source enforcement, independent held-out evidence, corpus binding, real cross-platform provider isolation, fresh Git/policy revalidation, and authenticated verified canary rollback. See `docs/plans/skillopt-v1-integration.md`.
 
 The active implementation sequence is recorded in `docs/plans/provider-adapter-implementation.md`. Durable fresh-process recovery is the first gate; APM/chezmoi production integration cannot proceed until a new adapter process can reconstruct every applied operation from durable plans, artifacts, backups, and receipts. SkillOpt cannot graduate until APM provider convergence and durable authenticated canary rollback are proven.
 
@@ -308,7 +308,7 @@ Portable capability editing remains governed by the layer and production-domain
 contracts. A screen may direct the user to Settings when setup is missing, but
 must not invent a desktop-only manifest, write provider output directly, or
 silently edit generated `headless.json`. A future editor must produce a
-reviewable personal-kit change, recompute its content digest, validate the
+reviewable persondemo-kit change, recompute its content digest, validate the
 organization policy floor, and enter the ordinary CommonKit plan path.
 
 ### Onboarding entry points

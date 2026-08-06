@@ -2,7 +2,7 @@
 # rtest — sync the current worktree and run a pnpm command on Hostinger.
 set -euo pipefail
 
-vps=${RTEST_VPS:-root@72.60.44.157}
+vps=${RTEST_VPS:?Set RTEST_VPS to user@host}
 key=${RTEST_SSH_KEY:-$HOME/.ssh/id_ed25519}
 worker=${RTEST_WORKER:-/root/bin/commonkit-rtest-worker}
 lock_root=${RTEST_LOCK_ROOT:-/tmp}

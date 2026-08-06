@@ -69,7 +69,7 @@ agent-initiated only.
 
 ### G6 — Not deployed
 
-VPS `srv1833518` (8 cores, 32 GB, 297 GB free) has no `commonkit-execd` binary,
+VPS `build-host` (8 cores, 32 GB, 297 GB free) has no `commonkit-execd` binary,
 no `/etc/commonkit`, no unit. Caddy 2.6.2 is already running and terminates TLS
 for `board.unsold.cloud`, so the TLS proxy is a vhost, not new infrastructure.
 No `actions-runner` on this host — the interim runner from EXP-2302 lives

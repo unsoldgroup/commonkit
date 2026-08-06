@@ -867,7 +867,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-about-me"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "serde",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-adapters"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "cap-std",
  "commonkit-contracts",
@@ -903,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clap",
  "commonkit-about-me",
@@ -928,7 +928,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-config"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "serde_json",
@@ -937,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-contracts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "regex",
  "schemars 1.2.1",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "regex",
@@ -961,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-desktop"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "commonkit-cli",
@@ -973,6 +973,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -985,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-personal-context"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "age",
  "base64 0.22.1",
@@ -1002,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-platform"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "directories",
@@ -1014,7 +1015,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-reconcile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "commonkit-core",
@@ -1027,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-relay"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "commonkit-core",
@@ -1045,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-service"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "axum",
  "clap",
@@ -1072,7 +1073,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-skills"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "commonkit-adapters",
  "commonkit-contracts",
@@ -1086,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "commonkit-snapshots"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chacha20poly1305",
  "rand 0.9.5",

@@ -21,8 +21,8 @@ fn principal_resolver_fails_closed() {
     let cases = [
         (
             "valid",
-            Ok(CommandOutput::success(b"Al-UnsoldGroup\n")),
-            Some("al-unsoldgroup"),
+            Ok(CommandOutput::success(b"Example-User\n")),
+            Some("example-user"),
         ),
         (
             "unavailable",

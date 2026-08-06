@@ -106,6 +106,16 @@ impl ServiceSupervisor {
             });
         }
         let runtime = RuntimeBinaryLayout::discover()?;
+        install_managed_daemon(&runtime)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if service_is_authenticated(client) {
+                return Ok(Self {
+                    child: Mutex::new(None),
+                });
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let child = Command::new(runtime.daemon)
             .args(["--port", "0", "--relay-port", "0"])
             .stdin(Stdio::null())
@@ -175,6 +185,21 @@ impl ServiceSupervisor {
     }
 }
 
+fn install_managed_daemon(runtime: &RuntimeBinaryLayout) -> Result<(), DesktopError> {
+    let status = Command::new(&runtime.cli)
+        .args(["daemon", "install"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| DesktopError::ServiceLaunchFailed)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(DesktopError::ServiceLaunchFailed)
+    }
+}
+
 impl Drop for ServiceSupervisor {
     fn drop(&mut self) {
         self.stop();
@@ -182,7 +207,25 @@ impl Drop for ServiceSupervisor {
 }
 
 fn service_is_authenticated(client: &ServiceClient) -> bool {
-    tauri::async_runtime::block_on(client.status()).is_ok()
+    let Ok(runtime) = RuntimeBinaryLayout::discover() else {
+        return false;
+    };
+    let Ok(expected_digest) = binary_sha256(&runtime.daemon) else {
+        return false;
+    };
+    tauri::async_runtime::block_on(client.status())
+        .is_ok_and(|status| service_matches_runtime(&status, &expected_digest))
+}
+
+fn binary_sha256(path: &Path) -> Result<String, DesktopError> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn service_matches_runtime(status: &ServiceStatus, expected_digest: &str) -> bool {
+    status.panel_contract_version == "commonkit.panel/v1"
+        && status.daemon_binary_sha256 == expected_digest
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,11 +241,57 @@ struct ServiceStatus {
     contract_version: String,
     schema_version: u32,
     runtime_version: String,
+    build_revision: String,
+    daemon_binary_sha256: String,
+    panel_contract_version: String,
     state: String,
     active_target: Option<String>,
     active_loadout: Option<String>,
     last_drift_check_unix_ms: Option<u128>,
     last_drift_error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PanelChannel {
+    state: String,
+    value: Option<u64>,
+    source: String,
+    observed_at_unix_ms: u128,
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PanelSnapshot {
+    contract_version: String,
+    observed_at_unix_ms: u128,
+    channels: BTreeMap<String, PanelChannel>,
+}
+
+impl PanelSnapshot {
+    fn unavailable() -> Self {
+        let channels = ["skills", "mcpServers", "changes", "credentials", "devices", "agentSessions", "drift"]
+            .into_iter()
+            .map(|id| {
+                (
+                    id.into(),
+                    PanelChannel {
+                        state: "unavailable".into(),
+                        value: None,
+                        source: "daemonPanel".into(),
+                        observed_at_unix_ms: 0,
+                        reason: Some("service_unavailable".into()),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            contract_version: "commonkit.panel/v1".into(),
+            observed_at_unix_ms: 0,
+            channels,
+        }
+    }
 }
 
 impl ServiceStatus {
@@ -212,6 +301,9 @@ impl ServiceStatus {
             contract_version: "1.0".into(),
             schema_version: 1,
             runtime_version: env!("CARGO_PKG_VERSION").into(),
+            build_revision: "unavailable".into(),
+            daemon_binary_sha256: "unavailable".into(),
+            panel_contract_version: "unavailable".into(),
             state: "offline".into(),
             active_target: None,
             active_loadout: None,
@@ -233,6 +325,7 @@ struct CapabilityState {
 #[serde(rename_all = "camelCase")]
 struct DesktopSnapshot {
     status: ServiceStatus,
+    panel: PanelSnapshot,
     capabilities: Vec<CapabilityState>,
     last_event_id: Option<u64>,
     events: Vec<serde_json::Value>,
@@ -786,6 +879,17 @@ impl ServiceClient {
             .await?)
     }
 
+    async fn panel(&self) -> Result<PanelSnapshot, DesktopError> {
+        Ok(self
+            .request(reqwest::Method::GET, "/panel")
+            .await?
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     async fn principal(&self) -> Result<Option<Principal>, DesktopError> {
         Ok(self
             .request(reqwest::Method::GET, "/principal")
@@ -1007,6 +1111,10 @@ async fn desktop_snapshot(
         .status()
         .await
         .unwrap_or_else(|_| ServiceStatus::offline());
+    let panel = client
+        .panel()
+        .await
+        .unwrap_or_else(|_| PanelSnapshot::unavailable());
     let event_snapshot = client
         .json(reqwest::Method::GET, "/events/snapshot", None)
         .await
@@ -1029,6 +1137,7 @@ async fn desktop_snapshot(
     let online = status.state != "offline";
     Ok(DesktopSnapshot {
         status,
+        panel,
         last_event_id: event_snapshot
             .get("lastEventId")
             .and_then(serde_json::Value::as_u64),
@@ -2031,18 +2140,18 @@ mod tests {
     fn onboarding_defaults_are_computed_natively_without_webview_path_permissions() {
         let paths = AppPaths::from_roots("/private/config", "/private/data", "/private/cache")
             .expect("fixture roots");
-        let defaults = onboarding_defaults_from(&paths, Some(Path::new("/Users/al")), "al-macbook")
+        let defaults = onboarding_defaults_from(&paths, Some(Path::new("/Users/developer")), "local-workstation")
             .expect("defaults");
 
         assert_eq!(
             defaults.kit_directory,
-            PathBuf::from("/Users/al/.commonkit-kit")
+            PathBuf::from("/Users/developer/.commonkit-kit")
         );
         assert_eq!(
             defaults.target_root,
-            PathBuf::from("/Users/al/CommonKitManaged")
+            PathBuf::from("/Users/developer/CommonKitManaged")
         );
-        assert_eq!(defaults.computer_name, "al-macbook");
+        assert_eq!(defaults.computer_name, "local-workstation");
     }
 
     #[test]
@@ -2059,12 +2168,12 @@ mod tests {
     #[test]
     fn repository_creation_is_bound_to_the_authenticated_github_owner() {
         let authenticated = GithubAuthStatus::Authenticated {
-            login: "al-unsoldgroup".into(),
+            login: "example-user".into(),
             method: "githubCli",
         };
 
         assert!(
-            authorize_github_repository("create", "al-unsoldgroup/my-kit", &authenticated).is_ok()
+            authorize_github_repository("create", "example-user/my-kit", &authenticated).is_ok()
         );
         assert!(
             authorize_github_repository("create", "someone-else/my-kit", &authenticated).is_err()
@@ -2075,7 +2184,7 @@ mod tests {
         assert!(
             authorize_github_repository(
                 "create",
-                "al-unsoldgroup/my-kit",
+                "example-user/my-kit",
                 &GithubAuthStatus::SignedOut
             )
             .is_err()
@@ -2178,13 +2287,29 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_service_must_match_the_bundled_daemon_identity() {
+        let expected = format!("sha256:{}", "a".repeat(64));
+        let status = ServiceStatus {
+            daemon_binary_sha256: expected.clone(),
+            panel_contract_version: "commonkit.panel/v1".into(),
+            ..ServiceStatus::offline()
+        };
+
+        assert!(service_matches_runtime(&status, &expected));
+        assert!(!service_matches_runtime(
+            &status,
+            &format!("sha256:{}", "b".repeat(64))
+        ));
+    }
+
+    #[test]
     fn tray_uses_the_one_persisted_selected_target() {
         assert_eq!(
             selected_target(&serde_json::json!({
-                "selected": ["al-macbook"],
-                "targets": [{"id": "al-macbook"}]
+                "selected": ["local-workstation"],
+                "targets": [{"id": "local-workstation"}]
             })),
-            Some("al-macbook".into())
+            Some("local-workstation".into())
         );
         assert_eq!(
             selected_target(&serde_json::json!({

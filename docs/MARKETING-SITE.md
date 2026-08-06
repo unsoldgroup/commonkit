@@ -5,6 +5,7 @@ directory:
 
 - `index.html` contains the page structure and copy.
 - `site.css` contains the responsive visual system.
+- `assets/commonkit-status-0.2.0.*` contains responsive, privacy-safe product proof.
 - `case-study-unsold-group.md` contains the long-form case study.
 
 GitHub Pages can publish the site directly from the repository's `/docs`
@@ -32,3 +33,5 @@ workflow status is not a CommonKit validation or release gate.
 - Use observed counts only when their inventory date is clear.
 - Keep unfinished capabilities and target boundaries explicit.
 - Never place secret values in the site, its source, or its build artifacts.
+- Product screenshots must use synthetic or anonymized target names and may not
+  expose personal paths, repositories, credentials, or session details.

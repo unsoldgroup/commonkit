@@ -16,58 +16,57 @@ const step = Number(params.get("step") ?? "1") as 1 | 2 | 3 | 4;
 
 const snapshot: DesktopSnapshot = {
   status: {
-    apiVersion: "v1", contractVersion: "1.0", schemaVersion: 1, runtimeVersion: "0.1.0",
-    state: "drifted", activeTarget: "al-macbook", activeLoadout: "personal",
-    lastDriftCheckUnixMs: Date.parse("2026-08-05T21:40:00Z"), lastDriftErrorCode: null,
+    apiVersion: "v1", contractVersion: "1.0", schemaVersion: 1, runtimeVersion: "0.2.0",
+    state: "healthy", activeTarget: "local-workstation", activeLoadout: "personal",
+    lastDriftCheckUnixMs: null, lastDriftErrorCode: null,
+  },
+  panel: {
+    contractVersion: "commonkit.panel/v1",
+    observedAtUnixMs: Date.parse("2026-08-06T20:00:00Z"),
+    channels: {
+      skills: { state: "available", value: 59, source: "skillInventory", observedAtUnixMs: Date.parse("2026-08-06T20:00:00Z") },
+      mcpServers: { state: "empty", value: 0, source: "relayStatus", observedAtUnixMs: Date.parse("2026-08-06T20:00:00Z") },
+      changes: { state: "empty", value: 0, source: "planStore", observedAtUnixMs: Date.parse("2026-08-06T20:00:00Z") },
+      credentials: { state: "empty", value: 0, source: "credentialReferences", observedAtUnixMs: Date.parse("2026-08-06T20:00:00Z") },
+      devices: { state: "available", value: 1, source: "targetInventory", observedAtUnixMs: Date.parse("2026-08-06T20:00:00Z") },
+      agentSessions: { state: "available", value: 11, source: "sessionBoardReporter", observedAtUnixMs: Date.parse("2026-08-06T20:00:00Z") },
+      drift: { state: "unchecked", source: "driftScheduler", observedAtUnixMs: Date.parse("2026-08-06T20:00:00Z"), reason: "never_checked" },
+    },
   },
   capabilities: [], lastEventId: 42, events: [],
-  gitSync: { state: "clean", branch: "main", revision: "8d7b180" },
+  gitSync: { state: "clean", branch: "main", revision: "2f6a911" },
   policy: { state: "ready", violations: [] },
 };
 
 const management: ManagementSnapshot = {
   aboutMe: { error: "about_me_domain_unconfigured" },
-  plans: {
-    plan: {
-      id: "sha256:9f2c4a17be08d3", targetId: "al-macbook", risk: "medium",
-      operations: [
-        { summary: "Write agent instructions", path: "~/CommonKitManaged/CLAUDE.md", risk: "low", provenance: { layer: "personal" } },
-        { summary: "Install skill bundle", path: "~/CommonKitManaged/.claude/skills/ast-grep", risk: "low", provenance: { layer: "personal" } },
-        { summary: "Replace MCP relay declaration", path: "~/CommonKitManaged/.mcp.json", risk: "medium", provenance: { layer: "project:commonkit" } },
-      ],
-    },
-  },
+  plans: {},
   credentials: { credentials: [] },
-  snapshots: { error: "snapshot_domain_unconfigured" },
-  relay: { state: "running", servers: [
-    { id: "context-mode", name: "context-mode", state: "ready", transport: "stdio" },
-    { id: "linear", name: "linear", state: "ready", transport: "https" },
-    { id: "posthog-local", name: "posthog-local", state: "degraded", transport: "http" },
-  ] },
+  snapshots: { snapshots: [] },
+  relay: { state: "running", servers: [] },
   schedule: { enabled: true, intervalSeconds: 900 },
   diagnostics: {},
 };
 
 const targets: TargetInventorySnapshot = {
-  selected: ["al-macbook"],
+  selected: ["local-workstation"],
   targets: [
-    { id: "al-macbook", identityDigest: "sha256:1f3a…", transport: { type: "local" } },
-    { id: "hostinger-vps", identityDigest: "sha256:c07b…", transport: { type: "ssh", host: "srv1833518", user: "root", port: 22 } },
+    { id: "local-workstation", identityDigest: "sha256:1f3a…", transport: { type: "local" } },
   ],
 };
 
 const settings = {
   autostart: true,
-  configDirectory: "/Users/al/Library/Application Support/CommonKit",
-  stateDirectory: "/Users/al/Library/Application Support/CommonKit/state",
-  repository: "al-unsoldgroup/commonkit",
-  targetRoot: "/Users/al/CommonKitManaged",
+  configDirectory: "/Users/demo/Library/Application Support/CommonKit",
+  stateDirectory: "/Users/demo/Library/Application Support/CommonKit/state",
+  repository: "example-org/my-commonkit",
+  targetRoot: "/Users/demo/CommonKitManaged",
 };
 
 const onboarding: OnboardingViewState = {
   step,
-  auth: step === 1 && params.get("auth") === "out" ? { state: "signedOut" } : { state: "authenticated", login: "al-unsoldgroup" },
-  draft: { ...defaultOnboardingDraft(), kitDirectory: "/Users/al/.config/commonkit", targetRoot: "/Users/al/CommonKitManaged", computerName: "al-macbook" },
+  auth: step === 1 && params.get("auth") === "out" ? { state: "signedOut" } : { state: "authenticated", login: "octocat" },
+  draft: { ...defaultOnboardingDraft(), kitDirectory: "/Users/demo/.config/commonkit", targetRoot: "/Users/demo/CommonKitManaged", computerName: "local-workstation" },
   message: step === 4 ? "" : "",
   submitting: false,
 };
@@ -90,10 +89,13 @@ const body = screen === "onboarding" ? onboardingPanel(onboarding)
   : managementPanel(screen as "plans", management as unknown as Record<string, unknown>);
 
 document.querySelector("#app")!.innerHTML =
-  `<aside class="rail"><div class="mark">${icon.mark()}<b>CommonKit</b></div><nav>${railGroups}</nav><p class="rail-foot">v0.1.0</p></aside><main class="deck">${body}</main>`;
+  `<aside class="rail"><div class="mark">${icon.mark()}<b>CommonKit</b></div><nav>${railGroups}</nav><p class="rail-foot">v0.2.0</p></aside><main class="deck">${body}</main>`;
 
 const root = document.querySelector("#app")!;
-for (const [spec, reading] of readPanel(screen === "onboarding" ? null : snapshot, screen === "onboarding" ? null : management)) {
+for (const [spec, reading] of readPanel(
+  screen === "onboarding" ? null : snapshot,
+  screen === "onboarding" ? null : management,
+  screen === "onboarding" ? null : targets,
+)) {
   driveInstrument(root, spec, reading);
 }
-

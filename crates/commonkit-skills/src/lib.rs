@@ -1088,12 +1088,28 @@ pub struct SessionActivityStatus {
 
 pub struct SkillEngine {
     repository: PathBuf,
+    inventory_relative_root: &'static str,
     state: PathBuf,
     artifacts: ArtifactStore,
 }
 
 impl SkillEngine {
     pub fn open(repository: impl AsRef<Path>, state: impl AsRef<Path>) -> Result<Self, SkillError> {
+        Self::open_with_inventory_root(repository, state, ".agents/skills")
+    }
+
+    pub fn open_plugin_repository(
+        repository: impl AsRef<Path>,
+        state: impl AsRef<Path>,
+    ) -> Result<Self, SkillError> {
+        Self::open_with_inventory_root(repository, state, "plugin/skills")
+    }
+
+    fn open_with_inventory_root(
+        repository: impl AsRef<Path>,
+        state: impl AsRef<Path>,
+        inventory_relative_root: &'static str,
+    ) -> Result<Self, SkillError> {
         fs::create_dir_all(repository.as_ref())?;
         fs::create_dir_all(state.as_ref())?;
         set_private_directory(state.as_ref())?;
@@ -1107,6 +1123,7 @@ impl SkillEngine {
         let artifacts = ArtifactStore::open(state.join("artifacts"))?;
         Ok(Self {
             repository,
+            inventory_relative_root,
             state,
             artifacts,
         })
@@ -1326,7 +1343,7 @@ impl SkillEngine {
 
     pub fn inventory(&self) -> Result<Vec<SkillInventoryEntry>, SkillError> {
         let mut inventory = Vec::new();
-        let relative_root = ".agents/skills";
+        let relative_root = self.inventory_relative_root;
         let skills_root = self.repository.join(relative_root);
         if skills_root.exists() {
             for entry in fs::read_dir(&skills_root)? {

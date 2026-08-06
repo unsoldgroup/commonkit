@@ -13,7 +13,7 @@ describe("Orca worktree normalizer", () => {
     expect(sessions).toHaveLength(2);
     expect(sessions[0]).toEqual({
       machineId: "studio",
-      worktreeId: "commonkit::/Users/al/code/commonkit",
+      worktreeId: "commonkit::/Users/developer/code/commonkit",
       repo: "commonkit",
       project: "commonkit",
       agent: "codex",

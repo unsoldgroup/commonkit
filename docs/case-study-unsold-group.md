@@ -45,6 +45,10 @@ The kit also declares shell and Git configuration, project loadouts, user
 services, MCP services, and references to credentials. Secret values do not
 enter the portable configuration.
 
+By the installed 0.2.0 verification run later that month, the same target
+reported 59 available skills. The original 52-skill count remains below as the
+dated adoption baseline rather than being silently rewritten.
+
 These counts are a point-in-time inventory, not product limits. Their value is
 that CommonKit turns a large, lived-in setup into explicit desired state rather
 than a checklist somebody must remember.
@@ -105,9 +109,11 @@ macOS external-provider path remain outside the current managed surface.
 CommonKit reports those boundaries instead of silently claiming a complete
 clone of an arbitrary machine.
 
-The source inventory and current limitations are recorded in
-[the dogfood inventory](plans/dogfood-inventory.md). Platform support requires
-native validation evidence; macOS results never stand in for Linux or Windows.
+The public architecture and current limitations are recorded in
+[the v1 completion audit](V1-COMPLETION-AUDIT.md). The target-specific source
+inventory remains in Unsold.Group's private kit repository. Platform support
+requires native validation evidence; macOS results never stand in for Linux or
+Windows.
 
 ## What we learned
 

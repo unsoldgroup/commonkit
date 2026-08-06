@@ -2,7 +2,7 @@
 
 Status: Active scope; implementation checkpoint is not merge-ready  
 Tracking: USG-48, with CommonKit delivery coordinated under UNS-1274  
-Reference: branch `al-unsoldgroup/skillopt`, commit `fc7de87`  
+Reference: branch `example-user/skillopt`, commit `fc7de87`  
 Handoff: `.claude/handoffs/2026-07-18-162116-commonkit-v1-skillopt-integration.md`
 
 ## Boundary

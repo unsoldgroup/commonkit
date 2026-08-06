@@ -1,7 +1,7 @@
 {
   "name": "commonkit-workspace",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Portable, layered developer capabilities and policy across machines, projects, and coding agents",
   "type": "module",
   "packageManager": "pnpm@10.28.2",

@@ -7,11 +7,8 @@
   <key>ProgramArguments</key>
   <array>
     <string>@@BUN_BIN@@</string>
-    <string>run</string>
-    <string>apps/session-board/reporter/src/main.ts</string>
+    <string>@@RUNTIME_DIR@@/session-board-reporter.js</string>
   </array>
-  <key>WorkingDirectory</key>
-  <string>@@REPO_DIR@@</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>SESSION_BOARD_CONFIG</key>

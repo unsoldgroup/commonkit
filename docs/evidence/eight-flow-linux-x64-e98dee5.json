@@ -3,7 +3,7 @@
   "commit": "e98dee5620eb34025366128339f5a1dbaf0c66ea",
   "platform": "linux",
   "architecture": "x64",
-  "kernel": "Linux srv1833518 6.8.0-134-generic #134-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
+  "kernel": "Linux build-host 6.8.0-134-generic #134-Ubuntu SMP PREEMPT_DYNAMIC Fri Jun 26 18:43:11 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
   "nodeVersion": "v24.18.0",
   "result": "passed",
   "command": "scripts/installed-lifecycle.sh <isolated-scratch> <installed-bin>",

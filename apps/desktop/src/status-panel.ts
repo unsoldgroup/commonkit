@@ -23,7 +23,18 @@ export function statusPanel(
   management: ManagementSnapshot | null,
   settings: SettingsSnapshot | null,
 ): string {
-  const view = statusView(snapshot.status);
+  const baseView = statusView(snapshot.status);
+  const driftState = snapshot.panel?.channels.drift?.state;
+  const requiredStates = ["skills", "mcpServers", "devices"]
+    .map((id) => snapshot.panel?.channels[id]?.state)
+    .filter(Boolean);
+  const view = driftState === "unchecked"
+    ? { ...baseView, heading: "Environment unchecked", detail: "Run a drift check before CommonKit reports this target as healthy." }
+    : driftState === "stale" || requiredStates.includes("stale")
+      ? { ...baseView, heading: "Environment stale", detail: "The last drift observation is too old to report current health." }
+      : driftState === "unavailable" || requiredStates.includes("unavailable")
+        ? { ...baseView, heading: "Environment unavailable", detail: "One or more required observations are unavailable, so CommonKit cannot report this target as healthy." }
+        : baseView;
   const selected = targets.selected.filter((id) => targets.targets.some((target) => target.id === id));
   const station = selected.length === 1 ? selected[0]! : `${selected.length} stations selected`;
   const lastCheck = snapshot.status.lastDriftCheckUnixMs
@@ -46,7 +57,7 @@ export function statusPanel(
     <div class="placard"><h1>${escapeHtml(view.heading)}</h1><span>${escapeHtml(station)}</span></div>
     <p class="brief">${escapeHtml(view.detail)}</p>
     ${sixPackMarkup()}
-    <p class="hint" style="margin:10px 0 20px">Skills and agent sessions are unpowered: the local service does not publish those channels yet, so CommonKit shows no reading rather than a guess.</p>
+    <p class="hint" style="margin:10px 0 20px">Every instrument reports the daemon's observed state. Empty, unchecked, stale, and unavailable remain distinct.</p>
     <p class="sr-only" role="status" aria-live="polite">${escapeHtml(spoken)}</p>
     ${annunciatorMarkup(snapshot, management, true)}
     <div class="controls" style="margin:16px 0 0"><a class="engage" href="#plans" style="display:grid;place-items:center;text-decoration:none">Review changes</a></div>

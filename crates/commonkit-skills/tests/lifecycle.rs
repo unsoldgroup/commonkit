@@ -58,6 +58,27 @@ fn inventory_uses_only_repo_bundled_agents_skill_source() {
     fs::remove_dir_all(directory.path()).expect("cleanup");
 }
 
+#[test]
+fn plugin_inventory_uses_the_explicit_plugin_skill_root() {
+    let directory = TestDirectory::new();
+    let repository = directory.path().join("repository");
+    let state = directory.path().join("state");
+    fs::create_dir_all(repository.join("plugin/skills/review")).expect("plugin skill");
+    fs::write(
+        repository.join("plugin/skills/review/SKILL.md"),
+        "# Plugin skill\n",
+    )
+    .expect("skill");
+
+    let inventory = SkillEngine::open_plugin_repository(&repository, &state)
+        .expect("engine")
+        .inventory()
+        .expect("inventory");
+
+    assert_eq!(inventory.len(), 1);
+    assert_eq!(inventory[0].source_path.as_str(), "plugin/skills/review/SKILL.md");
+}
+
 impl Drop for TestDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);

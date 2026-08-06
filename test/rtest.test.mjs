@@ -42,6 +42,7 @@ test("rtest sends pnpm arguments as NUL-delimited stdin instead of shell text", 
       ...process.env,
       PATH: `${harness.bin}:/usr/bin:/bin`,
       RTEST_LOCK_ROOT: harness.directory,
+      RTEST_VPS: "developer@build.example.test",
     },
   });
 
@@ -63,6 +64,7 @@ test("rtest defaults to pnpm test and rejects non-pnpm commands", async () => {
       ...process.env,
       PATH: `${harness.bin}:/usr/bin:/bin`,
       RTEST_LOCK_ROOT: harness.directory,
+      RTEST_VPS: "developer@build.example.test",
     },
   };
 

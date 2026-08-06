@@ -6,7 +6,7 @@ import { readPanel } from "../src/readings.ts";
 
 const status = {
   apiVersion: "v1", contractVersion: "1.0", schemaVersion: 1, runtimeVersion: "0.1.0",
-  state: "healthy" as const, activeTarget: "al-macbook", activeLoadout: null,
+  state: "healthy" as const, activeTarget: "local-workstation", activeLoadout: null,
   lastDriftCheckUnixMs: null, lastDriftErrorCode: null,
 };
 const snapshot = {
@@ -14,8 +14,8 @@ const snapshot = {
   gitSync: { state: "clean" }, policy: { state: "ready", violations: [] },
 };
 const targets = {
-  selected: ["al-macbook"],
-  targets: [{ id: "al-macbook", identityDigest: "sha256:x", transport: { type: "local" as const } }],
+  selected: ["local-workstation"],
+  targets: [{ id: "local-workstation", identityDigest: "sha256:x", transport: { type: "local" as const } }],
 };
 
 test("the menu-bar panel carries the five instruments the owner asked for", () => {
@@ -61,4 +61,31 @@ test("an unanswered target inventory reads no signal rather than zero devices", 
   );
 
   assert.equal(readings.get("devices")?.readout, "NO SIGNAL");
+});
+
+test("panel instruments preserve daemon-owned empty, unchecked, and unavailable states", () => {
+  const daemonPanel = {
+    ...snapshot,
+    panel: {
+      contractVersion: "commonkit.panel/v1",
+      observedAtUnixMs: 100,
+      channels: {
+        skills: { state: "available", value: 12, source: "skillInventory", observedAtUnixMs: 100 },
+        mcpServers: { state: "empty", value: 0, source: "relayStatus", observedAtUnixMs: 100 },
+        changes: { state: "empty", value: 0, source: "planStore", observedAtUnixMs: 100 },
+        agentSessions: { state: "unavailable", source: "sessionBoardReporter", observedAtUnixMs: 100, reason: "session_source_unconfigured" },
+        drift: { state: "unchecked", source: "driftScheduler", observedAtUnixMs: 100, reason: "never_checked" },
+      },
+    },
+  } as const;
+
+  const readings = new Map(
+    readPanel(daemonPanel, null, targets, TRAY_PACK).map(([spec, reading]) => [spec.id, reading]),
+  );
+
+  assert.equal(readings.get("skills")?.readout, "12");
+  assert.equal(readings.get("servers")?.readout, "00");
+  assert.equal(readings.get("plan")?.readout, "NONE");
+  assert.equal(readings.get("agents")?.readout, "UNAVAILABLE");
+  assert.equal(readings.get("drift")?.readout, "UNCHECKED");
 });

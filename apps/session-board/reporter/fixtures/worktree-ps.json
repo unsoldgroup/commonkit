@@ -4,13 +4,13 @@
   "result": {
     "worktrees": [
       {
-        "worktreeId": "commonkit::/Users/al/code/commonkit",
+        "worktreeId": "commonkit::/Users/developer/code/commonkit",
         "worktreeInstanceId": "wt-1303",
         "repoId": "repo-commonkit",
         "projectId": "github:unsold/commonkit",
         "hostId": "host-studio",
         "repo": { "name": "commonkit" },
-        "path": "/Users/al/code/commonkit",
+        "path": "/Users/developer/code/commonkit",
         "branch": "uns-1303-session-board-reporter",
         "displayName": "Session Board reporter",
         "status": "permission",
