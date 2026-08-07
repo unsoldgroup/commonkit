@@ -9,6 +9,7 @@ The configuration has four independent sections:
 - `aboutMe` configures the encrypted owner profile database, its separately provisioned key reference, and the Loadout/project view exposed to agent tools. The database contains personal text and never enters Git. Agent tools can read the approved summary, search approved claims, submit direct-statement suggestions, and replace a conflicting claim only after explicit user clarification.
 
 - `sync` identifies the target root, adapter state, declared and protected portable roots, composed-loadout and policy bindings, and a provider artifact store. Production loadouts use `providerPipeline`: CommonKit fetches and validates the trusted Git remote and exact pinned revision, runs configured native/APM/chezmoi providers in isolated controller workspaces, validates the combined ownership map, and persists digest-addressed `MaterializedState` records before planning. `materializedStates` remains a migration path and is mutually exclusive with `providerPipeline`. Provider code never runs during apply, recovery, or rollback.
+- `sync.engram` enrols one opaque Engram chunk set with a portable project ID, owner principal, project root, chunk root, and `project` scope. Local targets require an explicit absolute, regular, non-symlink Engram executable. One target may declare `autoReconcile` with a configured peer and an interval of at least 60 seconds; the daemon serializes export, opaque chunk exchange, and import and writes a private movement receipt for every cycle. `syncTargets` declares additional local or SSH peers. Top-level `engramGrants` authorize cross-principal project transport; missing Grants, personal scope, invalid/missing Engram scope attestations, project mismatch, and chunk collisions fail closed. A withdrawn Grant stops future delivery but retains observations already imported.
 - `credentials` maps stable destination IDs to a credential reference and a relative path below a capability-rooted private directory. Requests name destination IDs only. Secret bytes are resolved during confirmed apply; verification uses the applied receipt and does not resolve the provider again. Values never enter configuration responses, plans, receipts, logs, or portable metadata. The production registry accepts `env://` and absolute `file://` references, `bws://` references when an explicit BWS executable is configured, and `keychain://service/account` references through the target platform's native integration (`/usr/bin/security` on macOS, `/usr/bin/secret-tool` on Linux, and the native Credential Manager API on Windows). Unknown schemes, unavailable executables or stores, malformed references, symlinks in file references, and provider failures fail closed before credential mutation.
 
 Relay reconciliation is a two-step review contract described by
@@ -82,8 +83,43 @@ Example shape (digests abbreviated here must be full valid `sha256:` values in r
     "caseSensitive": true,
     "targetIdentityDigest": "sha256:...",
     "composedLoadoutDigest": "sha256:...",
-    "policyDigest": "sha256:..."
+    "policyDigest": "sha256:...",
+    "engram": {
+      "projectId": "github.com/example/commonkit",
+      "ownerId": "github:alice",
+      "projectRoot": "repo",
+      "root": "repo/.engram",
+      "scope": "project",
+      "executable": "/usr/local/bin/engram",
+      "autoReconcile": {
+        "peerTargetId": "workstation-b",
+        "intervalSeconds": 60
+      }
+    }
   },
+  "syncTargets": [
+    {
+      "targetId": "workstation-b",
+      "targetRoot": "/home/alice",
+      "adapterState": "/var/lib/commonkit/workstation-b-filesystem",
+      "providerArtifacts": "/var/lib/commonkit/provider-artifacts",
+      "materializedStates": ["/var/lib/commonkit/workstation-b-state.json"],
+      "declaredRoots": ["repo"],
+      "protectedRoots": [],
+      "caseSensitive": true,
+      "targetIdentityDigest": "sha256:...",
+      "composedLoadoutDigest": "sha256:...",
+      "policyDigest": "sha256:...",
+      "engram": {
+        "projectId": "github.com/example/commonkit",
+        "ownerId": "github:alice",
+        "projectRoot": "repo",
+        "root": "repo/.engram",
+        "scope": "project",
+        "executable": "/usr/local/bin/engram"
+      }
+    }
+  ],
   "credentials": {
     "root": "/home/al/.local/share/commonkit/credentials",
     "destinations": [

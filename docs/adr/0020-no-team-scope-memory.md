@@ -1,5 +1,9 @@
 # Memory stays single-owner; team knowledge is Git-owned content
 
+Superseded by ADR 0022. This decision remains the history of the earlier
+blanket prohibition; ADR 0022 preserves single-writer live stores while allowing
+opaque, scope-gated Engram chunk transport.
+
 CommonKit's multiplayer model adds no shared memory. An **About Me Profile**
 remains one person's encrypted, single-writer store under ADR 0010, and there is
 no `team` **Scope** inside it and no second profile store beside it. What a team

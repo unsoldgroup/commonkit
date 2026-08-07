@@ -138,6 +138,17 @@ _Avoid_: Shared audit log, full prompt trace
 A target-local database holding indexed project content and session memory for one agent-context tool, at a path CommonKit declares, observed and snapshotted as mutable state and never carried in portable state.
 _Avoid_: Cache, index, knowledge base
 
+**Engram chunk set**:
+An opaque, append-only, content-addressed set exported from one target-local
+Engram store for a declared **Engram project identity**. CommonKit may inventory
+and carry compressed chunks but never inspect their payloads.
+_Avoid_: Shared database, memory snapshot
+
+**Engram project identity**:
+A portable, explicitly declared subject identifier shared by the same project
+on different targets and independent of repository basename.
+_Avoid_: Project directory name, database key
+
 **Organization membership**:
 The GitHub-backed association and role that authorizes a user to access an **Organization CommonKit** in version 1.
 _Avoid_: CommonKit account, repository collaborator
@@ -469,7 +480,10 @@ _Avoid_: Share, invite, copy
 - An **About Me Profile** is stored in a dedicated encrypted SQLite database with one writer; context-mode and Engram remain project-memory systems.
 - CommonKit owns a **Project memory store**'s declared path, directory, and environment, never its contents, schema, keys, or retention. An **About Me Profile** is owner memory and is encrypted by CommonKit; a **Project memory store** is project memory, is not encrypted by CommonKit, and holds no **Claims**.
 - A **Project memory store** is per-**Target** and is never **Scope**-shareable. Cross-machine movement is operator-initiated snapshot and restore, never reconciliation, and never a merge of stores belonging to different targets.
-- Memory is never shared across **Scopes**. There is no team **About Me Profile**; shared team knowledge is Git-owned reviewable content circulated by **Grant** (ADR 0020).
+- There is no team **About Me Profile**. Engram's live store remains
+  target-local, while project-scoped **Engram chunk sets** may circulate by
+  **Grant** only after Engram attests their scope; personal observations and
+  session summaries never cross a principal boundary (ADR 0022).
 - A **Scoped View** controls disclosure by Loadout and trusted project. Organization policy may narrow access but never broaden it.
 - Agents may create **Suggestions**, but only direct user edits or explicit contradiction clarifications create approved **Claims**.
 

@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, OpenOptions};
@@ -10,8 +12,15 @@ use thiserror::Error;
 
 use crate::NormalizedManagedPath;
 
+static ATOMIC_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
+
 /// Filesystem operations available to target adapters after a root capability is granted.
 pub trait TargetFilesystem {
+    fn list_directory(
+        &self,
+        path: &NormalizedManagedPath,
+    ) -> Result<Vec<String>, TargetFilesystemError>;
+
     fn read_file(
         &self,
         path: &NormalizedManagedPath,
@@ -24,6 +33,22 @@ pub trait TargetFilesystem {
     ) -> Result<(), TargetFilesystemError>;
 
     fn remove(&self, path: &NormalizedManagedPath) -> Result<(), TargetFilesystemError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngramTargetSyncMode {
+    Export,
+    Import,
+}
+
+pub trait EngramTargetRuntime {
+    fn sync_engram(
+        &self,
+        project_id: &crate::EngramProjectId,
+        project_path: &NormalizedManagedPath,
+        mode: EngramTargetSyncMode,
+    ) -> Result<(), TargetFilesystemError>;
 }
 
 pub struct LocalTargetFilesystem {
@@ -95,6 +120,36 @@ impl LocalTargetFilesystem {
 }
 
 impl TargetFilesystem for LocalTargetFilesystem {
+    fn list_directory(
+        &self,
+        path: &NormalizedManagedPath,
+    ) -> Result<Vec<String>, TargetFilesystemError> {
+        self.ensure_safe_ancestors(path, false)?;
+        let metadata = self.root.symlink_metadata(path.as_str())?;
+        if metadata.file_type().is_symlink() {
+            return Err(TargetFilesystemError::SymlinkEncountered(path.to_string()));
+        }
+        if !metadata.is_dir() {
+            return Err(TargetFilesystemError::NotDirectory(path.to_string()));
+        }
+        let directory = self.root.open_dir(path.as_str())?;
+        let mut entries = Vec::new();
+        for entry in directory.entries()? {
+            let entry = entry?;
+            let metadata = entry.file_type()?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| TargetFilesystemError::InvalidDirectoryEntry)?;
+            if metadata.is_symlink() || !metadata.is_file() {
+                return Err(TargetFilesystemError::InvalidDirectoryEntry);
+            }
+            entries.push(name);
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
     fn read_file(
         &self,
         path: &NormalizedManagedPath,
@@ -119,12 +174,34 @@ impl TargetFilesystem for LocalTargetFilesystem {
         }
         self.ensure_safe_ancestors(path, true)?;
         self.reject_symlink_leaf(path)?;
+        let destination = Path::new(path.as_str());
+        let file_name = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(TargetFilesystemError::InvalidDirectoryEntry)?;
+        let temporary_name = format!(
+            ".{file_name}.commonkit-{}-{}.tmp",
+            std::process::id(),
+            ATOMIC_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let temporary = destination
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(temporary_name);
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        let mut file = self.root.open_with(path.as_str(), &options)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-        Ok(())
+        options.write(true).create_new(true);
+        let result = (|| {
+            let mut file = self.root.open_with(&temporary, &options)?;
+            file.write_all(content)?;
+            file.sync_all()?;
+            drop(file);
+            self.root.rename(&temporary, &self.root, destination)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.root.remove_file(&temporary);
+        }
+        result
     }
 
     fn remove(&self, path: &NormalizedManagedPath) -> Result<(), TargetFilesystemError> {
@@ -144,6 +221,16 @@ impl TargetFilesystem for LocalTargetFilesystem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SshFilesystemRequest {
+    EngramSync {
+        root_id: StableId,
+        project_id: crate::EngramProjectId,
+        project_path: NormalizedManagedPath,
+        mode: EngramTargetSyncMode,
+    },
+    ListDirectory {
+        root_id: StableId,
+        path: NormalizedManagedPath,
+    },
     ReadFile {
         root_id: StableId,
         path: NormalizedManagedPath,
@@ -183,7 +270,13 @@ pub enum SshFilesystemResponse {
     File {
         content: Vec<u8>,
     },
+    Directory {
+        entries: Vec<String>,
+    },
     Applied,
+    EngramSynced {
+        mode: EngramTargetSyncMode,
+    },
     ArtifactStaged {
         digest: commonkit_contracts::Sha256Digest,
     },
@@ -214,6 +307,119 @@ impl<T: SshFilesystemTransport + ?Sized> SshFilesystemTransport for Box<T> {
     }
 }
 
+pub struct SshTargetFilesystem<T> {
+    root_id: StableId,
+    transport: Mutex<T>,
+}
+
+impl<T> SshTargetFilesystem<T> {
+    pub fn new(root_id: StableId, transport: T) -> Self {
+        Self {
+            root_id,
+            transport: Mutex::new(transport),
+        }
+    }
+
+    pub fn into_transport(self) -> Result<T, TargetFilesystemError> {
+        self.transport
+            .into_inner()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)
+    }
+}
+
+impl<T: SshFilesystemTransport + Send> TargetFilesystem for SshTargetFilesystem<T> {
+    fn list_directory(
+        &self,
+        path: &NormalizedManagedPath,
+    ) -> Result<Vec<String>, TargetFilesystemError> {
+        match self
+            .transport
+            .lock()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?
+            .perform(SshFilesystemRequest::ListDirectory {
+                root_id: self.root_id.clone(),
+                path: path.clone(),
+            })? {
+            SshFilesystemResponse::Directory { entries } => Ok(entries),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+
+    fn read_file(
+        &self,
+        path: &NormalizedManagedPath,
+    ) -> Result<Option<Vec<u8>>, TargetFilesystemError> {
+        match self
+            .transport
+            .lock()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?
+            .perform(SshFilesystemRequest::ReadFile {
+                root_id: self.root_id.clone(),
+                path: path.clone(),
+            })? {
+            SshFilesystemResponse::Absent => Ok(None),
+            SshFilesystemResponse::File { content } => Ok(Some(content)),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+
+    fn write_file(
+        &self,
+        path: &NormalizedManagedPath,
+        content: &[u8],
+    ) -> Result<(), TargetFilesystemError> {
+        match self
+            .transport
+            .lock()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?
+            .perform(SshFilesystemRequest::WriteFile {
+                root_id: self.root_id.clone(),
+                path: path.clone(),
+                content: content.to_vec(),
+            })? {
+            SshFilesystemResponse::Applied => Ok(()),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+
+    fn remove(&self, path: &NormalizedManagedPath) -> Result<(), TargetFilesystemError> {
+        match self
+            .transport
+            .lock()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?
+            .perform(SshFilesystemRequest::Remove {
+                root_id: self.root_id.clone(),
+                path: path.clone(),
+            })? {
+            SshFilesystemResponse::Applied => Ok(()),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+}
+
+impl<T: SshFilesystemTransport + Send> EngramTargetRuntime for SshTargetFilesystem<T> {
+    fn sync_engram(
+        &self,
+        project_id: &crate::EngramProjectId,
+        project_path: &NormalizedManagedPath,
+        mode: EngramTargetSyncMode,
+    ) -> Result<(), TargetFilesystemError> {
+        match self
+            .transport
+            .lock()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?
+            .perform(SshFilesystemRequest::EngramSync {
+                root_id: self.root_id.clone(),
+                project_id: project_id.clone(),
+                project_path: project_path.clone(),
+                mode,
+            })? {
+            SshFilesystemResponse::EngramSynced { mode: observed } if observed == mode => Ok(()),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum TargetFilesystemError {
     #[error("target capability root must be an absolute, real directory")]
@@ -226,6 +432,8 @@ pub enum TargetFilesystemError {
     NotDirectory(String),
     #[error("managed target path is not a regular file: {0}")]
     NotFile(String),
+    #[error("managed target directory contains an unsafe entry")]
+    InvalidDirectoryEntry,
     #[error("invalid SSH target configuration: {0}")]
     InvalidSshConfig(&'static str),
     #[error("remote host key does not match the configured fingerprint")]
@@ -242,6 +450,12 @@ pub enum TargetFilesystemError {
     UnknownRoot(StableId),
     #[error("remote artifact validation failed")]
     RemoteArtifact,
+    #[error("remote Engram export or import failed")]
+    EngramCommandFailed,
+    #[error("remote Engram executable is not configured")]
+    EngramExecutableUnavailable,
+    #[error("remote Engram executable must be an absolute, real file")]
+    InvalidEngramExecutable,
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

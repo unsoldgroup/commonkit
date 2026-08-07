@@ -13,7 +13,9 @@ only the versioned JSON protocol on standard input; it does not expose a command
    that account. Do not grant sudo, setuid, or a login shell to the helper.
 4. Create `~/.config/commonkit/target-helper.json` on the target with mode `0600`. Its
    `stateRoot` and every declared root must be absolute, pre-created directories; grant only the
-   required `read_only` or `read_write` access.
+   required `read_only` or `read_write` access. If this target participates in Engram chunk sync,
+   set `engramExecutable` to an absolute, regular, non-symlink executable. The helper uses that
+   fixed path only for typed export/import requests and never accepts a caller-supplied command.
 5. Test the exact deployment using `commonkit targets verify <target>`. CommonKit invokes only
    `commonkit-target-helper --stdio-v1`, sends typed requests on stdin, pins the configured
    host-and-port key, and fails closed on missing or ambiguous pins.
@@ -23,6 +25,7 @@ Example configuration (paths are target-local):
 ```json
 {
   "stateRoot": "/home/al/.local/state/commonkit/target-helper",
+  "engramExecutable": "/home/al/.local/bin/engram",
   "roots": [
     { "id": "home", "path": "/home/al", "access": "read_write" }
   ]
@@ -32,4 +35,3 @@ Example configuration (paths are target-local):
 The helper must be upgraded atomically with the controlling CommonKit release. Retain the prior
 verified binary until the first post-upgrade target verification succeeds so rollback does not
 depend on the network.
-

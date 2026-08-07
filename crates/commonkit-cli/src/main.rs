@@ -4,6 +4,10 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use commonkit_adapters::{
+    EngramChunkAdapter, EngramChunkSetDeclaration, EngramOwnerId, EngramProjectId, EngramScope,
+    ProcessEngramCommandRunner,
+};
 use commonkit_cli::about_me_setup::{SetupAnswers, SetupRequest, setup_profile};
 use commonkit_config::{LayerSet, compose_layers, v1_merge_rules};
 use commonkit_contracts::{
@@ -131,10 +135,71 @@ enum Command {
         #[command(subcommand)]
         command: ContextCommand,
     },
+    /// Inspect and reconcile project-scoped Engram chunk sets.
+    Engram {
+        #[command(subcommand)]
+        command: EngramCommand,
+    },
     /// Read and contribute to the encrypted owner profile.
     AboutMe {
         #[command(subcommand)]
         command: AboutMeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum EngramCommand {
+    /// Inspect the Engram resource declared in the running CommonKit service.
+    ManagedStatus,
+    /// Reconcile this target's declared Engram resource with a configured peer.
+    Reconcile {
+        #[arg(long)]
+        peer_target_id: String,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    /// Inventory one declared project chunk set without reading chunk payloads.
+    Status {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        owner_id: String,
+        #[arg(long)]
+        root: PathBuf,
+    },
+    /// Export, exchange, and import chunks between two targets owned by one principal.
+    Sync {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        owner_id: String,
+        #[arg(long)]
+        left: PathBuf,
+        #[arg(long)]
+        right: PathBuf,
+        #[arg(long, default_value = "engram")]
+        engram_bin: PathBuf,
+        #[arg(long)]
+        confirmed: bool,
+    },
+    /// Reconcile repeatedly on a minimum one-minute cadence.
+    Watch {
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        owner_id: String,
+        #[arg(long)]
+        left: PathBuf,
+        #[arg(long)]
+        right: PathBuf,
+        #[arg(long, default_value = "engram")]
+        engram_bin: PathBuf,
+        #[arg(long, default_value_t = 60)]
+        interval_seconds: u64,
+        #[arg(long, hide = true, default_value_t = 0)]
+        cycles: u64,
+        #[arg(long)]
+        confirmed: bool,
     },
 }
 
@@ -756,6 +821,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 }))?
             );
         }
+        Command::Engram { command } => run_engram(command)?,
         Command::Principal => {
             print_daemon(daemon_control("GET", "/control/v1/principal", None, None)?)?
         }
@@ -944,6 +1010,139 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::AboutMe { command } => run_about_me(command)?,
     }
     Ok(())
+}
+
+fn run_engram(command: EngramCommand) -> Result<(), Box<dyn Error>> {
+    match command {
+        EngramCommand::ManagedStatus => {
+            print_daemon(daemon_control("GET", "/control/v1/engram", None, None)?)?
+        }
+        EngramCommand::Reconcile {
+            confirmed: false, ..
+        } => {
+            return Err("confirmation_required: pass --confirmed after reviewing the declared Engram peer target".into());
+        }
+        EngramCommand::Reconcile {
+            peer_target_id,
+            confirmed: true,
+        } => print_daemon(daemon_control(
+            "POST",
+            "/control/v1/engram/reconcile",
+            Some(json!({
+                "confirmed": true,
+                "confirmationId": nonce("engram-reconcile"),
+                "peerTargetId": StableId::parse(peer_target_id)?
+            })),
+            Some(nonce("engram-reconcile")),
+        )?)?,
+        EngramCommand::Status {
+            project_id,
+            owner_id,
+            root,
+        } => {
+            let declaration = engram_declaration(project_id, owner_id, root)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&EngramChunkAdapter::status(&declaration)?)?
+            );
+        }
+        EngramCommand::Sync {
+            confirmed: false, ..
+        } => {
+            return Err(
+                "confirmation_required: pass --confirmed after reviewing both Engram chunk roots"
+                    .into(),
+            );
+        }
+        EngramCommand::Sync {
+            project_id,
+            owner_id,
+            left,
+            right,
+            engram_bin,
+            confirmed: true,
+        } => {
+            let project_id = EngramProjectId::try_from(project_id)?;
+            let owner_id = EngramOwnerId::try_from(owner_id)?;
+            let left = EngramChunkSetDeclaration {
+                project_id: project_id.clone(),
+                owner_id: owner_id.clone(),
+                root: left,
+                scope: EngramScope::Project,
+            };
+            let right = EngramChunkSetDeclaration {
+                project_id,
+                owner_id,
+                root: right,
+                scope: EngramScope::Project,
+            };
+            let runner = ProcessEngramCommandRunner::from_path(engram_bin);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&EngramChunkAdapter::reconcile_installed(
+                    &runner, &left, &right,
+                )?)?
+            );
+        }
+        EngramCommand::Watch {
+            confirmed: false, ..
+        } => {
+            return Err("confirmation_required: pass --confirmed after reviewing both Engram chunk roots and cadence".into());
+        }
+        EngramCommand::Watch {
+            project_id,
+            owner_id,
+            left,
+            right,
+            engram_bin,
+            interval_seconds,
+            cycles,
+            confirmed: true,
+        } => {
+            if interval_seconds < 60 {
+                return Err("Engram watch interval must be at least 60 seconds".into());
+            }
+            let project_id = EngramProjectId::try_from(project_id)?;
+            let owner_id = EngramOwnerId::try_from(owner_id)?;
+            let left = EngramChunkSetDeclaration {
+                project_id: project_id.clone(),
+                owner_id: owner_id.clone(),
+                root: left,
+                scope: EngramScope::Project,
+            };
+            let right = EngramChunkSetDeclaration {
+                project_id,
+                owner_id,
+                root: right,
+                scope: EngramScope::Project,
+            };
+            let runner = ProcessEngramCommandRunner::from_path(engram_bin);
+            let mut completed = 0_u64;
+            loop {
+                let receipt = EngramChunkAdapter::reconcile_installed(&runner, &left, &right)?;
+                println!("{}", serde_json::to_string(&receipt)?);
+                completed += 1;
+                if cycles != 0 && completed >= cycles {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(interval_seconds));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn engram_declaration(
+    project_id: String,
+    owner_id: String,
+    root: PathBuf,
+) -> Result<EngramChunkSetDeclaration, Box<dyn Error>> {
+    Ok(EngramChunkSetDeclaration {
+        project_id: EngramProjectId::try_from(project_id)?,
+        owner_id: EngramOwnerId::try_from(owner_id)?,
+        root,
+        scope: EngramScope::Project,
+    })
 }
 
 fn run_context(command: ContextCommand) -> Result<(), Box<dyn Error>> {

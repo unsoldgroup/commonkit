@@ -14,6 +14,7 @@ use tower::ServiceExt;
 struct Remote {
     files: BTreeMap<String, Vec<u8>>,
     staged: BTreeMap<Sha256Digest, Vec<u8>>,
+    engram_syncs: Vec<EngramTargetSyncMode>,
 }
 #[derive(Clone, Default)]
 struct Memory(Arc<Mutex<Remote>>);
@@ -24,6 +25,22 @@ impl SshFilesystemTransport for Memory {
     ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
         let mut remote = self.0.lock().unwrap();
         match request {
+            SshFilesystemRequest::ListDirectory { path, .. } => {
+                let prefix = format!("{}/", path.as_str());
+                let mut entries = remote
+                    .files
+                    .keys()
+                    .filter_map(|candidate| candidate.strip_prefix(&prefix))
+                    .filter(|candidate| !candidate.contains('/'))
+                    .map(String::from)
+                    .collect::<Vec<_>>();
+                entries.sort();
+                Ok(SshFilesystemResponse::Directory { entries })
+            }
+            SshFilesystemRequest::EngramSync { mode, .. } => {
+                remote.engram_syncs.push(mode);
+                Ok(SshFilesystemResponse::EngramSynced { mode })
+            }
             SshFilesystemRequest::ReadFile { path, .. } => Ok(remote
                 .files
                 .get(path.as_str())
@@ -76,6 +93,120 @@ fn digest(value: &str) -> Sha256Digest {
 }
 fn write_json(path: &std::path::Path, value: &impl serde::Serialize) {
     std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+}
+
+fn engram_manifest(id: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({"version":1,"chunks":[{
+        "id":id,"created_by":"test","created_at":"2026-08-06T00:00:00Z",
+        "sessions":0,"memories":1,"prompts":0
+    }]}))
+    .unwrap()
+}
+
+#[test]
+fn periodic_engram_reconcile_carries_chunks_between_local_and_ssh_targets() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let local_target = root.join("local-target");
+    std::fs::create_dir_all(local_target.join("repo/.engram/chunks")).unwrap();
+    std::fs::write(
+        local_target.join("repo/.engram/manifest.json"),
+        engram_manifest("11111111"),
+    )
+    .unwrap();
+    std::fs::write(
+        local_target.join("repo/.engram/chunks/11111111.jsonl.gz"),
+        b"local",
+    )
+    .unwrap();
+    let remote = Memory::default();
+    {
+        let mut state = remote.0.lock().unwrap();
+        state.files.insert(
+            "repo/.engram/manifest.json".to_owned(),
+            engram_manifest("22222222"),
+        );
+        state.files.insert(
+            "repo/.engram/chunks/22222222.jsonl.gz".to_owned(),
+            b"remote".to_vec(),
+        );
+    }
+    let artifacts_path = root.join("artifacts");
+    let _artifacts = ArtifactStore::open(&artifacts_path).unwrap();
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "native.v1".into(),
+        BTreeMap::from([("git".into(), digest("revision"))]),
+        vec!["files".into()],
+    )
+    .unwrap();
+    let materialized = MaterializedState::finalize(inputs, vec![], vec![], vec![]).unwrap();
+    let state_path = root.join("state.json");
+    write_json(&state_path, &materialized);
+    std::fs::write(root.join("known_hosts"), "fixture").unwrap();
+    std::fs::create_dir_all(root.join("remote-controller-root")).unwrap();
+    let common = |id: &str, target: &std::path::Path, adapter: &str| {
+        serde_json::json!({
+            "targetId":id,"targetRoot":target,"adapterState":root.join(adapter),
+            "providerArtifacts":artifacts_path,"materializedStates":[state_path],
+            "declaredRoots":["repo"],"protectedRoots":[],"caseSensitive":true,
+            "targetIdentityDigest":digest(id),"composedLoadoutDigest":digest("loadout"),
+            "policyDigest":digest("policy")
+        })
+    };
+    let mut local = common("local", &local_target, "local-adapter");
+    local["engram"] = serde_json::json!({
+        "projectId":"github.com/unsoldgroup/commonkit","ownerId":"github:astemarie",
+        "projectRoot":"repo","root":"repo/.engram","scope":"project",
+        "executable":"/usr/bin/true",
+        "autoReconcile":{"peerTargetId":"remote","intervalSeconds":60}
+    });
+    let mut ssh = common(
+        "remote",
+        &root.join("remote-controller-root"),
+        "remote-adapter",
+    );
+    ssh["targetTransport"] = serde_json::json!({
+        "type":"ssh","rootId":"home-root","host":"fixture","user":"al","port":22,
+        "knownHosts":root.join("known_hosts"),"fingerprint":"SHA256:fixturefixturefixture"
+    });
+    ssh["targetPlatform"] = serde_json::json!({"operatingSystem":"linux","architecture":"x86_64"});
+    ssh["engram"] = serde_json::json!({
+        "projectId":"github.com/unsoldgroup/commonkit","ownerId":"github:astemarie",
+        "projectRoot":"repo","root":"repo/.engram","scope":"project"
+    });
+    let config_path = root.join("headless-engram-ssh.json");
+    write_json(
+        &config_path,
+        &serde_json::json!({"sync":local,"syncTargets":[ssh]}),
+    );
+    let registry = ProductionDomainRegistry::load_with_ssh_factory(
+        &config_path,
+        Arc::new(PlanStore::open(root.join("plans-engram")).unwrap()),
+        root.join("receipts-engram"),
+        Arc::new(Factory(remote.clone())),
+    )
+    .unwrap();
+
+    let receipt = registry.reconcile_engram_periodic_once().unwrap().unwrap();
+
+    assert_eq!(receipt["importsCompleted"], true);
+    assert!(
+        local_target
+            .join("repo/.engram/chunks/22222222.jsonl.gz")
+            .is_file()
+    );
+    let state = remote.0.lock().unwrap();
+    assert!(
+        state
+            .files
+            .contains_key("repo/.engram/chunks/11111111.jsonl.gz")
+    );
+    assert_eq!(
+        state.engram_syncs,
+        vec![EngramTargetSyncMode::Export, EngramTargetSyncMode::Import]
+    );
 }
 
 async fn call(

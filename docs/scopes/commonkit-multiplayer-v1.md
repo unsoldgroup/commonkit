@@ -30,7 +30,7 @@ flow inherits the answer.
 | 5 | A granted skill costs the recipient router text against a budget they did not choose | the grantee's Loadout pays; a grant over budget stays unresolved and is reported, never silently admitted | resolved |
 | 6 | A Job submitted in a shared scope must not exceed the least-privileged participant | two-principal intersection, submitter and target owner, recorded in the receipt as **Isolation level** is (ADR 0018) | resolved |
 | 7 | Bea submits a Declared task to an Execution Target Al owns | placement needs a grant edge; a credential-requiring **Declared task** does not place off-owner at all (ADR 0019) | resolved |
-| 8 | About Me Profile is single-owner, encrypted, one writer; multiplayer wants team-scope claims | no shared memory; team knowledge is Git-owned reviewable content (ADR 0020) | resolved |
+| 8 | About Me Profile is single-owner, encrypted, one writer; multiplayer wants team knowledge | About Me remains private; opaque Engram chunks may cross principals only with project-scope attestation and prospective revocation (ADR 0022) | resolved |
 | 9 | CommonKit has no principal concept at all | a **Principal** is a GitHub login brokered by the installed `gh`, resolved identically on every surface (ADR 0021) | resolved |
 | 10 | The Session Board shows every machine but decides nothing (ADR 0008) | team-wide visibility, verbs bound to the session's owner, so no one writes an "Always" rule into another's project | resolved |
 | 11 | Secrets are non-portable and provisioned per-target; a shared scope has no credential story | refused for v1: no shared credentials; follows from ADR 0019 | resolved |

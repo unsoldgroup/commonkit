@@ -32,6 +32,42 @@ fn local_filesystem_is_confined_to_one_declared_capability_root() {
         fs::read(root.join("config/tool/settings.json")).unwrap(),
         b"{}\n"
     );
+    assert_eq!(
+        target
+            .list_directory(&NormalizedManagedPath::parse("config/tool").unwrap())
+            .unwrap(),
+        vec!["settings.json".to_owned()]
+    );
+
+    drop(target);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn local_filesystem_replaces_existing_files_atomically() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = temp("atomic-write");
+    fs::create_dir_all(&root).unwrap();
+    let target = LocalTargetFilesystem::open(&root, RootAccess::ReadWrite).unwrap();
+    let path = NormalizedManagedPath::parse("state/manifest.json").unwrap();
+
+    target.write_file(&path, b"old").unwrap();
+    let previous_inode = fs::metadata(root.join("state/manifest.json"))
+        .unwrap()
+        .ino();
+    target.write_file(&path, b"new").unwrap();
+
+    assert_eq!(fs::read(root.join("state/manifest.json")).unwrap(), b"new");
+    assert_ne!(
+        fs::metadata(root.join("state/manifest.json"))
+            .unwrap()
+            .ino(),
+        previous_inode,
+        "atomic replacement must rename a new file over the old inode"
+    );
+    assert_eq!(fs::read_dir(root.join("state")).unwrap().count(), 1);
 
     drop(target);
     fs::remove_dir_all(root).unwrap();
@@ -103,6 +139,20 @@ fn ssh_boundary_exposes_typed_filesystem_requests() {
     let request = SshFilesystemRequest::ReadFile {
         root_id: commonkit_core::StableId::parse("home").unwrap(),
         path: NormalizedManagedPath::parse("config/tool").unwrap(),
+    };
+    assert_eq!(
+        ssh.perform(request.clone()).unwrap(),
+        SshFilesystemResponse::Absent
+    );
+    assert_eq!(ssh.requests, vec![request]);
+}
+
+#[test]
+fn ssh_boundary_exposes_typed_directory_inventory_requests() {
+    let mut ssh = FakeSsh::default();
+    let request = SshFilesystemRequest::ListDirectory {
+        root_id: commonkit_core::StableId::parse("home").unwrap(),
+        path: NormalizedManagedPath::parse("repo/.engram/chunks").unwrap(),
     };
     assert_eq!(
         ssh.perform(request.clone()).unwrap(),
