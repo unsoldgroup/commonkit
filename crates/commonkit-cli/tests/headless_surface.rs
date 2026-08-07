@@ -96,6 +96,27 @@ fn snapshot_and_drift_schedule_mutations_require_explicit_consent() {
 }
 
 #[test]
+fn managed_engram_status_uses_the_daemon_and_reconcile_requires_explicit_consent() {
+    let status = command(&["engram", "managed-status"]);
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("daemon_unavailable"));
+
+    let denied = command(&["engram", "reconcile", "--peer-target-id", "workstation-b"]);
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("confirmation_required"));
+
+    let confirmed = command(&[
+        "engram",
+        "reconcile",
+        "--peer-target-id",
+        "workstation-b",
+        "--confirmed",
+    ]);
+    assert!(!confirmed.status.success());
+    assert!(String::from_utf8_lossy(&confirmed.stderr).contains("daemon_unavailable"));
+}
+
+#[test]
 fn skill_canary_mutations_require_operator_confirmation_before_daemon_contact() {
     for arguments in [
         vec![

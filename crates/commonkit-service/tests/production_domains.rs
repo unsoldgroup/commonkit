@@ -14,6 +14,7 @@ use commonkit_snapshots::{
     AuthorityStore, DatabaseId, PortableAuthorityStore, ProcessGitAuthorityPublisher,
     PromotionPlan, PublisherFailpoint, SnapshotError, XChaCha20Cipher,
 };
+use sha2::{Digest, Sha256};
 
 struct UnexpectedExecutor;
 
@@ -390,6 +391,392 @@ fn write_json(path: &std::path::Path, value: &impl serde::Serialize) {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
 
+fn write_engram_chunks(root: &std::path::Path, chunks: &[(&str, &[u8])]) {
+    std::fs::create_dir_all(root.join("chunks")).unwrap();
+    write_json(
+        &root.join("manifest.json"),
+        &serde_json::json!({
+            "version": 1,
+            "chunks": chunks.iter().map(|(id, _)| serde_json::json!({
+                "id": id, "created_by": "test", "created_at": "2026-08-06T00:00:00Z",
+                "sessions": 0, "memories": 1, "prompts": 0
+            })).collect::<Vec<_>>()
+        }),
+    );
+    for (id, bytes) in chunks {
+        std::fs::write(root.join("chunks").join(format!("{id}.jsonl.gz")), bytes).unwrap();
+    }
+}
+
+fn write_engram_project_attestation(root: &std::path::Path, chunks: &[(&str, &[u8])]) {
+    let manifest = std::fs::read(root.join("manifest.json")).unwrap();
+    write_json(
+        &root.join("scope-attestation.json"),
+        &serde_json::json!({
+            "schema": "engram.scope-export.v1",
+            "exporterVersion": "1.17.0",
+            "projectId": "github.com/unsoldgroup/commonkit",
+            "scope": "project",
+            "manifestDigest": format!("sha256:{:x}", Sha256::digest(&manifest)),
+            "chunks": chunks.iter().map(|(id, bytes)| serde_json::json!({
+                "id": id,
+                "digest": format!("sha256:{:x}", Sha256::digest(bytes)),
+                "bytes": bytes.len()
+            })).collect::<Vec<_>>()
+        }),
+    );
+}
+
+#[test]
+fn production_engram_reconcile_exchanges_declared_targets_and_persists_a_receipt() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let left_target = root.join("left-target");
+    let right_target = root.join("right-target");
+    write_engram_chunks(&left_target.join("repo/.engram"), &[("11111111", b"left")]);
+    write_engram_chunks(
+        &right_target.join("repo/.engram"),
+        &[("22222222", b"right")],
+    );
+    let artifacts = root.join("artifacts");
+    ArtifactStore::open(&artifacts).unwrap();
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "1".to_owned(),
+        BTreeMap::from([(
+            "manifest".to_owned(),
+            digest_domain_json("test", &"engram-provider").unwrap(),
+        )]),
+        vec!["files".to_owned()],
+    )
+    .unwrap();
+    let materialized = MaterializedState::finalize(inputs, vec![], vec![], vec![]).unwrap();
+    let materialized_path = root.join("materialized.json");
+    write_json(&materialized_path, &materialized);
+    #[cfg(windows)]
+    let engram_executable =
+        std::path::PathBuf::from(std::env::var("WINDIR").unwrap()).join("System32/cmd.exe");
+    #[cfg(not(windows))]
+    let engram_executable = std::path::PathBuf::from("/usr/bin/true");
+    let sync_config = |id: &str, target: &std::path::Path, adapter: &str| {
+        serde_json::json!({
+            "targetId": id,
+            "targetRoot": target,
+            "adapterState": root.join(adapter),
+            "providerArtifacts": artifacts,
+            "materializedStates": [materialized_path],
+            "declaredRoots": ["repo"],
+            "protectedRoots": [],
+            "caseSensitive": true,
+            "targetIdentityDigest": digest_domain_json("test", &id).unwrap(),
+            "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
+            "policyDigest": digest_domain_json("test", &"policy").unwrap(),
+            "engram": {
+                "projectId": "github.com/unsoldgroup/commonkit",
+                "ownerId": "github:astemarie",
+                "projectRoot": "repo",
+                "root": "repo/.engram",
+                "scope": "project",
+                "executable": engram_executable,
+                "autoReconcile": if id == "left" {
+                    serde_json::json!({"peerTargetId": "right", "intervalSeconds": 60})
+                } else {
+                    serde_json::Value::Null
+                }
+            }
+        })
+    };
+    let config_path = root.join("headless-engram.json");
+    write_json(
+        &config_path,
+        &serde_json::json!({
+            "sync": sync_config("left", &left_target, "left-adapter"),
+            "syncTargets": [sync_config("right", &right_target, "right-adapter")]
+        }),
+    );
+    let receipt_root = root.join("receipts");
+    let registry = ProductionDomainRegistry::load(
+        &config_path,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        receipt_root.clone(),
+    )
+    .unwrap();
+    assert_eq!(registry.engram_periodic_interval_seconds(), Some(60));
+
+    let receipt = registry.reconcile_engram_periodic_once().unwrap();
+    let receipt = receipt.unwrap();
+
+    assert_eq!(receipt["importsCompleted"], true);
+    assert_eq!(
+        receipt["reconciliation"]["moved"].as_array().unwrap().len(),
+        2
+    );
+    assert!(
+        left_target
+            .join("repo/.engram/chunks/22222222.jsonl.gz")
+            .is_file()
+    );
+    assert!(
+        right_target
+            .join("repo/.engram/chunks/11111111.jsonl.gz")
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_dir(receipt_root.join("engram"))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn production_engram_team_reconcile_fails_closed_without_a_grant_and_withdrawal_is_a_no_op() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let left_target = root.join("left-target");
+    let right_target = root.join("right-target");
+    write_engram_chunks(&left_target.join("repo/.engram"), &[("11111111", b"left")]);
+    write_engram_chunks(
+        &right_target.join("repo/.engram"),
+        &[("22222222", b"right")],
+    );
+    let artifacts = root.join("artifacts");
+    ArtifactStore::open(&artifacts).unwrap();
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "1".to_owned(),
+        BTreeMap::from([(
+            "manifest".to_owned(),
+            digest_domain_json("test", &"engram-team-provider").unwrap(),
+        )]),
+        vec!["files".to_owned()],
+    )
+    .unwrap();
+    let materialized = MaterializedState::finalize(inputs, vec![], vec![], vec![]).unwrap();
+    let materialized_path = root.join("materialized.json");
+    write_json(&materialized_path, &materialized);
+    #[cfg(windows)]
+    let engram_executable =
+        std::path::PathBuf::from(std::env::var("WINDIR").unwrap()).join("System32/cmd.exe");
+    #[cfg(not(windows))]
+    let engram_executable = std::path::PathBuf::from("/usr/bin/true");
+    let sync_config = |id: &str, owner: &str, target: &std::path::Path, adapter: &str| {
+        serde_json::json!({
+            "targetId": id,
+            "targetRoot": target,
+            "adapterState": root.join(adapter),
+            "providerArtifacts": artifacts,
+            "materializedStates": [materialized_path],
+            "declaredRoots": ["repo"],
+            "protectedRoots": [],
+            "caseSensitive": true,
+            "targetIdentityDigest": digest_domain_json("test", &id).unwrap(),
+            "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
+            "policyDigest": digest_domain_json("test", &"policy").unwrap(),
+            "engram": {
+                "projectId": "github.com/unsoldgroup/commonkit",
+                "ownerId": owner,
+                "projectRoot": "repo",
+                "root": "repo/.engram",
+                "scope": "project",
+                "executable": engram_executable
+            }
+        })
+    };
+    let left = sync_config("left", "github:alice", &left_target, "left-adapter");
+    let right = sync_config("right", "github:bob", &right_target, "right-adapter");
+    let request = serde_json::json!({
+        "confirmed": true,
+        "confirmationId": "team-reconcile",
+        "peerTargetId": "right"
+    });
+    let config_path = root.join("headless-engram-team.json");
+    let mut left_without_executable = left.clone();
+    left_without_executable["engram"]
+        .as_object_mut()
+        .unwrap()
+        .remove("executable");
+    write_json(
+        &config_path,
+        &serde_json::json!({"sync": left_without_executable, "syncTargets": [right.clone()]}),
+    );
+    assert!(
+        ProductionDomainRegistry::load(
+            &config_path,
+            std::sync::Arc::new(PlanStore::open(root.join("plans-missing-executable")).unwrap()),
+            root.join("receipts-missing-executable"),
+        )
+        .is_err()
+    );
+    write_json(
+        &config_path,
+        &serde_json::json!({"sync": left, "syncTargets": [right]}),
+    );
+    let receipt_root = root.join("receipts");
+    let registry = ProductionDomainRegistry::load(
+        &config_path,
+        std::sync::Arc::new(PlanStore::open(root.join("plans-missing")).unwrap()),
+        receipt_root.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        registry.sync.unwrap().engram_reconcile(request.clone()),
+        Err(commonkit_service::DomainFailure::OperationFailed)
+    );
+    assert!(
+        !left_target
+            .join("repo/.engram/chunks/22222222.jsonl.gz")
+            .exists()
+    );
+    assert!(
+        !right_target
+            .join("repo/.engram/chunks/11111111.jsonl.gz")
+            .exists()
+    );
+    assert!(!receipt_root.join("engram").exists());
+
+    write_json(
+        &config_path,
+        &serde_json::json!({
+            "sync": sync_config("left", "github:alice", &left_target, "left-adapter"),
+            "syncTargets": [sync_config("right", "github:bob", &right_target, "right-adapter")],
+            "engramGrants": [{
+                "id": "team-grant",
+                "projectId": "github.com/unsoldgroup/commonkit",
+                "grantor": "github:alice",
+                "grantee": "github:bob",
+                "state": "withdrawn"
+            }]
+        }),
+    );
+    let registry = ProductionDomainRegistry::load(
+        &config_path,
+        std::sync::Arc::new(PlanStore::open(root.join("plans-withdrawn")).unwrap()),
+        receipt_root.clone(),
+    )
+    .unwrap();
+
+    let receipt = registry.sync.unwrap().engram_reconcile(request).unwrap();
+    assert_eq!(receipt["importsCompleted"], false);
+    assert_eq!(
+        receipt["reconciliation"]["unresolved"],
+        "grant withdrawn; previously materialized observations are retained"
+    );
+    assert!(
+        receipt["reconciliation"]["moved"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !left_target
+            .join("repo/.engram/chunks/22222222.jsonl.gz")
+            .exists()
+    );
+    assert!(
+        !right_target
+            .join("repo/.engram/chunks/11111111.jsonl.gz")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read_dir(receipt_root.join("engram"))
+            .unwrap()
+            .count(),
+        1
+    );
+
+    write_engram_project_attestation(&left_target.join("repo/.engram"), &[("11111111", b"left")]);
+    write_engram_project_attestation(
+        &right_target.join("repo/.engram"),
+        &[("22222222", b"right")],
+    );
+    write_json(
+        &config_path,
+        &serde_json::json!({
+            "sync": sync_config("left", "github:alice", &left_target, "left-adapter"),
+            "syncTargets": [sync_config("right", "github:bob", &right_target, "right-adapter")],
+            "engramGrants": [
+                {
+                    "id": "team-grant-active",
+                    "projectId": "github.com/unsoldgroup/commonkit",
+                    "grantor": "github:alice",
+                    "grantee": "github:bob",
+                    "state": "active"
+                },
+                {
+                    "id": "team-grant-withdrawn",
+                    "projectId": "github.com/unsoldgroup/commonkit",
+                    "grantor": "github:bob",
+                    "grantee": "github:alice",
+                    "state": "withdrawn"
+                }
+            ]
+        }),
+    );
+    assert!(
+        ProductionDomainRegistry::load(
+            &config_path,
+            std::sync::Arc::new(PlanStore::open(root.join("plans-conflicting-grants")).unwrap()),
+            root.join("receipts-conflicting-grants"),
+        )
+        .is_err()
+    );
+    write_json(
+        &config_path,
+        &serde_json::json!({
+            "sync": sync_config("left", "github:alice", &left_target, "left-adapter"),
+            "syncTargets": [sync_config("right", "github:bob", &right_target, "right-adapter")],
+            "engramGrants": [{
+                "id": "team-grant",
+                "projectId": "github.com/unsoldgroup/commonkit",
+                "grantor": "github:alice",
+                "grantee": "github:bob",
+                "state": "active"
+            }]
+        }),
+    );
+    let registry = ProductionDomainRegistry::load(
+        &config_path,
+        std::sync::Arc::new(PlanStore::open(root.join("plans-active")).unwrap()),
+        receipt_root.clone(),
+    )
+    .unwrap();
+
+    let receipt = registry
+        .sync
+        .unwrap()
+        .engram_reconcile(serde_json::json!({
+            "confirmed": true,
+            "confirmationId": "team-reconcile-active",
+            "peerTargetId": "right"
+        }))
+        .unwrap();
+    assert_eq!(receipt["importsCompleted"], true);
+    assert_eq!(
+        receipt["reconciliation"]["moved"].as_array().unwrap().len(),
+        2
+    );
+    assert!(
+        left_target
+            .join("repo/.engram/chunks/22222222.jsonl.gz")
+            .is_file()
+    );
+    assert!(
+        right_target
+            .join("repo/.engram/chunks/11111111.jsonl.gz")
+            .is_file()
+    );
+    assert_eq!(
+        std::fs::read_dir(receipt_root.join("engram"))
+            .unwrap()
+            .count(),
+        2
+    );
+}
+
 fn lifecycle_config() -> serde_json::Value {
     #[cfg(windows)]
     let (executable, args) = (
@@ -614,6 +1001,22 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
     std::fs::write(&source_secret, b"never serialize me").unwrap();
     let database = root.join("context.sqlite");
     std::fs::write(&database, b"database-v1").unwrap();
+    std::fs::create_dir_all(target.join("repo/.engram/chunks")).unwrap();
+    std::fs::write(
+        target.join("repo/.engram/chunks/08adcd96.jsonl.gz"),
+        b"opaque-compressed-chunk",
+    )
+    .unwrap();
+    write_json(
+        &target.join("repo/.engram/manifest.json"),
+        &serde_json::json!({
+            "version": 1,
+            "chunks": [{
+                "id": "08adcd96", "created_by": "engram", "created_at": "2026-08-06T00:00:00Z",
+                "sessions": 0, "memories": 1, "prompts": 0
+            }]
+        }),
+    );
     let git_authority = snapshot_git_authority(root);
     let config = serde_json::json!({
       "sync": {
@@ -623,6 +1026,15 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         "targetIdentityDigest": digest_domain_json("test", &"target").unwrap(),
         "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
         "policyDigest": digest_domain_json("test", &"policy").unwrap()
+        ,"engram": {
+          "projectId": "github.com/unsoldgroup/commonkit", "ownerId": "owner-al",
+          "projectRoot": "repo", "root": "repo/.engram", "scope": "project",
+          "executable": if cfg!(windows) {
+            std::path::PathBuf::from(std::env::var("WINDIR").unwrap()).join("System32/cmd.exe")
+          } else {
+            std::path::PathBuf::from("/usr/bin/true")
+          }
+        }
       },
       "credentials": { "root": root.join("credentials"), "destinations": [{
         "id": "api-token", "reference": format!("file://{}", source_secret.display()), "path": "tokens/api"
@@ -797,6 +1209,12 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         .verify(serde_json::json!({"planId": plan_contract.id}))
         .unwrap();
     assert_eq!(verified["verified"], true);
+    assert_eq!(verified["engram"]["state"], "in_sync");
+    assert_eq!(
+        verified["engram"]["projectId"],
+        "github.com/unsoldgroup/commonkit"
+    );
+    assert_eq!(verified["engram"]["present"][0]["id"], "08adcd96");
 
     let converged_plan: commonkit_contracts::Plan = serde_json::from_value(
         sync.plan(serde_json::json!({

@@ -69,6 +69,116 @@ fn sync_help_exposes_explicit_fetch_before_plan() {
 }
 
 #[test]
+fn engram_status_reports_a_declared_project_chunk_set() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("chunks")).unwrap();
+    fs::write(
+        root.path().join("manifest.json"),
+        r#"{"version":1,"chunks":[]}"#,
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args([
+            "engram",
+            "status",
+            "--project-id",
+            "github.com/unsoldgroup/commonkit",
+            "--owner-id",
+            "github:astemarie",
+            "--root",
+            root.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["projectId"], "github.com/unsoldgroup/commonkit");
+    assert_eq!(status["ownerId"], "github:astemarie");
+    assert_eq!(status["state"], "in_sync");
+}
+
+#[test]
+fn engram_watch_has_a_one_minute_default_and_requires_confirmation() {
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["engram", "watch", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--interval-seconds <INTERVAL_SECONDS>"));
+    assert!(help.contains("[default: 60]"));
+    assert!(help.contains("--confirmed"));
+    assert!(!help.contains("--cycles"));
+}
+
+#[cfg(unix)]
+#[test]
+fn engram_sync_runs_export_and_import_and_exchanges_chunks() {
+    let root = tempfile::tempdir().unwrap();
+    let left = root.path().join("left/.engram");
+    let right = root.path().join("right/.engram");
+    for (chunk_root, chunks) in [
+        (&left, vec![("11111111", b"left".as_slice())]),
+        (&right, vec![]),
+    ] {
+        fs::create_dir_all(chunk_root.join("chunks")).unwrap();
+        let manifest = json!({"version":1,"chunks":chunks.iter().map(|(id, _)| json!({
+            "id":id,"created_by":"test","created_at":"2026-08-06T00:00:00Z",
+            "sessions":0,"memories":1,"prompts":0
+        })).collect::<Vec<_>>()});
+        fs::write(
+            chunk_root.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        for (id, bytes) in chunks {
+            fs::write(
+                chunk_root.join("chunks").join(format!("{id}.jsonl.gz")),
+                bytes,
+            )
+            .unwrap();
+        }
+    }
+    let engram = root.path().join("engram-stub");
+    fs::write(&engram, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&engram, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args([
+            "engram",
+            "sync",
+            "--project-id",
+            "github.com/unsoldgroup/commonkit",
+            "--owner-id",
+            "github:astemarie",
+            "--left",
+            left.to_str().unwrap(),
+            "--right",
+            right.to_str().unwrap(),
+            "--engram-bin",
+            engram.to_str().unwrap(),
+            "--confirmed",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let receipt: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(receipt["moved"].as_array().unwrap().len(), 1);
+    assert!(right.join("chunks/11111111.jsonl.gz").is_file());
+}
+
+#[test]
 fn sync_fetch_sends_one_fetch_bound_plan_request_and_never_applies() {
     let root = tempfile::tempdir().unwrap();
     let mut status = Command::new(env!("CARGO_BIN_EXE_commonkit"));

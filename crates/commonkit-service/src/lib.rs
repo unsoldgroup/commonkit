@@ -1026,6 +1026,8 @@ fn router_with_control_and_relay(
             post(target_apply_plan),
         )
         .route("/control/v1/verify", post(verify_target))
+        .route("/control/v1/engram", get(engram_status))
+        .route("/control/v1/engram/reconcile", post(engram_reconcile))
         .route(
             "/control/v1/credentials/readiness",
             post(credentials_readiness),
@@ -1958,6 +1960,12 @@ pub trait SyncDomain: Send + Sync + 'static {
     fn plan(&self, request: Value) -> Result<Value, DomainFailure>;
     fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
     fn rollback(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn engram_status(&self) -> Result<Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    fn engram_reconcile(&self, _request: Value) -> Result<Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
     /// Inspects the configured, trusted provider repository. When `fetch` is true,
     /// only remote refs may be updated; managed content is never merged or applied.
     fn git_sync(&self, _fetch: bool) -> Result<Value, DomainFailure> {
@@ -3682,6 +3690,39 @@ async fn verify_target(
     Ok(Json(report))
 }
 
+async fn engram_status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let domain = state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .sync
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
+    safe_domain_result(domain.engram_status())
+}
+
+async fn engram_reconcile(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    assert_domain_request_safe(&request)?;
+    require_consent(&request)?;
+    let domain = state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .sync
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
+    safe_domain_result(domain.engram_reconcile(request))
+}
+
 async fn rollback_run(
     State(state): State<ApiState>,
     Json(request): Json<Value>,
@@ -4329,6 +4370,7 @@ pub struct BoundServer {
     relay: Option<(tokio::net::TcpListener, Router)>,
     relay_address: Option<SocketAddr>,
     scheduler: Arc<DriftScheduler<ProductionDriftChecker>>,
+    engram_periodic_job: Option<production_domains::ProductionEngramPeriodicJob>,
 }
 
 struct ProductionRuntimeReloader {
@@ -4507,6 +4549,7 @@ impl BoundServer {
             },
         ));
         let skill_canary = production_domains.skill_canary.clone();
+        let engram_periodic_job = production_domains.engram_periodic_job.clone();
         let skills = skill_canary.as_ref().map(|runtime| runtime.engine());
         if let Some(targets) = production_domains.targets.clone() {
             control.set_target_inventory(targets);
@@ -4572,6 +4615,7 @@ impl BoundServer {
             relay,
             relay_address,
             scheduler,
+            engram_periodic_job,
         })
     }
 
@@ -4601,11 +4645,28 @@ impl BoundServer {
                 })
                 .await;
         });
+        let (engram_shutdown, mut engram_signal) = tokio::sync::oneshot::channel();
+        let engram_task = self.engram_periodic_job.map(|job| {
+            tokio::spawn(async move {
+                loop {
+                    let current = job.clone();
+                    let _ = tokio::task::spawn_blocking(move || current.reconcile_once()).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(job.interval_seconds)) => {}
+                        _ = &mut engram_signal => break,
+                    }
+                }
+            })
+        });
         let result = axum::serve(self.listener, self.application)
             .with_graceful_shutdown(shutdown)
             .await;
         let _ = scheduler_shutdown.send(());
         let _ = scheduler_task.await;
+        let _ = engram_shutdown.send(());
+        if let Some(task) = engram_task {
+            let _ = task.await;
+        }
         if let Some(task) = relay_task {
             task.abort();
         }

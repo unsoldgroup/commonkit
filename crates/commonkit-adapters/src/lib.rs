@@ -6,6 +6,7 @@ mod budget;
 mod chezmoi;
 mod credentials;
 mod documentation;
+mod engram;
 mod files;
 mod git_sync;
 mod github_onboarding;
@@ -47,6 +48,13 @@ pub use documentation::{
     ProjectDocumentationRole, RichExtractionLimits, RichExtractionPlan, discover_project_context,
     extract_rich_document, fetch_web_snapshot, ingest_documentation, publish_documentation,
     validate_resolved_web_addresses,
+};
+pub use engram::{
+    EngramChunkAdapter, EngramChunkDigest, EngramChunkMovement, EngramChunkSetDeclaration,
+    EngramChunkSetState, EngramChunkSetStatus, EngramCommandOutput, EngramCommandRunner,
+    EngramError, EngramGrant, EngramGrantState, EngramOwnerId, EngramProjectId,
+    EngramReconciliationReceipt, EngramScope, EngramScopeAttestation, EngramTargetChunkMovement,
+    EngramTargetChunkSetDeclaration, EngramTargetReconciliationReceipt, ProcessEngramCommandRunner,
 };
 pub use files::{FileAdapter, FileAdapterError, FileIntent, ManagedRelativePath};
 pub use git_sync::{
@@ -93,6 +101,7 @@ pub use ssh::{
 };
 pub use ssh_files::{SshFileAdapter, SshFileAdapterError};
 pub use target::{
-    LocalTargetFilesystem, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
-    TargetFilesystem, TargetFilesystemError,
+    EngramTargetRuntime, EngramTargetSyncMode, LocalTargetFilesystem, SshFilesystemRequest,
+    SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem, TargetFilesystem,
+    TargetFilesystemError,
 };
