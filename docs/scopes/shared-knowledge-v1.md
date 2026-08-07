@@ -1,6 +1,6 @@
 # Shared knowledge v1 — design brief
 
-Tracking: unfiled. Belongs under epic USG-110 (CommonKit multiplayer).
+Tracking: USG-141, a sub-issue of epic USG-110 (CommonKit multiplayer).
 
 This brief was first written against context-mode. That premise was wrong and
 is corrected below, because the correction removes most of the work and points
