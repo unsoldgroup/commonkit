@@ -1,0 +1,117 @@
+{
+  "version": 1,
+  "chunks": [
+    {
+      "id": "8023be36",
+      "created_by": "astemarie",
+      "created_at": "2026-07-20T17:56:08Z",
+      "sessions": 2,
+      "memories": 1,
+      "prompts": 0
+    },
+    {
+      "id": "fd9e58e0",
+      "created_by": "astemarie",
+      "created_at": "2026-07-28T15:43:57Z",
+      "sessions": 2,
+      "memories": 6,
+      "prompts": 0
+    },
+    {
+      "id": "08adcd96",
+      "created_by": "astemarie",
+      "created_at": "2026-07-28T19:45:53Z",
+      "sessions": 1,
+      "memories": 3,
+      "prompts": 0
+    },
+    {
+      "id": "b9a67f9a",
+      "created_by": "astemarie",
+      "created_at": "2026-07-28T23:49:49Z",
+      "sessions": 2,
+      "memories": 2,
+      "prompts": 0
+    },
+    {
+      "id": "816bd652",
+      "created_by": "astemarie",
+      "created_at": "2026-07-30T17:34:00Z",
+      "sessions": 0,
+      "memories": 1,
+      "prompts": 0
+    },
+    {
+      "id": "4f9c94ee",
+      "created_by": "astemarie",
+      "created_at": "2026-07-30T18:25:08Z",
+      "sessions": 0,
+      "memories": 1,
+      "prompts": 0
+    },
+    {
+      "id": "8e4f7c15",
+      "created_by": "astemarie",
+      "created_at": "2026-07-30T19:33:38Z",
+      "sessions": 0,
+      "memories": 1,
+      "prompts": 0
+    },
+    {
+      "id": "da58f618",
+      "created_by": "astemarie",
+      "created_at": "2026-08-03T16:26:08Z",
+      "sessions": 1,
+      "memories": 2,
+      "prompts": 0
+    },
+    {
+      "id": "b62eb0b5",
+      "created_by": "astemarie",
+      "created_at": "2026-08-03T16:56:32Z",
+      "sessions": 0,
+      "memories": 1,
+      "prompts": 0
+    },
+    {
+      "id": "5b8d0193",
+      "created_by": "astemarie",
+      "created_at": "2026-08-03T18:15:28Z",
+      "sessions": 0,
+      "memories": 1,
+      "prompts": 0
+    },
+    {
+      "id": "81af5ed4",
+      "created_by": "astemarie",
+      "created_at": "2026-08-03T23:00:26Z",
+      "sessions": 2,
+      "memories": 10,
+      "prompts": 0
+    },
+    {
+      "id": "1045d0e6",
+      "created_by": "astemarie",
+      "created_at": "2026-08-05T20:53:47Z",
+      "sessions": 2,
+      "memories": 4,
+      "prompts": 0
+    },
+    {
+      "id": "bfcdf111",
+      "created_by": "astemarie",
+      "created_at": "2026-08-06T17:42:20Z",
+      "sessions": 3,
+      "memories": 2,
+      "prompts": 0
+    },
+    {
+      "id": "2cf1306a",
+      "created_by": "astemarie",
+      "created_at": "2026-08-06T18:07:19Z",
+      "sessions": 0,
+      "memories": 1,
+      "prompts": 0
+    }
+  ]
+}
