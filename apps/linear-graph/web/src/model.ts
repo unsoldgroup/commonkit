@@ -14,6 +14,19 @@ export function teamColor(team: string) {
   return TEAM_COLORS[hash % TEAM_COLORS.length];
 }
 
+export function topicColor(node: Pick<GraphNode, "topic" | "topicId">, zones: TopicZone[] = []) {
+  const zone = zones.find((candidate) => candidate.id === node.topicId || candidate.name === node.topic);
+  return zone?.color ?? "#64748b";
+}
+
+/** A redundant, non-colour status encoding keeps the graph legible for colour-blind users. */
+export function statusShape(statusType?: GraphNode["statusType"]) {
+  if (statusType === "completed") return "ellipse";
+  if (statusType === "canceled") return "diamond";
+  if (statusType === "started") return "round-rectangle";
+  return "rectangle";
+}
+
 export function teamSummaries(nodes: GraphNode[], metadata: TeamMetadata[] = []): TeamSummary[] {
   if (metadata.length) return metadata.slice().sort((left, right) => left.key.localeCompare(right.key) || left.id.localeCompare(right.id)).map((team) => ({ id: team.id, key: team.key, name: team.name, count: team.issueCount, activeCount: team.activeIssueCount, completedCount: team.completedIssueCount, canceledCount: team.canceledIssueCount, color: teamColor(team.key || team.name) }));
   const counts = new Map<string, number>();
@@ -32,7 +45,11 @@ export const edgeLabel = (edge: Pick<GraphEdge, "kind" | "sourceType">) => {
 
 export function matchesNode(node: GraphNode, filters: Filters) {
   const q = filters.query.trim().toLowerCase();
-  const queryMatch = !q || [node.identifier, node.title, node.team, node.teamKey, node.project, node.repo, node.assignee, ...(node.topics ?? [])].filter(Boolean).some((value) => value!.toLowerCase().includes(q));
+  const exactFields = [node.identifier, node.team, node.teamKey, node.project, node.repo, node.assignee, ...(node.topics ?? [])];
+  const broadFields = [node.title, node.description, ...(node.labels ?? [])];
+  // Short team keys such as EXP should not match incidental words in a long
+  // ticket description (for example, “explicit”).
+  const queryMatch = !q || [...exactFields, ...(q.length > 3 ? broadFields : [])].filter(Boolean).some((value) => value!.toLowerCase().includes(q));
   const teamMatch = !filters.teams.size || filters.teams.has(node.team);
   const topicMatch = !filters.topics.size || filters.topics.has(node.topic ?? "") || (node.topics ?? []).some((topic) => filters.topics.has(topic));
   const completedMatch = filters.showCompleted || !["completed", "canceled"].includes(node.statusType ?? "");

@@ -8,6 +8,7 @@ export type GraphNode = {
   id: string;
   identifier: string;
   title: string;
+  description?: string;
   url?: string;
   team: string;
   teamKey?: string;
@@ -25,6 +26,8 @@ export type GraphNode = {
   topics?: string[];
   assignee?: string;
   estimate?: number;
+  labels?: string[];
+  parentId?: string;
   focusScore?: number;
   whyNow?: string;
   nextAction?: string;
@@ -59,18 +62,18 @@ export type FocusRecommendation = {
   evidenceIssueIds?: string[];
   confidence?: number;
 };
-export type FocusBrief = { text: string; updatedAt?: string };
+export type FocusBrief = { text: string; updatedAt?: string; generatedAt?: string; snapshotAt?: string; status?: "ready" | "running" | "failed" | "stale"; source?: "codex" | "manual" | "fallback"; error?: string | null };
 export type AnalysisRun = { id: string; startedAt: string; completedAt?: string; status: "running" | "completed" | "failed"; issueCount?: number; error?: string };
 export type GraphPayload = { snapshot: GraphSnapshot; recommendations: FocusRecommendation[]; brief?: FocusBrief; analysis?: AnalysisRun };
 
 export function normalizeIssue(issue: Issue): GraphNode {
   return {
-    id: issue.id, identifier: issue.identifier, title: issue.title, url: issue.url,
+    id: issue.id, identifier: issue.identifier, title: issue.title, description: issue.description ?? undefined, url: issue.url,
     team: issue.team.name, teamKey: issue.team.key, teamId: issue.team.id, project: issue.project?.name, repo: issue.repo ?? undefined,
     status: issue.status.name, statusType: issue.status.type, priority: issue.priority,
     priorityLabel: issue.priority === 1 ? "Urgent" : issue.priority === 2 ? "High" : issue.priority === 3 ? "Medium" : issue.priority === 4 ? "Low" : undefined,
     dueDate: issue.dueDate ?? undefined, updatedAt: issue.updatedAt, topic: issue.zone, topicId: issue.zone,
-    topics: issue.topicTags, assignee: undefined,
+    topics: issue.topicTags, assignee: undefined, labels: issue.labels, parentId: issue.parentId ?? undefined,
   };
 }
 
@@ -91,7 +94,7 @@ export function normalizePayload(snapshot: ProtocolGraphSnapshot, brief?: Protoc
   return {
     snapshot: normalizeSnapshot(snapshot),
     recommendations: snapshot.recommendations.map((recommendation: ProtocolFocusRecommendation) => ({ issueId: recommendation.issueId, rank: recommendation.rank, whyNow: recommendation.whyNow, nextAction: recommendation.nextAction, evidenceIssueIds: recommendation.evidenceIssueIds, confidence: recommendation.confidence })),
-    brief: brief ? { text: brief.text, updatedAt: brief.updatedAt } : undefined,
+    brief: brief ? { text: brief.text, updatedAt: brief.updatedAt, generatedAt: brief.generatedAt, snapshotAt: brief.snapshotAt, status: brief.status, source: brief.source, error: brief.error } : undefined,
     analysis: analysis ? { id: analysis.id, startedAt: analysis.startedAt, completedAt: analysis.completedAt ?? undefined, status: analysis.status, issueCount: analysis.issueCount, error: analysis.error ?? undefined } : undefined,
   };
 }
@@ -105,12 +108,12 @@ export const demoPayload: GraphPayload = {
       { id: "unsold", key: "USG", name: "Unsold", issueCount: 2, activeIssueCount: 2, completedIssueCount: 0, canceledIssueCount: 0 },
     ],
     nodes: [
-      { id: "demo-1", identifier: "CK-142", title: "Harden portable receipt recovery", team: "CommonKit", project: "v1 stabilization", repo: "commonkit", status: "In Progress", statusType: "started", priority: 1, priorityLabel: "Urgent", topic: "Reliability", topics: ["Reliability", "Release"], focusScore: 98, whyNow: "Blocks the release validation path.", nextAction: "Add the missing recovery fixture." },
-      { id: "demo-2", identifier: "CK-138", title: "Document target mutation boundaries", team: "CommonKit", project: "v1 stabilization", repo: "commonkit", status: "Todo", statusType: "unstarted", priority: 2, priorityLabel: "High", topic: "Release", topics: ["Release"], focusScore: 72 },
-      { id: "demo-3", identifier: "USG-41", title: "Map graph topic zones to repositories", team: "Unsold", project: "Work graph", repo: "linear-issues-graph", status: "In Review", statusType: "started", priority: 2, priorityLabel: "High", topic: "Product", topics: ["Product", "Automation"], focusScore: 84, whyNow: "The graph is the shared planning surface.", nextAction: "Review the zone override rules." },
-      { id: "demo-4", identifier: "USG-44", title: "Schedule Codex graph refresh", team: "Unsold", project: "Work graph", repo: "linear-issues-graph", status: "Backlog", statusType: "backlog", priority: 3, priorityLabel: "Medium", topic: "Automation", topics: ["Automation"], focusScore: 51 },
-      { id: "demo-5", identifier: "TRV-19", title: "Refresh expedition pricing cache", team: "Expedition Insure", project: "Pricing", repo: "expedition-insure", status: "Todo", statusType: "unstarted", priority: 2, priorityLabel: "High", topic: "Operations", topics: ["Operations"], focusScore: 66 },
-      { id: "demo-6", identifier: "TRV-22", title: "Add stale-price warning to quote", team: "Expedition Insure", project: "Pricing", repo: "expedition-insure", status: "Todo", statusType: "unstarted", priority: 3, priorityLabel: "Medium", topic: "Product", topics: ["Product", "Operations"], focusScore: 48 },
+      { id: "demo-1", identifier: "CK-142", title: "Harden portable receipt recovery", description: "The portable receipt must recover cleanly after an interrupted target mutation.\n\n- Add a fixture for the interrupted state.\n- Verify the next run is idempotent.", team: "CommonKit", project: "v1 stabilization", repo: "commonkit", status: "In Progress", statusType: "started", priority: 1, priorityLabel: "Urgent", topic: "Reliability", topics: ["Reliability", "Release"], focusScore: 98, whyNow: "Blocks the release validation path.", nextAction: "Add the missing recovery fixture." },
+      { id: "demo-2", identifier: "CK-138", title: "Document target mutation boundaries", description: "Document which provider decisions are safe to apply and which require an explicit operator approval.", team: "CommonKit", project: "v1 stabilization", repo: "commonkit", status: "Todo", statusType: "unstarted", priority: 2, priorityLabel: "High", topic: "Release", topics: ["Release"], focusScore: 72 },
+      { id: "demo-3", identifier: "USG-41", title: "Map graph topic zones to repositories", description: "Make topical zones useful across teams by showing how each zone connects to repositories and related work.", team: "Unsold", project: "Work graph", repo: "linear-issues-graph", status: "In Review", statusType: "started", priority: 2, priorityLabel: "High", topic: "Product", topics: ["Product", "Automation"], focusScore: 84, whyNow: "The graph is the shared planning surface.", nextAction: "Review the zone override rules." },
+      { id: "demo-4", identifier: "USG-44", title: "Schedule Codex graph refresh", description: "Refresh the work universe daily and expose the freshness of the brief to the operator.", team: "Unsold", project: "Work graph", repo: "linear-issues-graph", status: "Backlog", statusType: "backlog", priority: 3, priorityLabel: "Medium", topic: "Automation", topics: ["Automation"], focusScore: 51 },
+      { id: "demo-5", identifier: "TRV-19", title: "Refresh expedition pricing cache", description: "Keep the expedition pricing cache fresh before quotes are prepared for customers.", team: "Expedition Insure", project: "Pricing", repo: "expedition-insure", status: "Todo", statusType: "unstarted", priority: 2, priorityLabel: "High", topic: "Operations", topics: ["Operations"], focusScore: 66 },
+      { id: "demo-6", identifier: "TRV-22", title: "Add stale-price warning to quote", description: "Show an operator-friendly warning when a quote relies on stale departure pricing.", team: "Expedition Insure", project: "Pricing", repo: "expedition-insure", status: "Todo", statusType: "unstarted", priority: 3, priorityLabel: "Medium", topic: "Product", topics: ["Product", "Operations"], focusScore: 48 },
     ],
     edges: [
       { id: "e1", source: "demo-1", target: "demo-2", kind: "blocks", sourceType: "linear" },

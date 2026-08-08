@@ -53,6 +53,7 @@ chmod 700 "$CONFIG_DIR" "$DATA_DIR"
   printf 'CODEX_HOME=%s\n' "$(systemd_quote "$DATA_DIR/codex")"
   [[ -z ${LINEAR_GRAPH_CODEX_MODEL:-} ]] || printf 'LINEAR_GRAPH_CODEX_MODEL=%s\n' "$(systemd_quote "$LINEAR_GRAPH_CODEX_MODEL")"
   [[ -z ${LINEAR_GRAPH_REPO_MAP:-} ]] || printf 'LINEAR_GRAPH_REPO_MAP=%s\n' "$(systemd_quote "$LINEAR_GRAPH_REPO_MAP")"
+  [[ -z ${LINEAR_GRAPH_EXECUTION_REPOS:-} ]] || printf 'LINEAR_GRAPH_EXECUTION_REPOS=%s\n' "$(systemd_quote "$LINEAR_GRAPH_EXECUTION_REPOS")"
 } >"$ENV_FILE"
 chmod 600 "$ENV_FILE"
 

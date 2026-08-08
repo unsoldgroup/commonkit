@@ -139,14 +139,186 @@ export const analysisRunSchema = z.object({
 }).strict();
 export type AnalysisRun = z.infer<typeof analysisRunSchema>;
 
+export const briefStatusSchema = z.enum(["ready", "running", "failed", "stale"]);
+export type BriefStatus = z.infer<typeof briefStatusSchema>;
+export const briefSourceSchema = z.enum(["codex", "manual", "fallback"]);
+export type BriefSource = z.infer<typeof briefSourceSchema>;
 export const focusBriefSchema = z.object({
   text: z.string().max(5000),
   updatedAt: date,
+  status: briefStatusSchema.optional(),
+  source: briefSourceSchema.optional(),
+  generatedAt: date.optional(),
+  snapshotAt: date.optional(),
+  error: z.string().max(1000).nullable().optional(),
 }).strict();
 export type FocusBrief = z.infer<typeof focusBriefSchema>;
 
 export const updateTopicRequestSchema = z.object({ zone: zoneIdSchema }).strict();
 export const updateFocusBriefRequestSchema = z.object({ text: z.string().max(5000) }).strict();
+
+export const triageDispositionSchema = z.enum(["ready", "blocked", "needs_clarification", "duplicate_stale", "bundle_candidate"]);
+export type TriageDisposition = z.infer<typeof triageDispositionSchema>;
+export const triageSourceSchema = z.enum(["codex", "manual"]);
+export type TriageSource = z.infer<typeof triageSourceSchema>;
+export const triageDecisionSchema = z.object({
+  issueId: id,
+  disposition: triageDispositionSchema,
+  rationale: z.string().min(1).max(2000),
+  confidence: z.number().min(0).max(1),
+  evidenceIssueIds: z.array(id).max(50),
+  nextAction: z.string().max(500).nullable(),
+  source: triageSourceSchema,
+  createdAt: date,
+  updatedAt: date,
+}).strict();
+export type TriageDecision = z.infer<typeof triageDecisionSchema>;
+
+export const workBundleStatusSchema = z.enum(["proposed", "approved", "rejected", "queued", "running", "blocked", "verified", "failed"]);
+export type WorkBundleStatus = z.infer<typeof workBundleStatusSchema>;
+export const workBundleIssueSchema = z.object({
+  issueId: id,
+  order: z.number().int().positive(),
+  rationale: z.string().max(1000).optional(),
+}).strict();
+export type WorkBundleIssue = z.infer<typeof workBundleIssueSchema>;
+export const workBundleSchema = z.object({
+  id,
+  campaignId: id,
+  title: z.string().min(1).max(240),
+  summary: z.string().min(1).max(2000),
+  issueIds: z.array(id).min(1),
+  issues: z.array(workBundleIssueSchema).min(1),
+  dependencyIssueIds: z.array(id).max(100),
+  expectedReduction: z.number().int().nonnegative(),
+  status: workBundleStatusSchema,
+  createdAt: date,
+  updatedAt: date,
+  approvedAt: date.nullable(),
+  approvalNote: z.string().max(1000).nullable(),
+  linearProjectId: id.nullable().optional(),
+  linearProjectUrl: z.string().url().nullable().optional(),
+  linearSyncError: z.string().max(1000).nullable().optional(),
+}).strict();
+export type WorkBundle = z.infer<typeof workBundleSchema>;
+
+export const bulkResolutionStatusSchema = z.enum(["proposed", "approved", "rejected", "applied", "failed"]);
+export type BulkResolutionStatus = z.infer<typeof bulkResolutionStatusSchema>;
+export const bulkResolutionActionSchema = z.enum(["close", "cancel", "merge"]);
+export type BulkResolutionAction = z.infer<typeof bulkResolutionActionSchema>;
+export const bulkResolutionSetSchema = z.object({
+  id,
+  campaignId: id,
+  issueIds: z.array(id),
+  action: bulkResolutionActionSchema,
+  rationale: z.string().min(1).max(2000),
+  status: bulkResolutionStatusSchema,
+  createdAt: date,
+  updatedAt: date,
+  approvedAt: date.nullable(),
+}).strict();
+export type BulkResolutionSet = z.infer<typeof bulkResolutionSetSchema>;
+
+export const campaignStatusSchema = z.enum(["proposed", "processing", "ready", "approved", "running", "completed", "failed"]);
+export type CampaignStatus = z.infer<typeof campaignStatusSchema>;
+export const campaignSchema = z.object({
+  id,
+  title: z.string().min(1).max(240),
+  prompt: z.string().min(1).max(1000),
+  status: campaignStatusSchema,
+  issueIds: z.array(id),
+  processedIssueCount: z.number().int().nonnegative(),
+  totalIssueCount: z.number().int().nonnegative(),
+  bundles: z.array(workBundleSchema),
+  resolutionSet: bulkResolutionSetSchema.nullable(),
+  snapshotAt: date,
+  createdAt: date,
+  updatedAt: date,
+  error: z.string().max(1000).nullable(),
+}).strict();
+export type Campaign = z.infer<typeof campaignSchema>;
+
+export const campaignRequestSchema = z.object({
+  title: z.string().min(1).max(240).optional(),
+  prompt: z.string().min(1).max(1000),
+  seedIssueIds: z.array(id).optional(),
+  teamKeys: z.array(z.string().min(1).max(40)).optional(),
+  topicIds: z.array(zoneIdSchema).optional(),
+  repository: z.string().max(200).optional(),
+}).strict();
+export type CampaignRequest = z.infer<typeof campaignRequestSchema>;
+
+export const bundleApprovalRequestSchema = z.object({
+  decision: z.enum(["approve", "reject"]),
+  note: z.string().max(1000).optional(),
+}).strict();
+export type BundleApprovalRequest = z.infer<typeof bundleApprovalRequestSchema>;
+
+export const triageDecisionRequestSchema = z.object({
+  issueId: id,
+  disposition: triageDispositionSchema,
+  rationale: z.string().min(1).max(2000),
+  confidence: z.number().min(0).max(1),
+  evidenceIssueIds: z.array(id).max(50).default([]),
+  nextAction: z.string().max(500).nullable().default(null),
+  source: triageSourceSchema.default("manual"),
+}).strict();
+export type TriageDecisionRequest = z.infer<typeof triageDecisionRequestSchema>;
+
+export const drainMetricsSchema = z.object({
+  snapshotAt: date,
+  activeIssueCount: z.number().int().nonnegative(),
+  completedIssueCount: z.number().int().nonnegative(),
+  canceledIssueCount: z.number().int().nonnegative(),
+  untriagedIssueCount: z.number().int().nonnegative(),
+  readyIssueCount: z.number().int().nonnegative(),
+  blockedIssueCount: z.number().int().nonnegative(),
+  needsClarificationIssueCount: z.number().int().nonnegative(),
+  duplicateStaleIssueCount: z.number().int().nonnegative(),
+  bundleCandidateIssueCount: z.number().int().nonnegative(),
+  approvedBundleIssueCount: z.number().int().nonnegative(),
+  expectedReduction: z.number().int().nonnegative(),
+  actualReduction: z.number().int().nonnegative(),
+  activeCampaignCount: z.number().int().nonnegative(),
+  proposedBundleCount: z.number().int().nonnegative(),
+  approvedBundleCount: z.number().int().nonnegative(),
+  drained: z.boolean(),
+  computedAt: date,
+}).strict();
+export type DrainMetrics = z.infer<typeof drainMetricsSchema>;
+
+export const drainStateSchema = z.object({
+  metrics: drainMetricsSchema,
+  campaigns: z.array(campaignSchema),
+  decisions: z.array(triageDecisionSchema),
+}).strict();
+export type DrainState = z.infer<typeof drainStateSchema>;
+
+export const executionRunStatusSchema = z.enum(["queued", "running", "completed", "failed", "timed_out"]);
+export type ExecutionRunStatus = z.infer<typeof executionRunStatusSchema>;
+export const executionRunSchema = z.object({
+  id,
+  bundleId: id,
+  repository: z.string().min(1).max(200),
+  branch: z.string().max(200).nullable(),
+  worktreePath: z.string().max(1000).nullable(),
+  status: executionRunStatusSchema,
+  startedAt: date,
+  completedAt: date.nullable(),
+  exitCode: z.number().int().nullable(),
+  stdout: z.string().max(100000).optional(),
+  stderr: z.string().max(100000).optional(),
+  evidence: z.array(z.object({ kind: z.string().min(1).max(80), text: z.string().max(100000) }).strict()).max(50),
+  error: z.string().max(2000).nullable(),
+  createdAt: date,
+}).strict();
+export type ExecutionRun = z.infer<typeof executionRunSchema>;
+
+export const executionRequestSchema = z.object({
+  repository: z.string().min(1).max(200),
+  instruction: z.string().max(2000).optional(),
+}).strict();
+export type ExecutionRequest = z.infer<typeof executionRequestSchema>;
 
 export const DEFAULT_ZONES: readonly TopicZone[] = [
   { id: "product", label: "Product", description: "User-facing product behavior and outcomes", color: "#4f8cff" },

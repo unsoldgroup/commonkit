@@ -2,9 +2,15 @@ import { timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
-import { DEFAULT_ZONES, focusBriefSchema, graphSnapshotSchema, updateFocusBriefRequestSchema, updateTopicRequestSchema, type AnalysisRun, type GraphSnapshot } from "@commonkit/linear-graph-protocol";
+import {
+  DEFAULT_ZONES, bundleApprovalRequestSchema, campaignRequestSchema, focusBriefSchema, graphSnapshotSchema,
+  executionRequestSchema, triageDecisionRequestSchema, updateFocusBriefRequestSchema, updateTopicRequestSchema,
+  type AnalysisRun, type Campaign, type ExecutionRun, type GraphSnapshot, type TriageDecision,
+} from "@commonkit/linear-graph-protocol";
 import { applyCodexAnalysis, defaultRecommendations, focusSnapshot } from "./analysis.js";
 import { runCodexAnalysis, type CodexRunnerOptions } from "./codex.js";
+import { computeDrainMetrics, proposeCampaign } from "./drain.js";
+import { executeApprovedBundle, type ExecutionRunnerOptions } from "./execution.js";
 import { syncLinear, type LinearSource } from "./linear.js";
 import { GraphStore } from "./store.js";
 
@@ -16,6 +22,7 @@ export interface GraphHubOptions {
   dataPath?: string;
   linear?: LinearSource;
   codex?: CodexRunnerOptions;
+  execution?: Omit<ExecutionRunnerOptions, "repositoryAllowlist"> & { repositoryAllowlist: Readonly<Record<string, string>> };
   webDistPath?: string;
   now?: () => Date;
 }
@@ -43,6 +50,12 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
   const webDistPath = options.webDistPath ?? join(import.meta.dir, "../../web/dist");
   let current = store.loadSnapshot();
   let analysisInFlight: Promise<AnalysisRun> | undefined;
+  const updateDrainMetrics = () => {
+    if (!current) return null;
+    const metrics = computeDrainMetrics(current, store.loadTriageDecisions(), store.loadCampaigns(), now());
+    store.saveDrainMetrics(metrics);
+    return metrics;
+  };
 
   const runAnalysis = async (): Promise<AnalysisRun> => {
     if (analysisInFlight) return analysisInFlight;
@@ -51,6 +64,8 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       const id = crypto.randomUUID();
       const running = { id, startedAt, completedAt: null, status: "running", issueCount: 0, error: null, inputHash: null } as const;
       store.saveAnalysisRun(running);
+      const existingBrief = store.loadBrief();
+      if (existingBrief) store.saveBrief({ ...existingBrief, status: "running", error: null, updatedAt: now().toISOString() });
       let fallback: GraphSnapshot | null = null;
       try {
         if (!options.linear) throw new Error("Linear source is not configured");
@@ -62,6 +77,13 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         const snapshot = { ...applied.snapshot, zones: baseline.zones, recommendations: applied.snapshot.recommendations.length ? applied.snapshot.recommendations : baseline.recommendations };
         store.saveSnapshot(snapshot);
         current = snapshot;
+        if (!existingBrief) {
+          const activeCount = snapshot.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
+          store.saveBrief({ text: `Universe synced: ${activeCount} active issues are ready for triage and bundle planning.`, updatedAt: now().toISOString(), generatedAt: now().toISOString(), snapshotAt: snapshot.syncedAt, status: "ready", source: "fallback", error: null });
+        } else {
+          store.saveBrief({ ...store.loadBrief()!, status: "ready", error: null, updatedAt: now().toISOString(), generatedAt: now().toISOString(), snapshotAt: snapshot.syncedAt });
+        }
+        updateDrainMetrics();
         const completed = { ...running, completedAt: now().toISOString(), status: "completed", issueCount: sync.rawCount, inputHash: applied.inputHash } as const;
         store.saveAnalysisRun(completed);
         return completed;
@@ -72,6 +94,8 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
           store.saveSnapshot(current);
         }
         const failed = { ...running, completedAt: now().toISOString(), status: "failed", error: caught instanceof Error ? caught.message.slice(0, 1000) : "analysis failed" } as const;
+        const staleBrief = store.loadBrief();
+        if (staleBrief) store.saveBrief({ ...staleBrief, status: "stale", error: failed.error, updatedAt: now().toISOString() });
         store.saveAnalysisRun(failed);
         throw caught;
       } finally { analysisInFlight = undefined; }
@@ -87,10 +111,23 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       if (url.pathname === "/api/graph" && request.method === "GET") {
         if (!current) return error("No snapshot available", 503);
         const snapshot = url.searchParams.get("view") === "focus" ? focusSnapshot(current) : current;
-        return json({ snapshot, brief: store.loadBrief(), analysis: store.latestAnalysisRun() });
+        return json({ snapshot, brief: store.loadBrief(), analysis: store.latestAnalysisRun(), drain: updateDrainMetrics() });
       }
-      if (url.pathname === "/api/focus-brief" && request.method === "GET") return json(store.loadBrief() ?? { text: "", updatedAt: now().toISOString() });
+      if (url.pathname === "/api/focus-brief" && request.method === "GET") return json(store.loadBrief() ?? { text: "", updatedAt: now().toISOString(), status: "stale", source: "fallback", error: "No brief has been generated yet" });
       if (url.pathname === "/api/analysis-runs/latest" && request.method === "GET") return json(store.latestAnalysisRun());
+      if (url.pathname === "/api/work-drain" && request.method === "GET") {
+        if (!current) return error("No snapshot available", 503);
+        return json({ metrics: updateDrainMetrics(), campaigns: store.loadCampaigns(), decisions: store.loadTriageDecisions() });
+      }
+      if (url.pathname === "/api/campaigns" && request.method === "GET") return json(store.loadCampaigns());
+      if (url.pathname === "/api/triage-decisions" && request.method === "GET") return json(store.loadTriageDecisions());
+      if (url.pathname === "/api/executions" && request.method === "GET") return json(store.loadExecutionRuns());
+      const executionMatch = /^\/api\/bundles\/([^/]+)\/executions$/.exec(url.pathname);
+      if (executionMatch && request.method === "GET") {
+        return json(store.loadExecutionRuns().filter((run) => run.bundleId === executionMatch[1]));
+      }
+      const campaignMatch = /^\/api\/campaigns\/([^/]+)$/.exec(url.pathname);
+      if (campaignMatch && request.method === "GET") return json(store.loadCampaign(campaignMatch[1]) ?? { error: "Campaign not found" }, store.loadCampaign(campaignMatch[1]) ? 200 : 404);
       if (request.method === "GET") {
         const relativePath = url.pathname === "/" ? "index.html" : url.pathname.replace(/^\/+/, "");
         const root = resolve(webDistPath);
@@ -104,8 +141,98 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       if (url.pathname === "/api/analysis-runs" && request.method === "POST") {
         try { return json(await runAnalysis(), 202); } catch (caught) { return error(caught instanceof Error ? caught.message : "analysis failed", 502); }
       }
+      if (url.pathname === "/api/campaigns" && request.method === "POST") {
+        try {
+          if (!current) return error("No snapshot available", 503);
+          const body = await parseBody(request, campaignRequestSchema);
+          const campaign = proposeCampaign(current, body, now());
+          store.saveCampaign(campaign);
+          updateDrainMetrics();
+          return json(campaign, 201);
+        } catch { return error("Invalid campaign request", 400); }
+      }
+      if (url.pathname === "/api/triage-decisions" && request.method === "POST") {
+        try {
+          if (!current) return error("No snapshot available", 503);
+          const body = await parseBody(request, triageDecisionRequestSchema);
+          if (!current.nodes.some((node) => node.id === body.issueId)) return error("Unknown issue", 404);
+          const timestamp = now().toISOString();
+          const decision: TriageDecision = { ...body, createdAt: store.loadTriageDecision(body.issueId)?.createdAt ?? timestamp, updatedAt: timestamp };
+          store.saveTriageDecision(decision);
+          updateDrainMetrics();
+          return json(decision, 201);
+        } catch { return error("Invalid triage decision", 400); }
+      }
+      const bundleMatch = /^\/api\/bundles\/([^/]+)\/approval$/.exec(url.pathname);
+      if (bundleMatch && request.method === "POST") {
+        try {
+          const body = await parseBody(request, bundleApprovalRequestSchema);
+          const target = store.loadCampaigns().find((campaign) => campaign.bundles.some((bundle) => bundle.id === bundleMatch[1]));
+          if (!target) return error("Bundle not found", 404);
+          const timestamp = now().toISOString();
+          let bundles = target.bundles.map((bundle) => bundle.id === bundleMatch[1]
+            ? { ...bundle, status: body.decision === "approve" ? "approved" as const : "rejected" as const, approvedAt: body.decision === "approve" ? timestamp : null, approvalNote: body.note ?? null, updatedAt: timestamp }
+            : bundle);
+          if (body.decision === "approve" && options.linear?.mutate && current) {
+            const approved = bundles.find((bundle) => bundle.id === bundleMatch[1])!;
+            try {
+              const teamIds = [...new Set(current.nodes.filter((issue) => approved.issueIds.includes(issue.id)).map((issue) => issue.team.id))];
+              const project = await options.linear.mutate.createProject({ name: approved.title, description: approved.summary, teamIds, issueIds: approved.issueIds });
+              bundles = bundles.map((bundle) => bundle.id === approved.id ? { ...bundle, linearProjectId: project.id, linearProjectUrl: project.url ?? null, linearSyncError: null } : bundle);
+            } catch (caught) {
+              const message = caught instanceof Error ? caught.message : "Linear project sync failed";
+              bundles = bundles.map((bundle) => bundle.id === approved.id ? { ...bundle, linearSyncError: message.slice(0, 1000), approvalNote: `${body.note ? `${body.note} · ` : ""}Linear project sync failed; review before execution.` } : bundle);
+            }
+          }
+          const campaign: Campaign = { ...target, bundles, status: bundles.some((bundle) => bundle.status === "approved") ? "approved" : target.status, updatedAt: timestamp };
+          store.saveCampaign(campaign);
+          updateDrainMetrics();
+          return json(bundles.find((bundle) => bundle.id === bundleMatch[1]));
+        } catch { return error("Invalid bundle approval", 400); }
+      }
+      const resolutionMatch = /^\/api\/resolution-sets\/([^/]+)\/approval$/.exec(url.pathname);
+      if (resolutionMatch && request.method === "POST") {
+        try {
+          const body = await parseBody(request, bundleApprovalRequestSchema);
+          const target = store.loadCampaigns().find((campaign) => campaign.resolutionSet?.id === resolutionMatch[1]);
+          if (!target?.resolutionSet) return error("Resolution set not found", 404);
+          const timestamp = now().toISOString();
+          const resolutionSet = { ...target.resolutionSet, status: body.decision === "approve" ? "approved" as const : "rejected" as const, approvedAt: body.decision === "approve" ? timestamp : null, updatedAt: timestamp };
+          const campaign: Campaign = { ...target, resolutionSet, updatedAt: timestamp };
+          store.saveCampaign(campaign);
+          updateDrainMetrics();
+          return json(resolutionSet);
+        } catch { return error("Invalid resolution approval", 400); }
+      }
+      if (executionMatch && request.method === "POST") {
+        if (!options.execution) return error("Headless execution is not configured on this VPS", 503);
+        try {
+          if (!current) return error("No snapshot available", 503);
+          const body = await parseBody(request, executionRequestSchema);
+          const campaign = store.loadCampaigns().find((candidate) => candidate.bundles.some((bundle) => bundle.id === executionMatch[1]));
+          const bundle = campaign?.bundles.find((candidate) => candidate.id === executionMatch[1]);
+          if (!campaign || !bundle) return error("Bundle not found", 404);
+          if (bundle.status !== "approved" || !bundle.approvedAt) return error("Bundle must be approved before execution", 409);
+          if (!options.execution.repositoryAllowlist[body.repository]) return error("Repository is not in the execution allowlist", 400);
+          const timestamp = now().toISOString();
+          const runningCampaign: Campaign = { ...campaign, bundles: campaign.bundles.map((candidate) => candidate.id === bundle.id ? { ...candidate, status: "running" as const, updatedAt: timestamp } : candidate), updatedAt: timestamp };
+          store.saveCampaign(runningCampaign);
+          const issueContext = current.nodes.filter((issue) => bundle.issueIds.includes(issue.id)).map((issue) => ({ identifier: issue.identifier, title: issue.title, description: issue.description }));
+          const result = await executeApprovedBundle({ bundle: { ...bundle, status: "approved" }, repository: body.repository, issueContext, instruction: body.instruction }, options.execution);
+          const execution: ExecutionRun = {
+            id: result.id, bundleId: result.bundleId, repository: result.repository, branch: result.branch, worktreePath: result.worktreePath,
+            status: result.status, startedAt: result.startedAt, completedAt: result.completedAt, exitCode: result.exitCode,
+            stdout: result.stdout, stderr: result.stderr, evidence: result.evidence, error: result.error, createdAt: timestamp,
+          };
+          store.saveExecutionRun(execution);
+          const finalStatus = result.status === "completed" ? "verified" : result.status === "timed_out" ? "blocked" : "failed";
+          store.saveCampaign({ ...runningCampaign, bundles: runningCampaign.bundles.map((candidate) => candidate.id === bundle.id ? { ...candidate, status: finalStatus, updatedAt: now().toISOString(), approvalNote: result.status === "completed" ? "Codex completed; merge and deploy remain human-approved." : result.error } : candidate), updatedAt: now().toISOString() });
+          updateDrainMetrics();
+          return json({ execution, campaignId: campaign.id }, result.status === "completed" ? 202 : 502);
+        } catch (caught) { return error(caught instanceof Error ? caught.message : "Execution failed", 502); }
+      }
       if (url.pathname === "/api/focus-brief" && request.method === "PUT") {
-        try { const body = await parseBody(request, updateFocusBriefRequestSchema); const brief = focusBriefSchema.parse({ ...body, updatedAt: now().toISOString() }); store.saveBrief(brief); return json(brief); } catch { return error("Invalid focus brief", 400); }
+        try { const body = await parseBody(request, updateFocusBriefRequestSchema); const timestamp = now().toISOString(); const brief = focusBriefSchema.parse({ ...body, updatedAt: timestamp, generatedAt: timestamp, status: "ready", source: "manual", error: null }); store.saveBrief(brief); return json(brief); } catch { return error("Invalid focus brief", 400); }
       }
       const topicMatch = /^\/api\/issues\/([^/]+)\/topic$/.exec(url.pathname);
       if (topicMatch && request.method === "PUT") {

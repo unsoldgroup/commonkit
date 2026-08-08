@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, matchesNode, teamColor, teamSummaries, topicCounts, visibleGraph, type Filters } from "../src/model.js";
+import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, matchesNode, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, type Filters } from "../src/model.js";
 import { demoPayload } from "../src/protocol.js";
 
 const base: Filters = { query: "", teams: new Set(), topics: new Set(), showSemantic: true, showCompleted: false };
@@ -68,5 +68,21 @@ describe("linear graph view model", () => {
     expect(graphLayoutName("universe")).toBe("grid");
     expect(deterministicGridColumns(0)).toBe(1);
     expect(deterministicGridColumns(4096)).toBe(64);
+  });
+
+  test("topic fills and status shapes are deterministic and redundant", () => {
+    const node = demoPayload.snapshot.nodes[0];
+    expect(topicColor(node, demoPayload.snapshot.zones)).toBe("#56d6a0");
+    expect(topicColor({ topic: "Missing" }, demoPayload.snapshot.zones)).toBe("#64748b");
+    expect(statusShape("started")).toBe("round-rectangle");
+    expect(statusShape("completed")).toBe("ellipse");
+    expect(statusShape("canceled")).toBe("diamond");
+  });
+
+  test("long searches include descriptions while short team keys stay exact", () => {
+    const node = demoPayload.snapshot.nodes[0];
+    expect(matchesNode(node, { ...base, query: "interrupted target mutation" })).toBe(true);
+    expect(matchesNode({ ...node, teamKey: "EXP", description: "An explicit unrelated detail" }, { ...base, query: "EXP" })).toBe(true);
+    expect(matchesNode({ ...node, teamKey: "CK", description: "An explicit unrelated detail" }, { ...base, query: "EXP" })).toBe(false);
   });
 });

@@ -2,8 +2,8 @@ import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database } from "bun:sqlite";
 import {
-  analysisRunSchema, focusBriefSchema, graphSnapshotSchema, issueSchema, type AnalysisRun, type FocusBrief, type GraphSnapshot,
-  type ZoneId,
+  analysisRunSchema, campaignSchema, drainMetricsSchema, executionRunSchema, focusBriefSchema, graphSnapshotSchema, issueSchema, triageDecisionSchema,
+  type AnalysisRun, type Campaign, type DrainMetrics, type ExecutionRun, type FocusBrief, type GraphSnapshot, type TriageDecision, type ZoneId,
 } from "@commonkit/linear-graph-protocol";
 import { summarizeTeams } from "./normalizer.js";
 
@@ -16,7 +16,11 @@ export class GraphStore {
     this.db.exec(`CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS topic_overrides (issue_id TEXT PRIMARY KEY, zone TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS focus_brief (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS analysis_runs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
+      CREATE TABLE IF NOT EXISTS analysis_runs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS triage_decisions (issue_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS campaigns (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS drain_metrics (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS execution_runs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
   }
 
   saveSnapshot(snapshot: GraphSnapshot) {
@@ -64,6 +68,61 @@ export class GraphStore {
   latestAnalysisRun(): AnalysisRun | null {
     const row = this.db.query("SELECT payload FROM analysis_runs ORDER BY rowid DESC LIMIT 1").get() as { payload: string } | null;
     return row ? analysisRunSchema.parse(JSON.parse(row.payload)) : null;
+  }
+
+  saveTriageDecision(decision: TriageDecision) {
+    const value = triageDecisionSchema.parse(decision);
+    this.db.query("INSERT INTO triage_decisions(issue_id, payload) VALUES(?, ?) ON CONFLICT(issue_id) DO UPDATE SET payload=excluded.payload").run(value.issueId, JSON.stringify(value));
+  }
+
+  loadTriageDecisions(): TriageDecision[] {
+    const rows = this.db.query("SELECT payload FROM triage_decisions ORDER BY rowid ASC").all() as Array<{ payload: string }>;
+    return rows.map((row) => triageDecisionSchema.parse(JSON.parse(row.payload)));
+  }
+
+  loadTriageDecision(issueId: string): TriageDecision | null {
+    const row = this.db.query("SELECT payload FROM triage_decisions WHERE issue_id=?").get(issueId) as { payload: string } | null;
+    return row ? triageDecisionSchema.parse(JSON.parse(row.payload)) : null;
+  }
+
+  saveCampaign(campaign: Campaign) {
+    const value = campaignSchema.parse(campaign);
+    this.db.query("INSERT INTO campaigns(id, payload) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(value.id, JSON.stringify(value));
+  }
+
+  loadCampaign(id: string): Campaign | null {
+    const row = this.db.query("SELECT payload FROM campaigns WHERE id=?").get(id) as { payload: string } | null;
+    return row ? campaignSchema.parse(JSON.parse(row.payload)) : null;
+  }
+
+  loadCampaigns(): Campaign[] {
+    const rows = this.db.query("SELECT payload FROM campaigns ORDER BY rowid DESC").all() as Array<{ payload: string }>;
+    return rows.map((row) => campaignSchema.parse(JSON.parse(row.payload)));
+  }
+
+  saveDrainMetrics(metrics: DrainMetrics) {
+    const value = drainMetricsSchema.parse(metrics);
+    this.db.query("INSERT INTO drain_metrics(id, payload) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(JSON.stringify(value));
+  }
+
+  loadDrainMetrics(): DrainMetrics | null {
+    const row = this.db.query("SELECT payload FROM drain_metrics WHERE id=1").get() as { payload: string } | null;
+    return row ? drainMetricsSchema.parse(JSON.parse(row.payload)) : null;
+  }
+
+  saveExecutionRun(run: ExecutionRun) {
+    const value = executionRunSchema.parse(run);
+    this.db.query("INSERT INTO execution_runs(id, payload) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(value.id, JSON.stringify(value));
+  }
+
+  loadExecutionRun(id: string): ExecutionRun | null {
+    const row = this.db.query("SELECT payload FROM execution_runs WHERE id=?").get(id) as { payload: string } | null;
+    return row ? executionRunSchema.parse(JSON.parse(row.payload)) : null;
+  }
+
+  loadExecutionRuns(): ExecutionRun[] {
+    const rows = this.db.query("SELECT payload FROM execution_runs ORDER BY rowid DESC").all() as Array<{ payload: string }>;
+    return rows.map((row) => executionRunSchema.parse(JSON.parse(row.payload)));
   }
 
   close() { this.db.close(); }
