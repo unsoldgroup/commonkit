@@ -1,0 +1,8 @@
+https://@@DOMAIN@@ {
+	tls /etc/caddy/certs/linear-graph/fullchain.pem /etc/caddy/certs/linear-graph/key.pem
+	@tailnet remote_ip 100.64.0.0/10
+	handle @tailnet {
+		reverse_proxy 127.0.0.1:@@HUB_PORT@@
+	}
+	respond 403
+}
