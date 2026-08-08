@@ -18,8 +18,13 @@ let initialLoading = true;
 let graphError: string | null = null;
 let analysisError: string | null = null;
 let campaignProposal: Campaign | null = null;
+type CodexAuthStatus = { authenticated: boolean; state: "connected" | "disconnected" | "connecting" | "unavailable"; account?: string; plan?: string; expiresAt?: string; message?: string };
+let codexAuth: CodexAuthStatus = { authenticated: false, state: "connecting", message: "Checking ChatGPT connection…" };
+let codexMenuOpen = false;
+let codexStatusTimer: ReturnType<typeof setInterval> | undefined;
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 let viewport: { zoom: number; pan: { x: number; y: number } } | null = null;
+let fitNextGraph = true;
 let lastEmptyState = emptyStateKind(payload.snapshot, payload.recommendations, filters, view);
 let graphRequestId = 0;
 let graphAbort: AbortController | undefined;
@@ -58,11 +63,12 @@ function renderMarkdown(markdown?: string) {
 }
 function selectedNodeIds() { return [...selectedIds]; }
 function selectNode(id: string, additive = false) {
+  const changedTicket = selectedId !== id;
   if (!additive) selectedIds.clear();
   if (additive && selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
   selectedId = selectedIds.has(id) ? id : selectedIds.values().next().value ?? null;
   renderRecommendations(); renderList(); renderContext();
-  if (cy) { cy.nodes().unselect(); selectedIds.forEach((selected) => cy.getElementById(selected).select()); if (selectedId) cy.center(cy.getElementById(selectedId)); }
+  if (cy) { cy.nodes().unselect(); selectedIds.forEach((selected) => cy.getElementById(selected).select()); if (changedTicket && !additive) cy.fit(undefined, 40); if (selectedId) cy.center(cy.getElementById(selectedId)); }
 }
 function clearSelection() { selectedIds.clear(); selectedId = null; renderRecommendations(); renderList(); renderContext(); if (cy) cy.nodes().unselect(); }
 async function authorizedFetch(path: string, init: RequestInit) {
@@ -77,12 +83,53 @@ async function authorizedFetch(path: string, init: RequestInit) {
   return retried;
 }
 
+function normalizeCodexAuth(body: unknown): CodexAuthStatus {
+  const value = body && typeof body === "object" ? body as Record<string, unknown> : {};
+  const authenticated = value.authenticated === true || value.connected === true || value.status === "connected";
+  const rawState = typeof value.status === "string" ? value.status : "";
+  const state: CodexAuthStatus["state"] = authenticated ? "connected" : rawState === "connecting" || rawState === "pending" ? "connecting" : rawState === "unavailable" ? "unavailable" : "disconnected";
+  const account = typeof value.account === "string" ? value.account.slice(0, 120) : typeof value.email === "string" ? value.email.slice(0, 120) : undefined;
+  const plan = typeof value.plan === "string" ? value.plan.slice(0, 80) : undefined;
+  const expiresAt = typeof value.expiresAt === "string" ? value.expiresAt : undefined;
+  const message = typeof value.message === "string" ? value.message.slice(0, 240) : typeof value.detail === "string" ? value.detail.slice(0, 240) : typeof value.error === "string" ? value.error.slice(0, 240) : undefined;
+  return { authenticated, state, account, plan, expiresAt, message };
+}
+async function refreshCodexStatus() {
+  try {
+    const response = await fetch("/api/codex/status", { cache: "no-store", credentials: "same-origin" });
+    if (response.status === 404) codexAuth = { authenticated: false, state: "unavailable", message: "ChatGPT connection is not configured on this hub." };
+    else if (!response.ok) codexAuth = { authenticated: false, state: "disconnected", message: "ChatGPT connection status is unavailable." };
+    else codexAuth = normalizeCodexAuth(await response.json());
+  } catch { codexAuth = { authenticated: false, state: "unavailable", message: "Could not reach the ChatGPT connection service." }; }
+  renderShell();
+}
+function startCodexStatusPolling() {
+  if (codexStatusTimer) return;
+  codexStatusTimer = setInterval(() => { void refreshCodexStatus(); }, 15000);
+}
+async function connectCodex() {
+  if (codexAuth.state === "connecting") return;
+  codexAuth = { authenticated: false, state: "connecting", message: "Opening ChatGPT connection…" };
+  renderShell();
+  try {
+    const response = await authorizedFetch("/api/codex/login", { method: "POST", body: JSON.stringify({}) });
+    if (!response.ok) throw new Error(response.status === 401 ? "Connection is not authorized. Refresh from the Tailscale URL and try again." : "ChatGPT connection could not start");
+    const body = await response.json() as Record<string, unknown>;
+    const loginUrl = typeof body.loginUrl === "string" ? body.loginUrl : typeof body.url === "string" ? body.url : undefined;
+    const safeLoginUrl = loginUrl ? safeUrl(loginUrl) : undefined;
+    const detail = typeof body.detail === "string" ? body.detail.slice(0, 240) : typeof body.message === "string" ? body.message.slice(0, 240) : undefined;
+    if (safeLoginUrl) window.open(safeLoginUrl, "codex-login", "noopener,noreferrer");
+    codexAuth = { authenticated: false, state: "connecting", message: detail ?? (safeLoginUrl ? "Finish connecting in the ChatGPT window…" : "Waiting for ChatGPT connection…") };
+    await refreshCodexStatus();
+  } catch (error) { codexAuth = { authenticated: false, state: "disconnected", message: error instanceof Error ? error.message : "ChatGPT connection failed." }; renderShell(); }
+}
+
 function renderShell() {
   const teams = teamSummaries(payload.snapshot.nodes, payload.snapshot.teams);
   const topics = uniqueTopics(payload.snapshot.nodes);
   app.innerHTML = `<header class="topbar">
     <div class="brand"><div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div><div><p class="eyebrow">UNSOLD · WORK GRAPH</p><h1>Focus universe</h1></div></div>
-    <div class="top-actions"><span class="freshness ${payload.snapshot.stale ? "stale" : ""}"><i></i>${payload.snapshot.stale ? "Snapshot stale" : `Synced ${formatRelative(payload.snapshot.generatedAt)}`}</span><button id="analyze" class="primary" type="button" ${loading ? "disabled" : ""}><span class="spark">✦</span>${loading ? "Analyzing…" : "Analyze now"}</button></div>
+    <div class="top-actions"><span class="freshness ${payload.snapshot.stale ? "stale" : ""}"><i></i>${payload.snapshot.stale ? "Snapshot stale" : `Synced ${formatRelative(payload.snapshot.generatedAt)}`}</span><button id="analyze" class="primary" type="button" ${loading ? "disabled" : ""}><span class="spark">✦</span>${loading ? "Analyzing…" : "Analyze now"}</button><div class="codex-menu"><button id="codex-menu-button" class="codex-menu-button" type="button" aria-haspopup="true" aria-expanded="${codexMenuOpen}" aria-label="ChatGPT connection status"><i class="codex-status-dot ${codexAuth.state}"></i><span>Codex</span><span class="codex-menu-chevron">⌄</span></button><div id="codex-menu-panel" class="codex-menu-panel" ${codexMenuOpen ? "" : "hidden"} role="menu"><div class="codex-menu-title"><span>ChatGPT connection</span><b class="codex-state ${codexAuth.state}">${codexAuth.authenticated ? "Connected" : codexAuth.state === "connecting" ? "Connecting…" : codexAuth.state === "unavailable" ? "Unavailable" : "Not connected"}</b></div>${codexAuth.account ? `<div class="codex-account">${esc(codexAuth.account)}${codexAuth.plan ? ` · ${esc(codexAuth.plan)}` : ""}</div>` : ""}${codexAuth.expiresAt ? `<div class="codex-account">Session refresh ${esc(formatDate(codexAuth.expiresAt))}</div>` : ""}${codexAuth.message ? `<p class="codex-menu-message">${esc(codexAuth.message)}</p>` : ""}<button id="codex-connect" class="codex-connect" type="button" role="menuitem" ${codexAuth.state === "connecting" ? "disabled" : ""}>${codexAuth.authenticated ? "Reconnect ChatGPT" : "Connect ChatGPT"}</button></div></div></div>
   </header>
   <main class="layout">
     <aside class="rail" aria-label="Focus controls">
@@ -141,7 +188,12 @@ function renderGraph() {
     if (cy) { viewport = { zoom: cy.zoom(), pan: { ...cy.pan() } }; cy.destroy(); cy = undefined; }
     return;
   }
-  if (cy) { viewport = { zoom: cy.zoom(), pan: { ...cy.pan() } }; cy.destroy(); }
+  const forceFit = fitNextGraph;
+  if (cy) {
+    if (!forceFit) viewport = { zoom: cy.zoom(), pan: { ...cy.pan() } };
+    else viewport = null;
+    cy.destroy();
+  }
   const ids = new Set(graph.nodes.map((node) => node.id));
   const sortedNodes = graph.nodes.slice().sort((left, right) => left.id.localeCompare(right.id));
   const elements = [
@@ -151,8 +203,8 @@ function renderGraph() {
   ];
   const layoutName = graphLayoutName(view);
   const layout = layoutName === "fcose"
-    ? { name: layoutName, quality: "default", animate: false, fit: !viewport, padding: 40, nodeRepulsion: 8000, idealEdgeLength: 130, nestingFactor: 0.9 }
-    : { name: layoutName, animate: false, fit: !viewport, padding: 40, avoidOverlap: true, avoidOverlapPadding: 5, condense: true, rows: deterministicGridColumns(graph.nodes.length), sort: (left: any, right: any) => left.id().localeCompare(right.id()) };
+    ? { name: layoutName, quality: "default", animate: false, fit: forceFit || !viewport, padding: 40, nodeRepulsion: 8000, idealEdgeLength: 130, nestingFactor: 0.9 }
+    : { name: layoutName, animate: false, fit: forceFit || !viewport, padding: 40, avoidOverlap: true, avoidOverlapPadding: 5, condense: true, rows: deterministicGridColumns(graph.nodes.length), sort: (left: any, right: any) => left.id().localeCompare(right.id()) };
   cy = cytoscape({ container: root, elements, wheelSensitivity: 0.22, minZoom: 0.25, maxZoom: 2.5, style: [
     { selector: "node", style: { "background-color": "data(topicColor)", "background-opacity": 0.72, "border-color": "data(teamColor)", "border-width": 2, color: "#f5f8ff", label: "data(label)", "font-family": "Fira Code, monospace", "font-size": 10, "text-valign": "center", "text-halign": "center", width: 48, height: 29, shape: "data(statusShape)", "overlay-opacity": 0 } },
     { selector: "node[isZone]", style: { "background-color": "data(zoneColor)", "background-opacity": 0.045, "border-color": "data(zoneColor)", "border-opacity": 0.4, "border-width": 1, label: "data(label)", color: "data(zoneColor)", "font-size": 11, "font-weight": 600, padding: 24, shape: "roundrectangle", "text-valign": "top", "text-margin-y": -10, "compound-sizing-wrt-labels": "include" } },
@@ -166,7 +218,12 @@ function renderGraph() {
     { selector: ".low-zoom", style: { "text-opacity": 0, width: 13, height: 13, "border-width": 1 } },
     { selector: "edge.low-zoom", style: { opacity: 0.16, width: 0.7 } },
   ], layout });
-  const restoreViewport = () => { if (!cy || !viewport) return; cy.zoom(viewport.zoom); cy.pan(viewport.pan); viewport = null; };
+  const restoreViewport = () => {
+    if (!cy) return;
+    if (forceFit) { cy.fit(undefined, 40); fitNextGraph = false; viewport = null; return; }
+    if (!viewport) return;
+    cy.zoom(viewport.zoom); cy.pan(viewport.pan); viewport = null;
+  };
   cy.one("layoutstop", restoreViewport);
   queueMicrotask(restoreViewport);
   cy.on("zoom pan", () => { viewport = { zoom: cy.zoom(), pan: { ...cy.pan() } }; });
@@ -229,6 +286,7 @@ async function saveTopic(issueId: string, zone: string) {
 }
 
 async function loadGraph() {
+  fitNextGraph = true;
   const requestId = ++graphRequestId;
   graphAbort?.abort();
   const controller = new AbortController();
@@ -309,9 +367,11 @@ async function analyze() { if (loading) return; loading = true; analysisError = 
 async function editBrief() { const current = payload.brief?.text ?? ""; const text = window.prompt("Focus brief", current); if (text === null) return; try { const response = await authorizedFetch("/api/focus-brief", { method: "PUT", body: JSON.stringify({ text: text.trim() }) }); if (!response.ok) throw new Error("Could not save brief"); payload.brief = { text: text.trim(), updatedAt: new Date().toISOString() }; renderShell(); } catch { toast("Could not save brief"); } }
 function toggleFilter(kind: "team" | "topic", value: string) { const target = kind === "team" ? filters.teams : filters.topics; if (target.has(value)) target.delete(value); else target.add(value); renderShell(); }
 
-document.addEventListener("click", (event) => { const target = event.target as Element; const button = target.closest<HTMLButtonElement>("button"); if (!button) return; if (button.dataset.cyAction) { runGraphAction(button.dataset.cyAction); return; } if (button.dataset.campaign) { void createCampaign(); return; } if (button.dataset.approveBundle) { void approveBundle(button.dataset.approveBundle); return; } if (button.dataset.approveResolution) { void approveResolution(button.dataset.approveResolution); return; } if (button.dataset.runBundle) { void runBundle(button.dataset.runBundle); return; } if (button.dataset.view) { view = button.dataset.view as ViewMode; void loadGraph(); return; } if (button.dataset.node) { const mouse = event as MouseEvent; selectNode(button.dataset.node, Boolean(mouse.metaKey || mouse.ctrlKey || mouse.shiftKey)); return; } if (button.dataset.filterKind) { toggleFilter(button.dataset.filterKind as "team" | "topic", button.dataset.filterValue!); return; } if (button.id === "analyze" || button.id === "analyze-empty") { void analyze(); return; } if (button.id === "edit-brief") { void editBrief(); return; } if (button.id === "filters") { const panel = $("#filter-panel") as HTMLElement; panel.hidden = !panel.hidden; button.setAttribute("aria-expanded", String(!panel.hidden)); return; } if (button.id === "clear-filters" || button.id === "clear-empty") { filters.teams.clear(); filters.topics.clear(); filters.query = ""; renderShell(); return; } if (button.id === "show-completed-empty") { filters.showCompleted = true; renderShell(); return; } if (button.id === "show-universe-empty") { view = "universe"; void loadGraph(); return; } if (button.id === "shortcuts") { toggleShortcuts(); return; } if (button.id === "close-shortcuts") { toggleShortcuts(false); return; } if (button.id === "close-context") { clearSelection(); } });
+document.addEventListener("click", (event) => { const target = event.target as Element; const button = target.closest<HTMLButtonElement>("button"); if (!button) return; if (button.dataset.cyAction) { runGraphAction(button.dataset.cyAction); return; } if (button.id === "codex-menu-button") { codexMenuOpen = !codexMenuOpen; const panel = $("#codex-menu-panel") as HTMLElement; panel.hidden = !codexMenuOpen; button.setAttribute("aria-expanded", String(codexMenuOpen)); return; } if (button.id === "codex-connect") { codexMenuOpen = true; void connectCodex(); return; } if (button.dataset.campaign) { void createCampaign(); return; } if (button.dataset.approveBundle) { void approveBundle(button.dataset.approveBundle); return; } if (button.dataset.approveResolution) { void approveResolution(button.dataset.approveResolution); return; } if (button.dataset.runBundle) { void runBundle(button.dataset.runBundle); return; } if (button.dataset.view) { view = button.dataset.view as ViewMode; void loadGraph(); return; } if (button.dataset.node) { const mouse = event as MouseEvent; selectNode(button.dataset.node, Boolean(mouse.metaKey || mouse.ctrlKey || mouse.shiftKey)); return; } if (button.dataset.filterKind) { toggleFilter(button.dataset.filterKind as "team" | "topic", button.dataset.filterValue!); return; } if (button.id === "analyze" || button.id === "analyze-empty") { void analyze(); return; } if (button.id === "edit-brief") { void editBrief(); return; } if (button.id === "filters") { const panel = $("#filter-panel") as HTMLElement; panel.hidden = !panel.hidden; button.setAttribute("aria-expanded", String(!panel.hidden)); return; } if (button.id === "clear-filters" || button.id === "clear-empty") { filters.teams.clear(); filters.topics.clear(); filters.query = ""; renderShell(); return; } if (button.id === "show-completed-empty") { filters.showCompleted = true; renderShell(); return; } if (button.id === "show-universe-empty") { view = "universe"; void loadGraph(); return; } if (button.id === "shortcuts") { toggleShortcuts(); return; } if (button.id === "close-shortcuts") { toggleShortcuts(false); return; } if (button.id === "close-context") { clearSelection(); } });
 document.addEventListener("input", (event) => { const input = event.target as HTMLInputElement; if (input.id === "search") { filters.query = input.value; renderList(); renderGraph(); } if (input.id === "semantic") { filters.showSemantic = input.checked; renderGraph(); renderList(); } if (input.id === "completed") { filters.showCompleted = input.checked; renderGraph(); renderList(); } });
 document.addEventListener("change", (event) => { const select = event.target as HTMLSelectElement; if (select.id === "topic-select" && selectedId) void saveTopic(selectedId, select.value).catch(() => toast("Could not save topic")); });
 document.addEventListener("keydown", (event) => { const tag = document.activeElement?.tagName; if (["INPUT", "TEXTAREA", "SELECT"].includes(tag ?? "")) { if (event.key === "Escape") (document.activeElement as HTMLElement).blur(); return; } const key = event.key.toLowerCase(); if (event.key === "/") { event.preventDefault(); ($( "#search") as HTMLInputElement)?.focus(); return; } if (event.key === "+" || event.key === "=") { event.preventDefault(); runGraphAction("zoom-in"); return; } if (event.key === "-" || event.key === "_") { event.preventDefault(); runGraphAction("zoom-out"); return; } if (event.key === "0") { event.preventDefault(); runGraphAction("fit"); return; } if (key === "r") { event.preventDefault(); runGraphAction("reset"); return; } if (key === "f") { event.preventDefault(); view = "focus"; void loadGraph(); return; } if (key === "u") { event.preventDefault(); view = "universe"; void loadGraph(); return; } if (event.key === "?") { event.preventDefault(); toggleShortcuts(); return; } if (event.key === "Escape") { if (!($("#shortcuts-help") as HTMLElement).hidden) { toggleShortcuts(false); return; } if (selectedId) { selectedId = null; renderShell(); } } });
 
 void loadGraph();
+void refreshCodexStatus();
+startCodexStatusPolling();

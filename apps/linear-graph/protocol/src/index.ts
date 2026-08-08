@@ -157,6 +157,17 @@ export type FocusBrief = z.infer<typeof focusBriefSchema>;
 export const updateTopicRequestSchema = z.object({ zone: zoneIdSchema }).strict();
 export const updateFocusBriefRequestSchema = z.object({ text: z.string().max(5000) }).strict();
 
+export const codexAuthModeSchema = z.enum(["subscription", "api-key"]);
+export type CodexAuthMode = z.infer<typeof codexAuthModeSchema>;
+export const codexAuthStatusSchema = z.object({
+  mode: codexAuthModeSchema,
+  status: z.enum(["authenticated", "not_authenticated", "starting", "configured", "missing", "unknown", "failed"]),
+  checkedAt: date,
+  account: z.string().max(200).nullable(),
+  detail: z.string().max(1200).nullable(),
+}).strict();
+export type CodexAuthStatus = z.infer<typeof codexAuthStatusSchema>;
+
 export const triageDispositionSchema = z.enum(["ready", "blocked", "needs_clarification", "duplicate_stale", "bundle_candidate"]);
 export type TriageDisposition = z.infer<typeof triageDispositionSchema>;
 export const triageSourceSchema = z.enum(["codex", "manual"]);
