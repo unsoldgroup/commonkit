@@ -1,0 +1,20 @@
+[Unit]
+Description=CommonKit Linear work graph hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@@REPO_DIR@@
+EnvironmentFile=%h/.config/commonkit/linear-graph/hub.env
+ExecStart=@@BUN_BIN@@ run apps/linear-graph/hub/src/main.ts
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/commonkit/linear-graph @@DATA_DIR@@
+
+[Install]
+WantedBy=default.target
