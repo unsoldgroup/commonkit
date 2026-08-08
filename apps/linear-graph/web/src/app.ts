@@ -16,6 +16,7 @@ let cy: any;
 let loading = false;
 let initialLoading = true;
 let graphError: string | null = null;
+let analysisError: string | null = null;
 let campaignProposal: Campaign | null = null;
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 let viewport: { zoom: number; pan: { x: number; y: number } } | null = null;
@@ -85,7 +86,7 @@ function renderShell() {
   </header>
   <main class="layout">
     <aside class="rail" aria-label="Focus controls">
-      <section class="brief-card ${graphError || ["failed", "stale"].includes(payload.brief?.status ?? "") ? "has-error" : ""}"><div class="section-kicker"><span class="status-dot"></span> TODAY'S BRIEF</div><p>${briefCopy()}</p>${payload.analysis?.status === "failed" ? `<small class="brief-error">${esc(payload.analysis.error ?? "The last brief run failed.")}</small>` : payload.brief?.error ? `<small class="brief-error">${esc(payload.brief.error)}</small>` : graphError ? `<small class="brief-error">${esc(graphError)}</small>` : ""}<button id="edit-brief" class="quiet-button" type="button">Edit brief <span>↗</span></button></section>
+      <section class="brief-card ${graphError || analysisError || ["failed", "stale"].includes(payload.brief?.status ?? "") ? "has-error" : ""}"><div class="section-kicker"><span class="status-dot"></span> TODAY'S BRIEF</div><p>${briefCopy()}</p>${analysisError ? `<small class="brief-error">${esc(analysisError)}</small>` : payload.analysis?.status === "failed" ? `<small class="brief-error">${esc(payload.analysis.error ?? "The last brief run failed.")}</small>` : payload.brief?.error ? `<small class="brief-error">${esc(payload.brief.error)}</small>` : graphError ? `<small class="brief-error">${esc(graphError)}</small>` : ""}<button id="edit-brief" class="quiet-button" type="button">Edit brief <span>↗</span></button></section>
       <section class="rail-section"><div class="section-heading"><h2>Recommended</h2><span class="count">${payload.recommendations.length}</span></div><div id="recommendations" class="recommendations"></div></section>
       <section class="rail-section"><div class="section-heading"><h2>Workstreams</h2><span class="count">${payload.snapshot.nodes.length}</span></div><div id="zones" class="zones"></div></section>
       <section class="rail-section team-section"><div class="section-heading"><h2>Teams</h2><span class="count">${teams.length}</span></div><div id="teams" class="teams">${teams.map((team) => `<button type="button" class="team-row ${filters.teams.has(team.name) ? "active" : ""}" data-filter-kind="team" data-filter-value="${esc(team.name)}"><i style="--team:${team.color}"></i><span>${esc(team.name)}</span><b>${team.count}</b></button>`).join("") || `<p class="muted">No team metadata yet.</p>`}</div></section>
@@ -253,6 +254,18 @@ async function loadGraph() {
     renderShell();
   } finally { if (graphAbort === controller) graphAbort = undefined; }
 }
+async function waitForAnalysis() {
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const response = await fetch("/api/analysis-runs/latest", { cache: "no-store" });
+    if (!response.ok) throw new Error("Analysis status could not be loaded");
+    const run = await response.json() as { status?: string; error?: string | null };
+    if (run.status === "completed") return;
+    if (run.status === "failed") throw new Error(run.error || "Codex analysis failed on the VPS");
+    if (attempt === 29 || attempt === 59 || attempt === 89) toast("Codex is still analyzing the work universe…");
+  }
+  throw new Error("Analysis is still running after two minutes; check the brief again shortly");
+}
 async function createCampaign() {
   if (loading) return;
   const seedNodes = selectedNodeIds().map(nodeById).filter(Boolean) as GraphNode[];
@@ -292,7 +305,7 @@ async function runBundle(bundleId: string) {
   if (campaignProposal) campaignProposal = { ...campaignProposal, status: "running", bundles: campaignProposal.bundles.map((bundle) => bundle.id === bundleId ? { ...bundle, status: execution.status === "verified" ? "verified" : "running" } : bundle) };
   toast("Headless Codex execution finished; review the evidence"); renderShell();
 }
-async function analyze() { if (loading) return; loading = true; renderShell(); try { const response = await authorizedFetch("/api/analysis-runs", { method: "POST", body: JSON.stringify({ reason: "manual" }) }); if (!response.ok) throw new Error(response.status === 401 ? "Analysis needs a graph action token" : "Analysis could not start"); toast("Codex analysis started"); await new Promise((resolve) => setTimeout(resolve, 700)); await loadGraph(); } catch (error) { toast(error instanceof Error ? error.message : "Analysis failed"); } finally { loading = false; renderShell(); } }
+async function analyze() { if (loading) return; loading = true; analysisError = null; renderShell(); try { const response = await authorizedFetch("/api/analysis-runs", { method: "POST", body: JSON.stringify({ reason: "manual" }) }); if (!response.ok) throw new Error(response.status === 401 ? "Analysis is not authorized. Refresh the page from the Tailscale URL and try again." : "Analysis could not start"); toast("Codex analysis started"); await waitForAnalysis(); await loadGraph(); toast("Analysis complete — the brief and Focus view are updated"); } catch (error) { analysisError = error instanceof Error ? error.message : "Analysis failed"; toast(analysisError); } finally { loading = false; renderShell(); } }
 async function editBrief() { const current = payload.brief?.text ?? ""; const text = window.prompt("Focus brief", current); if (text === null) return; try { const response = await authorizedFetch("/api/focus-brief", { method: "PUT", body: JSON.stringify({ text: text.trim() }) }); if (!response.ok) throw new Error("Could not save brief"); payload.brief = { text: text.trim(), updatedAt: new Date().toISOString() }; renderShell(); } catch { toast("Could not save brief"); } }
 function toggleFilter(kind: "team" | "topic", value: string) { const target = kind === "team" ? filters.teams : filters.topics; if (target.has(value)) target.delete(value); else target.add(value); renderShell(); }
 
