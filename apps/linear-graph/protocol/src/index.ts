@@ -165,6 +165,8 @@ export const codexAuthStatusSchema = z.object({
   checkedAt: date,
   account: z.string().max(200).nullable(),
   detail: z.string().max(1200).nullable(),
+  loginUrl: z.string().url().nullable().optional(),
+  deviceCode: z.string().max(32).nullable().optional(),
 }).strict();
 export type CodexAuthStatus = z.infer<typeof codexAuthStatusSchema>;
 
