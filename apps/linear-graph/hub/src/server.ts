@@ -49,6 +49,11 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
   const store = options.store ?? new GraphStore(options.dataPath ?? ":memory:");
   const webDistPath = options.webDistPath ?? join(import.meta.dir, "../../web/dist");
   let current = store.loadSnapshot();
+  if (current && !store.loadBrief()) {
+    const activeCount = current.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
+    const timestamp = now().toISOString();
+    store.saveBrief({ text: `Universe synced: ${activeCount} active issues are ready for triage and bundle planning.`, updatedAt: timestamp, generatedAt: timestamp, snapshotAt: current.syncedAt, status: "ready", source: "fallback", error: null });
+  }
   let analysisInFlight: Promise<AnalysisRun> | undefined;
   const updateDrainMetrics = () => {
     if (!current) return null;
