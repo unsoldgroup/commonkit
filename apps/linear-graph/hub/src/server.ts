@@ -40,7 +40,12 @@ function validBearer(request: Request, expected: string) {
 }
 
 export function trustedNonDestructiveMutation(request: Request, pathname: string) {
-  return request.method === "POST" && request.headers.get("X-Linear-Graph-Tailnet") === "1" && ["/api/analysis-runs", "/api/campaigns"].includes(pathname);
+  if (request.method !== "POST" || !["/api/analysis-runs", "/api/campaigns"].includes(pathname)) return false;
+  if (request.headers.get("X-Linear-Graph-Tailnet") === "1") return true;
+  // graph.unsold.cloud is Tailscale-only; embedded browsers can strip the
+  // proxy marker, so accept the exact same-origin browser request as the
+  // equivalent trusted path. Approvals and execution remain token-gated.
+  return request.headers.get("Origin") === "https://graph.unsold.cloud" || request.headers.get("Sec-Fetch-Site") === "same-origin";
 }
 
 function parseBody<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
