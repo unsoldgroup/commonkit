@@ -18,7 +18,7 @@ let initialLoading = true;
 let graphError: string | null = null;
 let analysisError: string | null = null;
 let campaignProposal: Campaign | null = null;
-type CodexAuthStatus = { authenticated: boolean; state: "connected" | "disconnected" | "connecting" | "unavailable"; account?: string; plan?: string; expiresAt?: string; message?: string };
+type CodexAuthStatus = { authenticated: boolean; state: "connected" | "disconnected" | "connecting" | "unavailable"; account?: string; plan?: string; expiresAt?: string; message?: string; loginUrl?: string; deviceCode?: string };
 let codexAuth: CodexAuthStatus = { authenticated: false, state: "connecting", message: "Checking ChatGPT connection…" };
 let codexMenuOpen = false;
 let codexStatusTimer: ReturnType<typeof setInterval> | undefined;
@@ -92,7 +92,9 @@ function normalizeCodexAuth(body: unknown): CodexAuthStatus {
   const plan = typeof value.plan === "string" ? value.plan.slice(0, 80) : undefined;
   const expiresAt = typeof value.expiresAt === "string" ? value.expiresAt : undefined;
   const message = typeof value.message === "string" ? value.message.slice(0, 240) : typeof value.detail === "string" ? value.detail.slice(0, 240) : typeof value.error === "string" ? value.error.slice(0, 240) : undefined;
-  return { authenticated, state, account, plan, expiresAt, message };
+  const loginUrl = typeof value.loginUrl === "string" && value.loginUrl.startsWith("https://auth.openai.com/") ? value.loginUrl : undefined;
+  const deviceCode = typeof value.deviceCode === "string" ? value.deviceCode.slice(0, 32) : undefined;
+  return { authenticated, state, account, plan, expiresAt, message, loginUrl, deviceCode };
 }
 async function refreshCodexStatus() {
   try {
@@ -102,6 +104,7 @@ async function refreshCodexStatus() {
     else codexAuth = normalizeCodexAuth(await response.json());
   } catch { codexAuth = { authenticated: false, state: "unavailable", message: "Could not reach the ChatGPT connection service." }; }
   renderShell();
+  return codexAuth;
 }
 function startCodexStatusPolling() {
   if (codexStatusTimer) return;
@@ -109,6 +112,7 @@ function startCodexStatusPolling() {
 }
 async function connectCodex() {
   if (codexAuth.state === "connecting") return;
+  const loginWindow = window.open("about:blank", "codex-login");
   codexAuth = { authenticated: false, state: "connecting", message: "Opening ChatGPT connection…" };
   renderShell();
   try {
@@ -118,10 +122,12 @@ async function connectCodex() {
     const loginUrl = typeof body.loginUrl === "string" ? body.loginUrl : typeof body.url === "string" ? body.url : undefined;
     const safeLoginUrl = loginUrl ? safeUrl(loginUrl) : undefined;
     const detail = typeof body.detail === "string" ? body.detail.slice(0, 240) : typeof body.message === "string" ? body.message.slice(0, 240) : undefined;
-    if (safeLoginUrl) window.open(safeLoginUrl, "codex-login", "noopener,noreferrer");
-    codexAuth = { authenticated: false, state: "connecting", message: detail ?? (safeLoginUrl ? "Finish connecting in the ChatGPT window…" : "Waiting for ChatGPT connection…") };
-    await refreshCodexStatus();
-  } catch (error) { codexAuth = { authenticated: false, state: "disconnected", message: error instanceof Error ? error.message : "ChatGPT connection failed." }; renderShell(); }
+    if (safeLoginUrl && loginWindow) loginWindow.location.href = safeLoginUrl;
+    else if (safeLoginUrl) window.open(safeLoginUrl, "codex-login");
+    codexAuth = { authenticated: false, state: "connecting", loginUrl: safeLoginUrl, deviceCode: typeof body.deviceCode === "string" ? body.deviceCode : undefined, message: detail ?? (safeLoginUrl ? "Finish connecting in the ChatGPT window…" : "Waiting for ChatGPT connection…") };
+    const refreshed = await refreshCodexStatus();
+    if (refreshed.loginUrl && loginWindow) loginWindow.location.href = refreshed.loginUrl;
+  } catch (error) { loginWindow?.close(); codexAuth = { authenticated: false, state: "disconnected", message: error instanceof Error ? error.message : "ChatGPT connection failed." }; renderShell(); }
 }
 
 function renderShell() {
@@ -129,7 +135,7 @@ function renderShell() {
   const topics = uniqueTopics(payload.snapshot.nodes);
   app.innerHTML = `<header class="topbar">
     <div class="brand"><div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div><div><p class="eyebrow">UNSOLD · WORK GRAPH</p><h1>Focus universe</h1></div></div>
-    <div class="top-actions"><span class="freshness ${payload.snapshot.stale ? "stale" : ""}"><i></i>${payload.snapshot.stale ? "Snapshot stale" : `Synced ${formatRelative(payload.snapshot.generatedAt)}`}</span><button id="analyze" class="primary" type="button" ${loading ? "disabled" : ""}><span class="spark">✦</span>${loading ? "Analyzing…" : "Analyze now"}</button><div class="codex-menu"><button id="codex-menu-button" class="codex-menu-button" type="button" aria-haspopup="true" aria-expanded="${codexMenuOpen}" aria-label="ChatGPT connection status"><i class="codex-status-dot ${codexAuth.state}"></i><span>Codex</span><span class="codex-menu-chevron">⌄</span></button><div id="codex-menu-panel" class="codex-menu-panel" ${codexMenuOpen ? "" : "hidden"} role="menu"><div class="codex-menu-title"><span>ChatGPT connection</span><b class="codex-state ${codexAuth.state}">${codexAuth.authenticated ? "Connected" : codexAuth.state === "connecting" ? "Connecting…" : codexAuth.state === "unavailable" ? "Unavailable" : "Not connected"}</b></div>${codexAuth.account ? `<div class="codex-account">${esc(codexAuth.account)}${codexAuth.plan ? ` · ${esc(codexAuth.plan)}` : ""}</div>` : ""}${codexAuth.expiresAt ? `<div class="codex-account">Session refresh ${esc(formatDate(codexAuth.expiresAt))}</div>` : ""}${codexAuth.message ? `<p class="codex-menu-message">${esc(codexAuth.message)}</p>` : ""}<button id="codex-connect" class="codex-connect" type="button" role="menuitem" ${codexAuth.state === "connecting" ? "disabled" : ""}>${codexAuth.authenticated ? "Reconnect ChatGPT" : "Connect ChatGPT"}</button></div></div></div>
+    <div class="top-actions"><span class="freshness ${payload.snapshot.stale ? "stale" : ""}"><i></i>${payload.snapshot.stale ? "Snapshot stale" : `Synced ${formatRelative(payload.snapshot.generatedAt)}`}</span><button id="analyze" class="primary" type="button" ${loading ? "disabled" : ""}><span class="spark">✦</span>${loading ? "Analyzing…" : "Analyze now"}</button><div class="codex-menu"><button id="codex-menu-button" class="codex-menu-button" type="button" aria-haspopup="true" aria-expanded="${codexMenuOpen}" aria-label="ChatGPT connection status"><i class="codex-status-dot ${codexAuth.state}"></i><span>Codex</span><span class="codex-menu-chevron">⌄</span></button><div id="codex-menu-panel" class="codex-menu-panel" ${codexMenuOpen ? "" : "hidden"} role="menu"><div class="codex-menu-title"><span>ChatGPT connection</span><b class="codex-state ${codexAuth.state}">${codexAuth.authenticated ? "Connected" : codexAuth.state === "connecting" ? "Connecting…" : codexAuth.state === "unavailable" ? "Unavailable" : "Not connected"}</b></div>${codexAuth.account ? `<div class="codex-account">${esc(codexAuth.account)}${codexAuth.plan ? ` · ${esc(codexAuth.plan)}` : ""}</div>` : ""}${codexAuth.expiresAt ? `<div class="codex-account">Session refresh ${esc(formatDate(codexAuth.expiresAt))}</div>` : ""}${codexAuth.message ? `<p class="codex-menu-message">${esc(codexAuth.message)}</p>` : ""}${codexAuth.loginUrl ? `<a class="codex-login-link" href="${esc(codexAuth.loginUrl)}" target="_blank" rel="noreferrer">Open ChatGPT sign-in ↗</a>` : ""}${codexAuth.deviceCode ? `<div class="codex-device-code"><span>Device code</span><code>${esc(codexAuth.deviceCode)}</code></div>` : ""}<button id="codex-connect" class="codex-connect" type="button" role="menuitem" ${codexAuth.state === "connecting" ? "disabled" : ""}>${codexAuth.authenticated ? "Reconnect ChatGPT" : "Connect ChatGPT"}</button></div></div></div>
   </header>
   <main class="layout">
     <aside class="rail" aria-label="Focus controls">
