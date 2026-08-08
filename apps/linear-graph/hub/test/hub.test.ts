@@ -70,4 +70,5 @@ describe("linear graph hub", () => {
     expect(focus.nodes.map((node) => node.id)).toEqual([first.id]);
     expect(focus.teams).toEqual(snapshot.teams);
   });
+
 });
