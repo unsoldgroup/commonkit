@@ -10,6 +10,7 @@
     "ci:desktop-test": "pnpm install --frozen-lockfile && pnpm --dir apps/desktop test",
     "ci:desktop-typecheck": "pnpm install --frozen-lockfile && pnpm --dir apps/desktop typecheck",
     "build": "pnpm --filter mcp-local-relay build && pnpm --filter @commonkit/session-board-protocol build",
+    "build:linear-graph": "pnpm --filter @commonkit/linear-graph-web build",
     "test": "pnpm run test:commonkit && pnpm run test:relay && pnpm --filter @commonkit/session-board-protocol build && pnpm run test:session-board-protocol && pnpm run test:session-board-hub && pnpm run test:session-board-reporter && pnpm run test:session-board-hook && pnpm run test:session-board-web",
     "test:commonkit": "node --test test/*.test.mjs",
     "test:relay": "pnpm --filter mcp-local-relay test",
@@ -18,7 +19,9 @@
     "test:session-board-reporter": "pnpm --filter @commonkit/session-board-reporter test",
     "test:session-board-hook": "pnpm --filter @commonkit/session-board-hook test",
     "test:session-board-web": "pnpm --filter @commonkit/session-board-web test",
-    "typecheck": "pnpm --filter mcp-local-relay typecheck && pnpm --filter @commonkit/session-board-protocol typecheck && pnpm --filter @commonkit/session-board-reporter typecheck && pnpm --filter @commonkit/session-board-web typecheck"
+    "test:linear-graph": "pnpm --filter @commonkit/linear-graph-protocol test && pnpm --filter @commonkit/linear-graph-hub test && pnpm --filter @commonkit/linear-graph-web test",
+    "typecheck": "pnpm --filter mcp-local-relay typecheck && pnpm --filter @commonkit/session-board-protocol typecheck && pnpm --filter @commonkit/session-board-reporter typecheck && pnpm --filter @commonkit/session-board-web typecheck",
+    "typecheck:linear-graph": "pnpm --filter @commonkit/linear-graph-protocol typecheck && pnpm --filter @commonkit/linear-graph-hub typecheck && pnpm --filter @commonkit/linear-graph-web typecheck"
   },
   "engines": {
     "node": ">=24"
