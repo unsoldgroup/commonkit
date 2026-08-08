@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { applyCodexAnalysis, focusSnapshot } from "../src/analysis.js";
 import { parseCodexEvents } from "../src/codex.js";
 import { normalizeLinearEdges, normalizeLinearIssue, summarizeTeams } from "../src/normalizer.js";
-import { startGraphHub } from "../src/server.js";
+import { startGraphHub, trustedNonDestructiveMutation } from "../src/server.js";
 
 const raw = (id: string, title = "Graph issue") => ({
   id, identifier: `USG-${id}`, title, description: "description", url: `https://linear.app/unsold/issue/USG-${id}`,
@@ -15,6 +15,15 @@ let hub: ReturnType<typeof startGraphHub> | undefined;
 afterEach(async () => { if (hub) await hub.stop(); hub = undefined; });
 
 describe("linear graph hub", () => {
+  test("allows only Tailscale-tagged non-destructive analysis and campaign starts without the action token", () => {
+    const trusted = new Request("http://localhost/api/analysis-runs", { method: "POST", headers: { "X-Linear-Graph-Tailnet": "1" } });
+    const campaign = new Request("http://localhost/api/campaigns", { method: "POST", headers: { "X-Linear-Graph-Tailnet": "1" } });
+    const approval = new Request("http://localhost/api/bundles/x/approval", { method: "POST", headers: { "X-Linear-Graph-Tailnet": "1" } });
+    expect(trustedNonDestructiveMutation(trusted, "/api/analysis-runs")).toBe(true);
+    expect(trustedNonDestructiveMutation(campaign, "/api/campaigns")).toBe(true);
+    expect(trustedNonDestructiveMutation(approval, "/api/bundles/x/approval")).toBe(false);
+  });
+
   test("normalizes parent and blocking relations without inventing external nodes", () => {
     const parentRaw = raw("parent");
     const childRaw = { ...raw("child"), parent: { id: "parent" }, relations: { nodes: [{ type: "blocks", issue: { id: "missing" } }] } };
