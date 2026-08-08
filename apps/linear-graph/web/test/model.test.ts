@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, matchesNode, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, type Filters } from "../src/model.js";
+import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, matchesNode, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
 import { demoPayload } from "../src/protocol.js";
 
 const base: Filters = { query: "", teams: new Set(), topics: new Set(), showSemantic: true, showCompleted: false };
@@ -84,5 +84,20 @@ describe("linear graph view model", () => {
     expect(matchesNode(node, { ...base, query: "interrupted target mutation" })).toBe(true);
     expect(matchesNode({ ...node, teamKey: "EXP", description: "An explicit unrelated detail" }, { ...base, query: "EXP" })).toBe(true);
     expect(matchesNode({ ...node, teamKey: "CK", description: "An explicit unrelated detail" }, { ...base, query: "EXP" })).toBe(false);
+  });
+
+  test("zone metrics include active counts and priority-weighted workload", () => {
+    const metrics = zoneMetrics(demoPayload.snapshot.nodes, demoPayload.snapshot.zones);
+    expect(metrics.find((zone) => zone.name === "Reliability")).toMatchObject({ issueCount: 1, activeCount: 1, weightedWorkload: 4 });
+    expect(metrics.find((zone) => zone.name === "Release")).toMatchObject({ issueCount: 2, activeCount: 2, weightedWorkload: 7 });
+    expect(metrics.every((zone) => zone.weightedWorkload >= zone.activeCount)).toBe(true);
+  });
+
+  test("Universe keeps explicit zone containers while filters still narrow issues", () => {
+    const universe = visibleGraph(demoPayload.snapshot, demoPayload.recommendations, base, "universe");
+    expect(universe.zones.map((zone) => zone.id)).toEqual(demoPayload.snapshot.zones.map((zone) => zone.id));
+    const filtered = visibleGraph(demoPayload.snapshot, demoPayload.recommendations, { ...base, topics: new Set(["Product"]) }, "universe");
+    expect(filtered.nodes.every((node) => node.topic === "Product" || node.topics?.includes("Product"))).toBe(true);
+    expect(filtered.zones.map((zone) => zone.id)).toEqual(demoPayload.snapshot.zones.map((zone) => zone.id));
   });
 });

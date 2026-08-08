@@ -1,14 +1,17 @@
 import { graphEdgeSchema, graphSnapshotSchema, type CodexAnalysis, type GraphEdge, type Issue, type FocusRecommendation, DEFAULT_ZONES, type ZoneId } from "@commonkit/linear-graph-protocol";
-import { hashAnalysisInput, summarizeTeams } from "./normalizer.js";
+import { hashAnalysisInput, inferTopicAssignment, summarizeTeams } from "./normalizer.js";
 
 export function applyCodexAnalysis(issues: Issue[], linearEdges: GraphEdge[], analysis: CodexAnalysis, syncedAt: string, runId: string): { snapshot: ReturnType<typeof graphSnapshotSchema.parse>; inputHash: string } {
   const ids = new Set(issues.map((issue) => issue.id));
   const byId = new Map(issues.map((issue) => [issue.id, issue]));
   const zoneIds = new Set(DEFAULT_ZONES.map((zone) => zone.id));
-  const assignments = new Map(analysis.assignments.filter((item) => ids.has(item.issueId) && zoneIds.has(item.zone)).map((item) => [item.issueId, item]));
+  const assignments = new Map(analysis.assignments.filter((item) => ids.has(item.issueId) && zoneIds.has(item.zone) && item.zone !== "unsorted").map((item) => [item.issueId, item]));
   const nodes = issues.map((issue) => {
     const assignment = assignments.get(issue.id);
-    return assignment && issue.zone === "unsorted" ? { ...issue, zone: assignment.zone as ZoneId, topicTags: assignment.topicTags } : issue;
+    if (issue.zone !== "unsorted") return issue;
+    if (assignment) return { ...issue, zone: assignment.zone as ZoneId, topicTags: assignment.topicTags };
+    const fallback = inferTopicAssignment(issue);
+    return fallback ? { ...issue, zone: fallback.zone as ZoneId, topicTags: fallback.topicTags } : issue;
   });
   const edges = new Map(linearEdges.map((edge) => [edge.id, edge]));
   for (const suggestion of analysis.semanticEdges) {
