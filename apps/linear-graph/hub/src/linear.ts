@@ -6,9 +6,14 @@ export interface LinearPage {
   pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
 }
 
+export interface LinearProjectMutation {
+  createProject(input: { name: string; description: string; teamIds: string[]; issueIds: string[] }): Promise<{ id: string; url?: string }>;
+}
+
 export interface LinearSource {
   fetchIssues(cursor?: string): Promise<LinearPage>;
   repoMap?: { teams?: Record<string, string>; projects?: Record<string, string> };
+  mutate?: LinearProjectMutation;
 }
 
 const QUERY = `query GraphIssues($after: String) {
@@ -25,10 +30,19 @@ const QUERY = `query GraphIssues($after: String) {
 
 export function createLinearSource(options: { token: string; endpoint?: string; fetcher?: typeof fetch; repoMap?: LinearSource["repoMap"] }): LinearSource {
   const request = options.fetcher ?? fetch;
+  const endpoint = options.endpoint ?? "https://api.linear.app/graphql";
+  const graphql = async <T>(query: string, variables: Record<string, unknown>): Promise<T> => {
+    const response = await request(endpoint, { method: "POST", headers: { "Authorization": options.token, "Content-Type": "application/json" }, body: JSON.stringify({ query, variables }) });
+    if (!response.ok) throw new Error(`Linear request failed (${response.status})`);
+    const body = await response.json() as { errors?: Array<{ message?: string }>; data?: T };
+    if (body.errors?.length) throw new Error(`Linear GraphQL error: ${body.errors.map((error) => error.message ?? "unknown").join("; ")}`);
+    if (!body.data) throw new Error("Linear response did not contain data");
+    return body.data;
+  };
   return {
     repoMap: options.repoMap,
     async fetchIssues(cursor) {
-      const response = await request(options.endpoint ?? "https://api.linear.app/graphql", {
+      const response = await request(endpoint, {
         method: "POST",
         headers: { "Authorization": options.token, "Content-Type": "application/json" },
         body: JSON.stringify({ query: QUERY, variables: { after: cursor ?? null } }),
@@ -38,6 +52,24 @@ export function createLinearSource(options: { token: string; endpoint?: string; 
       if (body.errors?.length) throw new Error(`Linear GraphQL error: ${body.errors.map((error) => error.message ?? "unknown").join("; ")}`);
       if (!body.data?.issues) throw new Error("Linear response did not contain issues");
       return body.data.issues;
+    },
+    mutate: {
+      async createProject(input) {
+        const data = await graphql<{ projectCreate?: { success?: boolean; project?: { id?: string; url?: string } | null } }>(
+          `mutation GraphBundleProject($input: ProjectCreateInput!) { projectCreate(input: $input) { success project { id url } } }`,
+          { input: { name: input.name, description: input.description, teamIds: input.teamIds } },
+        );
+        const project = data.projectCreate?.project;
+        if (!data.projectCreate?.success || !project?.id) throw new Error("Linear project creation was not successful");
+        for (const issueId of input.issueIds) {
+          const result = await graphql<{ issueUpdate?: { success?: boolean } }>(
+            `mutation AttachBundleIssue($id: String!, $projectId: String!) { issueUpdate(id: $id, input: { projectId: $projectId }) { success } }`,
+            { id: issueId, projectId: project.id },
+          );
+          if (!result.issueUpdate?.success) throw new Error(`Linear issue ${issueId} could not be attached to the project`);
+        }
+        return { id: project.id, ...(project.url ? { url: project.url } : {}) };
+      },
     },
   };
 }
