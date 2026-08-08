@@ -4,6 +4,7 @@ export type ViewMode = "focus" | "universe";
 export type GraphLayoutName = "fcose" | "grid";
 export type Filters = { query: string; teams: Set<string>; topics: Set<string>; showSemantic: boolean; showCompleted: boolean };
 export type TeamSummary = { id?: string; key?: string; name: string; count: number; activeCount?: number; completedCount?: number; canceledCount?: number; color: string };
+export type ZoneMetric = TopicZone & { issueCount: number; activeCount: number; completedCount: number; canceledCount: number; weightedWorkload: number };
 
 const TEAM_COLORS = ["#80a7ff", "#56d6a0", "#f5bd5c", "#d39bff", "#ff8f82", "#6bd7e8", "#f18fc0", "#b8d879"] as const;
 
@@ -32,6 +33,25 @@ export function teamSummaries(nodes: GraphNode[], metadata: TeamMetadata[] = [])
   const counts = new Map<string, number>();
   for (const node of nodes) counts.set(node.team, (counts.get(node.team) ?? 0) + 1);
   return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, count]) => ({ name, count, color: teamColor(name) }));
+}
+
+const workloadWeight = (priority?: number) => priority === 1 ? 4 : priority === 2 ? 3 : priority === 3 ? 2 : 1;
+const nodeUsesZone = (node: GraphNode, zone: TopicZone) => node.topic === zone.name || node.topicId === zone.id || (node.topics ?? []).includes(zone.name) || (node.topics ?? []).includes(zone.id);
+
+/** Stable topical workload metrics. Secondary topic tags are included so the rail reflects the same taxonomy as filtering. */
+export function zoneMetrics(nodes: GraphNode[], zones: TopicZone[]): ZoneMetric[] {
+  return zones.map((zone) => {
+    const issues = nodes.filter((node) => nodeUsesZone(node, zone));
+    const active = issues.filter((node) => !["completed", "canceled"].includes(node.statusType ?? ""));
+    return {
+      ...zone,
+      issueCount: issues.length,
+      activeCount: active.length,
+      completedCount: issues.filter((node) => node.statusType === "completed").length,
+      canceledCount: issues.filter((node) => node.statusType === "canceled").length,
+      weightedWorkload: active.reduce((total, node) => total + workloadWeight(node.priority), 0),
+    };
+  });
 }
 
 /** Focus benefits from semantic force placement; Universe needs bounded, deterministic placement. */
@@ -63,8 +83,11 @@ export function visibleGraph(snapshot: GraphSnapshot, recommendations: FocusReco
   const nodes = snapshot.nodes.filter((node) => (view === "universe" || focusNeighbors.has(node.id)) && matchesNode(node, filters));
   const ids = new Set(nodes.map((node) => node.id));
   const edges = snapshot.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target) && (filters.showSemantic || edge.sourceType !== "codex"));
-  const zoneIds = new Set(nodes.map((node) => node.topic).filter(Boolean));
-  return { nodes, edges, zones: snapshot.zones.filter((zone) => zoneIds.has(zone.name)) };
+  const zoneIds = new Set(nodes.flatMap((node) => [node.topic, node.topicId, ...(node.topics ?? [])]).filter(Boolean));
+  // Universe is the stable map of the configured taxonomy. Focus only shows
+  // containers that have relevant one-hop work to keep the focused view calm.
+  const zones = view === "universe" ? snapshot.zones : snapshot.zones.filter((zone) => zoneIds.has(zone.id) || zoneIds.has(zone.name));
+  return { nodes, edges, zones };
 }
 
 export function recommendationFor(nodeId: string, recommendations: FocusRecommendation[]) { return recommendations.find((item) => item.issueId === nodeId); }

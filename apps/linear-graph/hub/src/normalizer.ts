@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { graphEdgeSchema, issueSchema, teamSummarySchema, DEFAULT_ZONES, type GraphEdge, type Issue, type TeamSummary, type ZoneId } from "@commonkit/linear-graph-protocol";
+import { graphEdgeSchema, issueSchema, teamSummarySchema, DEFAULT_ZONES, type GraphEdge, type Issue, type TeamSummary, type TopicAssignment, type ZoneId } from "@commonkit/linear-graph-protocol";
 
 export type LinearIssueInput = Record<string, unknown>;
 
@@ -21,6 +21,43 @@ const relationNodes = (value: unknown): unknown[] => {
   const nodes = asRecord(value).nodes;
   return Array.isArray(nodes) ? nodes : [];
 };
+
+const fallbackKeywords: Readonly<Record<Exclude<ZoneId, "unsorted">, readonly string[]>> = {
+  product: ["product", "customer", "user", "checkout", "quote", "booking", "pricing", "price", "ui", "ux", "feature", "workflow", "journey", "frontend", "mobile"],
+  platform: ["api", "database", "db", "schema", "sdk", "agent", "codex", "graph", "integration", "sync", "worker", "service", "migration", "queue", "backend", "reliability", "recovery"],
+  operations: ["deploy", "deployment", "hosting", "server", "vps", "monitoring", "observability", "support", "incident", "scrape", "cron", "ops", "runbook", "alert", "release"],
+  security: ["auth", "authentication", "token", "credential", "password", "secret", "permission", "access", "security", "encryption", "vulnerability", "oauth"],
+  documentation: ["docs", "documentation", "guide", "readme", "context", "knowledge", "adr", "glossary", "runbook"],
+};
+
+const words = (value: string) => new Set(value.toLocaleLowerCase().match(/[a-z0-9]+/g) ?? []);
+
+/** Infer a stable topic from issue metadata when Codex has not assigned one. */
+export function inferTopicAssignment(issue: Issue): TopicAssignment | null {
+  if (issue.zone !== "unsorted") return null;
+  const fields: Array<[string, string, number]> = [
+    ["title", issue.title, 5], ["labels", issue.labels.join(" "), 4],
+    ["project", issue.project?.name ?? "", 3], ["repository", issue.repo ?? "", 3],
+    ["topic tags", issue.topicTags.join(" "), 3], ["description", issue.description ?? "", 1],
+  ];
+  const scores = new Map<Exclude<ZoneId, "unsorted">, number>();
+  const matched = new Map<Exclude<ZoneId, "unsorted">, string[]>();
+  for (const [field, value, weight] of fields) {
+    const tokens = words(value);
+    for (const [zone, keywords] of Object.entries(fallbackKeywords) as Array<[Exclude<ZoneId, "unsorted">, readonly string[]]>) {
+      for (const keyword of keywords) {
+        if (!tokens.has(keyword)) continue;
+        scores.set(zone, (scores.get(zone) ?? 0) + weight);
+        matched.set(zone, [...(matched.get(zone) ?? []), `${keyword} (${field})`]);
+      }
+    }
+  }
+  const winner = [...scores.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0];
+  if (!winner) return null;
+  const [zone, score] = winner;
+  const topicTags = [...new Set((matched.get(zone) ?? []).map((item) => item.split(" ")[0]))].slice(0, 12);
+  return { issueId: issue.id, zone, topicTags, confidence: Math.min(0.9, 0.5 + score * 0.08), rationale: `Matched ${topicTags.join(", ")} in issue metadata.` };
+}
 
 export function normalizeLinearIssue(raw: LinearIssueInput, overrides: Map<string, ZoneId> = new Map()): Issue {
   const team = asRecord(raw.team);

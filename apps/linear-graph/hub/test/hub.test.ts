@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { applyCodexAnalysis, focusSnapshot } from "../src/analysis.js";
 import { parseCodexEvents } from "../src/codex.js";
-import { normalizeLinearEdges, normalizeLinearIssue, summarizeTeams } from "../src/normalizer.js";
+import { inferTopicAssignment, normalizeLinearEdges, normalizeLinearIssue, summarizeTeams } from "../src/normalizer.js";
 import { startGraphHub, trustedNonDestructiveMutation } from "../src/server.js";
 
 const raw = (id: string, title = "Graph issue") => ({
@@ -44,6 +44,24 @@ describe("linear graph hub", () => {
       normalizeLinearIssue({ ...raw("cancelled"), state: { id: "state-cancelled", name: "Cancelled", type: "canceled" } }),
     ];
     expect(summarizeTeams(issues)).toEqual([{ id: "team", key: "USG", name: "Unsold", issueCount: 3, activeIssueCount: 1, completedIssueCount: 1, canceledIssueCount: 1 }]);
+  });
+
+  test("assigns unsorted issues to deterministic topic zones from metadata", () => {
+    const security = normalizeLinearIssue({ ...raw("security", "Rotate OAuth token"), labels: { nodes: [{ name: "credentials" }] }, project: { id: "p", name: "Access control" } });
+    const docs = normalizeLinearIssue({ ...raw("docs", "Write migration guide"), labels: { nodes: [{ name: "documentation" }] }, project: { id: "p", name: "Knowledge base" } });
+    expect(inferTopicAssignment(security)?.zone).toBe("security");
+    expect(inferTopicAssignment(docs)?.zone).toBe("documentation");
+    expect(inferTopicAssignment({ ...security, zone: "product" })).toBeNull();
+  });
+
+  test("uses fallback zones only when Codex and manual assignment are absent", () => {
+    const inferred = normalizeLinearIssue({ ...raw("inferred", "Deploy API worker") });
+    const manual = normalizeLinearIssue({ ...raw("manual", "Deploy API worker") }, new Map([["manual", "product"]]));
+    const snapshot = applyCodexAnalysis([inferred, manual], [], { assignments: [{ issueId: inferred.id, zone: "security", topicTags: ["reviewed"], confidence: 1, rationale: "review" }], semanticEdges: [], recommendations: [] }, inferred.updatedAt, "run").snapshot;
+    expect(snapshot.nodes.find((node) => node.id === inferred.id)?.zone).toBe("security");
+    expect(snapshot.nodes.find((node) => node.id === manual.id)?.zone).toBe("product");
+    const fallback = applyCodexAnalysis([normalizeLinearIssue({ ...raw("fallback", "Deploy API worker") })], [], { assignments: [], semanticEdges: [], recommendations: [] }, inferred.updatedAt, "run").snapshot;
+    expect(fallback.nodes[0]?.zone).toBe("platform");
   });
 
   test("serves a read-only snapshot and protects mutations with the action token", async () => {
