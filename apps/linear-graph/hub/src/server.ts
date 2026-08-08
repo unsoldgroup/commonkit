@@ -13,6 +13,7 @@ import { runCodexAnalysis, type CodexRunnerOptions } from "./codex.js";
 import { computeDrainMetrics, proposeCampaign } from "./drain.js";
 import { executeApprovedBundle, type ExecutionRunnerOptions } from "./execution.js";
 import { syncLinear, type LinearSource } from "./linear.js";
+import { inferTopicAssignment, summarizeTeams } from "./normalizer.js";
 import { GraphStore } from "./store.js";
 
 export interface GraphHubOptions {
@@ -60,7 +61,18 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
   const store = options.store ?? new GraphStore(options.dataPath ?? ":memory:");
   const webDistPath = options.webDistPath ?? join(import.meta.dir, "../../web/dist");
   const codexAuth = createCodexAuthManager(options.codexAuth);
-  let current = store.loadSnapshot();
+  const persisted = store.loadSnapshot();
+  const grouped = persisted ? graphSnapshotSchema.parse({
+    ...persisted,
+    nodes: persisted.nodes.map((issue) => {
+      const fallback = inferTopicAssignment(issue);
+      return fallback ? { ...issue, zone: fallback.zone, topicTags: fallback.topicTags } : issue;
+    }),
+  }) : null;
+  if (persisted && grouped && JSON.stringify(persisted.nodes.map((node) => node.zone)) !== JSON.stringify(grouped.nodes.map((node) => node.zone))) {
+    store.saveSnapshot({ ...grouped, teams: summarizeTeams(grouped.nodes) });
+  }
+  let current = grouped;
   if (current && !store.loadBrief()) {
     const activeCount = current.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
     const timestamp = now().toISOString();
