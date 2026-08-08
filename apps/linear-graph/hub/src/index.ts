@@ -1,5 +1,6 @@
 export * from "./analysis.js";
 export * from "./codex.js";
+export * from "./codex-auth.js";
 export * from "./execution.js";
 export * from "./drain.js";
 export * from "./linear.js";

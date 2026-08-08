@@ -8,6 +8,7 @@ import {
   type AnalysisRun, type Campaign, type ExecutionRun, type GraphSnapshot, type TriageDecision,
 } from "@commonkit/linear-graph-protocol";
 import { applyCodexAnalysis, defaultRecommendations, focusSnapshot } from "./analysis.js";
+import { createCodexAuthManager, type CodexAuthOptions } from "./codex-auth.js";
 import { runCodexAnalysis, type CodexRunnerOptions } from "./codex.js";
 import { computeDrainMetrics, proposeCampaign } from "./drain.js";
 import { executeApprovedBundle, type ExecutionRunnerOptions } from "./execution.js";
@@ -22,6 +23,7 @@ export interface GraphHubOptions {
   dataPath?: string;
   linear?: LinearSource;
   codex?: CodexRunnerOptions;
+  codexAuth?: CodexAuthOptions;
   execution?: Omit<ExecutionRunnerOptions, "repositoryAllowlist"> & { repositoryAllowlist: Readonly<Record<string, string>> };
   webDistPath?: string;
   now?: () => Date;
@@ -40,7 +42,7 @@ function validBearer(request: Request, expected: string) {
 }
 
 export function trustedNonDestructiveMutation(request: Request, pathname: string) {
-  if (request.method !== "POST" || !["/api/analysis-runs", "/api/campaigns"].includes(pathname)) return false;
+  if (request.method !== "POST" || !["/api/analysis-runs", "/api/campaigns", "/api/codex/login"].includes(pathname)) return false;
   if (request.headers.get("X-Linear-Graph-Tailnet") === "1") return true;
   // graph.unsold.cloud is Tailscale-only; embedded browsers can strip the
   // proxy marker, so accept the exact same-origin browser request as the
@@ -57,6 +59,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
   if (options.dataPath) mkdirSync(dirname(options.dataPath), { recursive: true });
   const store = options.store ?? new GraphStore(options.dataPath ?? ":memory:");
   const webDistPath = options.webDistPath ?? join(import.meta.dir, "../../web/dist");
+  const codexAuth = createCodexAuthManager(options.codexAuth);
   let current = store.loadSnapshot();
   if (current && !store.loadBrief()) {
     const activeCount = current.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
@@ -129,6 +132,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       }
       if (url.pathname === "/api/focus-brief" && request.method === "GET") return json(store.loadBrief() ?? { text: "", updatedAt: now().toISOString(), status: "stale", source: "fallback", error: "No brief has been generated yet" });
       if (url.pathname === "/api/analysis-runs/latest" && request.method === "GET") return json(store.latestAnalysisRun());
+      if (url.pathname === "/api/codex/status" && request.method === "GET") return json(await codexAuth.status());
       if (url.pathname === "/api/work-drain" && request.method === "GET") {
         if (!current) return error("No snapshot available", 503);
         return json({ metrics: updateDrainMetrics(), campaigns: store.loadCampaigns(), decisions: store.loadTriageDecisions() });
@@ -157,6 +161,10 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
           void runAnalysis().catch((caught) => console.error("Linear graph analysis failed", caught));
           return json(store.latestAnalysisRun() ?? { status: "running" }, 202);
         } catch (caught) { return error(caught instanceof Error ? caught.message : "analysis failed", 502); }
+      }
+      if (url.pathname === "/api/codex/login" && request.method === "POST") {
+        const status = await codexAuth.startDeviceLogin();
+        return json(status, status.mode === "api-key" ? 409 : status.status === "failed" ? 502 : 202);
       }
       if (url.pathname === "/api/campaigns" && request.method === "POST") {
         try {

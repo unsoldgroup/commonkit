@@ -42,14 +42,18 @@ function nextDailyRun(now: Date, timeZone: string, hour: number): Date {
 }
 
 const executionRepoMap = executionRepos();
+const codexAuthMode = process.env.LINEAR_GRAPH_CODEX_AUTH ?? "subscription";
+if (codexAuthMode !== "subscription" && codexAuthMode !== "api-key") throw new Error("LINEAR_GRAPH_CODEX_AUTH must be subscription or api-key");
+const codexApiKey = codexAuthMode === "api-key" ? process.env.CODEX_API_KEY : undefined;
 const hub = startGraphHub({
   actionToken: required("LINEAR_GRAPH_ACTION_TOKEN"),
   dataPath: process.env.LINEAR_GRAPH_DATA_PATH ?? "/var/lib/linear-graph/graph.sqlite",
   hostname: process.env.LINEAR_GRAPH_HOST ?? "127.0.0.1",
   port: Number(process.env.LINEAR_GRAPH_PORT ?? 8790),
   linear: createLinearSource({ token: required("LINEAR_API_TOKEN"), repoMap: repoMap() }),
-  codex: { apiKey: process.env.CODEX_API_KEY, model: process.env.LINEAR_GRAPH_CODEX_MODEL },
-  execution: executionRepoMap ? { repositoryAllowlist: executionRepoMap, apiKey: process.env.CODEX_API_KEY, model: process.env.LINEAR_GRAPH_CODEX_MODEL } : undefined,
+  codex: { apiKey: codexApiKey, model: process.env.LINEAR_GRAPH_CODEX_MODEL },
+  codexAuth: { mode: codexAuthMode, codexHome: process.env.CODEX_HOME, apiKeyConfigured: Boolean(codexApiKey) },
+  execution: executionRepoMap ? { repositoryAllowlist: executionRepoMap, apiKey: codexApiKey, model: process.env.LINEAR_GRAPH_CODEX_MODEL } : undefined,
 });
 console.log(`Linear graph hub listening on ${hub.url}`);
 
