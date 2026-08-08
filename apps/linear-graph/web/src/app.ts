@@ -85,7 +85,7 @@ async function authorizedFetch(path: string, init: RequestInit) {
 
 function normalizeCodexAuth(body: unknown): CodexAuthStatus {
   const value = body && typeof body === "object" ? body as Record<string, unknown> : {};
-  const authenticated = value.authenticated === true || value.connected === true || value.status === "connected";
+  const authenticated = value.authenticated === true || value.connected === true || value.status === "connected" || value.status === "authenticated";
   const rawState = typeof value.status === "string" ? value.status : "";
   const state: CodexAuthStatus["state"] = authenticated ? "connected" : rawState === "connecting" || rawState === "pending" ? "connecting" : rawState === "unavailable" ? "unavailable" : "disconnected";
   const account = typeof value.account === "string" ? value.account.slice(0, 120) : typeof value.email === "string" ? value.email.slice(0, 120) : undefined;
