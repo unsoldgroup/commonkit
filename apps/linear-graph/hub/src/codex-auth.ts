@@ -53,8 +53,9 @@ export function createCodexAuthManager(options: CodexAuthOptions = {}): CodexAut
       const stderr = child.stderr && typeof child.stderr !== "number" ? streamText(child.stderr) : Promise.resolve("");
       const [exitCode, out, err] = await Promise.all([child.exited, stdout, stderr]);
       const detail = safeOutput((out || err).trim()) || null;
-      if (exitCode === 0 && /logged\s+in|authenticated/i.test(out)) return blankStatus(mode, "authenticated", checkedAt, detail);
-      if (/not\s+logged|not\s+authenticated|no\s+login/i.test(`${out}\n${err}`)) return blankStatus(mode, "not_authenticated", checkedAt, detail);
+      const combined = `${out}\n${err}`;
+      if (exitCode === 0 && /logged\s+in|authenticated/i.test(combined)) return blankStatus(mode, "authenticated", checkedAt, detail);
+      if (/not\s+logged|not\s+authenticated|no\s+login/i.test(combined)) return blankStatus(mode, "not_authenticated", checkedAt, detail);
       return blankStatus(mode, exitCode === 0 ? "unknown" : "failed", checkedAt, detail ?? `codex login status exited with ${exitCode}`);
     } catch (caught) {
       return blankStatus(mode, "failed", checkedAt, safeOutput(caught instanceof Error ? caught.message : "Unable to check Codex login status"));
