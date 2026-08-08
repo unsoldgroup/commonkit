@@ -39,6 +39,10 @@ function validBearer(request: Request, expected: string) {
   return left.length === right.length && timingSafeEqual(left, right);
 }
 
+export function trustedNonDestructiveMutation(request: Request, pathname: string) {
+  return request.method === "POST" && request.headers.get("X-Linear-Graph-Tailnet") === "1" && ["/api/analysis-runs", "/api/campaigns"].includes(pathname);
+}
+
 function parseBody<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
   return request.json().then((body) => schema.parse(body));
 }
@@ -142,9 +146,12 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
           if (await file.exists()) return new Response(file);
         }
       }
-      if (!validBearer(request, options.actionToken)) return error("Unauthorized", 401);
+      if (!validBearer(request, options.actionToken) && !trustedNonDestructiveMutation(request, url.pathname)) return error("Unauthorized", 401);
       if (url.pathname === "/api/analysis-runs" && request.method === "POST") {
-        try { return json(await runAnalysis(), 202); } catch (caught) { return error(caught instanceof Error ? caught.message : "analysis failed", 502); }
+        try {
+          void runAnalysis().catch((caught) => console.error("Linear graph analysis failed", caught));
+          return json(store.latestAnalysisRun() ?? { status: "running" }, 202);
+        } catch (caught) { return error(caught instanceof Error ? caught.message : "analysis failed", 502); }
       }
       if (url.pathname === "/api/campaigns" && request.method === "POST") {
         try {
