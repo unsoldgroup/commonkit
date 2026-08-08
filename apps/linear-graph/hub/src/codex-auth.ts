@@ -32,7 +32,9 @@ async function streamText(stream: ReadableStream<Uint8Array> | string | number |
 async function readPreview(stream: ReadableStream<Uint8Array> | string | number | undefined, timeoutMs = 1500) {
   if (!stream || typeof stream === "number") return "";
   if (typeof stream === "string") return stream;
-  const reader = stream.getReader();
+  const [preview, remainder] = stream.tee();
+  void new Response(remainder).text().catch(() => undefined);
+  const reader = preview.getReader();
   const decoder = new TextDecoder();
   let text = "";
   const deadline = Date.now() + timeoutMs;
