@@ -14,6 +14,7 @@ readonly CADDY_FILE="/etc/caddy/Caddyfile.d/linear-graph.caddy"
 readonly CERT_DIR="/etc/caddy/certs/linear-graph"
 readonly DATA_DIR="$HOME/.local/share/commonkit/linear-graph"
 readonly CODEX_AUTH="${LINEAR_GRAPH_CODEX_AUTH:-subscription}"
+readonly CODEX_HOME="${LINEAR_GRAPH_CODEX_HOME:-$DATA_DIR/codex}"
 
 require_command() { command -v "$1" >/dev/null 2>&1 || { printf 'Required command not found: %s\n' "$1" >&2; exit 1; }; }
 systemd_quote() {
@@ -22,7 +23,7 @@ systemd_quote() {
   value=${value//\\/\\\\}; value=${value//\"/\\\"}; printf '"%s"' "$value"
 }
 render_service() {
-  sed -e "s|@@REPO_DIR@@|${REPO_DIR//&/\\&}|g" -e "s|@@BUN_BIN@@|${BUN_BIN//&/\\&}|g" -e "s|@@DATA_DIR@@|${DATA_DIR//&/\\&}|g" "$TEMPLATE_DIR/linear-graph.service" >"$UNIT_FILE"
+  sed -e "s|@@REPO_DIR@@|${REPO_DIR//&/\\&}|g" -e "s|@@BUN_BIN@@|${BUN_BIN//&/\\&}|g" -e "s|@@DATA_DIR@@|${DATA_DIR//&/\\&}|g" -e "s|@@CODEX_HOME@@|${CODEX_HOME//&/\\&}|g" "$TEMPLATE_DIR/linear-graph.service" >"$UNIT_FILE"
 }
 
 for command_name in bun pnpm systemctl sudo caddy; do require_command "$command_name"; done
@@ -45,7 +46,10 @@ if [[ -z ${CF_Token:-} && -r ${HOME}/.acme.sh/account.conf ]]; then
 fi
 : "${CF_Token:?Set CF_Token for the Cloudflare DNS challenge}"
 
-mkdir -p "$CONFIG_DIR" "$SYSTEMD_DIR" "$DATA_DIR/codex"
+mkdir -p "$CONFIG_DIR" "$SYSTEMD_DIR" "$DATA_DIR" "$CODEX_HOME"
+if [[ "$CODEX_HOME" == "$DATA_DIR/codex" && -f "$HOME/.codex/auth.json" && ! -f "$CODEX_HOME/auth.json" ]]; then
+  install -m 600 "$HOME/.codex/auth.json" "$CODEX_HOME/auth.json"
+fi
 umask 077
 chmod 700 "$CONFIG_DIR" "$DATA_DIR"
 {
@@ -56,7 +60,7 @@ chmod 700 "$CONFIG_DIR" "$DATA_DIR"
   printf 'LINEAR_GRAPH_PORT=%s\n' "$(systemd_quote "$HUB_PORT")"
   printf 'LINEAR_GRAPH_DATA_PATH=%s\n' "$(systemd_quote "$DATA_DIR/graph.sqlite")"
   [[ -z ${LINEAR_GRAPH_TIMEZONE:-} ]] || printf 'LINEAR_GRAPH_TIMEZONE=%s\n' "$(systemd_quote "$LINEAR_GRAPH_TIMEZONE")"
-  printf 'CODEX_HOME=%s\n' "$(systemd_quote "$DATA_DIR/codex")"
+  printf 'CODEX_HOME=%s\n' "$(systemd_quote "$CODEX_HOME")"
   printf 'LINEAR_GRAPH_CODEX_AUTH=%s\n' "$(systemd_quote "$CODEX_AUTH")"
   [[ -z ${LINEAR_GRAPH_CODEX_MODEL:-} ]] || printf 'LINEAR_GRAPH_CODEX_MODEL=%s\n' "$(systemd_quote "$LINEAR_GRAPH_CODEX_MODEL")"
   [[ -z ${LINEAR_GRAPH_REPO_MAP:-} ]] || printf 'LINEAR_GRAPH_REPO_MAP=%s\n' "$(systemd_quote "$LINEAR_GRAPH_REPO_MAP")"

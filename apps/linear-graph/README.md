@@ -41,9 +41,11 @@ curl -fsS https://graph.unsold.cloud/health
 systemctl --user status linear-graph.service
 ```
 
-Codex uses the subscription login by default. Set `LINEAR_GRAPH_CODEX_AUTH=api-key` together with
+Codex uses the existing subscription login copied into the graph’s private `CODEX_HOME` by default. Set `LINEAR_GRAPH_CODEX_AUTH=api-key` together with
 `CODEX_API_KEY` only when API-key mode is intended; subscription mode never forwards that variable
-to the Codex child process. The authenticated VPS user can start device login from the graph with
+to the Codex child process. The installer copies only the existing `~/.codex/auth.json` once; future
+device logins stay inside the graph’s private home. Override `LINEAR_GRAPH_CODEX_HOME` only when you
+intentionally want a separate account. The authenticated VPS user can start device login from the graph with
 `POST /api/codex/login` and inspect redacted state at `GET /api/codex/status`. `LINEAR_GRAPH_REPO_MAP`
 is optional JSON such as
 `{"teams":{"UNS":"unsold"},"projects":{"project-id":"repo-name"}}`; it provides bounded
