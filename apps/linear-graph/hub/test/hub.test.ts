@@ -19,10 +19,12 @@ describe("linear graph hub", () => {
     const trusted = new Request("http://localhost/api/analysis-runs", { method: "POST", headers: { "X-Linear-Graph-Tailnet": "1" } });
     const campaign = new Request("http://localhost/api/campaigns", { method: "POST", headers: { "X-Linear-Graph-Tailnet": "1" } });
     const sameOrigin = new Request("https://graph.unsold.cloud/api/analysis-runs", { method: "POST", headers: { Origin: "https://graph.unsold.cloud" } });
+    const login = new Request("https://graph.unsold.cloud/api/codex/login", { method: "POST", headers: { Origin: "https://graph.unsold.cloud" } });
     const approval = new Request("http://localhost/api/bundles/x/approval", { method: "POST", headers: { "X-Linear-Graph-Tailnet": "1" } });
     expect(trustedNonDestructiveMutation(trusted, "/api/analysis-runs")).toBe(true);
     expect(trustedNonDestructiveMutation(campaign, "/api/campaigns")).toBe(true);
     expect(trustedNonDestructiveMutation(sameOrigin, "/api/analysis-runs")).toBe(true);
+    expect(trustedNonDestructiveMutation(login, "/api/codex/login")).toBe(true);
     expect(trustedNonDestructiveMutation(approval, "/api/bundles/x/approval")).toBe(false);
   });
 

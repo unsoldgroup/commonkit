@@ -18,7 +18,7 @@ LINEAR_API_TOKEN=... CODEX_API_KEY=... LINEAR_GRAPH_ACTION_TOKEN=... \
 
 The hub listens on `127.0.0.1:8790` by default. `POST /api/analysis-runs` is protected by the
 action token; Linear and Codex credentials are never exposed to the browser. The scheduled run
-is daily at 06:00 Europe/Madrid by default (override with `LINEAR_GRAPH_TIMEZONE`), with a startup
+is daily at 07:00 Europe/Madrid by default (override with `LINEAR_GRAPH_TIMEZONE`), with a startup
 run when no completed snapshot exists.
 
 ## VPS deployment
@@ -41,8 +41,11 @@ curl -fsS https://graph.unsold.cloud/health
 systemctl --user status linear-graph.service
 ```
 
-Codex uses `CODEX_API_KEY` when supplied, or the existing headless Codex OAuth session on the
-VPS when that variable is omitted. `LINEAR_GRAPH_REPO_MAP` is optional JSON such as
+Codex uses the subscription login by default. Set `LINEAR_GRAPH_CODEX_AUTH=api-key` together with
+`CODEX_API_KEY` only when API-key mode is intended; subscription mode never forwards that variable
+to the Codex child process. The authenticated VPS user can start device login from the graph with
+`POST /api/codex/login` and inspect redacted state at `GET /api/codex/status`. `LINEAR_GRAPH_REPO_MAP`
+is optional JSON such as
 `{"teams":{"UNS":"unsold"},"projects":{"project-id":"repo-name"}}`; it provides bounded
 repository context without sending repository source code to Codex. Codex runs as a read-only,
 non-interactive child process with a strict output schema and no tools or network access.

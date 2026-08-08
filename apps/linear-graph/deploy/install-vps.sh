@@ -13,6 +13,7 @@ readonly UNIT_FILE="$SYSTEMD_DIR/linear-graph.service"
 readonly CADDY_FILE="/etc/caddy/Caddyfile.d/linear-graph.caddy"
 readonly CERT_DIR="/etc/caddy/certs/linear-graph"
 readonly DATA_DIR="$HOME/.local/share/commonkit/linear-graph"
+readonly CODEX_AUTH="${LINEAR_GRAPH_CODEX_AUTH:-subscription}"
 
 require_command() { command -v "$1" >/dev/null 2>&1 || { printf 'Required command not found: %s\n' "$1" >&2; exit 1; }; }
 systemd_quote() {
@@ -31,6 +32,11 @@ readonly ACME_SH="${ACME_SH:-$HOME/.acme.sh/acme.sh}"
 [[ -x "$ACME_SH" ]] || { printf 'acme.sh not found at %s\n' "$ACME_SH" >&2; exit 1; }
 : "${LINEAR_API_TOKEN:?Set LINEAR_API_TOKEN}"
 : "${LINEAR_GRAPH_ACTION_TOKEN:?Set LINEAR_GRAPH_ACTION_TOKEN}"
+case "$CODEX_AUTH" in
+  subscription) ;;
+  api-key) : "${CODEX_API_KEY:?Set CODEX_API_KEY when LINEAR_GRAPH_CODEX_AUTH=api-key}" ;;
+  *) printf 'LINEAR_GRAPH_CODEX_AUTH must be subscription or api-key.\n' >&2; exit 1 ;;
+esac
 if [[ -z ${CF_Token:-} && -r ${HOME}/.acme.sh/account.conf ]]; then
   # Reuse the credential acme.sh already stores on this VPS without copying it into our env file.
   # shellcheck disable=SC1091
@@ -44,13 +50,14 @@ umask 077
 chmod 700 "$CONFIG_DIR" "$DATA_DIR"
 {
   printf 'LINEAR_API_TOKEN=%s\n' "$(systemd_quote "$LINEAR_API_TOKEN")"
-  [[ -z ${CODEX_API_KEY:-} ]] || printf 'CODEX_API_KEY=%s\n' "$(systemd_quote "$CODEX_API_KEY")"
+  [[ "$CODEX_AUTH" != "api-key" ]] || printf 'CODEX_API_KEY=%s\n' "$(systemd_quote "$CODEX_API_KEY")"
   printf 'LINEAR_GRAPH_ACTION_TOKEN=%s\n' "$(systemd_quote "$LINEAR_GRAPH_ACTION_TOKEN")"
   printf 'LINEAR_GRAPH_HOST=%s\n' "$(systemd_quote 127.0.0.1)"
   printf 'LINEAR_GRAPH_PORT=%s\n' "$(systemd_quote "$HUB_PORT")"
   printf 'LINEAR_GRAPH_DATA_PATH=%s\n' "$(systemd_quote "$DATA_DIR/graph.sqlite")"
   [[ -z ${LINEAR_GRAPH_TIMEZONE:-} ]] || printf 'LINEAR_GRAPH_TIMEZONE=%s\n' "$(systemd_quote "$LINEAR_GRAPH_TIMEZONE")"
   printf 'CODEX_HOME=%s\n' "$(systemd_quote "$DATA_DIR/codex")"
+  printf 'LINEAR_GRAPH_CODEX_AUTH=%s\n' "$(systemd_quote "$CODEX_AUTH")"
   [[ -z ${LINEAR_GRAPH_CODEX_MODEL:-} ]] || printf 'LINEAR_GRAPH_CODEX_MODEL=%s\n' "$(systemd_quote "$LINEAR_GRAPH_CODEX_MODEL")"
   [[ -z ${LINEAR_GRAPH_REPO_MAP:-} ]] || printf 'LINEAR_GRAPH_REPO_MAP=%s\n' "$(systemd_quote "$LINEAR_GRAPH_REPO_MAP")"
   [[ -z ${LINEAR_GRAPH_EXECUTION_REPOS:-} ]] || printf 'LINEAR_GRAPH_EXECUTION_REPOS=%s\n' "$(systemd_quote "$LINEAR_GRAPH_EXECUTION_REPOS")"
