@@ -2,7 +2,7 @@ import cytoscape from "cytoscape";
 import fcose from "cytoscape-fcose";
 import { demoPayload, normalizePayload, type GraphEdge, type GraphNode, type GraphPayload } from "./protocol.js";
 import type { Campaign, WorkBundle } from "@commonkit/linear-graph-protocol";
-import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, recommendationFor, statusShape, teamColor, teamSummaries, topicColor, topicCounts, uniqueTopics, visibleGraph, type Filters, type ViewMode } from "./model.js";
+import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, recommendationFor, statusShape, teamColor, teamSummaries, topicColor, uniqueTopics, visibleGraph, zoneMetrics, type Filters, type ViewMode } from "./model.js";
 
 cytoscape.use(fcose);
 const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
@@ -176,7 +176,9 @@ function renderRecommendations() {
 }
 function renderZones() {
   const root = $("#zones");
-  root.innerHTML = topicCounts(payload.snapshot.nodes, payload.snapshot.zones).map((zone) => `<button type="button" class="zone-row ${filters.topics.has(zone.name) ? "active" : ""}" data-filter-kind="topic" data-filter-value="${esc(zone.name)}"><i style="--zone:${zone.color}"></i><span>${esc(zone.name)}</span><b>${zone.issueCount}</b></button>`).join("");
+  const metrics = zoneMetrics(payload.snapshot.nodes, payload.snapshot.zones);
+  const maxWorkload = Math.max(1, ...metrics.map((zone) => zone.weightedWorkload));
+  root.innerHTML = metrics.map((zone) => { const meter = Math.round((zone.weightedWorkload / maxWorkload) * 100); return `<button type="button" class="zone-row ${filters.topics.has(zone.name) ? "active" : ""}" data-filter-kind="topic" data-filter-value="${esc(zone.name)}" aria-label="${esc(zone.name)}: ${zone.activeCount} active issues, workload ${zone.weightedWorkload}"><i style="--zone:${zone.color}"></i><span class="zone-copy"><b>${esc(zone.name)}</b><small>${zone.activeCount} active · ${zone.weightedWorkload} workload</small><span class="zone-meter" aria-hidden="true"><i style="width:${meter}%;--zone:${zone.color}"></i></span></span><b class="zone-count">${zone.issueCount}</b></button>`; }).join("") || `<p class="muted">No topical zones yet.</p>`;
 }
 function renderList() {
   const graph = visibleGraph(payload.snapshot, payload.recommendations, filters, view);
@@ -202,8 +204,9 @@ function renderGraph() {
   }
   const ids = new Set(graph.nodes.map((node) => node.id));
   const sortedNodes = graph.nodes.slice().sort((left, right) => left.id.localeCompare(right.id));
+  const graphZoneMetrics = zoneMetrics(graph.nodes, graph.zones);
   const elements = [
-    ...graph.zones.map((zone) => ({ data: { id: `zone:${zone.id}`, label: zone.name, zoneColor: zone.color, isZone: true } })),
+    ...graphZoneMetrics.map((zone) => ({ data: { id: `zone:${zone.id}`, label: `${zone.name}\n${zone.activeCount} active · ${zone.weightedWorkload} load`, zoneName: zone.name, zoneColor: zone.color, zoneIssueCount: zone.issueCount, zoneActiveCount: zone.activeCount, zoneWorkload: zone.weightedWorkload, zonePadding: Math.min(60, 22 + Math.sqrt(zone.activeCount) * 7), isZone: true } })),
     ...sortedNodes.map((node) => ({ data: { id: node.id, label: node.identifier, title: node.title, topic: node.topic ?? "Unsorted", description: descriptionExcerpt(node), topicColor: topicColor(node, graph.zones), teamColor: teamColor(node.teamKey ?? node.team), statusType: node.statusType ?? "unstarted", statusShape: statusShape(node.statusType), parent: graph.zones.find((zone) => zone.name === node.topic)?.id ? `zone:${graph.zones.find((zone) => zone.name === node.topic)!.id}` : undefined, score: node.focusScore ?? 0, selected: selectedIds.has(node.id) } })),
     ...graph.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)).map((edge) => ({ data: { id: edge.id, source: edge.source, target: edge.target, kind: edge.kind, sourceType: edge.sourceType ?? "linear", confidence: edge.confidence ?? 0 } })),
   ];
@@ -213,7 +216,7 @@ function renderGraph() {
     : { name: layoutName, animate: false, fit: forceFit || !viewport, padding: 40, avoidOverlap: true, avoidOverlapPadding: 5, condense: true, rows: deterministicGridColumns(graph.nodes.length), sort: (left: any, right: any) => left.id().localeCompare(right.id()) };
   cy = cytoscape({ container: root, elements, wheelSensitivity: 0.22, minZoom: 0.25, maxZoom: 2.5, style: [
     { selector: "node", style: { "background-color": "data(topicColor)", "background-opacity": 0.72, "border-color": "data(teamColor)", "border-width": 2, color: "#f5f8ff", label: "data(label)", "font-family": "Fira Code, monospace", "font-size": 10, "text-valign": "center", "text-halign": "center", width: 48, height: 29, shape: "data(statusShape)", "overlay-opacity": 0 } },
-    { selector: "node[isZone]", style: { "background-color": "data(zoneColor)", "background-opacity": 0.045, "border-color": "data(zoneColor)", "border-opacity": 0.4, "border-width": 1, label: "data(label)", color: "data(zoneColor)", "font-size": 11, "font-weight": 600, padding: 24, shape: "roundrectangle", "text-valign": "top", "text-margin-y": -10, "compound-sizing-wrt-labels": "include" } },
+    { selector: "node[isZone]", style: { "background-color": "data(zoneColor)", "background-opacity": 0.045, "border-color": "data(zoneColor)", "border-opacity": 0.4, "border-width": 1, label: "data(label)", color: "data(zoneColor)", "font-size": 11, "font-weight": 600, padding: "data(zonePadding)", shape: "roundrectangle", "text-valign": "top", "text-margin-y": -10, "text-wrap": "wrap", "text-max-width": 180, "compound-sizing-wrt-labels": "include" } },
     { selector: "node[score > 80]", style: { "border-width": 3 } },
     { selector: 'node[statusType = "completed"]', style: { opacity: 0.62 } },
     { selector: 'node[statusType = "canceled"]', style: { opacity: 0.42, "border-style": "dashed" } },
