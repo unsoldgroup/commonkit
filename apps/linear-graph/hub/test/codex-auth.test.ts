@@ -19,7 +19,7 @@ describe("Codex auth manager", () => {
       commands.push(command);
       expect(options.env).not.toHaveProperty("CODEX_API_KEY");
       if (command[2] === "status") return { exited: Promise.resolve(0), stdout: stream("Logged in using ChatGPT\naccess-sess-123456789012345\n"), stderr: stream("") } as any;
-      login = { exited: Promise.resolve(0), killed: false, stdout: stream("Open https://auth.openai.com/device\n"), stderr: stream("") };
+      login = { exited: new Promise<number>(() => undefined), killed: false, stdout: stream("Open https://auth.openai.com/codex/device\nEnter code GERY-PHROH\n"), stderr: stream("") };
       return login;
     } });
     expect((await manager.status()).status).toBe("authenticated");
@@ -27,6 +27,8 @@ describe("Codex auth manager", () => {
     const secondLogin = manager.startDeviceLogin();
     const started = await firstLogin;
     expect(started.status).toBe("starting");
+    expect(started.loginUrl).toBe("https://auth.openai.com/codex/device");
+    expect(started.deviceCode).toBe("GERY-PHROH");
     expect((await secondLogin).detail).toContain("already in progress");
     expect(commands).toEqual([["codex", "login", "status"], ["codex", "login", "--device-auth"]]);
     expect(JSON.stringify(started)).not.toContain("access-sess");
