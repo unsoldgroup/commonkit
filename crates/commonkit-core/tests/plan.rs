@@ -1,6 +1,6 @@
 use commonkit_core::{
-    OperationDraft, OperationKind, PlanBindings, PlanBuildError, PlanDraft, ResourceRef, Risk,
-    Sha256Digest, StableId, build_plan, digest_domain_json, finalize_operation,
+    OperationDraft, OperationKind, PlanBindings, PlanBuildError, PlanDraft, RecoveryCapability,
+    ResourceRef, Risk, Sha256Digest, StableId, build_plan, digest_domain_json, finalize_operation,
 };
 
 fn id(value: &str) -> StableId {
@@ -22,6 +22,7 @@ fn operation(adapter: &str, resource: &str, summary: &str) -> OperationDraft {
         },
         risk: Risk::Low,
         requires_confirmation: false,
+        recovery_capability: RecoveryCapability::ExactRollback,
         depends_on: vec![],
         before_digest: Some(digest('1')),
         after_digest: Some(digest('2')),
@@ -29,6 +30,16 @@ fn operation(adapter: &str, resource: &str, summary: &str) -> OperationDraft {
         provenance: None,
         summary: summary.into(),
     }
+}
+
+fn operation_with_capability(
+    adapter: &str,
+    resource: &str,
+    capability: RecoveryCapability,
+) -> OperationDraft {
+    let mut draft = operation(adapter, resource, resource);
+    draft.recovery_capability = capability;
+    draft
 }
 
 fn bindings() -> PlanBindings {
@@ -141,5 +152,66 @@ fn orders_dependencies_before_dependents_and_rejects_cycles() {
     assert!(matches!(
         build_plan(draft(vec![left, right])),
         Err(PlanBuildError::DependencyCycle)
+    ));
+}
+
+#[test]
+fn orders_exact_rollback_before_forward_only_and_binds_capability_into_identity() {
+    let exact = finalize_operation(operation_with_capability(
+        "zeta",
+        "exact",
+        RecoveryCapability::ExactRollback,
+    ))
+    .unwrap();
+    let forward = finalize_operation(operation_with_capability(
+        "alpha",
+        "forward",
+        RecoveryCapability::ConvergeForwardOnly,
+    ))
+    .unwrap();
+    let plan = build_plan(PlanDraft {
+        target_id: id("laptop"),
+        desired_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: digest('c'),
+        bindings: bindings(),
+        operations: vec![forward.clone(), exact.clone()],
+    })
+    .unwrap();
+
+    assert_eq!(plan.operations[0].id, exact.id);
+    assert_eq!(plan.operations[1].id, forward.id);
+    let mut changed =
+        operation_with_capability("zeta", "exact", RecoveryCapability::ConvergeForwardOnly);
+    changed.summary = "identity must ignore only display text".into();
+    assert_ne!(exact.id, finalize_operation(changed).unwrap().id);
+}
+
+#[test]
+fn rejects_exact_operations_that_transitively_depend_on_forward_only_work() {
+    let forward = finalize_operation(operation_with_capability(
+        "alpha",
+        "forward",
+        RecoveryCapability::ConvergeForwardOnly,
+    ))
+    .unwrap();
+    let mut middle =
+        operation_with_capability("alpha", "middle", RecoveryCapability::ConvergeForwardOnly);
+    middle.depends_on = vec![forward.id.clone()];
+    let middle = finalize_operation(middle).unwrap();
+    let mut exact = operation_with_capability("alpha", "exact", RecoveryCapability::ExactRollback);
+    exact.depends_on = vec![middle.id.clone()];
+    let exact = finalize_operation(exact).unwrap();
+
+    assert!(matches!(
+        build_plan(PlanDraft {
+            target_id: id("laptop"),
+            desired_digest: digest('a'),
+            observed_digest: digest('b'),
+            policy_digest: digest('c'),
+            bindings: bindings(),
+            operations: vec![exact, middle, forward],
+        }),
+        Err(PlanBuildError::ExactDependsOnForwardOnly(_))
     ));
 }

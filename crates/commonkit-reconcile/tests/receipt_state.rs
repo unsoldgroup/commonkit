@@ -75,3 +75,28 @@ fn enforces_recovery_and_terminal_state_transitions() {
         Err(ReceiptError::IllegalTransition { .. })
     ));
 }
+
+#[test]
+fn records_one_way_forward_recovery_states() {
+    let mut journal = ReceiptJournal::new(
+        StableId::parse("run-forward").unwrap(),
+        digest('a'),
+        StableId::parse("laptop").unwrap(),
+        digest('b'),
+        digest('c'),
+        digest('d'),
+        bindings(),
+    )
+    .unwrap();
+    journal.transition(ReceiptState::Applying).unwrap();
+    journal
+        .transition(ReceiptState::ForwardRecoveryRequired)
+        .unwrap();
+    journal.transition(ReceiptState::ConvergingForward).unwrap();
+    journal.transition(ReceiptState::ForwardRecovered).unwrap();
+    assert!(matches!(
+        journal.transition(ReceiptState::RollingBack),
+        Err(ReceiptError::IllegalTransition { .. })
+    ));
+    journal.verify_chain().unwrap();
+}

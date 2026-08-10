@@ -75,6 +75,7 @@ fn reloads_a_pre_provenance_v1_operation_without_changing_its_identity() {
         },
         risk: Risk::Low,
         requires_confirmation: true,
+        recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
         depends_on: Vec::new(),
         before_digest: Some(digest('4')),
         after_digest: Some(digest('5')),

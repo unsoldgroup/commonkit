@@ -1,15 +1,18 @@
+use std::collections::BTreeMap;
+use std::fs;
 use std::sync::{Arc, Mutex};
 
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_contracts::{
-    Operation, OperationKind, OperationPhase, PlanBindings, ReceiptState, ResourceRef, Risk,
-    Sha256Digest, StableId,
+    Operation, OperationKind, OperationPhase, PlanBindings, ReceiptState, RecoveryCapability,
+    ResourceRef, Risk, Sha256Digest, StableId,
 };
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_reconcile::{
-    Adapter, AdapterFailure, ReceiptJournal, ReceiptStore, ReconcileOutcome, Reconciler,
+    Adapter, AdapterFailure, ReceiptJournal, ReceiptStore, ReconcileError, ReconcileOutcome,
+    Reconciler, RecoveryObservation,
 };
 
 fn digest(character: char) -> Sha256Digest {
@@ -35,6 +38,14 @@ fn temporary_directory(test: &str) -> PathBuf {
 }
 
 fn operation(adapter: &str, resource: &str) -> Operation {
+    operation_with_capability(adapter, resource, RecoveryCapability::ExactRollback)
+}
+
+fn operation_with_capability(
+    adapter: &str,
+    resource: &str,
+    recovery_capability: RecoveryCapability,
+) -> Operation {
     finalize_operation(OperationDraft {
         adapter_id: StableId::parse(adapter).expect("adapter"),
         kind: OperationKind::Update,
@@ -45,6 +56,7 @@ fn operation(adapter: &str, resource: &str) -> Operation {
         },
         risk: Risk::Low,
         requires_confirmation: false,
+        recovery_capability,
         depends_on: vec![],
         before_digest: Some(digest('1')),
         after_digest: Some(digest('2')),
@@ -61,6 +73,9 @@ struct RecordingAdapter {
     fail_apply_for: Option<String>,
     fail_verify_for: Option<String>,
     fail_rollback_for: Option<String>,
+    supports_forward: bool,
+    unsupported_resource: Option<String>,
+    observations: Arc<Mutex<BTreeMap<String, RecoveryObservation>>>,
 }
 
 impl Adapter for RecordingAdapter {
@@ -75,7 +90,12 @@ impl Adapter for RecordingAdapter {
 
     fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
         self.record("apply", operation);
-        self.fail_if(&self.fail_apply_for, operation)
+        self.fail_if(&self.fail_apply_for, operation)?;
+        self.observations.lock().unwrap().insert(
+            operation.resource.resource_id.to_string(),
+            RecoveryObservation::After,
+        );
+        Ok(())
     }
 
     fn verify(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
@@ -86,6 +106,29 @@ impl Adapter for RecordingAdapter {
     fn rollback(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
         self.record("rollback", operation);
         self.fail_if(&self.fail_rollback_for, operation)
+    }
+
+    fn supports_recovery(&self, capability: RecoveryCapability) -> bool {
+        capability == RecoveryCapability::ExactRollback || self.supports_forward
+    }
+
+    fn supports_operation(&self, operation: &Operation) -> bool {
+        self.supports_recovery(operation.recovery_capability)
+            && self.unsupported_resource.as_deref() != Some(operation.resource.resource_id.as_str())
+    }
+
+    fn observe_recovery(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<RecoveryObservation, AdapterFailure> {
+        self.record("observe", operation);
+        Ok(self
+            .observations
+            .lock()
+            .unwrap()
+            .get(operation.resource.resource_id.as_str())
+            .copied()
+            .unwrap_or(RecoveryObservation::Before))
     }
 }
 
@@ -117,6 +160,9 @@ fn adapter(events: Arc<Mutex<Vec<String>>>) -> RecordingAdapter {
         fail_apply_for: None,
         fail_verify_for: None,
         fail_rollback_for: None,
+        supports_forward: false,
+        unsupported_resource: None,
+        observations: Arc::new(Mutex::new(BTreeMap::new())),
     }
 }
 
@@ -130,6 +176,95 @@ fn plan() -> commonkit_contracts::Plan {
         operations: vec![operation("files", "alpha"), operation("files", "beta")],
     })
     .expect("plan")
+}
+
+fn plan_with(operations: Vec<Operation>) -> commonkit_contracts::Plan {
+    build_plan(PlanDraft {
+        target_id: StableId::parse("laptop").expect("target"),
+        desired_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: digest('c'),
+        bindings: bindings(),
+        operations,
+    })
+    .expect("plan")
+}
+
+fn store_snapshot(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    fn visit(root: &std::path::Path, path: &std::path::Path, output: &mut Vec<(String, Vec<u8>)>) {
+        let mut entries = fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        for entry in entries {
+            if entry.is_dir() {
+                visit(root, &entry, output);
+            } else {
+                output.push((
+                    entry
+                        .strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    fs::read(&entry).unwrap(),
+                ));
+            }
+        }
+    }
+    let mut output = Vec::new();
+    visit(root, root, &mut output);
+    output
+}
+
+fn persist_crash_after_forward_barrier(
+    store: &ReceiptStore,
+    plan: &commonkit_contracts::Plan,
+    run_id: &StableId,
+) {
+    let mut journal = ReceiptJournal::new(
+        run_id.clone(),
+        plan.id.clone(),
+        plan.target_id.clone(),
+        plan.desired_digest.clone(),
+        plan.observed_digest.clone(),
+        plan.policy_digest.clone(),
+        plan.bindings.clone(),
+    )
+    .unwrap();
+    store.persist(&journal).unwrap();
+    for operation in &plan.operations {
+        journal
+            .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+            .unwrap();
+        store.persist(&journal).unwrap();
+    }
+    journal.transition(ReceiptState::Applying).unwrap();
+    store.persist(&journal).unwrap();
+    let exact = plan
+        .operations
+        .iter()
+        .find(|operation| operation.recovery_capability == RecoveryCapability::ExactRollback)
+        .unwrap();
+    for phase in [
+        OperationPhase::ApplyStarted,
+        OperationPhase::Applied,
+        OperationPhase::Verified,
+    ] {
+        journal
+            .record_operation(exact.id.clone(), phase, None)
+            .unwrap();
+        store.persist(&journal).unwrap();
+    }
+    let forward = plan
+        .operations
+        .iter()
+        .find(|operation| operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly)
+        .unwrap();
+    journal
+        .record_operation(forward.id.clone(), OperationPhase::ApplyStarted, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
 }
 
 #[test]
@@ -248,8 +383,17 @@ fn restart_recovery_rolls_back_durably_recorded_operations_in_reverse_order() {
 
     let events = Arc::new(Mutex::new(Vec::new()));
     let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter(events.clone()))];
+    let mut legacy_value = serde_json::to_value(&plan).unwrap();
+    for operation in legacy_value["operations"].as_array_mut().unwrap() {
+        operation
+            .as_object_mut()
+            .unwrap()
+            .remove("recoveryCapability");
+    }
+    let legacy_plan: commonkit_contracts::Plan = serde_json::from_value(legacy_value).unwrap();
+    assert_eq!(legacy_plan.id, plan.id);
     let outcome = Reconciler::with_store(&store)
-        .recover_run(run_id.clone(), &plan, &mut adapters)
+        .recover_run(run_id.clone(), &legacy_plan, &mut adapters)
         .expect("recover");
 
     assert_eq!(outcome, ReconcileOutcome::RolledBack);
@@ -262,4 +406,224 @@ fn restart_recovery_rolls_back_durably_recorded_operations_in_reverse_order() {
         ReceiptState::RolledBack
     );
     std::fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn adapter_capability_preflight_fails_before_creating_a_receipt() {
+    let directory = temporary_directory("capability-preflight");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let forward = plan_with(vec![operation_with_capability(
+        "files",
+        "package",
+        RecoveryCapability::ConvergeForwardOnly,
+    )]);
+    let before = store_snapshot(&directory);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter(events))];
+
+    assert!(matches!(
+        Reconciler::with_store(&store).execute(
+            &forward,
+            StableId::parse("unsupported-capability").unwrap(),
+            &mut adapters,
+        ),
+        Err(ReconcileError::AdapterCapabilityUnsupported { .. })
+    ));
+    assert_eq!(store_snapshot(&directory), before);
+
+    let mut wrong_type = adapter(Arc::new(Mutex::new(Vec::new())));
+    wrong_type.unsupported_resource = Some("alpha".into());
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(wrong_type)];
+    assert!(matches!(
+        Reconciler::with_store(&store).execute(
+            &plan(),
+            StableId::parse("unsupported-type").unwrap(),
+            &mut adapters,
+        ),
+        Err(ReconcileError::AdapterCapabilityUnsupported { .. })
+    ));
+    assert_eq!(store_snapshot(&directory), before);
+
+    let mut no_adapters = Vec::<Box<dyn Adapter>>::new();
+    assert!(matches!(
+        Reconciler::with_store(&store).execute(
+            &plan(),
+            StableId::parse("missing-adapter").unwrap(),
+            &mut no_adapters,
+        ),
+        Err(ReconcileError::AdapterNotFound(_))
+    ));
+    assert_eq!(store_snapshot(&directory), before);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn forward_barrier_never_rolls_back_and_records_forward_recovery_required() {
+    let directory = temporary_directory("forward-barrier");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let mixed = plan_with(vec![
+        operation_with_capability("files", "exact", RecoveryCapability::ExactRollback),
+        operation_with_capability("files", "forward", RecoveryCapability::ConvergeForwardOnly),
+    ]);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut failing = adapter(events.clone());
+    failing.supports_forward = true;
+    failing.fail_apply_for = Some("forward".into());
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(failing)];
+    let run_id = StableId::parse("forward-failure").unwrap();
+
+    assert_eq!(
+        Reconciler::with_store(&store)
+            .execute(&mixed, run_id.clone(), &mut adapters)
+            .unwrap(),
+        ReconcileOutcome::ForwardRecoveryRequired
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "prepare:exact",
+            "prepare:forward",
+            "apply:exact",
+            "verify:exact",
+            "apply:forward",
+        ]
+    );
+    assert_eq!(
+        store.load(run_id).unwrap().receipt().state,
+        ReceiptState::ForwardRecoveryRequired
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn explicit_rollback_rejects_forward_only_plans_before_loading_a_receipt() {
+    let directory = temporary_directory("rollback-unsupported");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let seed = ReceiptJournal::new(
+        StableId::parse("existing-run").unwrap(),
+        digest('a'),
+        StableId::parse("laptop").unwrap(),
+        digest('b'),
+        digest('c'),
+        digest('d'),
+        bindings(),
+    )
+    .unwrap();
+    store.persist(&seed).unwrap();
+    let before = store_snapshot(&directory);
+    let forward = plan_with(vec![operation_with_capability(
+        "files",
+        "package",
+        RecoveryCapability::ConvergeForwardOnly,
+    )]);
+    let mut supported = adapter(Arc::new(Mutex::new(Vec::new())));
+    supported.supports_forward = true;
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(supported)];
+
+    assert!(matches!(
+        Reconciler::with_store(&store).rollback_succeeded_run(
+            StableId::parse("receipt-does-not-exist").unwrap(),
+            &forward,
+            &mut adapters,
+        ),
+        Err(ReconcileError::RollbackUnsupported)
+    ));
+    assert_eq!(store_snapshot(&directory), before);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn restart_after_forward_barrier_converges_bound_before_and_after_states_without_rollback() {
+    let directory = temporary_directory("forward-restart");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let mixed = plan_with(vec![
+        operation_with_capability("files", "exact", RecoveryCapability::ExactRollback),
+        operation_with_capability("files", "forward", RecoveryCapability::ConvergeForwardOnly),
+    ]);
+    let run_id = StableId::parse("forward-crashed").unwrap();
+    persist_crash_after_forward_barrier(&store, &mixed, &run_id);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut recovering = adapter(events.clone());
+    recovering.supports_forward = true;
+    recovering
+        .observations
+        .lock()
+        .unwrap()
+        .insert("exact".into(), RecoveryObservation::After);
+    recovering
+        .observations
+        .lock()
+        .unwrap()
+        .insert("forward".into(), RecoveryObservation::Before);
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(recovering)];
+
+    assert_eq!(
+        Reconciler::with_store(&store)
+            .recover_run(run_id.clone(), &mixed, &mut adapters)
+            .unwrap(),
+        ReconcileOutcome::ForwardRecovered
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "observe:exact",
+            "observe:forward",
+            "apply:forward",
+            "observe:forward",
+        ]
+    );
+    let receipt = store.load(run_id).unwrap();
+    assert_eq!(receipt.receipt().state, ReceiptState::ForwardRecovered);
+    assert!(
+        receipt
+            .receipt()
+            .operation_progress
+            .iter()
+            .all(|progress| { progress.phase == OperationPhase::ForwardRecovered })
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn ambiguous_forward_recovery_fails_without_apply_or_rollback() {
+    let directory = temporary_directory("forward-ambiguous");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let mixed = plan_with(vec![
+        operation_with_capability("files", "exact", RecoveryCapability::ExactRollback),
+        operation_with_capability("files", "forward", RecoveryCapability::ConvergeForwardOnly),
+    ]);
+    let run_id = StableId::parse("forward-ambiguous").unwrap();
+    persist_crash_after_forward_barrier(&store, &mixed, &run_id);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut recovering = adapter(events.clone());
+    recovering.supports_forward = true;
+    recovering
+        .observations
+        .lock()
+        .unwrap()
+        .insert("exact".into(), RecoveryObservation::After);
+    recovering
+        .observations
+        .lock()
+        .unwrap()
+        .insert("forward".into(), RecoveryObservation::Other);
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(recovering)];
+
+    assert_eq!(
+        Reconciler::with_store(&store)
+            .recover_run(run_id.clone(), &mixed, &mut adapters)
+            .unwrap(),
+        ReconcileOutcome::ForwardRecoveryFailed
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["observe:exact", "observe:forward"]
+    );
+    assert_eq!(
+        store.load(run_id).unwrap().receipt().state,
+        ReceiptState::ForwardRecoveryFailed
+    );
+    fs::remove_dir_all(directory).unwrap();
 }

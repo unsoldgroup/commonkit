@@ -60,6 +60,7 @@ fn plan() -> commonkit_contracts::Plan {
         },
         risk: Risk::Low,
         requires_confirmation: true,
+        recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
         depends_on: vec![],
         before_digest: None,
         after_digest: Some(digest('d')),

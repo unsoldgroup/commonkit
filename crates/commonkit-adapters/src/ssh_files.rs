@@ -158,6 +158,7 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
                 Risk::Low
             },
             requires_confirmation: true,
+            recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
             depends_on: vec![],
             before_digest,
             after_digest,

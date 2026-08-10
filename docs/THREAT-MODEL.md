@@ -46,7 +46,7 @@ execution API, not a lifecycle authority.
 | Malicious provider/package | Exact version and input digests, preflight policy, isolated staging, normalized output scan |
 | Stale-plan substitution | Content-addressed plans and immediate binding/preimage revalidation |
 | Path escape or type confusion | Capability roots, lexical validation, no-follow inspection, ownership/type collision checks |
-| Crash during mutation | Apply-started checkpoint, immutable backups, reverse rollback, startup recovery |
+| Crash during mutation | Exact-rollback operations run first and reverse-roll back before the durable forward-only barrier; after that barrier, startup recovery re-observes and converges only from the bound plan payload |
 | Secret exfiltration | Reference-only portable state, scrubbed provider environments, central redaction/scanning |
 | Malicious Git update | Trusted remote/revision validation, clean fast-forward rules, organization-floor validation |
 | Local API abuse | Private endpoint, per-installation authentication, capability authorization, explicit consent |
