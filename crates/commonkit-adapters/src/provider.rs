@@ -213,6 +213,12 @@ impl MaterializedState {
     ) -> Result<Self, ProviderContractError> {
         inputs.verify()?;
         for resource in &resources {
+            if matches!(
+                resource.intent,
+                super::resources::ResourceIntent::ResolvedPackage(_)
+            ) {
+                return Err(ProviderContractError::ControllerOwnedPackageResolution);
+            }
             let provenance = &resource.provenance;
             if provenance.provider_id != inputs.provider_id
                 || provenance.provider_version != inputs.provider_version.as_str()
@@ -274,6 +280,92 @@ impl MaterializedState {
 
     pub fn verify(&self) -> Result<(), ProviderContractError> {
         let rebuilt = Self::finalize_with_capabilities(
+            self.inputs.clone(),
+            self.resources.clone(),
+            self.declared_side_effects.clone(),
+            self.unsupported.clone(),
+            self.capabilities.clone(),
+        )?;
+        if &rebuilt == self {
+            Ok(())
+        } else {
+            Err(ProviderContractError::MaterializationDigestMismatch)
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolvedMaterializedState {
+    pub inputs: ProviderInputs,
+    pub resources: Vec<NormalizedResource>,
+    pub declared_side_effects: Vec<DeclaredSideEffect>,
+    pub unsupported: Vec<UnsupportedCapability>,
+    #[serde(default)]
+    pub capabilities: Vec<ProviderCapabilityResource>,
+    pub digest: Sha256Digest,
+}
+
+impl ResolvedMaterializedState {
+    pub fn finalize(
+        inputs: ProviderInputs,
+        mut resources: Vec<NormalizedResource>,
+        mut declared_side_effects: Vec<DeclaredSideEffect>,
+        mut unsupported: Vec<UnsupportedCapability>,
+        mut capabilities: Vec<ProviderCapabilityResource>,
+    ) -> Result<Self, ProviderContractError> {
+        inputs.verify()?;
+        for resource in &resources {
+            if matches!(
+                resource.intent,
+                super::resources::ResourceIntent::Package(_)
+            ) {
+                return Err(ProviderContractError::UnresolvedPackageIntent);
+            }
+            let provenance = &resource.provenance;
+            if provenance.provider_id != inputs.provider_id
+                || provenance.provider_version != inputs.provider_version.as_str()
+                || provenance.input_digest != inputs.input_set_digest
+            {
+                return Err(ProviderContractError::InvalidResourceProvenance);
+            }
+        }
+        resources.sort_by(|left, right| {
+            (left.sort_key(), &left.provenance.source)
+                .cmp(&(right.sort_key(), &right.provenance.source))
+        });
+        declared_side_effects.sort();
+        declared_side_effects.dedup();
+        unsupported.sort();
+        unsupported.dedup();
+        capabilities.sort_by(|left, right| {
+            let ProviderCapability::McpStreamableHttp { id: left_id, .. } = &left.capability;
+            let ProviderCapability::McpStreamableHttp { id: right_id, .. } = &right.capability;
+            (&left.provenance.source, left_id).cmp(&(&right.provenance.source, right_id))
+        });
+        capabilities.dedup();
+        let digest = digest_domain_json(
+            "commonkit.resolved-materialized-state.v1",
+            &MaterializedSemantic {
+                inputs_digest: &inputs.input_set_digest,
+                resources: &resources,
+                declared_side_effects: &declared_side_effects,
+                unsupported: &unsupported,
+                capabilities: &capabilities,
+            },
+        )?;
+        Ok(Self {
+            inputs,
+            resources,
+            declared_side_effects,
+            unsupported,
+            capabilities,
+            digest,
+        })
+    }
+
+    pub fn verify(&self) -> Result<(), ProviderContractError> {
+        let rebuilt = Self::finalize(
             self.inputs.clone(),
             self.resources.clone(),
             self.declared_side_effects.clone(),
@@ -406,6 +498,10 @@ pub enum ProviderContractError {
     InvalidResourceProvenance,
     #[error("materialization digest does not match its canonical state")]
     MaterializationDigestMismatch,
+    #[error("provider output cannot contain controller-owned package resolution")]
+    ControllerOwnedPackageResolution,
+    #[error("resolved materialized state still contains a desired package intent")]
+    UnresolvedPackageIntent,
     #[error("provider staging root must be an existing directory")]
     InvalidStagingRoot,
     #[error("provider staging root overlaps a live or protected root")]

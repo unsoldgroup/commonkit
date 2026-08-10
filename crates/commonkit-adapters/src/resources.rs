@@ -8,7 +8,7 @@ use commonkit_contracts::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::artifacts::ContentReference;
+use super::{artifacts::ContentReference, package_resolution::ResolvedPackageIntent};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -271,31 +271,16 @@ pub enum ResourceAddress {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum PackageResourceIntent {
-    Package {
-        declaration: PackageDeclaration,
-        resolution: ContentReference,
-        artifacts: Vec<ContentReference>,
-    },
+pub enum PackageDesiredIntent {
+    Package { declaration: PackageDeclaration },
 }
 
-impl PackageResourceIntent {
-    pub fn new(
-        declaration: PackageDeclaration,
-        resolution: ContentReference,
-        artifacts: Vec<ContentReference>,
-    ) -> Result<Self, ResourceError> {
+impl PackageDesiredIntent {
+    pub fn new(declaration: PackageDeclaration) -> Result<Self, ResourceError> {
         declaration
             .validate()
             .map_err(|_| ResourceError::InvalidPackageDeclaration)?;
-        if artifacts.is_empty() {
-            return Err(ResourceError::MissingPackageArtifact);
-        }
-        Ok(Self::Package {
-            declaration,
-            resolution,
-            artifacts,
-        })
+        Ok(Self::Package { declaration })
     }
 }
 
@@ -303,7 +288,9 @@ impl PackageResourceIntent {
 #[serde(untagged)]
 pub enum ResourceIntent {
     Filesystem(FilesystemIntent),
-    Package(PackageResourceIntent),
+    Package(PackageDesiredIntent),
+    #[serde(skip_deserializing)]
+    ResolvedPackage(ResolvedPackageIntent),
 }
 
 impl From<FilesystemIntent> for ResourceIntent {
@@ -312,9 +299,15 @@ impl From<FilesystemIntent> for ResourceIntent {
     }
 }
 
-impl From<PackageResourceIntent> for ResourceIntent {
-    fn from(intent: PackageResourceIntent) -> Self {
+impl From<PackageDesiredIntent> for ResourceIntent {
+    fn from(intent: PackageDesiredIntent) -> Self {
         Self::Package(intent)
+    }
+}
+
+impl From<ResolvedPackageIntent> for ResourceIntent {
+    fn from(intent: ResolvedPackageIntent) -> Self {
+        Self::ResolvedPackage(intent)
     }
 }
 
@@ -322,7 +315,7 @@ impl ResourceIntent {
     pub fn resource_type(&self) -> ResourceType {
         match self {
             Self::Filesystem(_) => ResourceType::Filesystem,
-            Self::Package(_) => ResourceType::Package,
+            Self::Package(_) | Self::ResolvedPackage(_) => ResourceType::Package,
         }
     }
 
@@ -331,12 +324,16 @@ impl ResourceIntent {
             Self::Filesystem(intent) => ResourceAddress::Filesystem {
                 path: intent.path().clone(),
             },
-            Self::Package(PackageResourceIntent::Package { declaration, .. }) => {
+            Self::Package(PackageDesiredIntent::Package { declaration }) => {
                 ResourceAddress::Package {
                     manager: declaration.manager,
                     id: declaration.id.clone(),
                 }
             }
+            Self::ResolvedPackage(intent) => ResourceAddress::Package {
+                manager: intent.declaration.manager,
+                id: intent.declaration.id.clone(),
+            },
         }
     }
 
@@ -348,14 +345,11 @@ impl ResourceIntent {
         match self {
             Self::Filesystem(FilesystemIntent::File { content, .. }) => vec![content],
             Self::Filesystem(_) => Vec::new(),
-            Self::Package(PackageResourceIntent::Package {
-                resolution,
-                artifacts,
-                ..
-            }) => {
-                let mut references = Vec::with_capacity(artifacts.len() + 1);
-                references.push(resolution);
-                references.extend(artifacts);
+            Self::Package(_) => Vec::new(),
+            Self::ResolvedPackage(intent) => {
+                let mut references = Vec::with_capacity(intent.artifacts.len() + 1);
+                references.push(&intent.resolution);
+                references.extend(&intent.artifacts);
                 references
             }
         }
@@ -367,7 +361,10 @@ impl ResourceIntent {
                 digest_domain_json("commonkit.filesystem-resource-desired.v1", intent)
             }
             Self::Package(intent) => {
-                digest_domain_json("commonkit.package-resource-desired.v1", intent)
+                digest_domain_json("commonkit.package-desired-intent.v1", intent)
+            }
+            Self::ResolvedPackage(intent) => {
+                digest_domain_json("commonkit.resolved-package-intent.v1", intent)
             }
         }
     }
@@ -375,21 +372,21 @@ impl ResourceIntent {
     pub fn recovery_capability(&self) -> RecoveryCapability {
         match self {
             Self::Filesystem(_) => RecoveryCapability::ExactRollback,
-            Self::Package(_) => RecoveryCapability::ConvergeForwardOnly,
+            Self::Package(_) | Self::ResolvedPackage(_) => RecoveryCapability::ConvergeForwardOnly,
         }
     }
 
     pub fn filesystem(&self) -> Option<&FilesystemIntent> {
         match self {
             Self::Filesystem(intent) => Some(intent),
-            Self::Package(_) => None,
+            Self::Package(_) | Self::ResolvedPackage(_) => None,
         }
     }
 
     pub fn filesystem_mut(&mut self) -> Option<&mut FilesystemIntent> {
         match self {
             Self::Filesystem(intent) => Some(intent),
-            Self::Package(_) => None,
+            Self::Package(_) | Self::ResolvedPackage(_) => None,
         }
     }
 }
@@ -509,20 +506,16 @@ pub fn validate_ownership(
             return Err(OwnershipError::DuplicatePackage { address });
         }
         let Some(intent) = resource.intent.filesystem() else {
-            let ResourceIntent::Package(PackageResourceIntent::Package {
-                declaration,
-                artifacts,
-                ..
-            }) = &resource.intent
-            else {
-                unreachable!("closed resource vocabulary")
+            let declaration = match &resource.intent {
+                ResourceIntent::Package(PackageDesiredIntent::Package { declaration }) => {
+                    declaration
+                }
+                ResourceIntent::ResolvedPackage(intent) => &intent.declaration,
+                ResourceIntent::Filesystem(_) => unreachable!("closed resource vocabulary"),
             };
             declaration
                 .validate()
                 .map_err(|_| OwnershipError::InvalidPackageDeclaration)?;
-            if artifacts.is_empty() {
-                return Err(OwnershipError::MissingPackageArtifact { address });
-            }
             continue;
         };
         let path = intent.path();
