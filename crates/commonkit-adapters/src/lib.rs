@@ -75,8 +75,8 @@ pub use packages::{
 };
 pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutput};
 pub use planning::{
-    PackageResourcePlanner, ProviderPlanError, ProviderPlanRequest, ProviderPlannerRoute,
-    ProviderResourcePlanner, ProviderResourceRouter, build_provider_plan,
+    FilesystemPlannerRoute, PackageResourcePlanner, ProviderPlanError, ProviderPlanRequest,
+    ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter, build_provider_plan,
     build_provider_plan_with_router, provider_plan_bindings,
 };
 pub use provider::{

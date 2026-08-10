@@ -16,6 +16,7 @@ use commonkit_reconcile::Adapter;
 
 pub trait ProviderResourcePlanner {
     fn adapter_id(&self) -> &StableId;
+    fn route(&self) -> FilesystemPlannerRoute;
 
     fn register_provider_resource(
         &mut self,
@@ -28,6 +29,10 @@ pub trait ProviderResourcePlanner {
 impl ProviderResourcePlanner for FileAdapter {
     fn adapter_id(&self) -> &StableId {
         Adapter::id(self)
+    }
+
+    fn route(&self) -> FilesystemPlannerRoute {
+        FilesystemPlannerRoute::Local
     }
 
     fn register_provider_resource(
@@ -49,6 +54,10 @@ impl<T: SshFilesystemTransport + Send> ProviderResourcePlanner for SshFileAdapte
         Adapter::id(self)
     }
 
+    fn route(&self) -> FilesystemPlannerRoute {
+        FilesystemPlannerRoute::Ssh(self.target_capabilities())
+    }
+
     fn register_provider_resource(
         &mut self,
         id: StableId,
@@ -58,6 +67,12 @@ impl<T: SshFilesystemTransport + Send> ProviderResourcePlanner for SshFileAdapte
         self.register_materialized_resource(id, resource, provider_artifacts)
             .map_err(Into::into)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemPlannerRoute {
+    Local,
+    Ssh(crate::SshTargetCapabilities),
 }
 
 pub trait PackageResourcePlanner {
@@ -79,6 +94,7 @@ pub enum ProviderPlannerRoute<'a> {
 
 pub struct ProviderResourceRouter<'a> {
     filesystem: Option<&'a mut dyn ProviderResourcePlanner>,
+    filesystem_route: Option<FilesystemPlannerRoute>,
     package: Option<&'a mut dyn PackageResourcePlanner>,
 }
 
@@ -86,12 +102,19 @@ impl<'a> ProviderResourceRouter<'a> {
     pub fn new(routes: Vec<ProviderPlannerRoute<'a>>) -> Result<Self, ProviderPlanError> {
         let mut router = Self {
             filesystem: None,
+            filesystem_route: None,
             package: None,
         };
         for route in routes {
             match route {
                 ProviderPlannerRoute::Filesystem(planner) => {
-                    if !matches!(planner.adapter_id().as_str(), "files" | "ssh-files") {
+                    let route = planner.route();
+                    let valid_route = matches!(
+                        (planner.adapter_id().as_str(), route),
+                        ("files", FilesystemPlannerRoute::Local)
+                            | ("ssh-files", FilesystemPlannerRoute::Ssh(_))
+                    );
+                    if !valid_route {
                         return Err(ProviderPlanError::InvalidResourcePlanner {
                             resource_type: ResourceType::Filesystem,
                             adapter_id: planner.adapter_id().clone(),
@@ -102,6 +125,7 @@ impl<'a> ProviderResourceRouter<'a> {
                             ResourceType::Filesystem,
                         ));
                     }
+                    router.filesystem_route = Some(route);
                 }
                 ProviderPlannerRoute::Package(planner) => {
                     if planner.adapter_id().as_str() != "packages" {
@@ -142,15 +166,18 @@ impl<'a> ProviderResourceRouter<'a> {
         resource: &NormalizedResource,
         provider_artifacts: &ArtifactStore,
     ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
-        let (declared_adapter, operation) = match &resource.intent {
+        let (declared_adapter, filesystem_route, operation) = match &resource.intent {
             crate::ResourceIntent::Filesystem(_) => {
                 let planner = self.filesystem.as_deref_mut().ok_or(
                     ProviderPlanError::MissingResourcePlanner(ResourceType::Filesystem),
                 )?;
                 let adapter_id = planner.adapter_id().clone();
+                let route = self
+                    .filesystem_route
+                    .expect("installed filesystem planner has a captured route");
                 let operation =
-                    planner.register_provider_resource(id, resource, provider_artifacts)?;
-                (adapter_id, operation)
+                    planner.register_provider_resource(id.clone(), resource, provider_artifacts)?;
+                (adapter_id, Some(route), operation)
             }
             crate::ResourceIntent::Package(intent) => {
                 let planner = self.package.as_deref_mut().ok_or(
@@ -158,12 +185,12 @@ impl<'a> ProviderResourceRouter<'a> {
                 )?;
                 let adapter_id = planner.adapter_id().clone();
                 let operation = planner.register_package_resource(
-                    id,
+                    id.clone(),
                     intent,
                     &resource.provenance,
                     provider_artifacts,
                 )?;
-                (adapter_id, operation)
+                (adapter_id, None, operation)
             }
         };
         if let Some(operation) = &operation
@@ -175,8 +202,60 @@ impl<'a> ProviderResourceRouter<'a> {
                 actual: operation.adapter_id.clone(),
             });
         }
+        if let Some(operation) = &operation {
+            validate_operation_binding(id, resource, filesystem_route, operation)?;
+        }
         Ok(operation)
     }
+}
+
+fn validate_operation_binding(
+    id: StableId,
+    resource: &NormalizedResource,
+    filesystem_route: Option<FilesystemPlannerRoute>,
+    operation: &commonkit_contracts::Operation,
+) -> Result<(), ProviderPlanError> {
+    let (resource_type, managed_path, after_digest, payload_digest) = match &resource.intent {
+        crate::ResourceIntent::Filesystem(intent) => {
+            let (resource_type, after_digest, payload_digest) = match filesystem_route
+                .expect("filesystem route was captured before registration")
+            {
+                FilesystemPlannerRoute::Local => crate::files::provider_operation_binding(intent)?,
+                FilesystemPlannerRoute::Ssh(capabilities) => {
+                    crate::ssh_files::provider_operation_binding(intent, capabilities)?
+                }
+            };
+            (
+                resource_type,
+                Some(intent.path().as_str().to_owned()),
+                after_digest,
+                payload_digest,
+            )
+        }
+        crate::ResourceIntent::Package(_) => {
+            let desired_digest = resource.desired_digest()?;
+            (
+                StableId::parse("package").expect("static resource type"),
+                None,
+                Some(desired_digest.clone()),
+                desired_digest,
+            )
+        }
+    };
+    let valid = operation.resource.resource_id == id
+        && operation.resource.resource_type == resource_type
+        && operation.resource.managed_path == managed_path
+        && operation.provenance.as_ref() == Some(&resource.provenance)
+        && operation.after_digest == after_digest
+        && operation.payload_digest == payload_digest
+        && operation.recovery_capability == resource.recovery_capability();
+    if !valid {
+        return Err(ProviderPlanError::UnexpectedResourceBinding {
+            resource_type: resource.resource_type(),
+            resource_id: id,
+        });
+    }
+    Ok(())
 }
 
 pub struct ProviderPlanRequest<'a> {
@@ -203,6 +282,10 @@ pub fn provider_plan_bindings(
     impl ProviderResourcePlanner for AuthorityOnlyFilesystemPlanner {
         fn adapter_id(&self) -> &StableId {
             &self.id
+        }
+
+        fn route(&self) -> FilesystemPlannerRoute {
+            FilesystemPlannerRoute::Local
         }
 
         fn register_provider_resource(
@@ -423,6 +506,13 @@ pub enum ProviderPlanError {
         resource_type: ResourceType,
         expected: StableId,
         actual: StableId,
+    },
+    #[error(
+        "operation returned for {resource_type:?} does not match routed resource {resource_id}"
+    )]
+    UnexpectedResourceBinding {
+        resource_type: ResourceType,
+        resource_id: StableId,
     },
     #[error("unsupported provider capability {capability} at {entry}: {remediation}")]
     UnsupportedCapability {

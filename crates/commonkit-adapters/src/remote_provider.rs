@@ -1,5 +1,6 @@
 use commonkit_contracts::{Sha256Digest, StableId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::{
@@ -55,18 +56,30 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
         state.verify()?;
         self.validate_before_remote_contact(state)?;
 
-        let mut references = state
+        let references = state
             .resources
             .iter()
             .flat_map(|resource| resource.artifact_references())
             .collect::<Vec<_>>();
-        references.sort_by(|left, right| left.digest.cmp(&right.digest));
-        references.dedup_by(|left, right| left.digest == right.digest);
-
-        let mut artifact_digests = Vec::with_capacity(references.len());
+        let mut metadata_by_digest = BTreeMap::new();
+        let mut content_by_digest = BTreeMap::new();
         for reference in references {
+            if let Some(existing) = metadata_by_digest.get(&reference.digest)
+                && *existing != reference
+            {
+                return Err(RemoteProviderStagingError::ConflictingArtifactReference {
+                    digest: reference.digest.clone(),
+                });
+            }
             let content = artifacts.load(reference)?;
-            let digest = reference.digest.clone();
+            metadata_by_digest.insert(reference.digest.clone(), reference);
+            content_by_digest
+                .entry(reference.digest.clone())
+                .or_insert(content);
+        }
+
+        let mut artifact_digests = Vec::with_capacity(content_by_digest.len());
+        for (digest, content) in content_by_digest {
             let staged = self
                 .transport
                 .perform(SshFilesystemRequest::StageArtifact {
@@ -133,6 +146,8 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
 pub enum RemoteProviderStagingError {
     #[error("provider output contains unsupported capabilities; no remote artifacts were staged")]
     UnsupportedOutput,
+    #[error("artifact digest has conflicting immutable reference metadata: {digest}")]
+    ConflictingArtifactReference { digest: Sha256Digest },
     #[error(
         "provider output declares side effects that have not been normalized into CommonKit operations"
     )]
