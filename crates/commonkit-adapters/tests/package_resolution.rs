@@ -1157,6 +1157,41 @@ fn schema_valid_hybrid_v1_closure_migrates_each_missing_source_and_rejects_misma
 }
 
 #[test]
+fn explicit_null_closure_source_is_rejected_by_schema_and_runtime() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let mut fixture: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/package-resolution-v1-hybrid.json"))
+            .unwrap();
+    fixture["closure"][0]["source"] = serde_json::Value::Null;
+    let schema = commonkit_adapters::package_resolution_schema().unwrap();
+    assert!(
+        !jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&fixture),
+        "the v1 schema permits omission but not explicit null"
+    );
+    let resolution = store
+        .put(
+            &serde_json::to_vec(&fixture).unwrap(),
+            commonkit_adapters::ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let intent = commonkit_adapters::ResolvedPackageIntent {
+        declaration: match desired() {
+            PackageDesiredIntent::Package { declaration } => declaration,
+        },
+        resolution,
+        artifacts: vec![],
+    };
+
+    assert!(matches!(
+        intent.load_persisted(&store),
+        Err(PackageResolutionError::Json(_))
+    ));
+}
+
+#[test]
 fn resolved_materialized_state_roundtrips_for_offline_reopen() {
     let root = tempfile::tempdir().unwrap();
     let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
