@@ -83,6 +83,17 @@ fn lifecycle_adapter_applies_verifies_and_rolls_back_typed_state() {
 }
 
 #[test]
+fn service_operations_do_not_claim_restart_safe_offline_recovery() {
+    let backend = Arc::new(FakeBackend::default());
+    let mut adapter = ServiceAdapter::new("systemd_user", backend).unwrap();
+    let operation = adapter
+        .register("relay", spec(), ServiceDesiredState::Running)
+        .unwrap();
+
+    assert!(!adapter.supports_offline_recovery(&operation));
+}
+
+#[test]
 fn platform_commands_are_fixed_argv_without_a_shell() {
     let service = spec();
     assert_eq!(

@@ -102,6 +102,8 @@ fn plan_id_and_order_are_independent_of_input_enumeration() {
     let left = build_plan(draft(vec![first.clone(), second.clone()])).expect("plan");
     let right = build_plan(draft(vec![second, first])).expect("plan");
     assert_eq!(left.id, right.id);
+    assert_eq!(left.schema_version.0, 1);
+    assert_eq!(left.contract_version, "1.0");
     assert_eq!(
         left.operations
             .iter()
@@ -181,6 +183,23 @@ fn orders_exact_rollback_before_forward_only_and_binds_capability_into_identity(
 
     assert_eq!(plan.operations[0].id, exact.id);
     assert_eq!(plan.operations[1].id, forward.id);
+    assert_eq!(plan.schema_version.0, 2);
+    assert_eq!(plan.contract_version, "2.0");
+    assert_eq!(
+        plan.id,
+        digest_domain_json(
+            "commonkit.plan.v2",
+            &serde_json::json!({
+                "targetId": plan.target_id,
+                "desiredDigest": plan.desired_digest,
+                "observedDigest": plan.observed_digest,
+                "policyDigest": plan.policy_digest,
+                "bindings": plan.bindings,
+                "operationIds": plan.operations.iter().map(|operation| &operation.id).collect::<Vec<_>>(),
+            }),
+        )
+        .unwrap()
+    );
     let mut changed =
         operation_with_capability("zeta", "exact", RecoveryCapability::ConvergeForwardOnly);
     changed.summary = "identity must ignore only display text".into();

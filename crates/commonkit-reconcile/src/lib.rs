@@ -18,9 +18,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use commonkit_contracts::{
-    CONTRACT_VERSION, ContractError, Operation, OperationPhase, OperationProgress, Plan,
-    PlanBindings, ReceiptState, ReceiptTransition, RecoveryCapability, RunReceipt, SCHEMA_VERSION,
-    SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
+    CONTRACT_VERSION, ContractError, FORWARD_CONTRACT_VERSION, FORWARD_SCHEMA_VERSION, Operation,
+    OperationPhase, OperationProgress, Plan, PlanBindings, ReceiptState, ReceiptTransition,
+    RecoveryCapability, RunReceipt, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
+    canonical_json, digest_domain_json,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use serde::{Deserialize, Serialize};
@@ -42,13 +43,59 @@ impl ReceiptJournal {
         policy_digest: Sha256Digest,
         bindings: PlanBindings,
     ) -> Result<Self, ReceiptError> {
+        Self::new_versioned(
+            run_id,
+            plan_id,
+            target_id,
+            desired_digest,
+            observed_digest,
+            policy_digest,
+            bindings,
+            SchemaVersion(SCHEMA_VERSION),
+            CONTRACT_VERSION.into(),
+        )
+    }
+
+    pub fn for_plan(run_id: StableId, plan: &Plan) -> Result<Self, ReceiptError> {
+        Self::new_versioned(
+            run_id,
+            plan.id.clone(),
+            plan.target_id.clone(),
+            plan.desired_digest.clone(),
+            plan.observed_digest.clone(),
+            plan.policy_digest.clone(),
+            plan.bindings.clone(),
+            plan.schema_version,
+            plan.contract_version.clone(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_versioned(
+        run_id: StableId,
+        plan_id: Sha256Digest,
+        target_id: StableId,
+        desired_digest: Sha256Digest,
+        observed_digest: Sha256Digest,
+        policy_digest: Sha256Digest,
+        bindings: PlanBindings,
+        schema_version: SchemaVersion,
+        contract_version: String,
+    ) -> Result<Self, ReceiptError> {
+        validate_receipt_version(schema_version, &contract_version)?;
         let progress = Vec::new();
-        let progress_digest = digest_domain_json("commonkit.operation-progress.v1", &progress)?;
-        let first = make_transition(0, ReceiptState::Prepared, None, progress_digest)?;
+        let progress_digest = progress_digest(schema_version, &progress)?;
+        let first = make_transition_for_schema(
+            schema_version,
+            0,
+            ReceiptState::Prepared,
+            None,
+            progress_digest,
+        )?;
         Ok(Self {
             receipt: RunReceipt {
-                schema_version: SchemaVersion(SCHEMA_VERSION),
-                contract_version: CONTRACT_VERSION.into(),
+                schema_version,
+                contract_version,
                 receipt_id: first.entry_digest.clone(),
                 run_id,
                 plan_id,
@@ -65,7 +112,9 @@ impl ReceiptJournal {
     }
 
     pub fn transition(&mut self, next: ReceiptState) -> Result<(), ReceiptError> {
-        if !legal_transition(self.receipt.state, next) {
+        if !receipt_state_supported(self.receipt.schema_version, next)
+            || !legal_transition(self.receipt.state, next)
+        {
             return Err(ReceiptError::IllegalTransition {
                 from: self.receipt.state,
                 to: next,
@@ -76,11 +125,12 @@ impl ReceiptJournal {
             .transitions
             .last()
             .map(|entry| entry.entry_digest.clone());
-        let progress_digest = digest_domain_json(
-            "commonkit.operation-progress.v1",
+        let progress_digest = progress_digest(
+            self.receipt.schema_version,
             &self.receipt.operation_progress,
         )?;
-        let transition = make_transition(
+        let transition = make_transition_for_schema(
+            self.receipt.schema_version,
             self.receipt.transitions.len() as u64,
             next,
             previous,
@@ -98,6 +148,9 @@ impl ReceiptJournal {
         phase: OperationPhase,
         failure_code: Option<StableId>,
     ) -> Result<(), ReceiptError> {
+        if !operation_phase_supported(self.receipt.schema_version, phase) {
+            return Err(ReceiptError::InvalidOperationProgress);
+        }
         if failure_code.is_some()
             != matches!(
                 phase,
@@ -143,11 +196,12 @@ impl ReceiptJournal {
             .transitions
             .last()
             .map(|entry| entry.entry_digest.clone());
-        let progress_digest = digest_domain_json(
-            "commonkit.operation-progress.v1",
+        let progress_digest = progress_digest(
+            self.receipt.schema_version,
             &self.receipt.operation_progress,
         )?;
-        let transition = make_transition(
+        let transition = make_transition_for_schema(
+            self.receipt.schema_version,
             self.receipt.transitions.len() as u64,
             self.receipt.state,
             previous,
@@ -169,6 +223,7 @@ impl ReceiptJournal {
     }
 
     pub fn verify_chain(&self) -> Result<(), ReceiptError> {
+        validate_receipt_version(self.receipt.schema_version, &self.receipt.contract_version)?;
         if self
             .receipt
             .transitions
@@ -180,6 +235,9 @@ impl ReceiptJournal {
         let mut previous = None;
         let mut previous_state = None;
         for (sequence, transition) in self.receipt.transitions.iter().enumerate() {
+            if !receipt_state_supported(self.receipt.schema_version, transition.state) {
+                return Err(ReceiptError::InvalidHashChain);
+            }
             if transition.sequence != sequence as u64 || transition.previous_digest != previous {
                 return Err(ReceiptError::InvalidHashChain);
             }
@@ -188,7 +246,8 @@ impl ReceiptJournal {
             }) {
                 return Err(ReceiptError::InvalidHashChain);
             }
-            let expected = make_transition(
+            let expected = make_transition_for_schema(
+                self.receipt.schema_version,
                 transition.sequence,
                 transition.state,
                 previous.clone(),
@@ -203,10 +262,18 @@ impl ReceiptJournal {
         if previous.as_ref() != Some(&self.receipt.receipt_id) {
             return Err(ReceiptError::InvalidHashChain);
         }
-        let progress_digest = digest_domain_json(
-            "commonkit.operation-progress.v1",
+        let progress_digest = progress_digest(
+            self.receipt.schema_version,
             &self.receipt.operation_progress,
         )?;
+        if self
+            .receipt
+            .operation_progress
+            .iter()
+            .any(|progress| !operation_phase_supported(self.receipt.schema_version, progress.phase))
+        {
+            return Err(ReceiptError::InvalidHashChain);
+        }
         if self
             .receipt
             .transitions
@@ -456,15 +523,7 @@ impl<'a> Reconciler<'a> {
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
         preflight_adapters(plan, adapters)?;
-        let mut journal = ReceiptJournal::new(
-            run_id,
-            plan.id.clone(),
-            plan.target_id.clone(),
-            plan.desired_digest.clone(),
-            plan.observed_digest.clone(),
-            plan.policy_digest.clone(),
-            plan.bindings.clone(),
-        )?;
+        let mut journal = ReceiptJournal::for_plan(run_id, plan)?;
         self.persist(&journal)?;
 
         for operation in &plan.operations {
@@ -602,6 +661,8 @@ impl<'a> Reconciler<'a> {
         let mut journal = store.load(run_id)?;
         let receipt = journal.receipt();
         if receipt.plan_id != plan.id
+            || receipt.schema_version != plan.schema_version
+            || receipt.contract_version != plan.contract_version
             || receipt.target_id != plan.target_id
             || receipt.desired_digest != plan.desired_digest
             || receipt.observed_digest != plan.observed_digest
@@ -695,7 +756,11 @@ impl<'a> Reconciler<'a> {
         preflight_adapters(plan, adapters)?;
         let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
         let mut journal = store.load(run_id)?;
-        if journal.receipt().plan_id != plan.id || journal.receipt().target_id != plan.target_id {
+        if journal.receipt().plan_id != plan.id
+            || journal.receipt().schema_version != plan.schema_version
+            || journal.receipt().contract_version != plan.contract_version
+            || journal.receipt().target_id != plan.target_id
+        {
             return Err(ReconcileError::ReceiptPlanMismatch);
         }
         if journal.receipt().state != ReceiptState::Succeeded {
@@ -1096,14 +1161,35 @@ struct TransitionSemantic<'a> {
     progress_digest: &'a Sha256Digest,
 }
 
+#[cfg(test)]
 fn make_transition(
     sequence: u64,
     state: ReceiptState,
     previous_digest: Option<Sha256Digest>,
     progress_digest: Sha256Digest,
 ) -> Result<ReceiptTransition, ContractError> {
+    make_transition_for_schema(
+        SchemaVersion(SCHEMA_VERSION),
+        sequence,
+        state,
+        previous_digest,
+        progress_digest,
+    )
+}
+
+fn make_transition_for_schema(
+    schema_version: SchemaVersion,
+    sequence: u64,
+    state: ReceiptState,
+    previous_digest: Option<Sha256Digest>,
+    progress_digest: Sha256Digest,
+) -> Result<ReceiptTransition, ContractError> {
     let entry_digest = digest_domain_json(
-        "commonkit.receipt-transition.v1",
+        if schema_version.0 == FORWARD_SCHEMA_VERSION {
+            "commonkit.receipt-transition.v2"
+        } else {
+            "commonkit.receipt-transition.v1"
+        },
         &TransitionSemantic {
             sequence,
             state,
@@ -1118,6 +1204,54 @@ fn make_transition(
         progress_digest,
         entry_digest,
     })
+}
+
+fn progress_digest(
+    schema_version: SchemaVersion,
+    progress: &[OperationProgress],
+) -> Result<Sha256Digest, ContractError> {
+    digest_domain_json(
+        if schema_version.0 == FORWARD_SCHEMA_VERSION {
+            "commonkit.operation-progress.v2"
+        } else {
+            "commonkit.operation-progress.v1"
+        },
+        progress,
+    )
+}
+
+fn validate_receipt_version(
+    schema_version: SchemaVersion,
+    contract_version: &str,
+) -> Result<(), ReceiptError> {
+    if (schema_version.0 == SCHEMA_VERSION && contract_version == CONTRACT_VERSION)
+        || (schema_version.0 == FORWARD_SCHEMA_VERSION
+            && contract_version == FORWARD_CONTRACT_VERSION)
+    {
+        Ok(())
+    } else {
+        Err(ReceiptError::UnsupportedSchemaVersion(schema_version.0))
+    }
+}
+
+fn receipt_state_supported(schema_version: SchemaVersion, state: ReceiptState) -> bool {
+    schema_version.0 == FORWARD_SCHEMA_VERSION
+        || !matches!(
+            state,
+            ReceiptState::ApplyingForward
+                | ReceiptState::ForwardRecoveryRequired
+                | ReceiptState::ConvergingForward
+                | ReceiptState::ForwardRecovered
+                | ReceiptState::ForwardRecoveryFailed
+        )
+}
+
+fn operation_phase_supported(schema_version: SchemaVersion, phase: OperationPhase) -> bool {
+    schema_version.0 == FORWARD_SCHEMA_VERSION
+        || !matches!(
+            phase,
+            OperationPhase::ForwardRecovered | OperationPhase::ForwardRecoveryFailed
+        )
 }
 
 fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool {
@@ -1219,6 +1353,8 @@ fn legal_transition(from: ReceiptState, to: ReceiptState) -> bool {
 
 #[derive(Debug, Error)]
 pub enum ReceiptError {
+    #[error("receipt schema/contract version is unsupported: {0}")]
+    UnsupportedSchemaVersion(u32),
     #[error(transparent)]
     Contract(#[from] ContractError),
     #[error("illegal receipt transition from {from:?} to {to:?}")]

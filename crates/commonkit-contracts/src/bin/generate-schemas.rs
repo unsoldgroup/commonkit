@@ -23,8 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         ("plan.schema.json", commonkit_contracts::plan_schema()?),
         (
+            "plan-v2.schema.json",
+            commonkit_contracts::plan_v2_schema()?,
+        ),
+        (
             "receipt.schema.json",
             commonkit_contracts::receipt_schema()?,
+        ),
+        (
+            "receipt-v2.schema.json",
+            commonkit_contracts::receipt_v2_schema()?,
         ),
         (
             "diagnostics.schema.json",

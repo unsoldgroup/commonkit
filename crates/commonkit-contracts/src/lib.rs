@@ -14,6 +14,8 @@ pub mod portable_context;
 
 pub const CONTRACT_VERSION: &str = "1.0";
 pub const SCHEMA_VERSION: u32 = 1;
+pub const FORWARD_CONTRACT_VERSION: &str = "2.0";
+pub const FORWARD_SCHEMA_VERSION: u32 = 2;
 
 pub fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, ContractError> {
     serde_jcs::to_vec(value).map_err(|_| ContractError::Canonicalization)
@@ -1581,17 +1583,87 @@ pub fn lock_schema() -> Result<Value, ContractError> {
 }
 
 pub fn plan_schema() -> Result<Value, ContractError> {
-    schema_with_id(
+    let mut schema = schema_with_id(
         schema_for!(Plan),
         "https://schemas.commonkit.dev/v1/plan.schema.json",
-    )
+    )?;
+    let definitions = schema
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    definitions.remove("RecoveryCapability");
+    definitions
+        .get_mut("Operation")
+        .and_then(Value::as_object_mut)
+        .and_then(|operation| operation.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?
+        .remove("recoveryCapability");
+    Ok(schema)
+}
+
+pub fn plan_v2_schema() -> Result<Value, ContractError> {
+    let mut schema = schema_with_id(
+        schema_for!(Plan),
+        "https://schemas.commonkit.dev/v2/plan.schema.json",
+    )?;
+    constrain_wire_version(
+        &mut schema,
+        FORWARD_SCHEMA_VERSION,
+        FORWARD_CONTRACT_VERSION,
+    )?;
+    Ok(schema)
 }
 
 pub fn receipt_schema() -> Result<Value, ContractError> {
-    schema_with_id(
+    let mut schema = schema_with_id(
         schema_for!(RunReceipt),
         "https://schemas.commonkit.dev/v1/receipt.schema.json",
-    )
+    )?;
+    retain_schema_enum(
+        &mut schema,
+        "OperationPhase",
+        &[
+            "prepared",
+            "prepare_failed",
+            "apply_started",
+            "applied",
+            "apply_failed",
+            "verified",
+            "verify_failed",
+            "rolled_back",
+            "rollback_failed",
+        ],
+    )?;
+    retain_schema_enum(
+        &mut schema,
+        "ReceiptState",
+        &[
+            "prepared",
+            "applying",
+            "verifying",
+            "succeeded",
+            "recovery_required",
+            "rolling_back",
+            "rolled_back",
+            "rollback_failed",
+            "canceled",
+        ],
+    )?;
+    Ok(schema)
+}
+
+pub fn receipt_v2_schema() -> Result<Value, ContractError> {
+    let mut schema = schema_with_id(
+        schema_for!(RunReceipt),
+        "https://schemas.commonkit.dev/v2/receipt.schema.json",
+    )?;
+    constrain_wire_version(
+        &mut schema,
+        FORWARD_SCHEMA_VERSION,
+        FORWARD_CONTRACT_VERSION,
+    )?;
+    Ok(schema)
 }
 
 pub fn diagnostics_schema() -> Result<Value, ContractError> {
@@ -1653,6 +1725,43 @@ fn schema_with_id(schema: schemars::Schema, id: &str) -> Result<Value, ContractE
         .ok_or(ContractError::SchemaGeneration)?
         .insert("$id".into(), Value::String(id.into()));
     Ok(schema)
+}
+
+fn retain_schema_enum(
+    schema: &mut Value,
+    definition: &str,
+    allowed: &[&str],
+) -> Result<(), ContractError> {
+    let values = schema
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .and_then(|definitions| definitions.get_mut(definition))
+        .and_then(Value::as_object_mut)
+        .and_then(|definition| definition.get_mut("enum"))
+        .and_then(Value::as_array_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    values.retain(|value| value.as_str().is_some_and(|value| allowed.contains(&value)));
+    Ok(())
+}
+
+fn constrain_wire_version(
+    schema: &mut Value,
+    schema_version: u32,
+    contract_version: &str,
+) -> Result<(), ContractError> {
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    properties.insert(
+        "schemaVersion".into(),
+        serde_json::json!({"const": schema_version, "type":"integer"}),
+    );
+    properties.insert(
+        "contractVersion".into(),
+        serde_json::json!({"const": contract_version, "type":"string"}),
+    );
+    Ok(())
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
