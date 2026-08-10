@@ -1,5 +1,6 @@
 use commonkit_adapters::*;
 use commonkit_contracts::{Sha256Digest, StableId, digest_domain_json};
+use commonkit_core::{OperationDraft, finalize_operation};
 use commonkit_reconcile::{Adapter, ReceiptStore, ReconcileOutcome, Reconciler};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -104,6 +105,9 @@ fn root(label: &str) -> std::path::PathBuf {
     std::fs::create_dir_all(&path).unwrap();
     path
 }
+fn linux_capabilities() -> SshTargetCapabilities {
+    SshTargetCapabilities::for_operating_system("linux").unwrap()
+}
 fn state(artifacts: &ArtifactStore) -> MaterializedState {
     let inputs = ProviderInputs::new(
         StableId::parse("native").unwrap(),
@@ -181,10 +185,11 @@ fn build(
     desired: &MaterializedState,
     artifacts: &ArtifactStore,
 ) -> (commonkit_contracts::Plan, SshFileAdapter<Memory>) {
-    let mut adapter = SshFileAdapter::open(
+    let mut adapter = SshFileAdapter::open_with_capabilities(
         StableId::parse("home-root").unwrap(),
         root.join("adapter"),
         transport,
+        linux_capabilities(),
     )
     .unwrap();
     let observed = adapter
@@ -224,6 +229,138 @@ fn execute(
     Reconciler::with_store(&receipts)
         .execute(plan, StableId::parse(run).unwrap(), &mut adapters)
         .unwrap()
+}
+
+#[test]
+fn modeful_resources_require_bound_remote_capability_before_planning() {
+    let temp = root("mode-capability");
+    let desired = relative_symlink_state();
+    let remote = Memory::default();
+    let mut fail_closed = SshFileAdapter::open(
+        StableId::parse("home-root").unwrap(),
+        temp.join("fail-closed"),
+        remote.clone(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        fail_closed
+            .observed_state_digest(desired.resources.iter().map(|resource| &resource.intent)),
+        Err(SshFileAdapterError::UnsupportedMode)
+    ));
+
+    let mut linux = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        temp.join("linux"),
+        remote,
+        SshTargetCapabilities::for_operating_system("linux").unwrap(),
+    )
+    .unwrap();
+    linux
+        .observed_state_digest(desired.resources.iter().map(|resource| &resource.intent))
+        .expect("declared Linux capability supports modes");
+
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn remote_capabilities_participate_in_observed_authority_binding() {
+    let temp = root("capability-binding");
+    let remote = Memory::default();
+    let intent = FilesystemIntent::Directory {
+        path: NormalizedManagedPath::parse("home/config").unwrap(),
+        mode: None,
+        exact: false,
+    };
+    let mut windows = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        temp.join("windows"),
+        remote.clone(),
+        SshTargetCapabilities::for_operating_system("windows").unwrap(),
+    )
+    .unwrap();
+    let mut linux = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        temp.join("linux"),
+        remote,
+        SshTargetCapabilities::for_operating_system("linux").unwrap(),
+    )
+    .unwrap();
+
+    assert_ne!(
+        windows.observed_state_digest([&intent]).unwrap(),
+        linux.observed_state_digest([&intent]).unwrap()
+    );
+
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn fresh_adapter_can_recover_a_legacy_v1_ssh_operation_payload() {
+    let temp = root("legacy-operation-payload");
+    let artifacts = ArtifactStore::open(temp.join("artifacts")).unwrap();
+    let desired = state(&artifacts);
+    let resource = &desired.resources[0];
+    let remote = Memory::default();
+    let adapter_state = temp.join("adapter");
+    let mut planning = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        &adapter_state,
+        remote.clone(),
+        linux_capabilities(),
+    )
+    .unwrap();
+    let current = planning
+        .register_materialized_resource(
+            StableId::parse("managed-file").unwrap(),
+            resource,
+            &artifacts,
+        )
+        .unwrap()
+        .unwrap();
+    let legacy_payload =
+        digest_domain_json("commonkit.ssh-filesystem-payload.v1", &resource.intent).unwrap();
+    let legacy = finalize_operation(OperationDraft {
+        adapter_id: current.adapter_id.clone(),
+        kind: current.kind,
+        resource: current.resource.clone(),
+        risk: current.risk,
+        requires_confirmation: current.requires_confirmation,
+        recovery_capability: current.recovery_capability,
+        depends_on: current.depends_on.clone(),
+        before_digest: current.before_digest.clone(),
+        after_digest: current.after_digest.clone(),
+        payload_digest: legacy_payload,
+        provenance: current.provenance.clone(),
+        summary: current.summary.clone(),
+    })
+    .unwrap();
+    let record = serde_json::json!({
+        "operationId": legacy.id,
+        "intent": resource.intent,
+    });
+    std::fs::write(
+        adapter_state.join("operations").join(format!(
+            "{}.json",
+            legacy.id.as_str().trim_start_matches("sha256:")
+        )),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let mut fresh = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        &adapter_state,
+        remote.clone(),
+        linux_capabilities(),
+    )
+    .unwrap();
+    fresh.prepare(&legacy).unwrap();
+    fresh.apply(&legacy).unwrap();
+    fresh.verify(&legacy).unwrap();
+    assert_eq!(remote.0.lock().unwrap().files["home/a"], b"a\n");
+
+    std::fs::remove_dir_all(temp).unwrap();
 }
 
 #[test]
@@ -269,10 +406,11 @@ fn stale_plan_is_rejected_crash_rolls_back_and_fresh_adapter_verifies() {
         ),
         ReconcileOutcome::Succeeded
     );
-    let mut fresh = SshFileAdapter::open(
+    let mut fresh = SshFileAdapter::open_with_capabilities(
         StableId::parse("home-root").unwrap(),
         temp.join("success/adapter"),
         remote,
+        linux_capabilities(),
     )
     .unwrap();
     for operation in &success.operations {
@@ -308,10 +446,11 @@ fn relative_directories_and_symlinks_plan_apply_and_verify_over_typed_ssh() {
     );
     drop(resources);
 
-    let mut fresh = SshFileAdapter::open(
+    let mut fresh = SshFileAdapter::open_with_capabilities(
         StableId::parse("home-root").unwrap(),
         temp.join("apply/adapter"),
         remote,
+        linux_capabilities(),
     )
     .unwrap();
     for operation in &plan.operations {
@@ -332,8 +471,13 @@ fn unsafe_remote_symlink_preimages_fail_before_planning() {
             SymlinkTargetKind::Directory,
         ),
     );
-    let mut adapter =
-        SshFileAdapter::open(StableId::parse("home-root").unwrap(), &temp, remote).unwrap();
+    let mut adapter = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        &temp,
+        remote,
+        linux_capabilities(),
+    )
+    .unwrap();
 
     assert!(matches!(
         adapter.observed_state_digest(desired.resources.iter().map(|resource| &resource.intent)),

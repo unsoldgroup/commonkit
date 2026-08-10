@@ -187,13 +187,24 @@ fn local_filesystem_observes_and_applies_relative_directories_and_symlinks_witho
         target.inspect_resource(&link).unwrap(),
         TargetResource::Symlink {
             target: "../../.agents/skills/tool".into(),
-            target_kind: SymlinkTargetKind::Directory,
+            target_kind: SymlinkTargetKind::File,
         }
     );
     assert!(matches!(
         target.read_file(&link),
         Err(TargetFilesystemError::SymlinkEncountered(_))
     ));
+
+    let dangling = NormalizedManagedPath::parse(".codex/skills/dangling").unwrap();
+    std::os::unix::fs::symlink("../../.agents/skills/missing", root.join(dangling.as_str()))
+        .unwrap();
+    assert_eq!(
+        target.inspect_resource(&dangling).unwrap(),
+        TargetResource::Symlink {
+            target: "../../.agents/skills/missing".into(),
+            target_kind: SymlinkTargetKind::File,
+        }
+    );
 
     drop(target);
     fs::remove_dir_all(root).unwrap();

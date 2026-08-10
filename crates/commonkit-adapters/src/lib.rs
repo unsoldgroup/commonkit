@@ -99,7 +99,7 @@ pub use service_lifecycle::{
 pub use ssh::{
     OpenSshConfig, OpenSshTransport, ProcessOutput, ProcessRemoteRunner, RemoteProcessRunner,
 };
-pub use ssh_files::{SshFileAdapter, SshFileAdapterError};
+pub use ssh_files::{SshFileAdapter, SshFileAdapterError, SshTargetCapabilities};
 pub use target::{
     EngramTargetRuntime, EngramTargetSyncMode, LocalTargetFilesystem, SshFilesystemRequest,
     SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem, TargetFilesystem,

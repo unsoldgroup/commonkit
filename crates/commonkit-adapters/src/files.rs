@@ -917,6 +917,17 @@ fn project_preimage_for_intent(intent: &FilesystemIntent, preimage: &mut Resourc
             ResourcePreimage::Absent | ResourcePreimage::Symlink { .. } => {}
         }
     }
+    #[cfg(unix)]
+    if let (
+        FilesystemIntent::Symlink { target_kind, .. },
+        ResourcePreimage::Symlink {
+            target_kind: observed,
+            ..
+        },
+    ) = (intent, preimage)
+    {
+        *observed = *target_kind;
+    }
 }
 
 fn desired_preimage(intent: &FilesystemIntent) -> ResourcePreimage {
@@ -957,20 +968,37 @@ fn semantic_digest(
         .map(Some),
         ResourcePreimage::Symlink {
             target,
-            target_kind: crate::SymlinkTargetKind::File,
-        } => digest_domain_json(
+            target_kind,
+        } => symlink_semantic_digest(target, *target_kind).map(Some),
+    }
+}
+
+#[cfg(unix)]
+fn symlink_semantic_digest(
+    target: &str,
+    _target_kind: crate::SymlinkTargetKind,
+) -> Result<Sha256Digest, commonkit_contracts::ContractError> {
+    digest_domain_json(
+        "commonkit.filesystem-resource-state.v1",
+        &("symlink", target),
+    )
+}
+
+#[cfg(not(unix))]
+fn symlink_semantic_digest(
+    target: &str,
+    target_kind: crate::SymlinkTargetKind,
+) -> Result<Sha256Digest, commonkit_contracts::ContractError> {
+    if target_kind == crate::SymlinkTargetKind::File {
+        digest_domain_json(
             "commonkit.filesystem-resource-state.v1",
             &("symlink", target),
         )
-        .map(Some),
-        ResourcePreimage::Symlink {
-            target,
-            target_kind,
-        } => digest_domain_json(
+    } else {
+        digest_domain_json(
             "commonkit.filesystem-resource-state.v2",
             &("symlink", target, target_kind),
         )
-        .map(Some),
     }
 }
 
@@ -997,7 +1025,7 @@ fn inspect_resource(
         let target = parent.read_link(&leaf)?;
         let target = target.to_string_lossy().into_owned();
         return Ok(ResourcePreimage::Symlink {
-            target_kind: inspect_symlink_target_kind_in(directory, path, &target)?,
+            target_kind: symlink_target_kind_from_metadata(&metadata),
             target,
         });
     }
@@ -1016,26 +1044,20 @@ fn inspect_resource(
     Err(FileAdapterError::UnsupportedResource)
 }
 
-fn inspect_symlink_target_kind_in(
-    root: &Dir,
-    link: &str,
-    target: &str,
-) -> Result<crate::SymlinkTargetKind, FileAdapterError> {
-    let link = NormalizedManagedPath::parse(link.to_owned())?;
-    let target = SafeSymlinkTarget::parse(&link, target.to_owned())?;
-    let resolved = target.resolved_for(&link)?;
-    let (parent, leaf) = open_parent_nofollow(root, resolved.as_str(), false)?;
-    let metadata = parent.symlink_metadata(&leaf)?;
-    if metadata_is_reparse_or_symlink(&metadata) {
-        return Err(FileAdapterError::UnsupportedResource);
-    }
-    if metadata.is_dir() {
-        Ok(crate::SymlinkTargetKind::Directory)
-    } else if metadata.is_file() {
-        Ok(crate::SymlinkTargetKind::File)
+#[cfg(windows)]
+fn symlink_target_kind_from_metadata(metadata: &cap_std::fs::Metadata) -> crate::SymlinkTargetKind {
+    if metadata_has_directory_attribute(metadata) {
+        crate::SymlinkTargetKind::Directory
     } else {
-        Err(FileAdapterError::UnsupportedResource)
+        crate::SymlinkTargetKind::File
     }
+}
+
+#[cfg(not(windows))]
+fn symlink_target_kind_from_metadata(
+    _metadata: &cap_std::fs::Metadata,
+) -> crate::SymlinkTargetKind {
+    crate::SymlinkTargetKind::File
 }
 
 #[cfg(unix)]

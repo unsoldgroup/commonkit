@@ -223,6 +223,20 @@ fn destructive_ancestor_claims_cannot_enclose_protected_state() {
     for resource in [
         removal("native", "home"),
         directory("native", "home/.ssh", true),
+        file("native", "home"),
+        NormalizedResource {
+            intent: FilesystemIntent::Symlink {
+                path: NormalizedManagedPath::parse("home").unwrap(),
+                target: SafeSymlinkTarget::parse(
+                    &NormalizedManagedPath::parse("home").unwrap(),
+                    "managed-home",
+                )
+                .unwrap(),
+                target_kind: SymlinkTargetKind::Directory,
+                expected_before: None,
+            },
+            provenance: provenance("native", "home-link"),
+        },
     ] {
         assert!(matches!(
             validate_ownership(&[resource], &rules(true)),
