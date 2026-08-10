@@ -92,6 +92,8 @@ enum Command {
     Rollback {
         run_id: String,
         #[arg(long)]
+        plan_id: Option<String>,
+        #[arg(long)]
         confirmed: bool,
     },
     /// Configure scheduled drift checks.
@@ -904,15 +906,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         )?)?,
         Command::Rollback {
             run_id,
+            plan_id,
             confirmed: true,
-        } => print_daemon(daemon_control(
-            "POST",
-            "/control/v1/rollback",
-            Some(
-                json!({"runId":run_id,"confirmed":true,"confirmationId":"cli-rollback","idempotencyKey":nonce("rollback")}),
-            ),
-            None,
-        )?)?,
+        } => {
+            let plan_id = plan_id.ok_or("rollback_plan_required: pass --plan-id <sha256:...>")?;
+            print_daemon(daemon_control(
+                "POST",
+                "/control/v1/rollback",
+                Some(
+                    json!({"runId":run_id,"planId":plan_id,"confirmed":true,"confirmationId":"cli-rollback","idempotencyKey":nonce("rollback")}),
+                ),
+                None,
+            )?)?
+        }
         Command::Verify => print_daemon(daemon_control(
             "POST",
             "/control/v1/verify",

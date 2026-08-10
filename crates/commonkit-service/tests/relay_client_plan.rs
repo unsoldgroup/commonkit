@@ -120,7 +120,7 @@ fn local_provider_mcp_clients_share_the_plan_receipt_and_rollback_path() {
     let receipt_store = ReceiptStore::open(&receipts_root).unwrap();
     let run_id = receipt_store.run_ids().unwrap().pop().unwrap();
     sync.rollback(serde_json::json!({
-        "runId":run_id,"confirmed":true,"confirmationId":"rollback-review"
+        "runId":run_id,"planId":plan.id,"confirmed":true,"confirmationId":"rollback-review"
     }))
     .unwrap();
     assert!(!target.join("home/.mcp.json").exists());

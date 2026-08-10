@@ -1725,6 +1725,7 @@ impl LocalPlanExecutor {
             if matches!(
                 receipt.receipt().state,
                 ReceiptState::Succeeded
+                    | ReceiptState::ForwardRecovered
                     | ReceiptState::Canceled
                     | ReceiptState::RolledBack
                     | ReceiptState::RollbackFailed
@@ -1775,6 +1776,7 @@ impl LocalPlanExecutor {
         match self.receipt_store.load(run_id.clone()) {
             Ok(receipt) => match receipt.receipt().state {
                 ReceiptState::Succeeded => return Ok(ReconcileOutcome::Succeeded),
+                ReceiptState::ForwardRecovered => return Ok(ReconcileOutcome::ForwardRecovered),
                 ReceiptState::Canceled => return Ok(ReconcileOutcome::Canceled),
                 ReceiptState::RolledBack => return Ok(ReconcileOutcome::RolledBack),
                 ReceiptState::RollbackFailed => return Ok(ReconcileOutcome::RollbackFailed),
@@ -1816,7 +1818,7 @@ impl PlanExecutor for LocalPlanExecutor {
 
 fn execution_result(result: Result<ReconcileOutcome, LocalExecutionError>) -> ExecutionResult {
     match result {
-        Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
+        Ok(ReconcileOutcome::Succeeded | ReconcileOutcome::ForwardRecovered) => ExecutionResult {
             status: ApplyStatus::Succeeded,
             failure_code: None,
         },
@@ -1828,6 +1830,12 @@ fn execution_result(result: Result<ReconcileOutcome, LocalExecutionError>) -> Ex
             status: ApplyStatus::Failed,
             failure_code: Some(stable_code("rollback_failed")),
         },
+        Ok(ReconcileOutcome::ForwardRecoveryRequired | ReconcileOutcome::ForwardRecoveryFailed) => {
+            ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("forward_recovery_required")),
+            }
+        }
         Err(error) => ExecutionResult {
             status: ApplyStatus::Failed,
             failure_code: Some(error.code()),
@@ -1898,6 +1906,7 @@ impl RelayPlanExecutor {
         match self.receipt_store.load(run_id.clone()) {
             Ok(receipt) => match receipt.receipt().state {
                 ReceiptState::Succeeded => Ok(ReconcileOutcome::Succeeded),
+                ReceiptState::ForwardRecovered => Ok(ReconcileOutcome::ForwardRecovered),
                 ReceiptState::Canceled => Ok(ReconcileOutcome::Canceled),
                 ReceiptState::RolledBack => Ok(ReconcileOutcome::RolledBack),
                 ReceiptState::RollbackFailed => Ok(ReconcileOutcome::RollbackFailed),
@@ -1929,10 +1938,12 @@ impl PlanExecutor for RelayPlanExecutor {
             .map_err(|_| LocalExecutionError::Lock)
             .and_then(|_guard| self.execute_durable(plan, confirmation_id));
         match result {
-            Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
-                status: ApplyStatus::Succeeded,
-                failure_code: None,
-            },
+            Ok(ReconcileOutcome::Succeeded | ReconcileOutcome::ForwardRecovered) => {
+                ExecutionResult {
+                    status: ApplyStatus::Succeeded,
+                    failure_code: None,
+                }
+            }
             Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
                 status: ApplyStatus::RolledBack,
                 failure_code: None,
@@ -1940,6 +1951,12 @@ impl PlanExecutor for RelayPlanExecutor {
             Ok(ReconcileOutcome::RollbackFailed) => ExecutionResult {
                 status: ApplyStatus::Failed,
                 failure_code: Some(stable_code("rollback_failed")),
+            },
+            Ok(
+                ReconcileOutcome::ForwardRecoveryRequired | ReconcileOutcome::ForwardRecoveryFailed,
+            ) => ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("forward_recovery_required")),
             },
             Err(_) => ExecutionResult {
                 status: ApplyStatus::Failed,
@@ -2242,6 +2259,7 @@ pub enum DomainFailure {
     StalePlan,
     VerificationFailed,
     RelayRequiresTargetResidentDaemon,
+    RollbackUnsupported,
     OperationFailed,
 }
 
@@ -3673,6 +3691,7 @@ fn domain_error(error: DomainFailure) -> ApiError {
         DomainFailure::RelayRequiresTargetResidentDaemon => {
             ApiError::conflict("relay_requires_target_resident_daemon")
         }
+        DomainFailure::RollbackUnsupported => ApiError::conflict("rollback_unsupported"),
         DomainFailure::OperationFailed => ApiError::internal("domain_operation_failed"),
     }
 }

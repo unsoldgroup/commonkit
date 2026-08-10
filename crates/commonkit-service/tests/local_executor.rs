@@ -131,11 +131,43 @@ fn local_execution_is_receipt_idempotent_and_startup_scan_cancels_prepared_runs(
     )
     .unwrap();
     receipts.persist(&pending).unwrap();
+    let recovered_id = StableId::parse("already-forward-recovered").unwrap();
+    let mut already_recovered = ReceiptJournal::new(
+        recovered_id.clone(),
+        plan.id.clone(),
+        plan.target_id.clone(),
+        plan.desired_digest.clone(),
+        plan.observed_digest.clone(),
+        plan.policy_digest.clone(),
+        plan.bindings.clone(),
+    )
+    .unwrap();
+    receipts.persist(&already_recovered).unwrap();
+    already_recovered
+        .transition(ReceiptState::Applying)
+        .unwrap();
+    receipts.persist(&already_recovered).unwrap();
+    already_recovered
+        .transition(ReceiptState::ForwardRecoveryRequired)
+        .unwrap();
+    receipts.persist(&already_recovered).unwrap();
+    already_recovered
+        .transition(ReceiptState::ConvergingForward)
+        .unwrap();
+    receipts.persist(&already_recovered).unwrap();
+    already_recovered
+        .transition(ReceiptState::ForwardRecovered)
+        .unwrap();
+    receipts.persist(&already_recovered).unwrap();
     let recovered = executor.recover_pending().unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(
         receipts.load(pending_id).unwrap().receipt().state,
         ReceiptState::Canceled
+    );
+    assert_eq!(
+        receipts.load(recovered_id).unwrap().receipt().state,
+        ReceiptState::ForwardRecovered
     );
     fs::remove_dir_all(root).unwrap();
 }

@@ -44,8 +44,7 @@
           ]
         },
         "recoveryCapability": {
-          "$ref": "#/$defs/RecoveryCapability",
-          "default": "exact_rollback"
+          "$ref": "#/$defs/RecoveryCapability"
         },
         "requiresConfirmation": {
           "type": "boolean"

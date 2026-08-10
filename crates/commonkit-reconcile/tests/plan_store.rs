@@ -105,6 +105,10 @@ fn reloads_a_pre_provenance_v1_operation_without_changing_its_identity() {
         !serialized.contains("provenance"),
         "the legacy v1 representation must remain byte-shape compatible"
     );
+    assert!(
+        !serialized.contains("recoveryCapability"),
+        "the default exact rollback capability must preserve v1 plan bytes"
+    );
     store.persist(&plan).expect("persist");
     assert_eq!(store.load(&plan.id).expect("reload"), plan);
 

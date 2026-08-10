@@ -432,8 +432,19 @@ impl ProductionSshPlanExecutor {
             .map_err(|_| DomainFailure::OperationFailed)?;
         let mut adapters = self.adapter()?;
         match self.receipts.load(run_id.clone()) {
-            Ok(receipt) if matches!(receipt.receipt().state, ReceiptState::Succeeded) => {
-                Ok(ReconcileOutcome::Succeeded)
+            Ok(receipt)
+                if matches!(
+                    receipt.receipt().state,
+                    ReceiptState::Succeeded | ReceiptState::ForwardRecovered
+                ) =>
+            {
+                Ok(
+                    if receipt.receipt().state == ReceiptState::ForwardRecovered {
+                        ReconcileOutcome::ForwardRecovered
+                    } else {
+                        ReconcileOutcome::Succeeded
+                    },
+                )
             }
             Ok(receipt)
                 if matches!(
@@ -467,15 +478,22 @@ impl PlanExecutor for ProductionSshPlanExecutor {
             .map_err(|_| DomainFailure::OperationFailed)
             .and_then(|_| self.execute_inner(plan, confirmation_id));
         match result {
-            Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
-                status: ApplyStatus::Succeeded,
-                failure_code: None,
-            },
+            Ok(ReconcileOutcome::Succeeded | ReconcileOutcome::ForwardRecovered) => {
+                ExecutionResult {
+                    status: ApplyStatus::Succeeded,
+                    failure_code: None,
+                }
+            }
             Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
                 status: ApplyStatus::RolledBack,
                 failure_code: None,
             },
-            Ok(ReconcileOutcome::RollbackFailed) | Err(_) => ExecutionResult {
+            Ok(
+                ReconcileOutcome::RollbackFailed
+                | ReconcileOutcome::ForwardRecoveryRequired
+                | ReconcileOutcome::ForwardRecoveryFailed,
+            )
+            | Err(_) => ExecutionResult {
                 status: ApplyStatus::Failed,
                 failure_code: Some(StableId::parse("remote_execution_failed").expect("static ID")),
             },
@@ -2161,6 +2179,7 @@ impl VerifyRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RollbackRequest {
     run_id: StableId,
+    plan_id: Sha256Digest,
     confirmed: bool,
     confirmation_id: StableId,
     idempotency_key: Option<String>,
@@ -2417,15 +2436,18 @@ impl SyncDomain for ProductionSyncDomain {
             reference.idempotency_key,
         );
         let run_id = reference.run_id;
-        let receipts =
-            ReceiptStore::open(&self.receipt_root).map_err(|_| DomainFailure::OperationFailed)?;
-        let receipt = receipts
-            .load(run_id.clone())
-            .map_err(|_| DomainFailure::InvalidRequest)?;
         let plan = self
             .plan_store
-            .load(&receipt.receipt().plan_id)
-            .map_err(|_| DomainFailure::OperationFailed)?;
+            .load(&reference.plan_id)
+            .map_err(|_| DomainFailure::InvalidRequest)?;
+        if plan.operations.iter().any(|operation| {
+            operation.recovery_capability
+                == commonkit_contracts::RecoveryCapability::ConvergeForwardOnly
+        }) {
+            return Err(DomainFailure::RollbackUnsupported);
+        }
+        let receipts =
+            ReceiptStore::open(&self.receipt_root).map_err(|_| DomainFailure::OperationFailed)?;
         let mut adapters: Vec<Box<dyn Adapter>> = match self
             .config
             .target_transport
@@ -2447,7 +2469,16 @@ impl SyncDomain for ProductionSyncDomain {
         };
         let outcome = Reconciler::with_store(&receipts)
             .rollback_succeeded_run(run_id.clone(), &plan, &mut adapters)
-            .map_err(|_| DomainFailure::OperationFailed)?;
+            .map_err(|error| match error {
+                commonkit_reconcile::ReconcileError::RollbackUnsupported => {
+                    DomainFailure::RollbackUnsupported
+                }
+                commonkit_reconcile::ReconcileError::Receipt(_)
+                | commonkit_reconcile::ReconcileError::ReceiptPlanMismatch => {
+                    DomainFailure::InvalidRequest
+                }
+                _ => DomainFailure::OperationFailed,
+            })?;
         Ok(serde_json::json!({"runId":run_id,"outcome":format!("{outcome:?}").to_lowercase()}))
     }
 }
