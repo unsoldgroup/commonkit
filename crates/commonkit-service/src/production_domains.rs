@@ -1718,8 +1718,8 @@ impl ProductionSyncDomain {
                     state.resources.iter().any(|resource| {
                         resource.provenance.source.ends_with(&source_suffix)
                             && matches!(
-                                &resource.intent,
-                                FilesystemIntent::File { path, .. }
+                                resource.intent.filesystem(),
+                                Some(FilesystemIntent::File { path, .. })
                                     if path.as_str().ends_with(&suffix)
                             )
                     })
@@ -2043,7 +2043,8 @@ impl ProductionSyncDomain {
                             content,
                             mode: None,
                             expected_before: None,
-                        },
+                        }
+                        .into(),
                         provenance: ResourceProvenance {
                             provider_id: inputs.provider_id.clone(),
                             provider_version: inputs.provider_version.to_string(),
@@ -2173,9 +2174,12 @@ impl ProductionSyncDomain {
             DomainFailure::OperationFailed
         })?;
         let intents = || {
-            states
-                .iter()
-                .flat_map(|state| state.resources.iter().map(|resource| &resource.intent))
+            states.iter().flat_map(|state| {
+                state
+                    .resources
+                    .iter()
+                    .filter_map(|resource| resource.intent.filesystem())
+            })
         };
         let plan = match self
             .config
@@ -2236,7 +2240,7 @@ impl ProductionSyncDomain {
         Ok(plan)
     }
 
-    fn finish_plan<P: ProviderResourcePlanner + ?Sized>(
+    fn finish_plan<P: ProviderResourcePlanner>(
         &self,
         states: &[MaterializedState],
         artifacts: &ArtifactStore,
@@ -2471,7 +2475,7 @@ fn relay_authority_from_states(
     for state in &states {
         state.verify().map_err(|_| DomainFailure::OperationFailed)?;
         for resource in &state.resources {
-            if let FilesystemIntent::File { content, .. } = &resource.intent {
+            for content in resource.artifact_references() {
                 artifact_store
                     .load(content)
                     .map_err(|_| DomainFailure::OperationFailed)?;
@@ -2761,7 +2765,7 @@ impl SyncDomain for ProductionSyncDomain {
         for state in &record.states {
             state.verify().map_err(|_| DomainFailure::OperationFailed)?;
             for resource in &state.resources {
-                if let FilesystemIntent::File { content, .. } = &resource.intent {
+                for content in resource.artifact_references() {
                     artifacts
                         .load(content)
                         .map_err(|_| DomainFailure::OperationFailed)?;
@@ -2803,7 +2807,7 @@ impl SyncDomain for ProductionSyncDomain {
         for state in &states {
             state.verify().map_err(|_| DomainFailure::OperationFailed)?;
             for resource in &state.resources {
-                if let FilesystemIntent::File { content, .. } = &resource.intent {
+                for content in resource.artifact_references() {
                     artifact_store
                         .load(content)
                         .map_err(|_| DomainFailure::OperationFailed)?;

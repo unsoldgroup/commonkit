@@ -533,7 +533,8 @@ fn production_local_target_executor_applies_to_each_configured_root_and_survives
                     content: reference,
                     mode: None,
                     expected_before: None,
-                },
+                }
+                .into(),
                 provenance: ResourceProvenance {
                     provider_id: inputs.provider_id.clone(),
                     provider_version: inputs.provider_version.to_string(),

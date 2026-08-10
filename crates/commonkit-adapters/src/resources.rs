@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use commonkit_contracts::{ContractError, Sha256Digest, digest_domain_json};
+use commonkit_contracts::{
+    ContractError, PackageDeclaration, PackageManager, RecoveryCapability, Sha256Digest, StableId,
+    digest_domain_json,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -247,11 +250,181 @@ impl FilesystemIntent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceType {
+    Filesystem,
+    Package,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "resourceType", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ResourceAddress {
+    Filesystem {
+        path: NormalizedManagedPath,
+    },
+    Package {
+        manager: PackageManager,
+        id: StableId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PackageResourceIntent {
+    Package {
+        declaration: PackageDeclaration,
+        resolution: ContentReference,
+        artifacts: Vec<ContentReference>,
+    },
+}
+
+impl PackageResourceIntent {
+    pub fn new(
+        declaration: PackageDeclaration,
+        resolution: ContentReference,
+        artifacts: Vec<ContentReference>,
+    ) -> Result<Self, ResourceError> {
+        declaration
+            .validate()
+            .map_err(|_| ResourceError::InvalidPackageDeclaration)?;
+        if artifacts.is_empty() {
+            return Err(ResourceError::MissingPackageArtifact);
+        }
+        Ok(Self::Package {
+            declaration,
+            resolution,
+            artifacts,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ResourceIntent {
+    Filesystem(FilesystemIntent),
+    Package(PackageResourceIntent),
+}
+
+impl From<FilesystemIntent> for ResourceIntent {
+    fn from(intent: FilesystemIntent) -> Self {
+        Self::Filesystem(intent)
+    }
+}
+
+impl From<PackageResourceIntent> for ResourceIntent {
+    fn from(intent: PackageResourceIntent) -> Self {
+        Self::Package(intent)
+    }
+}
+
+impl ResourceIntent {
+    pub fn resource_type(&self) -> ResourceType {
+        match self {
+            Self::Filesystem(_) => ResourceType::Filesystem,
+            Self::Package(_) => ResourceType::Package,
+        }
+    }
+
+    pub fn address(&self) -> ResourceAddress {
+        match self {
+            Self::Filesystem(intent) => ResourceAddress::Filesystem {
+                path: intent.path().clone(),
+            },
+            Self::Package(PackageResourceIntent::Package { declaration, .. }) => {
+                ResourceAddress::Package {
+                    manager: declaration.manager,
+                    id: declaration.id.clone(),
+                }
+            }
+        }
+    }
+
+    pub fn sort_key(&self) -> ResourceAddress {
+        self.address()
+    }
+
+    pub fn artifact_references(&self) -> Vec<&ContentReference> {
+        match self {
+            Self::Filesystem(FilesystemIntent::File { content, .. }) => vec![content],
+            Self::Filesystem(_) => Vec::new(),
+            Self::Package(PackageResourceIntent::Package {
+                resolution,
+                artifacts,
+                ..
+            }) => {
+                let mut references = Vec::with_capacity(artifacts.len() + 1);
+                references.push(resolution);
+                references.extend(artifacts);
+                references
+            }
+        }
+    }
+
+    pub fn desired_digest(&self) -> Result<Sha256Digest, ContractError> {
+        match self {
+            Self::Filesystem(intent) => {
+                digest_domain_json("commonkit.filesystem-resource-desired.v1", intent)
+            }
+            Self::Package(intent) => {
+                digest_domain_json("commonkit.package-resource-desired.v1", intent)
+            }
+        }
+    }
+
+    pub fn recovery_capability(&self) -> RecoveryCapability {
+        match self {
+            Self::Filesystem(_) => RecoveryCapability::ExactRollback,
+            Self::Package(_) => RecoveryCapability::ConvergeForwardOnly,
+        }
+    }
+
+    pub fn filesystem(&self) -> Option<&FilesystemIntent> {
+        match self {
+            Self::Filesystem(intent) => Some(intent),
+            Self::Package(_) => None,
+        }
+    }
+
+    pub fn filesystem_mut(&mut self) -> Option<&mut FilesystemIntent> {
+        match self {
+            Self::Filesystem(intent) => Some(intent),
+            Self::Package(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NormalizedResource {
-    pub intent: FilesystemIntent,
+    pub intent: ResourceIntent,
     pub provenance: ResourceProvenance,
+}
+
+impl NormalizedResource {
+    pub fn resource_type(&self) -> ResourceType {
+        self.intent.resource_type()
+    }
+
+    pub fn address(&self) -> ResourceAddress {
+        self.intent.address()
+    }
+
+    pub fn sort_key(&self) -> ResourceAddress {
+        self.intent.sort_key()
+    }
+
+    pub fn artifact_references(&self) -> Vec<&ContentReference> {
+        self.intent.artifact_references()
+    }
+
+    pub fn desired_digest(&self) -> Result<Sha256Digest, ContractError> {
+        self.intent.desired_digest()
+    }
+
+    pub fn recovery_capability(&self) -> RecoveryCapability {
+        self.intent.recovery_capability()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -324,12 +497,36 @@ pub fn validate_ownership(
     resources: &[NormalizedResource],
     rules: &OwnershipRules,
 ) -> Result<(), OwnershipError> {
+    let mut addresses: BTreeMap<ResourceAddress, &NormalizedResource> = BTreeMap::new();
     let mut paths: BTreeMap<String, &NormalizedResource> = BTreeMap::new();
     let mut folded: BTreeMap<String, &NormalizedResource> = BTreeMap::new();
 
     for resource in resources {
-        let path = resource.intent.path();
-        if let FilesystemIntent::Symlink { target, .. } = &resource.intent {
+        let address = resource.address();
+        if addresses.insert(address.clone(), resource).is_some()
+            && matches!(address, ResourceAddress::Package { .. })
+        {
+            return Err(OwnershipError::DuplicatePackage { address });
+        }
+        let Some(intent) = resource.intent.filesystem() else {
+            let ResourceIntent::Package(PackageResourceIntent::Package {
+                declaration,
+                artifacts,
+                ..
+            }) = &resource.intent
+            else {
+                unreachable!("closed resource vocabulary")
+            };
+            declaration
+                .validate()
+                .map_err(|_| OwnershipError::InvalidPackageDeclaration)?;
+            if artifacts.is_empty() {
+                return Err(OwnershipError::MissingPackageArtifact { address });
+            }
+            continue;
+        };
+        let path = intent.path();
+        if let FilesystemIntent::Symlink { target, .. } = intent {
             let resolved = target
                 .resolved_for(path)
                 .map_err(|_| OwnershipError::UnsafeSymlinkTarget { path: path.clone() })?;
@@ -352,7 +549,7 @@ pub fn validate_ownership(
             rules.contains_path(path, root)
                 || (rules.contains_path(root, path)
                     && !matches!(
-                        resource.intent,
+                        intent,
                         FilesystemIntent::Directory {
                             exact: false,
                             mode: None,
@@ -363,8 +560,12 @@ pub fn validate_ownership(
             return Err(OwnershipError::ProtectedPath { path: path.clone() });
         }
         if let Some(existing) = paths.insert(path.as_str().into(), resource) {
-            let existing_kind = existing.intent.kind();
-            let incoming_kind = resource.intent.kind();
+            let existing_kind = existing
+                .intent
+                .filesystem()
+                .expect("filesystem path map only")
+                .kind();
+            let incoming_kind = intent.kind();
             return Err(
                 if existing_kind == ResourceKind::Remove || incoming_kind == ResourceKind::Remove {
                     OwnershipError::RemovalConflict { path: path.clone() }
@@ -378,10 +579,20 @@ pub fn validate_ownership(
         if !rules.case_sensitive {
             let key = path.as_str().to_lowercase();
             if let Some(existing) = folded.insert(key, resource)
-                && existing.intent.path() != path
+                && existing
+                    .intent
+                    .filesystem()
+                    .expect("filesystem folded map only")
+                    .path()
+                    != path
             {
                 return Err(OwnershipError::CaseCollision {
-                    first: existing.intent.path().clone(),
+                    first: existing
+                        .intent
+                        .filesystem()
+                        .expect("filesystem folded map only")
+                        .path()
+                        .clone(),
                     second: path.clone(),
                 });
             }
@@ -389,18 +600,25 @@ pub fn validate_ownership(
     }
 
     let claims: Vec<&NormalizedResource> = paths.values().copied().collect();
-    for exact in claims
-        .iter()
-        .filter(|claim| claim.intent.is_exact_directory())
-    {
+    for exact in claims.iter().filter(|claim| {
+        claim
+            .intent
+            .filesystem()
+            .is_some_and(FilesystemIntent::is_exact_directory)
+    }) {
+        let exact_intent = exact.intent.filesystem().expect("filesystem claims only");
         for descendant in &claims {
-            if exact.intent.path() != descendant.intent.path()
-                && rules.contains_path(descendant.intent.path(), exact.intent.path())
+            let descendant_intent = descendant
+                .intent
+                .filesystem()
+                .expect("filesystem claims only");
+            if exact_intent.path() != descendant_intent.path()
+                && rules.contains_path(descendant_intent.path(), exact_intent.path())
                 && exact.provenance.provider_id != descendant.provenance.provider_id
             {
                 return Err(OwnershipError::ExactDirectoryConflict {
-                    directory: exact.intent.path().clone(),
-                    descendant: descendant.intent.path().clone(),
+                    directory: exact_intent.path().clone(),
+                    descendant: descendant_intent.path().clone(),
                 });
             }
         }
@@ -413,16 +631,18 @@ pub fn materialized_resources_digest(
 ) -> Result<Sha256Digest, ContractError> {
     let mut ordered: Vec<&NormalizedResource> = resources.iter().collect();
     ordered.sort_by(|left, right| {
-        (
-            left.intent.path().as_str(),
-            left.provenance.provider_id.as_str(),
-        )
-            .cmp(&(
-                right.intent.path().as_str(),
-                right.provenance.provider_id.as_str(),
-            ))
+        (left.sort_key(), left.provenance.provider_id.as_str())
+            .cmp(&(right.sort_key(), right.provenance.provider_id.as_str()))
     });
-    digest_domain_json("commonkit.materialized-filesystem.v1", &ordered)
+    let domain = if ordered
+        .iter()
+        .all(|resource| resource.resource_type() == ResourceType::Filesystem)
+    {
+        "commonkit.materialized-filesystem.v1"
+    } else {
+        "commonkit.materialized-resources.v2"
+    };
+    digest_domain_json(domain, &ordered)
 }
 
 #[derive(Debug, Error)]
@@ -433,12 +653,22 @@ pub enum ResourceError {
     UnsafeSymlinkTarget(String),
     #[error("file mode exceeds portable permission bits: {0:o}")]
     InvalidFileMode(u32),
+    #[error("package declaration is not exact")]
+    InvalidPackageDeclaration,
+    #[error("package resource must bind at least one immutable artifact")]
+    MissingPackageArtifact,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum OwnershipError {
     #[error("at least one target root must be declared")]
     NoDeclaredRoots,
+    #[error("package declaration is not exact")]
+    InvalidPackageDeclaration,
+    #[error("package resource has no immutable artifact: {address:?}")]
+    MissingPackageArtifact { address: ResourceAddress },
+    #[error("multiple resources claim the same package identity: {address:?}")]
+    DuplicatePackage { address: ResourceAddress },
     #[error("symlink target escapes the managed root at path: {path}")]
     UnsafeSymlinkTarget { path: NormalizedManagedPath },
     #[error("provider claim is outside declared roots: {path}")]

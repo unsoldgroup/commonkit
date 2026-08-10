@@ -65,7 +65,8 @@ fn provider_mcp_becomes_content_addressed_claude_and_codex_relay_configs() {
         .resources
         .iter()
         .map(|resource| {
-            let commonkit_adapters::FilesystemIntent::File { path, content, .. } = &resource.intent
+            let Some(commonkit_adapters::FilesystemIntent::File { path, content, .. }) =
+                resource.intent.filesystem()
             else {
                 panic!("client configuration must be a file")
             };

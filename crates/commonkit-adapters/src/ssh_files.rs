@@ -166,7 +166,11 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
         resource: &NormalizedResource,
         provider_artifacts: &ArtifactStore,
     ) -> Result<Option<Operation>, SshFileAdapterError> {
-        let mut intent = resource.intent.clone();
+        let mut intent = resource
+            .intent
+            .filesystem()
+            .cloned()
+            .ok_or(SshFileAdapterError::UnsupportedResource)?;
         ensure_supported(&intent, self.capabilities)?;
         if let FilesystemIntent::File { content, .. } = &mut intent {
             let bytes = provider_artifacts.load(content)?;

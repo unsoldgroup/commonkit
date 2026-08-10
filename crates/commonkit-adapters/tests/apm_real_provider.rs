@@ -67,19 +67,18 @@ fn checksum_pinned_apm_release_materializes_without_touching_live_target() {
             panic!("{error}\nredacted bounded APM install diagnostic:\n{summary}");
         });
     state.verify().unwrap();
-    assert!(
-        state
-            .resources
-            .iter()
-            .any(|resource| resource.intent.path().as_str() == "home/AGENTS.md")
-    );
-    assert!(
-        state.resources.iter().any(|resource| resource
+    assert!(state.resources.iter().any(|resource| {
+        resource
             .intent
-            .path()
-            .as_str()
-            .starts_with("home/.claude/"))
-    );
+            .filesystem()
+            .is_some_and(|intent| intent.path().as_str() == "home/AGENTS.md")
+    }));
+    assert!(state.resources.iter().any(|resource| {
+        resource
+            .intent
+            .filesystem()
+            .is_some_and(|intent| intent.path().as_str().starts_with("home/.claude/"))
+    }));
     assert_eq!(fs::read_dir(live).unwrap().count(), 0);
     drop(artifacts);
     fs::remove_dir_all(root).unwrap();

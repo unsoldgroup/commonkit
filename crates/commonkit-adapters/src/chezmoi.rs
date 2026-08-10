@@ -557,7 +557,7 @@ fn scan_destination(
             )));
         };
         resources.push(NormalizedResource {
-            intent,
+            intent: intent.into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: TESTED_CHEZMOI_VERSION.into(),

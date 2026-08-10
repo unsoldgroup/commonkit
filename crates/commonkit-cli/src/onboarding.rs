@@ -1700,7 +1700,8 @@ fn write_runtime_state(
                 content,
                 mode: None,
                 expected_before: None,
-            },
+            }
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),
@@ -1815,7 +1816,7 @@ fn write_runtime_state(
         materialized
             .resources
             .iter()
-            .map(|resource| &resource.intent),
+            .filter_map(|resource| resource.intent.filesystem()),
     )?;
     let ownership = OwnershipRules::new(
         !cfg!(windows),

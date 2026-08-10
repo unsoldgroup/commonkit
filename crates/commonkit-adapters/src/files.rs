@@ -416,7 +416,11 @@ impl FileAdapter {
         resource: &NormalizedResource,
         provider_artifacts: &ArtifactStore,
     ) -> Result<Operation, FileAdapterError> {
-        let mut intent = resource.intent.clone();
+        let mut intent = resource
+            .intent
+            .filesystem()
+            .cloned()
+            .ok_or(FileAdapterError::UnsupportedResource)?;
         if let FilesystemIntent::File { content, .. } = &mut intent {
             let bytes = provider_artifacts.load(content)?;
             *content = self.artifacts.put(&bytes, content.sensitivity)?;

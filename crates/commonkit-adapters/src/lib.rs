@@ -75,8 +75,9 @@ pub use packages::{
 };
 pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutput};
 pub use planning::{
-    ProviderPlanError, ProviderPlanRequest, ProviderResourcePlanner, build_provider_plan,
-    provider_plan_bindings,
+    PackageResourcePlanner, ProviderPlanError, ProviderPlanRequest, ProviderPlannerRoute,
+    ProviderResourcePlanner, ProviderResourceRouter, build_provider_plan,
+    build_provider_plan_with_router, provider_plan_bindings,
 };
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,
@@ -89,7 +90,8 @@ pub use remote_provider::{
 };
 pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
-    OwnershipRules, ResourceError, ResourceProvenance, SafeSymlinkTarget, SymlinkTargetKind,
+    OwnershipRules, PackageResourceIntent, ResourceAddress, ResourceError, ResourceIntent,
+    ResourceProvenance, ResourceType, SafeSymlinkTarget, SymlinkTargetKind,
     materialized_resources_digest, validate_ownership,
 };
 pub use service_lifecycle::{

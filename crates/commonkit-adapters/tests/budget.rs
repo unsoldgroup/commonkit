@@ -23,12 +23,13 @@ impl Fixture {
             .put(contents.as_bytes(), ContentSensitivity::Portable)
             .expect("put");
         NormalizedResource {
-            intent: FilesystemIntent::File {
+            intent: (FilesystemIntent::File {
                 path: NormalizedManagedPath::parse(path).expect("path"),
                 content,
                 mode: Some(FileMode::parse(0o600).expect("mode")),
                 expected_before: None,
-            },
+            })
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: StableId::parse("apm").expect("provider"),
                 provider_version: "0.25.0".into(),
@@ -288,11 +289,12 @@ fn malformed_context_budget_is_rejected_rather_than_ignored() {
 fn non_file_intents_are_ignored_rather_than_rejected() {
     let fixture = Fixture::new();
     let directory = NormalizedResource {
-        intent: FilesystemIntent::Directory {
+        intent: (FilesystemIntent::Directory {
             path: NormalizedManagedPath::parse("skills").expect("path"),
             mode: None,
             exact: false,
-        },
+        })
+        .into(),
         provenance: ResourceProvenance {
             provider_id: StableId::parse("apm").expect("provider"),
             provider_version: "0.25.0".into(),
