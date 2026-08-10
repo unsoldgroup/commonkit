@@ -21,6 +21,8 @@ pub struct RemoteMaterializationReceipt {
     pub provider_inputs_digest: Sha256Digest,
     pub materialized_state_digest: Sha256Digest,
     pub artifact_digests: Vec<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_resolution_authority_digest: Option<Sha256Digest>,
 }
 
 pub struct RemoteProviderStager<'a, T> {
@@ -54,12 +56,13 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
         run_id: StableId,
     ) -> Result<RemoteMaterializationReceipt, RemoteProviderStagingError> {
         state.verify()?;
-        self.stage_state(state, artifacts, target_id, run_id)
+        self.stage_state(state, None, artifacts, target_id, run_id)
     }
 
     pub fn stage_resolved_materialized(
         &mut self,
         state: &ResolvedMaterializedState,
+        package_authority: &crate::PackageResolutionAuthority,
         artifacts: &ArtifactStore,
         target_id: StableId,
         run_id: StableId,
@@ -67,15 +70,22 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
         state.verify()?;
         for resource in &state.resources {
             if let crate::ResourceIntent::ResolvedPackage(intent) = &resource.intent {
-                intent.load_persisted(artifacts)?;
+                package_authority.validate(intent, artifacts)?;
             }
         }
-        self.stage_state(state, artifacts, target_id, run_id)
+        self.stage_state(
+            state,
+            Some(package_authority.digest().clone()),
+            artifacts,
+            target_id,
+            run_id,
+        )
     }
 
     fn stage_state<S: RemoteStagingState>(
         &mut self,
         state: &S,
+        package_resolution_authority_digest: Option<Sha256Digest>,
         artifacts: &ArtifactStore,
         target_id: StableId,
         run_id: StableId,
@@ -143,6 +153,7 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
             provider_inputs_digest: state.inputs().input_set_digest.clone(),
             materialized_state_digest: state.digest().clone(),
             artifact_digests,
+            package_resolution_authority_digest,
         })
     }
 

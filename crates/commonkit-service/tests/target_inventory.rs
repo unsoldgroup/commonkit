@@ -190,6 +190,7 @@ async fn target_routes_are_authenticated_and_selection_requires_confirmation() {
             provider_inputs_digest: digest("providers"),
             ownership_map_digest: digest("ownership"),
             artifact_set_digest: digest("artifacts"),
+            package_resolution_authority_digest: None,
         },
         operations: vec![],
     })

@@ -4218,6 +4218,7 @@ async fn plan_relay_reconcile(
             provider_inputs_digest: authority.provider_inputs_digest.clone(),
             ownership_map_digest: authority.ownership_map_digest.clone(),
             artifact_set_digest: authority.artifact_set_digest.clone(),
+            package_resolution_authority_digest: None,
         },
         operations: operation.into_iter().collect(),
     })

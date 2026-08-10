@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use commonkit_adapters::{
     DeclaredSideEffect, ExactProviderVersion, FilesystemIntent, MaterializedState,
     NormalizedManagedPath, NormalizedResource, PackageDesiredIntent, ProviderInputs,
-    ProviderWorkspace, ResourceIntent, ResourceProvenance, UnsupportedCapability,
+    ProviderWorkspace, ResourceProvenance, UnsupportedCapability,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, Sha256Digest, StableId, digest_domain_json,
@@ -166,8 +166,25 @@ fn provider_json_cannot_submit_package_resolution_or_artifacts() {
     });
 
     assert!(
-        serde_json::from_value::<ResourceIntent>(provider_selected_resolution).is_err(),
+        serde_json::from_value::<commonkit_adapters::ProviderResourceIntent>(
+            provider_selected_resolution.clone()
+        )
+        .is_err(),
         "provider wire input must not cross the controller-owned resolution boundary"
+    );
+
+    let state = MaterializedState::finalize(
+        provider_inputs(),
+        vec![resource("home/provider-output")],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let mut state_json = serde_json::to_value(state).unwrap();
+    state_json["resources"][0]["intent"] = provider_selected_resolution;
+    assert!(
+        serde_json::from_value::<MaterializedState>(state_json).is_err(),
+        "provider materialized-state decoding must use the desired-only vocabulary"
     );
 }
 

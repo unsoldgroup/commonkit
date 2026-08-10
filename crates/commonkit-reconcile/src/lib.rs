@@ -1411,6 +1411,7 @@ mod receipt_chain_tests {
                 provider_inputs_digest: digest('1'),
                 ownership_map_digest: digest('2'),
                 artifact_set_digest: digest('3'),
+                package_resolution_authority_digest: None,
             },
         )
         .unwrap()

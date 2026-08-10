@@ -64,10 +64,11 @@ pub use native::NativeProvider;
 pub use package_resolution::{
     ArtifactEvidence, ControlledPackageSourceV1, ManagerBindingV1, OfflineInstallRecipeV1,
     OfflinePackageBackend, PackageArtifactV1, PackageFetch, PackageFetchRequestV1,
-    PackageObservationV1, PackageResolutionBackend, PackageResolutionCoordinator,
-    PackageResolutionDraftV1, PackageResolutionError, PackageResolutionProbeV1,
-    PackageResolutionRequestV1, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
-    ResolvedPackage, ResolvedPackageIntent, SourceBindingV1, package_resolution_schema,
+    PackageFetchResultV1, PackageObservationV1, PackageResolutionAuthority,
+    PackageResolutionBackend, PackageResolutionCoordinator, PackageResolutionDraftV1,
+    PackageResolutionError, PackageResolutionProbeV1, PackageResolutionRequestV1,
+    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ResolvedPackage,
+    ResolvedPackageIntent, SourceBindingV1, package_resolution_schema,
 };
 pub use packages::{
     PackageBackendEvidence, PackageCommandError, PackageCommandOutput, PackageCommandRunner,
@@ -93,8 +94,8 @@ pub use remote_provider::{
 };
 pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
-    OwnershipRules, PackageDesiredIntent, ResourceAddress, ResourceError, ResourceIntent,
-    ResourceProvenance, ResourceType, SafeSymlinkTarget, SymlinkTargetKind,
+    OwnershipRules, PackageDesiredIntent, ProviderResourceIntent, ResourceAddress, ResourceError,
+    ResourceIntent, ResourceProvenance, ResourceType, SafeSymlinkTarget, SymlinkTargetKind,
     materialized_resources_digest, validate_ownership,
 };
 pub use service_lifecycle::{

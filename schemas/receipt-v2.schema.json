@@ -50,6 +50,12 @@
         "ownershipMapDigest": {
           "type": "string"
         },
+        "packageResolutionAuthorityDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "providerInputsDigest": {
           "type": "string"
         },

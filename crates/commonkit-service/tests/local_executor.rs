@@ -62,6 +62,7 @@ fn fixture(root: &std::path::Path) -> (Arc<PlanStore>, commonkit_contracts::Plan
             provider_inputs_digest: digest(5),
             ownership_map_digest: digest(6),
             artifact_set_digest: digest(7),
+            package_resolution_authority_digest: None,
         },
         operations: vec![operation],
     })
