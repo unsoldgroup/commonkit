@@ -1067,6 +1067,17 @@ fn reopens_4c7b3a7_v1_resolution_without_closure_source() {
     let root = tempfile::tempdir().unwrap();
     let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
     let bytes = include_bytes!("fixtures/package-resolution-v1-4c7b3a7.json");
+    let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let schema = commonkit_adapters::package_resolution_schema().unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let schema_errors = validator
+        .iter_errors(&fixture)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        schema_errors.is_empty(),
+        "the published v1 schema must accept the 4c7b3a7 artifact before migration: {schema_errors:?}"
+    );
     let resolution = store
         .put(bytes, commonkit_adapters::ContentSensitivity::Portable)
         .unwrap();
