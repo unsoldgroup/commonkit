@@ -197,7 +197,7 @@ impl TargetFilesystem for LocalTargetFilesystem {
         if metadata.file_type().is_symlink() {
             let target = parent.read_link(&leaf)?.to_string_lossy().into_owned();
             return Ok(TargetResource::Symlink {
-                target_kind: inspect_symlink_target_kind(&self.root, path, &target)?,
+                target_kind: symlink_target_kind_from_metadata(&metadata),
                 target,
             });
         }
@@ -674,29 +674,18 @@ fn metadata_has_directory_attribute(metadata: &cap_std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
 }
 
-fn inspect_symlink_target_kind(
-    root: &Dir,
-    link: &NormalizedManagedPath,
-    target: &str,
-) -> Result<SymlinkTargetKind, TargetFilesystemError> {
-    let target = SafeSymlinkTarget::parse(link, target.to_owned())?;
-    let resolved = target.resolved_for(link)?;
-    let (parent, leaf) = open_target_parent_nofollow(root, &resolved, false)?;
-    let metadata = parent.symlink_metadata(&leaf)?;
-    if metadata_is_reparse_or_symlink(&metadata) {
-        return Err(TargetFilesystemError::UnsupportedResource(
-            resolved.to_string(),
-        ));
-    }
-    if metadata.is_dir() {
-        Ok(SymlinkTargetKind::Directory)
-    } else if metadata.is_file() {
-        Ok(SymlinkTargetKind::File)
+#[cfg(windows)]
+fn symlink_target_kind_from_metadata(metadata: &cap_std::fs::Metadata) -> SymlinkTargetKind {
+    if metadata_has_directory_attribute(metadata) {
+        SymlinkTargetKind::Directory
     } else {
-        Err(TargetFilesystemError::UnsupportedResource(
-            resolved.to_string(),
-        ))
+        SymlinkTargetKind::File
     }
+}
+
+#[cfg(not(windows))]
+fn symlink_target_kind_from_metadata(_metadata: &cap_std::fs::Metadata) -> SymlinkTargetKind {
+    SymlinkTargetKind::File
 }
 
 #[cfg(windows)]

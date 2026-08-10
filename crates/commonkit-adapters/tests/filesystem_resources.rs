@@ -384,6 +384,73 @@ fn applies_and_rolls_back_directory_symlink_and_removal_resources() {
 }
 
 #[test]
+fn repairs_and_rolls_back_a_dangling_relative_symlink_without_following_its_target() {
+    let root = temporary_directory("dangling-relative-symlink");
+    let target = root.join("target");
+    let state = root.join("state");
+    fs::create_dir_all(&target).expect("target");
+    symlink("missing-old", target.join("current")).expect("dangling preimage");
+
+    let path = NormalizedManagedPath::parse("current").expect("path");
+    let mut adapter = FileAdapter::open(&target, &state).expect("adapter");
+    let operation = adapter
+        .register_resource(
+            id("managed-symlink"),
+            FilesystemIntent::Symlink {
+                path: path.clone(),
+                target: SafeSymlinkTarget::parse(&path, "missing-new").expect("target"),
+                target_kind: SymlinkTargetKind::Directory,
+                expected_before: None,
+            },
+        )
+        .expect("symlink operation");
+    adapter.prepare(&operation).expect("prepare");
+    adapter.apply(&operation).expect("apply");
+    adapter.verify(&operation).expect("verify");
+    assert_eq!(
+        fs::read_link(target.join("current")).expect("managed link"),
+        PathBuf::from("missing-new")
+    );
+
+    adapter.rollback(&operation).expect("rollback");
+    assert_eq!(
+        fs::read_link(target.join("current")).expect("restored link"),
+        PathBuf::from("missing-old")
+    );
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn posix_symlink_digest_does_not_depend_on_unstored_target_kind() {
+    let root = temporary_directory("posix-symlink-kind-digest");
+    let link = NormalizedManagedPath::parse("current").expect("path");
+    let target = SafeSymlinkTarget::parse(&link, "missing").expect("target");
+    let operation = |suffix: &str, target_kind| {
+        let target_root = root.join(format!("target-{suffix}"));
+        let state = root.join(format!("state-{suffix}"));
+        let mut adapter = FileAdapter::open(&target_root, &state).expect("adapter");
+        adapter
+            .register_resource(
+                id(&format!("managed-symlink-{suffix}")),
+                FilesystemIntent::Symlink {
+                    path: link.clone(),
+                    target: target.clone(),
+                    target_kind,
+                    expected_before: None,
+                },
+            )
+            .expect("operation")
+    };
+
+    let file = operation("file", SymlinkTargetKind::File);
+    let directory = operation("directory", SymlinkTargetKind::Directory);
+    assert_eq!(file.after_digest, directory.after_digest);
+
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
 fn semantic_apply_rejects_an_ancestor_substitution_without_mutating_outside() {
     let root = temporary_directory("semantic-apply-ancestor-substitution");
     let target = root.join("target");

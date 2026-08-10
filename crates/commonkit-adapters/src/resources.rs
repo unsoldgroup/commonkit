@@ -350,12 +350,15 @@ pub fn validate_ownership(
         }
         if rules.protected_roots.iter().any(|root| {
             rules.contains_path(path, root)
-                || (matches!(
-                    resource.intent,
-                    FilesystemIntent::Remove { .. }
-                        | FilesystemIntent::Directory { exact: true, .. }
-                        | FilesystemIntent::Directory { mode: Some(_), .. }
-                ) && rules.contains_path(root, path))
+                || (rules.contains_path(root, path)
+                    && !matches!(
+                        resource.intent,
+                        FilesystemIntent::Directory {
+                            exact: false,
+                            mode: None,
+                            ..
+                        }
+                    ))
         }) {
             return Err(OwnershipError::ProtectedPath { path: path.clone() });
         }

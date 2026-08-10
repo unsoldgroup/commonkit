@@ -67,12 +67,36 @@ struct BackupRecord {
     preimage: Option<RemoteBackup>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SshTargetCapabilities {
+    unix_modes: bool,
+    stores_symlink_target_kind: bool,
+}
+
+impl SshTargetCapabilities {
+    pub fn for_operating_system(operating_system: &str) -> Result<Self, SshFileAdapterError> {
+        match operating_system.trim().to_ascii_lowercase().as_str() {
+            "linux" | "macos" | "freebsd" | "openbsd" | "netbsd" | "dragonfly" => Ok(Self {
+                unix_modes: true,
+                stores_symlink_target_kind: false,
+            }),
+            "windows" => Ok(Self {
+                unix_modes: false,
+                stores_symlink_target_kind: true,
+            }),
+            _ => Err(SshFileAdapterError::UnsupportedTargetPlatform),
+        }
+    }
+}
+
 pub struct SshFileAdapter<T> {
     id: StableId,
     root_id: StableId,
     state: PathBuf,
     artifacts: ArtifactStore,
     transport: T,
+    capabilities: SshTargetCapabilities,
     intents: BTreeMap<Sha256Digest, FilesystemIntent>,
 }
 
@@ -81,6 +105,15 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
         root_id: StableId,
         state: impl AsRef<Path>,
         transport: T,
+    ) -> Result<Self, SshFileAdapterError> {
+        Self::open_with_capabilities(root_id, state, transport, SshTargetCapabilities::default())
+    }
+
+    pub fn open_with_capabilities(
+        root_id: StableId,
+        state: impl AsRef<Path>,
+        transport: T,
+        capabilities: SshTargetCapabilities,
     ) -> Result<Self, SshFileAdapterError> {
         let state = state.as_ref();
         if !state.is_absolute() || state.parent().is_none() {
@@ -98,6 +131,7 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
             state: state.canonicalize()?,
             artifacts: ArtifactStore::open(state.join("artifacts"))?,
             transport,
+            capabilities,
             intents: BTreeMap::new(),
         })
     }
@@ -112,15 +146,18 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
     ) -> Result<Sha256Digest, SshFileAdapterError> {
         let mut observed = Vec::new();
         for intent in intents {
-            ensure_supported(intent)?;
+            ensure_supported(intent, self.capabilities)?;
             let mut preimage = self.observe(intent.path().clone())?;
-            project_preimage_for_intent(intent, &mut preimage);
+            project_preimage_for_intent(intent, &mut preimage, self.capabilities);
             observed.push((intent.path().as_str().to_owned(), preimage));
         }
         observed.sort_by(|left, right| left.0.cmp(&right.0));
         observed.dedup_by(|left, right| left.0 == right.0);
-        digest_domain_json("commonkit.ssh-observed-managed-resources.v1", &observed)
-            .map_err(SshFileAdapterError::Contract)
+        digest_domain_json(
+            "commonkit.ssh-observed-managed-resources.v2",
+            &(self.capabilities, observed),
+        )
+        .map_err(SshFileAdapterError::Contract)
     }
 
     pub fn register_materialized_resource(
@@ -130,7 +167,7 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
         provider_artifacts: &ArtifactStore,
     ) -> Result<Option<Operation>, SshFileAdapterError> {
         let mut intent = resource.intent.clone();
-        ensure_supported(&intent)?;
+        ensure_supported(&intent, self.capabilities)?;
         if let FilesystemIntent::File { content, .. } = &mut intent {
             let bytes = provider_artifacts.load(content)?;
             if content.sensitivity != ContentSensitivity::Portable {
@@ -139,14 +176,17 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
             *content = self.artifacts.put(&bytes, ContentSensitivity::Portable)?;
         }
         let mut observed = self.observe(intent.path().clone())?;
-        project_preimage_for_intent(&intent, &mut observed);
+        project_preimage_for_intent(&intent, &mut observed, self.capabilities);
         let desired = desired_preimage(&intent);
-        let before_digest = preimage_digest(&observed)?;
-        let after_digest = preimage_digest(&desired)?;
+        let before_digest = preimage_digest(&observed, self.capabilities)?;
+        let after_digest = preimage_digest(&desired, self.capabilities)?;
         if before_digest == after_digest {
             return Ok(None);
         }
-        let payload_digest = digest_domain_json("commonkit.ssh-filesystem-payload.v1", &intent)?;
+        let payload_digest = digest_domain_json(
+            "commonkit.ssh-filesystem-payload.v2",
+            &(self.capabilities, &intent),
+        )?;
         let kind = match (&observed, &intent) {
             (RemotePreimage::Absent, FilesystemIntent::Remove { .. }) => return Ok(None),
             (RemotePreimage::Absent, _) => OperationKind::Create,
@@ -237,20 +277,34 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
                     "remote operation payload is missing",
                 )
             })?;
-        let digest = digest_domain_json("commonkit.ssh-filesystem-payload.v1", &record.intent)
-            .map_err(|_| {
-                failure(
-                    "operation_payload_mismatch",
-                    "remote operation payload is invalid",
-                )
-            })?;
-        if record.operation_id != operation.id || digest != operation.payload_digest {
+        let digest = digest_domain_json(
+            "commonkit.ssh-filesystem-payload.v2",
+            &(self.capabilities, &record.intent),
+        )
+        .map_err(|_| {
+            failure(
+                "operation_payload_mismatch",
+                "remote operation payload is invalid",
+            )
+        })?;
+        let legacy_digest =
+            digest_domain_json("commonkit.ssh-filesystem-payload.v1", &record.intent).map_err(
+                |_| {
+                    failure(
+                        "operation_payload_mismatch",
+                        "remote operation payload is invalid",
+                    )
+                },
+            )?;
+        if record.operation_id != operation.id
+            || (digest != operation.payload_digest && legacy_digest != operation.payload_digest)
+        {
             return Err(failure(
                 "operation_payload_mismatch",
                 "remote operation does not match its durable payload",
             ));
         }
-        ensure_supported(&record.intent).map_err(|_| {
+        ensure_supported(&record.intent, self.capabilities).map_err(|_| {
             failure(
                 "unsupported_remote_resource",
                 "remote resource type is unsupported",
@@ -358,8 +412,8 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
                 "remote observation failed",
             )
         })?;
-        project_preimage_for_intent(&intent, &mut current);
-        let current = preimage_digest(&current)
+        project_preimage_for_intent(&intent, &mut current, self.capabilities);
+        let current = preimage_digest(&current, self.capabilities)
             .map_err(|_| failure("remote_digest_failed", "remote resource digest failed"))?;
         Ok(if current == operation.after_digest {
             commonkit_reconcile::RecoveryObservation::After
@@ -447,8 +501,8 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
                 ));
             }
         };
-        project_preimage_for_intent(&intent, &mut observed);
-        if preimage_digest(&observed)
+        project_preimage_for_intent(&intent, &mut observed, self.capabilities);
+        if preimage_digest(&observed, self.capabilities)
             .map_err(|_| failure("remote_digest_failed", "could not digest remote preimage"))?
             != operation.before_digest
         {
@@ -479,8 +533,8 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
         let mut observed = self
             .observe(intent.path().clone())
             .map_err(|_| failure("remote_verify_failed", "could not inspect remote result"))?;
-        project_preimage_for_intent(&intent, &mut observed);
-        if preimage_digest(&observed)
+        project_preimage_for_intent(&intent, &mut observed, self.capabilities);
+        if preimage_digest(&observed, self.capabilities)
             .map_err(|_| failure("remote_digest_failed", "could not digest remote result"))?
             == operation.after_digest
         {
@@ -510,8 +564,8 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
                 "could not inspect remote resource before rollback",
             )
         })?;
-        project_preimage_for_intent(&intent, &mut current);
-        let current_digest = preimage_digest(&current)
+        project_preimage_for_intent(&intent, &mut current, self.capabilities);
+        let current_digest = preimage_digest(&current, self.capabilities)
             .map_err(|_| failure("remote_digest_failed", "could not digest remote resource"))?;
         if current_digest == operation.before_digest {
             return Ok(());
@@ -567,8 +621,8 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
                 let mut observed = self.observe(intent.path().clone()).map_err(|_| {
                     failure("remote_rollback_failed", "could not verify remote rollback")
                 })?;
-                project_preimage_for_intent(&intent, &mut observed);
-                if preimage_digest(&observed).map_err(|_| {
+                project_preimage_for_intent(&intent, &mut observed, self.capabilities);
+                if preimage_digest(&observed, self.capabilities).map_err(|_| {
                     failure("remote_digest_failed", "could not digest rollback result")
                 })? == operation.before_digest
                 {
@@ -588,7 +642,19 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
     }
 }
 
-fn ensure_supported(intent: &FilesystemIntent) -> Result<(), SshFileAdapterError> {
+fn ensure_supported(
+    intent: &FilesystemIntent,
+    capabilities: SshTargetCapabilities,
+) -> Result<(), SshFileAdapterError> {
+    if !capabilities.unix_modes
+        && matches!(
+            intent,
+            FilesystemIntent::File { mode: Some(_), .. }
+                | FilesystemIntent::Directory { mode: Some(_), .. }
+        )
+    {
+        return Err(SshFileAdapterError::UnsupportedMode);
+    }
     if let FilesystemIntent::Symlink { path, target, .. } = intent {
         SafeSymlinkTarget::parse(path, target.as_str().to_owned())?;
     }
@@ -613,16 +679,49 @@ fn desired_preimage(intent: &FilesystemIntent) -> RemotePreimage {
         },
     }
 }
-fn project_preimage_for_intent(intent: &FilesystemIntent, preimage: &mut RemotePreimage) {
+fn project_preimage_for_intent(
+    intent: &FilesystemIntent,
+    preimage: &mut RemotePreimage,
+    capabilities: SshTargetCapabilities,
+) {
     if matches!(intent, FilesystemIntent::Directory { mode: None, .. })
         && let RemotePreimage::Directory { mode } = preimage
     {
         *mode = None;
     }
+    if !capabilities.stores_symlink_target_kind
+        && let (
+            FilesystemIntent::Symlink { target_kind, .. },
+            RemotePreimage::Symlink {
+                target_kind: observed,
+                ..
+            },
+        ) = (intent, preimage)
+    {
+        *observed = *target_kind;
+    }
 }
-fn preimage_digest(value: &RemotePreimage) -> Result<Option<Sha256Digest>, SshFileAdapterError> {
+fn preimage_digest(
+    value: &RemotePreimage,
+    capabilities: SshTargetCapabilities,
+) -> Result<Option<Sha256Digest>, SshFileAdapterError> {
     match value {
         RemotePreimage::Absent => Ok(None),
+        RemotePreimage::Symlink {
+            target,
+            target_kind,
+        } if !capabilities.stores_symlink_target_kind
+            || *target_kind == SymlinkTargetKind::File =>
+        {
+            Ok(Some(digest_domain_json(
+                "commonkit.ssh-file-preimage.v1",
+                &serde_json::json!({"type":"symlink","target":target}),
+            )?))
+        }
+        RemotePreimage::Symlink { .. } => Ok(Some(digest_domain_json(
+            "commonkit.ssh-file-preimage.v2",
+            value,
+        )?)),
         _ => Ok(Some(digest_domain_json(
             "commonkit.ssh-file-preimage.v1",
             value,
@@ -657,7 +756,11 @@ fn failure(code: &str, message: &str) -> AdapterFailure {
 pub enum SshFileAdapterError {
     #[error("SSH adapter state must be an absolute non-symlink directory")]
     UnsafeState,
-    #[error("SSH v1 supports normalized files and removals only")]
+    #[error("remote target does not support POSIX file modes")]
+    UnsupportedMode,
+    #[error("remote target platform is not supported")]
+    UnsupportedTargetPlatform,
+    #[error("remote filesystem resource is unsupported")]
     UnsupportedResource,
     #[error("local-sensitive content cannot be copied to an SSH target")]
     SensitiveArtifact,

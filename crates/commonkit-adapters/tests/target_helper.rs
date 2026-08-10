@@ -132,7 +132,7 @@ fn helper_subprocess_routes_relative_directories_and_symlinks_without_following_
         SshFilesystemResponse::Resource {
             resource: TargetResource::Symlink {
                 target: "../../.agents/skills/tool".into(),
-                target_kind: SymlinkTargetKind::Directory,
+                target_kind: SymlinkTargetKind::File,
             }
         }
     );
