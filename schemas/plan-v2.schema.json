@@ -43,6 +43,9 @@
             }
           ]
         },
+        "recoveryCapability": {
+          "$ref": "#/$defs/RecoveryCapability"
+        },
         "requiresConfirmation": {
           "type": "boolean"
         },
@@ -135,6 +138,13 @@
       ],
       "type": "object"
     },
+    "RecoveryCapability": {
+      "enum": [
+        "exact_rollback",
+        "converge_forward_only"
+      ],
+      "type": "string"
+    },
     "ResourceRef": {
       "additionalProperties": false,
       "properties": {
@@ -168,7 +178,7 @@
       "type": "string"
     }
   },
-  "$id": "https://schemas.commonkit.dev/v1/plan.schema.json",
+  "$id": "https://schemas.commonkit.dev/v2/plan.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -176,6 +186,7 @@
       "$ref": "#/$defs/PlanBindings"
     },
     "contractVersion": {
+      "const": "2.0",
       "type": "string"
     },
     "desiredDigest": {
@@ -197,8 +208,7 @@
       "type": "string"
     },
     "schemaVersion": {
-      "format": "uint32",
-      "minimum": 0,
+      "const": 2,
       "type": "integer"
     },
     "targetId": {

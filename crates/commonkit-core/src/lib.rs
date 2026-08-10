@@ -230,8 +230,15 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
             return Err(PlanBuildError::OperationIdMismatch(operation.id.clone()));
         }
     }
+    let forward_capable = ordered
+        .iter()
+        .any(|operation| operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly);
     let id = digest_domain_json(
-        "commonkit.plan.v1",
+        if forward_capable {
+            "commonkit.plan.v2"
+        } else {
+            "commonkit.plan.v1"
+        },
         &PlanSemantic {
             target_id: &draft.target_id,
             desired_digest: &draft.desired_digest,
@@ -242,8 +249,17 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
         },
     )?;
     Ok(Plan {
-        schema_version: SchemaVersion(SCHEMA_VERSION),
-        contract_version: CONTRACT_VERSION.into(),
+        schema_version: SchemaVersion(if forward_capable {
+            FORWARD_SCHEMA_VERSION
+        } else {
+            SCHEMA_VERSION
+        }),
+        contract_version: if forward_capable {
+            FORWARD_CONTRACT_VERSION
+        } else {
+            CONTRACT_VERSION
+        }
+        .into(),
         id,
         target_id: draft.target_id,
         desired_digest: draft.desired_digest,

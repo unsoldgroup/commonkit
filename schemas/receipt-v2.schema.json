@@ -10,7 +10,9 @@
         "verified",
         "verify_failed",
         "rolled_back",
-        "rollback_failed"
+        "rollback_failed",
+        "forward_recovered",
+        "forward_recovery_failed"
       ],
       "type": "string"
     },
@@ -69,8 +71,13 @@
         "prepared",
         "applying",
         "verifying",
+        "applying_forward",
         "succeeded",
         "recovery_required",
+        "forward_recovery_required",
+        "converging_forward",
+        "forward_recovered",
+        "forward_recovery_failed",
         "rolling_back",
         "rolled_back",
         "rollback_failed",
@@ -111,7 +118,7 @@
       "type": "object"
     }
   },
-  "$id": "https://schemas.commonkit.dev/v1/receipt.schema.json",
+  "$id": "https://schemas.commonkit.dev/v2/receipt.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -119,6 +126,7 @@
       "$ref": "#/$defs/PlanBindings"
     },
     "contractVersion": {
+      "const": "2.0",
       "type": "string"
     },
     "desiredDigest": {
@@ -146,8 +154,7 @@
       "type": "string"
     },
     "schemaVersion": {
-      "format": "uint32",
-      "minimum": 0,
+      "const": 2,
       "type": "integer"
     },
     "state": {

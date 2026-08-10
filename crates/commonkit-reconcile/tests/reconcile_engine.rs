@@ -263,16 +263,7 @@ fn persist_crash_after_forward_barrier(
     plan: &commonkit_contracts::Plan,
     run_id: &StableId,
 ) {
-    let mut journal = ReceiptJournal::new(
-        run_id.clone(),
-        plan.id.clone(),
-        plan.target_id.clone(),
-        plan.desired_digest.clone(),
-        plan.observed_digest.clone(),
-        plan.policy_digest.clone(),
-        plan.bindings.clone(),
-    )
-    .unwrap();
+    let mut journal = ReceiptJournal::for_plan(run_id.clone(), plan).unwrap();
     store.persist(&journal).unwrap();
     for operation in &plan.operations {
         journal
@@ -551,6 +542,8 @@ fn forward_barrier_never_rolls_back_and_records_forward_recovery_required() {
         ]
     );
     let receipt = store.load(run_id.clone()).unwrap();
+    assert_eq!(receipt.receipt().schema_version.0, 2);
+    assert_eq!(receipt.receipt().contract_version, "2.0");
     assert_eq!(
         receipt.receipt().state,
         ReceiptState::ForwardRecoveryRequired

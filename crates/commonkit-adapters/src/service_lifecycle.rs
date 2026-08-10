@@ -301,8 +301,8 @@ impl<B: ServiceBackend> Adapter for ServiceAdapter<B> {
     fn supports_recovery(&self, capability: commonkit_contracts::RecoveryCapability) -> bool {
         capability == commonkit_contracts::RecoveryCapability::ExactRollback
     }
-    fn supports_offline_recovery(&self, operation: &Operation) -> bool {
-        self.intents.contains_key(&operation.id)
+    fn supports_offline_recovery(&self, _operation: &Operation) -> bool {
+        false
     }
     fn observe_recovery(
         &mut self,
