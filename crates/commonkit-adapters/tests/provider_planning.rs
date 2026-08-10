@@ -14,7 +14,7 @@ use commonkit_adapters::{
 };
 use commonkit_contracts::{
     Operation, OperationKind, PackageDeclaration, PackageManager, PackageSelector,
-    RecoveryCapability, ResourceRef, Risk, SchemaVersion, Sha256Digest, StableId,
+    RecoveryCapability, ResourceRef, Risk, SchemaVersion, SecurityPolicy, Sha256Digest, StableId,
 };
 use commonkit_core::{OperationDraft, finalize_operation};
 use commonkit_reconcile::Adapter;
@@ -88,11 +88,22 @@ fn package_manager() -> ManagerBindingV1 {
     }
 }
 
+fn package_policy() -> SecurityPolicy {
+    SecurityPolicy {
+        allowlists: BTreeMap::from([(
+            StableId::parse("package_sources").unwrap(),
+            BTreeSet::from(["homebrew-core".into()]),
+        )]),
+        ..SecurityPolicy::default()
+    }
+}
+
 fn package_authority() -> PackageResolutionAuthority {
     PackageResolutionAuthority::new(
         &package_target(),
         &package_manager(),
         &PackageSourceRegistry::builtin().unwrap(),
+        &package_policy(),
     )
     .unwrap()
 }
@@ -230,8 +241,13 @@ fn resolved_planning_rejects_stale_authority_before_registration_and_binds_curre
     let registry = PackageSourceRegistry::builtin().unwrap();
     let mut stale_target = package_target();
     stale_target.arch = "x86_64".into();
-    let stale_authority =
-        PackageResolutionAuthority::new(&stale_target, &package_manager(), &registry).unwrap();
+    let stale_authority = PackageResolutionAuthority::new(
+        &stale_target,
+        &package_manager(),
+        &registry,
+        &package_policy(),
+    )
+    .unwrap();
     let adapter_state = root.join("stale-adapter-state");
     let mut files = FileAdapter::open(&root.join("stale-target"), &adapter_state).unwrap();
     let mut packages = NoopPackagePlanner::new("packages");
@@ -262,8 +278,13 @@ fn resolved_planning_rejects_stale_authority_before_registration_and_binds_curre
                 .is_none()
     );
 
-    let authority =
-        PackageResolutionAuthority::new(&package_target(), &package_manager(), &registry).unwrap();
+    let authority = PackageResolutionAuthority::new(
+        &package_target(),
+        &package_manager(),
+        &registry,
+        &package_policy(),
+    )
+    .unwrap();
     let mut files = FileAdapter::open(
         &root.join("current-target"),
         &root.join("current-adapter-state"),
@@ -288,6 +309,68 @@ fn resolved_planning_rejects_stale_authority_before_registration_and_binds_curre
         Some(authority.digest().clone())
     );
 
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resolved_planning_rejects_removed_package_source_policy_before_registration() {
+    let root = temporary_directory("provider-plan-package-policy");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let state = mixed_state(&artifacts);
+    let rules = OwnershipRules::new(
+        true,
+        vec![NormalizedManagedPath::parse("home").unwrap()],
+        vec![],
+    )
+    .unwrap();
+    let request = ProviderPlanRequest {
+        target_id: StableId::parse("local").unwrap(),
+        target_identity_digest: digest('9'),
+        composed_loadout_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: digest('c'),
+        ownership_rules: &rules,
+        mapped_side_effects: BTreeSet::new(),
+    };
+    let authority = PackageResolutionAuthority::new(
+        &package_target(),
+        &package_manager(),
+        &PackageSourceRegistry::builtin().unwrap(),
+        &SecurityPolicy::default(),
+    )
+    .unwrap();
+    let adapter_state = root.join("adapter-state");
+    let mut files = FileAdapter::open(&root.join("target"), &adapter_state).unwrap();
+    let mut packages = NoopPackagePlanner::new("packages");
+    let mut router = ProviderResourceRouter::new(vec![
+        ProviderPlannerRoute::Filesystem(&mut files),
+        ProviderPlannerRoute::Package(&mut packages),
+    ])
+    .unwrap();
+
+    let error = build_resolved_provider_plan_with_router(
+        request,
+        &[state],
+        &authority,
+        &artifacts,
+        &mut router,
+    )
+    .expect_err("removed package source policy must invalidate prior resolution");
+
+    assert!(matches!(
+        error,
+        ProviderPlanError::PackageResolution(
+            commonkit_adapters::PackageResolutionError::PackageSourceNotAllowed { .. }
+        )
+    ));
+    assert!(
+        !adapter_state.join("operations").exists()
+            || fs::read_dir(adapter_state.join("operations"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
     drop(artifacts);
     fs::remove_dir_all(root).unwrap();
 }
