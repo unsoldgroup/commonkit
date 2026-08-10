@@ -171,6 +171,11 @@ pub struct ResolvedPackageIntent {
 
 pub fn package_resolution_schema() -> Result<serde_json::Value, serde_json::Error> {
     let mut schema = serde_json::to_value(schema_for!(PackageResolutionV1))?;
+    // Early v1 artifacts omitted the closure-level source. The dual loader
+    // inherits the top-level source and validates the strict current model.
+    if let Some(required) = schema["$defs"]["ResolvedPackage"]["required"].as_array_mut() {
+        required.retain(|field| field != "source");
+    }
     schema["$id"] = serde_json::Value::String(
         "https://schemas.commonkit.dev/v1/package-resolution.schema.json".into(),
     );
