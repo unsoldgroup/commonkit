@@ -231,6 +231,7 @@ pub fn plan_relay_operation(
         },
         risk: Risk::Medium,
         requires_confirmation: true,
+        recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
         depends_on: vec![],
         before_digest: before,
         after_digest: Some(after),

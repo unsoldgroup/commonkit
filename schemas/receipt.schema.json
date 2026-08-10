@@ -10,7 +10,9 @@
         "verified",
         "verify_failed",
         "rolled_back",
-        "rollback_failed"
+        "rollback_failed",
+        "forward_recovered",
+        "forward_recovery_failed"
       ],
       "type": "string"
     },
@@ -71,6 +73,10 @@
         "verifying",
         "succeeded",
         "recovery_required",
+        "forward_recovery_required",
+        "converging_forward",
+        "forward_recovered",
+        "forward_recovery_failed",
         "rolling_back",
         "rolled_back",
         "rollback_failed",

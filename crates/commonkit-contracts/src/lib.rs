@@ -1054,6 +1054,16 @@ pub enum Risk {
     Destructive,
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryCapability {
+    #[default]
+    ExactRollback,
+    ConvergeForwardOnly,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceRef {
@@ -1081,6 +1091,8 @@ pub struct Operation {
     pub resource: ResourceRef,
     pub risk: Risk,
     pub requires_confirmation: bool,
+    #[serde(default)]
+    pub recovery_capability: RecoveryCapability,
     pub depends_on: Vec<Sha256Digest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_digest: Option<Sha256Digest>,
@@ -1124,6 +1136,10 @@ pub enum ReceiptState {
     Verifying,
     Succeeded,
     RecoveryRequired,
+    ForwardRecoveryRequired,
+    ConvergingForward,
+    ForwardRecovered,
+    ForwardRecoveryFailed,
     RollingBack,
     RolledBack,
     RollbackFailed,
@@ -1142,6 +1158,8 @@ pub enum OperationPhase {
     VerifyFailed,
     RolledBack,
     RollbackFailed,
+    ForwardRecovered,
+    ForwardRecoveryFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

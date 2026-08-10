@@ -210,6 +210,7 @@ impl<B: ServiceBackend> ServiceAdapter<B> {
             },
             risk: Risk::Medium,
             requires_confirmation: true,
+            recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
             depends_on: vec![],
             before_digest: Some(before_digest),
             after_digest: Some(after_digest),

@@ -43,6 +43,10 @@
             }
           ]
         },
+        "recoveryCapability": {
+          "$ref": "#/$defs/RecoveryCapability",
+          "default": "exact_rollback"
+        },
         "requiresConfirmation": {
           "type": "boolean"
         },
@@ -134,6 +138,13 @@
         "artifactSetDigest"
       ],
       "type": "object"
+    },
+    "RecoveryCapability": {
+      "enum": [
+        "exact_rollback",
+        "converge_forward_only"
+      ],
+      "type": "string"
     },
     "ResourceRef": {
       "additionalProperties": false,

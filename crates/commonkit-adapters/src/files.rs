@@ -233,6 +233,7 @@ impl FileAdapter {
             },
             risk: Risk::Low,
             requires_confirmation: true,
+            recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
             depends_on: Vec::new(),
             before_digest,
             after_digest: Some(after_digest),
@@ -372,6 +373,7 @@ impl FileAdapter {
                 Risk::Low
             },
             requires_confirmation: true,
+            recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
             depends_on: Vec::new(),
             before_digest,
             after_digest,
