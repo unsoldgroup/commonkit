@@ -8,10 +8,10 @@ use thiserror::Error;
 
 use crate::{
     ArtifactError, ArtifactStore, DeclaredSideEffect, FileAdapter, FileAdapterError,
-    MaterializedState, NormalizedResource, OwnershipError, OwnershipRules, ProviderContractError,
-    ResolvedMaterializedState, ResolvedPackageIntent, ResourceProvenance, ResourceType,
-    SshFileAdapter, SshFileAdapterError, SshFilesystemTransport, UnsupportedCapability,
-    validate_ownership,
+    MaterializedState, NormalizedResource, OwnershipError, OwnershipRules,
+    PackageResolutionAuthority, ProviderContractError, ResolvedMaterializedState,
+    ResolvedPackageIntent, ResourceProvenance, ResourceType, SshFileAdapter, SshFileAdapterError,
+    SshFilesystemTransport, UnsupportedCapability, validate_ownership,
 };
 use commonkit_reconcile::Adapter;
 
@@ -165,6 +165,7 @@ impl<'a> ProviderResourceRouter<'a> {
         &mut self,
         id: StableId,
         resource: &NormalizedResource,
+        package_authority: Option<&PackageResolutionAuthority>,
         provider_artifacts: &ArtifactStore,
     ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
         let (declared_adapter, filesystem_route, operation) = match &resource.intent {
@@ -185,6 +186,9 @@ impl<'a> ProviderResourceRouter<'a> {
                 return Err(ProviderPlanError::PackageResolutionRequired);
             }
             crate::ResourceIntent::ResolvedPackage(intent) => {
+                package_authority
+                    .ok_or(ProviderPlanError::MissingPackageResolutionAuthority)?
+                    .validate(intent, provider_artifacts)?;
                 let planner = self.package.as_deref_mut().ok_or(
                     ProviderPlanError::MissingResourcePlanner(ResourceType::Package),
                 )?;
@@ -213,6 +217,7 @@ impl<'a> ProviderResourceRouter<'a> {
                 resource,
                 filesystem_route,
                 operation,
+                package_authority,
                 provider_artifacts,
             )?;
         }
@@ -225,6 +230,7 @@ fn validate_operation_binding(
     resource: &NormalizedResource,
     filesystem_route: Option<FilesystemPlannerRoute>,
     operation: &commonkit_contracts::Operation,
+    package_authority: Option<&PackageResolutionAuthority>,
     provider_artifacts: &ArtifactStore,
 ) -> Result<(), ProviderPlanError> {
     let (resource_type, managed_path, after_digest, payload_digest) = match &resource.intent {
@@ -248,7 +254,9 @@ fn validate_operation_binding(
             return Err(ProviderPlanError::PackageResolutionRequired);
         }
         crate::ResourceIntent::ResolvedPackage(intent) => {
-            intent.load_persisted(provider_artifacts)?;
+            package_authority
+                .ok_or(ProviderPlanError::MissingPackageResolutionAuthority)?
+                .validate(intent, provider_artifacts)?;
             let desired_digest = resource.desired_digest()?;
             (
                 StableId::parse("package").expect("static resource type"),
@@ -292,20 +300,22 @@ pub fn provider_plan_bindings(
     states: &[MaterializedState],
     provider_artifacts: &ArtifactStore,
 ) -> Result<PlanBindings, ProviderPlanError> {
-    authority_plan_bindings(request, states, provider_artifacts)
+    authority_plan_bindings(request, states, None, provider_artifacts)
 }
 
 pub fn resolved_provider_plan_bindings(
     request: ProviderPlanRequest<'_>,
     states: &[ResolvedMaterializedState],
+    package_authority: &PackageResolutionAuthority,
     provider_artifacts: &ArtifactStore,
 ) -> Result<PlanBindings, ProviderPlanError> {
-    authority_plan_bindings(request, states, provider_artifacts)
+    authority_plan_bindings(request, states, Some(package_authority), provider_artifacts)
 }
 
 fn authority_plan_bindings<S: ProviderPlanningState>(
     request: ProviderPlanRequest<'_>,
     states: &[S],
+    package_authority: Option<&PackageResolutionAuthority>,
     provider_artifacts: &ArtifactStore,
 ) -> Result<PlanBindings, ProviderPlanError> {
     struct AuthorityOnlyFilesystemPlanner {
@@ -357,7 +367,14 @@ fn authority_plan_bindings<S: ProviderPlanningState>(
         ProviderPlannerRoute::Filesystem(&mut filesystem),
         ProviderPlannerRoute::Package(&mut package),
     ])?;
-    Ok(build_provider_plan_from_states(request, states, provider_artifacts, &mut router)?.bindings)
+    Ok(build_provider_plan_from_states(
+        request,
+        states,
+        package_authority,
+        provider_artifacts,
+        &mut router,
+    )?
+    .bindings)
 }
 
 pub fn build_provider_plan<P: ProviderResourcePlanner>(
@@ -376,16 +393,23 @@ pub fn build_provider_plan_with_router(
     provider_artifacts: &ArtifactStore,
     router: &mut ProviderResourceRouter<'_>,
 ) -> Result<Plan, ProviderPlanError> {
-    build_provider_plan_from_states(request, states, provider_artifacts, router)
+    build_provider_plan_from_states(request, states, None, provider_artifacts, router)
 }
 
 pub fn build_resolved_provider_plan_with_router(
     request: ProviderPlanRequest<'_>,
     states: &[ResolvedMaterializedState],
+    package_authority: &PackageResolutionAuthority,
     provider_artifacts: &ArtifactStore,
     router: &mut ProviderResourceRouter<'_>,
 ) -> Result<Plan, ProviderPlanError> {
-    build_provider_plan_from_states(request, states, provider_artifacts, router)
+    build_provider_plan_from_states(
+        request,
+        states,
+        Some(package_authority),
+        provider_artifacts,
+        router,
+    )
 }
 
 trait ProviderPlanningState {
@@ -442,6 +466,7 @@ impl ProviderPlanningState for ResolvedMaterializedState {
 fn build_provider_plan_from_states<S: ProviderPlanningState>(
     request: ProviderPlanRequest<'_>,
     states: &[S],
+    package_authority: Option<&PackageResolutionAuthority>,
     provider_artifacts: &ArtifactStore,
     router: &mut ProviderResourceRouter<'_>,
 ) -> Result<Plan, ProviderPlanError> {
@@ -509,7 +534,9 @@ fn build_provider_plan_from_states<S: ProviderPlanningState>(
                 return Err(ProviderPlanError::PackageResolutionRequired);
             }
             crate::ResourceIntent::ResolvedPackage(intent) => {
-                intent.load_persisted(provider_artifacts)?;
+                package_authority
+                    .ok_or(ProviderPlanError::MissingPackageResolutionAuthority)?
+                    .validate(intent, provider_artifacts)?;
             }
             crate::ResourceIntent::Filesystem(_) => {}
         }
@@ -554,9 +581,12 @@ fn build_provider_plan_from_states<S: ProviderPlanningState>(
 
     let mut operations = Vec::new();
     for resource in ordered {
-        if let Some(operation) =
-            router.register(resource_id(resource)?, resource, provider_artifacts)?
-        {
+        if let Some(operation) = router.register(
+            resource_id(resource)?,
+            resource,
+            package_authority,
+            provider_artifacts,
+        )? {
             operations.push(operation);
         }
     }
@@ -571,6 +601,8 @@ fn build_provider_plan_from_states<S: ProviderPlanningState>(
             provider_inputs_digest,
             ownership_map_digest,
             artifact_set_digest,
+            package_resolution_authority_digest: package_authority
+                .map(|authority| authority.digest().clone()),
         },
         operations,
     })
@@ -608,6 +640,8 @@ pub enum ProviderPlanError {
     MissingResourcePlanner(ResourceType),
     #[error("package desired intent must be resolved by the trusted controller before planning")]
     PackageResolutionRequired,
+    #[error("resolved package planning requires current controller package authority")]
+    MissingPackageResolutionAuthority,
     #[error("more than one resource planner is installed for {0:?}")]
     DuplicateResourcePlanner(ResourceType),
     #[error("adapter {adapter_id} is not a fixed route for {resource_type:?}")]

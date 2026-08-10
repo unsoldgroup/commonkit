@@ -16,6 +16,7 @@ fn bindings() -> PlanBindings {
         provider_inputs_digest: digest('5'),
         ownership_map_digest: digest('6'),
         artifact_set_digest: digest('7'),
+        package_resolution_authority_digest: None,
     }
 }
 

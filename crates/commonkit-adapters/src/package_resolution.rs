@@ -80,6 +80,7 @@ pub struct PackageResolutionProbeV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolvedPackage {
     pub declaration: PackageDeclaration,
+    pub source: SourceBindingV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -143,6 +144,12 @@ pub struct PackageFetchRequestV1 {
     pub source_metadata_digest: Sha256Digest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageFetchResultV1 {
+    pub bytes: Vec<u8>,
+    pub final_locator: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageResolutionDraftV1 {
@@ -161,8 +168,10 @@ pub struct PackageResolutionRequestV1<'a> {
 }
 
 pub trait PackageFetch {
-    fn fetch(&mut self, request: &PackageFetchRequestV1)
-    -> Result<Vec<u8>, PackageResolutionError>;
+    fn fetch(
+        &mut self,
+        request: &PackageFetchRequestV1,
+    ) -> Result<PackageFetchResultV1, PackageResolutionError>;
 }
 
 pub trait PackageResolutionBackend {
@@ -173,12 +182,24 @@ pub trait PackageResolutionBackend {
         request: &PackageResolutionRequestV1<'_>,
     ) -> Result<PackageResolutionProbeV1, PackageResolutionError>;
 
-    fn resolve_and_fetch(
+    fn resolve(
         &mut self,
         request: &PackageResolutionRequestV1<'_>,
         source: &SourceBindingV1,
-        fetch: &mut dyn PackageFetch,
     ) -> Result<PackageResolutionDraftV1, PackageResolutionError>;
+
+    fn fetch_artifacts(
+        &mut self,
+        _request: &PackageResolutionRequestV1<'_>,
+        _source: &SourceBindingV1,
+        artifacts: &[PackageFetchRequestV1],
+        fetch: &mut dyn PackageFetch,
+    ) -> Result<(), PackageResolutionError> {
+        for artifact in artifacts {
+            fetch.fetch(artifact)?;
+        }
+        Ok(())
+    }
 }
 
 /// Target-side package preparation seam. It deliberately has no fetch or
@@ -199,6 +220,7 @@ struct PackageSourceDefinitionV1<'a> {
     source_id: &'a StableId,
     manager: PackageManager,
     canonical_repository: &'a str,
+    approved_artifact_roots: &'a BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -206,6 +228,7 @@ struct PackageSourceDefinition {
     source_id: StableId,
     manager: PackageManager,
     canonical_repository: String,
+    approved_artifact_roots: BTreeSet<String>,
     digest: Sha256Digest,
 }
 
@@ -215,11 +238,54 @@ pub struct ControlledPackageSourceV1 {
     pub source_id: StableId,
     pub manager: PackageManager,
     pub canonical_repository: String,
+    pub approved_artifact_roots: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageSourceRegistry {
     sources: BTreeMap<StableId, PackageSourceDefinition>,
+    digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageResolutionAuthority {
+    target: PackageTargetV1,
+    manager: ManagerBindingV1,
+    registry: PackageSourceRegistry,
+    digest: Sha256Digest,
+}
+
+impl PackageResolutionAuthority {
+    pub fn new(
+        target: &PackageTargetV1,
+        manager: &ManagerBindingV1,
+        registry: &PackageSourceRegistry,
+    ) -> Result<Self, PackageResolutionError> {
+        validate_target(target)?;
+        validate_manager(manager)?;
+        let digest = digest_domain_json(
+            "commonkit.package-resolution-authority.v1",
+            &(target, manager, registry.digest()),
+        )?;
+        Ok(Self {
+            target: target.clone(),
+            manager: manager.clone(),
+            registry: registry.clone(),
+            digest,
+        })
+    }
+
+    pub fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+
+    pub fn validate(
+        &self,
+        intent: &ResolvedPackageIntent,
+        store: &ArtifactStore,
+    ) -> Result<PackageResolutionV1, PackageResolutionError> {
+        intent.load_and_validate(&self.target, &self.manager, &self.registry, store)
+    }
 }
 
 impl PackageSourceRegistry {
@@ -259,8 +325,16 @@ impl PackageSourceRegistry {
         sources: Vec<ControlledPackageSourceV1>,
     ) -> Result<Self, PackageResolutionError> {
         let mut registry = BTreeMap::new();
-        for source in sources {
-            if !source.canonical_repository.starts_with("https://") {
+        for mut source in sources {
+            source
+                .approved_artifact_roots
+                .insert(source.canonical_repository.clone());
+            if !source.canonical_repository.starts_with("https://")
+                || source
+                    .approved_artifact_roots
+                    .iter()
+                    .any(|root| !root.starts_with("https://"))
+            {
                 return Err(PackageResolutionError::MutableSourceMetadata);
             }
             let digest = digest_domain_json(
@@ -269,6 +343,7 @@ impl PackageSourceRegistry {
                     source_id: &source.source_id,
                     manager: source.manager,
                     canonical_repository: &source.canonical_repository,
+                    approved_artifact_roots: &source.approved_artifact_roots,
                 },
             )?;
             if registry
@@ -278,6 +353,7 @@ impl PackageSourceRegistry {
                         source_id: source.source_id,
                         manager: source.manager,
                         canonical_repository: source.canonical_repository,
+                        approved_artifact_roots: source.approved_artifact_roots,
                         digest,
                     },
                 )
@@ -286,7 +362,36 @@ impl PackageSourceRegistry {
                 return Err(PackageResolutionError::DuplicateSource);
             }
         }
-        Ok(Self { sources: registry })
+        let entries = registry
+            .values()
+            .map(|source| PackageSourceDefinitionV1 {
+                source_id: &source.source_id,
+                manager: source.manager,
+                canonical_repository: &source.canonical_repository,
+                approved_artifact_roots: &source.approved_artifact_roots,
+            })
+            .collect::<Vec<_>>();
+        let digest = digest_domain_json("commonkit.package-source-registry.v1", &entries)?;
+        Ok(Self {
+            sources: registry,
+            digest,
+        })
+    }
+
+    pub fn source_definition_digest(
+        &self,
+        source_id: &StableId,
+    ) -> Result<Sha256Digest, PackageResolutionError> {
+        self.sources
+            .get(source_id)
+            .map(|source| source.digest.clone())
+            .ok_or_else(|| PackageResolutionError::UnknownSource {
+                source_id: source_id.clone(),
+            })
+    }
+
+    pub fn digest(&self) -> &Sha256Digest {
+        &self.digest
     }
 }
 
@@ -299,6 +404,7 @@ fn controlled_source(
         source_id: StableId::parse(source_id)?,
         manager,
         canonical_repository: canonical_repository.into(),
+        approved_artifact_roots: BTreeSet::new(),
     })
 }
 
@@ -333,30 +439,8 @@ impl<'a> PackageResolutionCoordinator<'a> {
         target: &PackageTargetV1,
         store: &ArtifactStore,
     ) -> Result<ResolvedPackageIntent, PackageResolutionError> {
+        let definition = self.preflight_desired(desired, target)?;
         let PackageDesiredIntent::Package { declaration } = desired;
-        declaration.validate()?;
-        enforce_package_source_policy(self.policy, declaration).map_err(|_| {
-            PackageResolutionError::PackageSourceNotAllowed {
-                source_id: declaration.source.clone(),
-            }
-        })?;
-        validate_target(target)?;
-        validate_manager(&self.manager)?;
-        if self.manager.manager != declaration.manager
-            || self.backend.manager() != declaration.manager
-        {
-            return Err(PackageResolutionError::ManagerMismatch);
-        }
-        let definition = self
-            .registry
-            .sources
-            .get(&declaration.source)
-            .ok_or_else(|| PackageResolutionError::UnknownSource {
-                source_id: declaration.source.clone(),
-            })?;
-        if definition.manager != declaration.manager || definition.source_id != declaration.source {
-            return Err(PackageResolutionError::SourceManagerMismatch);
-        }
         let request = PackageResolutionRequestV1 {
             desired,
             target,
@@ -383,25 +467,20 @@ impl<'a> PackageResolutionCoordinator<'a> {
         };
         validate_source(&source)?;
         let source_metadata_digest = source.metadata_digest()?;
-        let mut recording_fetch = RecordingPackageFetch {
-            inner: self.fetch,
-            fetched: Vec::new(),
-        };
-        let mut draft = self
-            .backend
-            .resolve_and_fetch(&request, &source, &mut recording_fetch)?;
+        let mut draft = self.backend.resolve(&request, &source)?;
         canonicalize_draft(&mut draft)?;
-        if !draft
-            .closure
-            .iter()
-            .any(|package| package.declaration == *declaration)
-        {
-            return Err(PackageResolutionError::MissingRootPackage);
-        }
+        self.validate_closure(&draft.closure, declaration, &source)?;
         validate_recipe_roles(
             &draft.recipe,
             draft.artifacts.iter().map(|artifact| artifact.role.clone()),
         )?;
+        let mut recording_fetch = RecordingPackageFetch {
+            inner: self.fetch,
+            fetched: Vec::new(),
+            approved_artifact_roots: &definition.approved_artifact_roots,
+        };
+        self.backend
+            .fetch_artifacts(&request, &source, &draft.artifacts, &mut recording_fetch)?;
         let artifacts = validate_and_persist_artifacts(
             &draft.artifacts,
             recording_fetch.fetched,
@@ -439,6 +518,11 @@ impl<'a> PackageResolutionCoordinator<'a> {
         store: &ArtifactStore,
     ) -> Result<ResolvedMaterializedState, PackageResolutionError> {
         state.verify()?;
+        for resource in &state.resources {
+            if let ResourceIntent::Package(desired) = &resource.intent {
+                self.preflight_desired(desired, target)?;
+            }
+        }
         let mut resources = Vec::with_capacity(state.resources.len());
         for resource in &state.resources {
             let intent = match &resource.intent {
@@ -463,6 +547,79 @@ impl<'a> PackageResolutionCoordinator<'a> {
             state.capabilities.clone(),
         )
         .map_err(Into::into)
+    }
+
+    fn preflight_desired(
+        &self,
+        desired: &PackageDesiredIntent,
+        target: &PackageTargetV1,
+    ) -> Result<PackageSourceDefinition, PackageResolutionError> {
+        let PackageDesiredIntent::Package { declaration } = desired;
+        declaration.validate_for_resolution()?;
+        enforce_package_source_policy(self.policy, declaration).map_err(|_| {
+            PackageResolutionError::PackageSourceNotAllowed {
+                source_id: declaration.source.clone(),
+            }
+        })?;
+        validate_target(target)?;
+        validate_manager(&self.manager)?;
+        if self.manager.manager != declaration.manager
+            || self.backend.manager() != declaration.manager
+        {
+            return Err(PackageResolutionError::ManagerMismatch);
+        }
+        let definition = self
+            .registry
+            .sources
+            .get(&declaration.source)
+            .ok_or_else(|| PackageResolutionError::UnknownSource {
+                source_id: declaration.source.clone(),
+            })?
+            .clone();
+        if definition.manager != declaration.manager || definition.source_id != declaration.source {
+            return Err(PackageResolutionError::SourceManagerMismatch);
+        }
+        Ok(definition)
+    }
+
+    fn validate_closure(
+        &self,
+        closure: &[ResolvedPackage],
+        root: &PackageDeclaration,
+        source: &SourceBindingV1,
+    ) -> Result<(), PackageResolutionError> {
+        if !closure
+            .iter()
+            .any(|package| package.declaration == *root && package.source == *source)
+        {
+            return Err(PackageResolutionError::MissingRootPackage);
+        }
+        for package in closure {
+            package.declaration.validate_for_resolution()?;
+            enforce_package_source_policy(self.policy, &package.declaration).map_err(|_| {
+                PackageResolutionError::PackageSourceNotAllowed {
+                    source_id: package.declaration.source.clone(),
+                }
+            })?;
+            let definition = self
+                .registry
+                .sources
+                .get(&package.declaration.source)
+                .ok_or_else(|| PackageResolutionError::UnknownSource {
+                    source_id: package.declaration.source.clone(),
+                })?;
+            if package.declaration.manager != self.manager.manager
+                || definition.manager != package.declaration.manager
+                || package.source.source_id != definition.source_id
+                || package.source.registry_definition_digest != definition.digest
+                || package.source.canonical_repository != definition.canonical_repository
+                || package.source != *source
+            {
+                return Err(PackageResolutionError::SourceBindingMismatch);
+            }
+            validate_source(&package.source)?;
+        }
+        Ok(())
     }
 }
 
@@ -543,14 +700,28 @@ impl ResolvedPackageIntent {
 fn validate_persisted_resolution(
     resolution: &PackageResolutionV1,
 ) -> Result<(), PackageResolutionError> {
-    resolution.declaration.validate()?;
+    resolution.declaration.validate_for_resolution()?;
     validate_target(&resolution.target)?;
     validate_manager(&resolution.manager)?;
     validate_source(&resolution.source)?;
+    if resolution.declaration.source != resolution.source.source_id {
+        return Err(PackageResolutionError::SourceBindingMismatch);
+    }
+    if resolution.declaration.manager != resolution.manager.manager {
+        return Err(PackageResolutionError::ManagerBindingMismatch);
+    }
     let source_metadata_digest = resolution.source.metadata_digest()?;
     let mut previous_closure = None;
     for package in &resolution.closure {
-        package.declaration.validate()?;
+        package.declaration.validate_for_resolution()?;
+        if package.source != resolution.source
+            || package.declaration.source != package.source.source_id
+        {
+            return Err(PackageResolutionError::SourceBindingMismatch);
+        }
+        if package.declaration.manager != resolution.manager.manager {
+            return Err(PackageResolutionError::ManagerBindingMismatch);
+        }
         let key = (
             package.declaration.manager,
             package.declaration.id.as_str(),
@@ -588,17 +759,19 @@ fn validate_persisted_resolution(
 struct RecordingPackageFetch<'a> {
     inner: &'a mut dyn PackageFetch,
     fetched: Vec<(PackageFetchRequestV1, Vec<u8>)>,
+    approved_artifact_roots: &'a BTreeSet<String>,
 }
 
 impl PackageFetch for RecordingPackageFetch<'_> {
     fn fetch(
         &mut self,
         request: &PackageFetchRequestV1,
-    ) -> Result<Vec<u8>, PackageResolutionError> {
-        validate_fetch_request(request)?;
-        let bytes = self.inner.fetch(request)?;
-        self.fetched.push((request.clone(), bytes.clone()));
-        Ok(bytes)
+    ) -> Result<PackageFetchResultV1, PackageResolutionError> {
+        validate_fetch_request(request, self.approved_artifact_roots)?;
+        let result = self.inner.fetch(request)?;
+        validate_fetch_locator(&result.final_locator, self.approved_artifact_roots)?;
+        self.fetched.push((request.clone(), result.bytes.clone()));
+        Ok(result)
     }
 }
 
@@ -641,13 +814,57 @@ fn validate_source(source: &SourceBindingV1) -> Result<(), PackageResolutionErro
     Ok(())
 }
 
-fn validate_fetch_request(request: &PackageFetchRequestV1) -> Result<(), PackageResolutionError> {
-    if !request.immutable_locator.starts_with("https://")
-        || contains_floating_word(&request.immutable_locator)
-    {
+fn validate_fetch_request(
+    request: &PackageFetchRequestV1,
+    approved_artifact_roots: &BTreeSet<String>,
+) -> Result<(), PackageResolutionError> {
+    validate_fetch_locator(&request.immutable_locator, approved_artifact_roots)
+}
+
+fn validate_fetch_locator(
+    locator: &str,
+    approved_artifact_roots: &BTreeSet<String>,
+) -> Result<(), PackageResolutionError> {
+    if !locator.starts_with("https://") || contains_floating_artifact_word(locator) {
         return Err(PackageResolutionError::MutableArtifactLocator);
     }
+    if !approved_artifact_roots
+        .iter()
+        .any(|root| locator_is_within_root(locator, root))
+    {
+        return Err(PackageResolutionError::UnapprovedArtifactLocation);
+    }
     Ok(())
+}
+
+fn contains_floating_artifact_word(value: &str) -> bool {
+    value
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .any(|part| {
+            matches!(
+                part.to_ascii_lowercase().as_str(),
+                "latest" | "stable" | "default" | "current" | "lts"
+            )
+        })
+}
+
+fn locator_is_within_root(locator: &str, root: &str) -> bool {
+    let (Ok(locator), Ok(root)) = (reqwest::Url::parse(locator), reqwest::Url::parse(root)) else {
+        return false;
+    };
+    if locator.scheme() != "https"
+        || root.scheme() != "https"
+        || locator.host_str() != root.host_str()
+        || locator.port_or_known_default() != root.port_or_known_default()
+    {
+        return false;
+    }
+    let root_path = root.path().trim_end_matches('/');
+    locator.path() == root_path
+        || locator
+            .path()
+            .strip_prefix(root_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn contains_floating_word(value: &str) -> bool {
@@ -663,7 +880,7 @@ fn contains_floating_word(value: &str) -> bool {
 
 fn canonicalize_draft(draft: &mut PackageResolutionDraftV1) -> Result<(), PackageResolutionError> {
     for package in &draft.closure {
-        package.declaration.validate()?;
+        package.declaration.validate_for_resolution()?;
     }
     draft.closure.sort_by(|left, right| {
         (
@@ -774,6 +991,8 @@ pub enum PackageResolutionError {
     MutableSourceMetadata,
     #[error("package artifact locator is not immutable")]
     MutableArtifactLocator,
+    #[error("package artifact locator is outside the controlled source roots")]
+    UnapprovedArtifactLocation,
     #[error("package resolution omitted the requested root package")]
     MissingRootPackage,
     #[error("package resolution closure contains a duplicate")]

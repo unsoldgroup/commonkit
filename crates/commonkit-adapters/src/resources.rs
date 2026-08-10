@@ -284,12 +284,30 @@ impl PackageDesiredIntent {
     }
 }
 
+/// Closed provider-output vocabulary. Durable controller state uses
+/// [`ResourceIntent`], which additionally admits controller-owned package
+/// resolutions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProviderResourceIntent {
+    Filesystem(FilesystemIntent),
+    Package(PackageDesiredIntent),
+}
+
+impl From<ProviderResourceIntent> for ResourceIntent {
+    fn from(intent: ProviderResourceIntent) -> Self {
+        match intent {
+            ProviderResourceIntent::Filesystem(intent) => Self::Filesystem(intent),
+            ProviderResourceIntent::Package(intent) => Self::Package(intent),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResourceIntent {
     Filesystem(FilesystemIntent),
     Package(PackageDesiredIntent),
-    #[serde(skip_deserializing)]
     ResolvedPackage(ResolvedPackageIntent),
 }
 

@@ -30,6 +30,7 @@ fn plan() -> commonkit_contracts::Plan {
             provider_inputs_digest: digest('e'),
             ownership_map_digest: digest('f'),
             artifact_set_digest: digest('1'),
+            package_resolution_authority_digest: None,
         },
         operations: Vec::new(),
     })
@@ -95,6 +96,7 @@ fn reloads_a_pre_provenance_v1_operation_without_changing_its_identity() {
             provider_inputs_digest: digest('e'),
             ownership_map_digest: digest('f'),
             artifact_set_digest: digest('1'),
+            package_resolution_authority_digest: None,
         },
         operations: vec![operation],
     })

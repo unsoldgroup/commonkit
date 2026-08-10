@@ -400,10 +400,14 @@
       "properties": {
         "declaration": {
           "$ref": "#/$defs/PackageDeclaration"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceBindingV1"
         }
       },
       "required": [
-        "declaration"
+        "declaration",
+        "source"
       ],
       "type": "object"
     },

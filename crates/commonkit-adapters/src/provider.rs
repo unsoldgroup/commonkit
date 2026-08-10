@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::artifacts::ArtifactStore;
-use super::resources::{NormalizedManagedPath, NormalizedResource, ResourceType};
+use super::resources::{
+    NormalizedManagedPath, NormalizedResource, ProviderResourceIntent, ResourceProvenance,
+    ResourceType,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -142,7 +145,7 @@ pub struct UnsupportedCapability {
     pub remediation: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MaterializedState {
     pub inputs: ProviderInputs,
@@ -152,6 +155,49 @@ pub struct MaterializedState {
     #[serde(default)]
     pub capabilities: Vec<ProviderCapabilityResource>,
     pub digest: Sha256Digest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderNormalizedResource {
+    intent: ProviderResourceIntent,
+    provenance: ResourceProvenance,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProviderMaterializedState {
+    inputs: ProviderInputs,
+    resources: Vec<ProviderNormalizedResource>,
+    declared_side_effects: Vec<DeclaredSideEffect>,
+    unsupported: Vec<UnsupportedCapability>,
+    #[serde(default)]
+    capabilities: Vec<ProviderCapabilityResource>,
+    digest: Sha256Digest,
+}
+
+impl<'de> Deserialize<'de> for MaterializedState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ProviderMaterializedState::deserialize(deserializer)?;
+        Ok(Self {
+            inputs: wire.inputs,
+            resources: wire
+                .resources
+                .into_iter()
+                .map(|resource| NormalizedResource {
+                    intent: resource.intent.into(),
+                    provenance: resource.provenance,
+                })
+                .collect(),
+            declared_side_effects: wire.declared_side_effects,
+            unsupported: wire.unsupported,
+            capabilities: wire.capabilities,
+            digest: wire.digest,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

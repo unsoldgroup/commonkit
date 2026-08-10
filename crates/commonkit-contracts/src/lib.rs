@@ -946,6 +946,61 @@ impl PackageDeclaration {
         }
         Ok(())
     }
+
+    /// Stricter controller boundary used before package resolution. Legacy
+    /// declarations without a selector remain decodable, but cannot authorize
+    /// resolver or network access.
+    pub fn validate_for_resolution(&self) -> Result<(), ContractError> {
+        self.validate()?;
+        let selector = self
+            .selector
+            .as_ref()
+            .ok_or(ContractError::InvalidPackageDeclaration)?;
+        selector.validate_for(self.manager)?;
+        if exact_package_version(self.manager, &self.version) {
+            Ok(())
+        } else {
+            Err(ContractError::InvalidPackageDeclaration)
+        }
+    }
+}
+
+fn exact_package_version(manager: PackageManager, version: &str) -> bool {
+    match manager {
+        PackageManager::Fnm | PackageManager::Nvm => numeric_triplet(version, true),
+        PackageManager::Rustup => numeric_triplet(version, false),
+        PackageManager::Homebrew | PackageManager::Apt => {
+            version.chars().any(|character| character.is_ascii_digit())
+                && version.chars().any(|character| ".+-_:".contains(character))
+                && version.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".+-_:".contains(character)
+                })
+                && !version
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|part| {
+                        matches!(
+                            part.to_ascii_lowercase().as_str(),
+                            "x" | "main" | "major" | "nightly"
+                        )
+                    })
+        }
+    }
+}
+
+fn numeric_triplet(version: &str, allow_v_prefix: bool) -> bool {
+    let version = if allow_v_prefix {
+        version.strip_prefix('v').unwrap_or(version)
+    } else {
+        version
+    };
+    let components = version.split('.').collect::<Vec<_>>();
+    components.len() == 3
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+        })
 }
 
 fn is_floating_package_version(version: &str) -> bool {
@@ -1207,6 +1262,8 @@ pub struct PlanBindings {
     pub provider_inputs_digest: Sha256Digest,
     pub ownership_map_digest: Sha256Digest,
     pub artifact_set_digest: Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_resolution_authority_digest: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

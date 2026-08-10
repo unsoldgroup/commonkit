@@ -81,6 +81,7 @@ fn plan_writing(store: &ArtifactStore, files: &[(&str, &str)]) -> commonkit_cont
             provider_inputs_digest: digest('5'),
             ownership_map_digest: digest('6'),
             artifact_set_digest: digest('7'),
+            package_resolution_authority_digest: None,
         },
         operations,
     })
@@ -238,6 +239,7 @@ async fn plan_budget_ignores_removals_so_an_eviction_measures_after_itself() {
             provider_inputs_digest: digest('5'),
             ownership_map_digest: digest('6'),
             artifact_set_digest: digest('7'),
+            package_resolution_authority_digest: None,
         },
         operations: vec![keep, evict],
     })
