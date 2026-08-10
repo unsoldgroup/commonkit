@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_adapters::{
     ArtifactStore, ContentSensitivity, FileAdapter, FileAdapterError, FileMode, FilesystemIntent,
-    NormalizedManagedPath, SafeSymlinkTarget,
+    NormalizedManagedPath, SafeSymlinkTarget, SymlinkTargetKind,
 };
 use commonkit_contracts::StableId;
 use commonkit_reconcile::Adapter;
@@ -327,6 +327,7 @@ fn applies_and_rolls_back_directory_symlink_and_removal_resources() {
                     "config",
                 )
                 .expect("target"),
+                target_kind: SymlinkTargetKind::Directory,
                 expected_before: None,
             },
         )

@@ -113,6 +113,8 @@ enum ResourcePreimage {
     },
     Symlink {
         target: String,
+        #[serde(default, skip_serializing_if = "crate::SymlinkTargetKind::is_file")]
+        target_kind: crate::SymlinkTargetKind,
     },
 }
 
@@ -823,6 +825,14 @@ impl Adapter for FileAdapter {
 
 fn validate_semantic_intent(intent: &FilesystemIntent) -> Result<(), FileAdapterError> {
     let path = NormalizedManagedPath::parse(intent.path().as_str().to_owned())?;
+    #[cfg(not(unix))]
+    if matches!(
+        intent,
+        FilesystemIntent::File { mode: Some(_), .. }
+            | FilesystemIntent::Directory { mode: Some(_), .. }
+    ) {
+        return Err(FileAdapterError::UnsupportedMode);
+    }
     if let FilesystemIntent::Symlink { target, .. } = intent {
         SafeSymlinkTarget::parse(&path, target.as_str().to_owned())?;
     }
@@ -848,8 +858,13 @@ fn desired_preimage(intent: &FilesystemIntent) -> ResourcePreimage {
         FilesystemIntent::Directory { mode, .. } => ResourcePreimage::Directory {
             mode: mode.as_ref().map(FileMode::value),
         },
-        FilesystemIntent::Symlink { target, .. } => ResourcePreimage::Symlink {
+        FilesystemIntent::Symlink {
+            target,
+            target_kind,
+            ..
+        } => ResourcePreimage::Symlink {
             target: target.as_str().to_owned(),
+            target_kind: *target_kind,
         },
         FilesystemIntent::Remove { .. } => ResourcePreimage::Absent,
         FilesystemIntent::File { content, mode, .. } => ResourcePreimage::File {
@@ -874,9 +889,20 @@ fn semantic_digest(
             &("directory", mode),
         )
         .map(Some),
-        ResourcePreimage::Symlink { target } => digest_domain_json(
+        ResourcePreimage::Symlink {
+            target,
+            target_kind: crate::SymlinkTargetKind::File,
+        } => digest_domain_json(
             "commonkit.filesystem-resource-state.v1",
             &("symlink", target),
+        )
+        .map(Some),
+        ResourcePreimage::Symlink {
+            target,
+            target_kind,
+        } => digest_domain_json(
+            "commonkit.filesystem-resource-state.v2",
+            &("symlink", target, target_kind),
         )
         .map(Some),
     }
@@ -903,9 +929,14 @@ fn inspect_resource(
     };
     if metadata.file_type().is_symlink() {
         let target = parent.read_link(&leaf)?;
+        let target = target.to_string_lossy().into_owned();
         return Ok(ResourcePreimage::Symlink {
-            target: target.to_string_lossy().into_owned(),
+            target_kind: inspect_symlink_target_kind_in(directory, path, &target)?,
+            target,
         });
+    }
+    if metadata_is_unsupported_reparse(&metadata) {
+        return Err(FileAdapterError::UnsupportedResource);
     }
     let mode = portable_mode(&metadata);
     if metadata.is_dir() {
@@ -917,6 +948,28 @@ fn inspect_resource(
         return Ok(ResourcePreimage::File { content, mode });
     }
     Err(FileAdapterError::UnsupportedResource)
+}
+
+fn inspect_symlink_target_kind_in(
+    root: &Dir,
+    link: &str,
+    target: &str,
+) -> Result<crate::SymlinkTargetKind, FileAdapterError> {
+    let link = NormalizedManagedPath::parse(link.to_owned())?;
+    let target = SafeSymlinkTarget::parse(&link, target.to_owned())?;
+    let resolved = target.resolved_for(&link)?;
+    let (parent, leaf) = open_parent_nofollow(root, resolved.as_str(), false)?;
+    let metadata = parent.symlink_metadata(&leaf)?;
+    if metadata_is_reparse_or_symlink(&metadata) {
+        return Err(FileAdapterError::UnsupportedResource);
+    }
+    if metadata.is_dir() {
+        Ok(crate::SymlinkTargetKind::Directory)
+    } else if metadata.is_file() {
+        Ok(crate::SymlinkTargetKind::File)
+    } else {
+        Err(FileAdapterError::UnsupportedResource)
+    }
 }
 
 #[cfg(unix)]
@@ -1112,6 +1165,16 @@ fn open_directory_handle(path: &Path) -> Result<Dir, std::io::Error> {
 
 fn remove_entry_in(parent: &Dir, leaf: &Path) -> Result<(), std::io::Error> {
     match parent.symlink_metadata(leaf) {
+        Ok(metadata) if metadata_is_unsupported_reparse(&metadata) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unsupported reparse point in managed path",
+        )),
+        #[cfg(windows)]
+        Ok(metadata)
+            if metadata.file_type().is_symlink() && metadata_has_directory_attribute(&metadata) =>
+        {
+            parent.remove_dir(leaf)
+        }
         Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
             parent.remove_file(leaf)
         }
@@ -1123,6 +1186,23 @@ fn remove_entry_in(parent: &Dir, leaf: &Path) -> Result<(), std::io::Error> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+#[cfg(windows)]
+fn metadata_is_unsupported_reparse(metadata: &cap_std::fs::Metadata) -> bool {
+    metadata_is_reparse_or_symlink(metadata) && !metadata.file_type().is_symlink()
+}
+
+#[cfg(not(windows))]
+fn metadata_is_unsupported_reparse(_metadata: &cap_std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn metadata_has_directory_attribute(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+    metadata.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0
 }
 
 fn replace_file_in(
@@ -1213,9 +1293,13 @@ fn apply_intent_in(
             let directory = open_dir_component_nofollow(parent, leaf)?;
             set_directory_mode(&directory, mode.as_ref().map(FileMode::value))
         }
-        FilesystemIntent::Symlink { target, .. } => {
+        FilesystemIntent::Symlink {
+            target,
+            target_kind,
+            ..
+        } => {
             remove_entry_in(parent, leaf)?;
-            create_symlink_in(parent, target.as_str(), leaf)
+            create_symlink_in(parent, target.as_str(), leaf, *target_kind)
         }
         FilesystemIntent::Remove { .. } => remove_entry_in(parent, leaf),
         FilesystemIntent::File { .. } => Err(std::io::Error::new(
@@ -1270,7 +1354,10 @@ fn restore_preimage_in(
             let directory = open_dir_component_nofollow(parent, leaf)?;
             set_directory_mode(&directory, *mode)
         }
-        ResourcePreimage::Symlink { target } => create_symlink_in(parent, target, leaf),
+        ResourcePreimage::Symlink {
+            target,
+            target_kind,
+        } => create_symlink_in(parent, target, leaf, *target_kind),
         ResourcePreimage::File { .. } => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "file artifact requires adapter access",
@@ -1310,13 +1397,26 @@ fn set_directory_mode(_directory: &Dir, _mode: Option<u32>) -> Result<(), std::i
 }
 
 #[cfg(not(windows))]
-fn create_symlink_in(parent: &Dir, target: &str, leaf: &Path) -> Result<(), std::io::Error> {
+fn create_symlink_in(
+    parent: &Dir,
+    target: &str,
+    leaf: &Path,
+    _target_kind: crate::SymlinkTargetKind,
+) -> Result<(), std::io::Error> {
     parent.symlink(target, leaf)
 }
 
 #[cfg(windows)]
-fn create_symlink_in(parent: &Dir, target: &str, leaf: &Path) -> Result<(), std::io::Error> {
-    parent.symlink_file(target, leaf)
+fn create_symlink_in(
+    parent: &Dir,
+    target: &str,
+    leaf: &Path,
+    target_kind: crate::SymlinkTargetKind,
+) -> Result<(), std::io::Error> {
+    match target_kind {
+        crate::SymlinkTargetKind::File => parent.symlink_file(target, leaf),
+        crate::SymlinkTargetKind::Directory => parent.symlink_dir(target, leaf),
+    }
 }
 
 fn read_optional(directory: &Dir, path: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
@@ -1465,6 +1565,8 @@ pub enum FileAdapterError {
     UnsafeStateEntry,
     #[error("filesystem resource type is unsupported")]
     UnsupportedResource,
+    #[error("target platform cannot apply portable file modes")]
+    UnsupportedMode,
     #[error(transparent)]
     Resource(#[from] crate::ResourceError),
     #[error(transparent)]

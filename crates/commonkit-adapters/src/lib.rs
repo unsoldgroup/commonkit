@@ -89,7 +89,7 @@ pub use remote_provider::{
 };
 pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
-    OwnershipRules, ResourceError, ResourceProvenance, SafeSymlinkTarget,
+    OwnershipRules, ResourceError, ResourceProvenance, SafeSymlinkTarget, SymlinkTargetKind,
     materialized_resources_digest, validate_ownership,
 };
 pub use service_lifecycle::{

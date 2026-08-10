@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 
 use commonkit_adapters::{
     FileMode, NormalizedManagedPath, SafeSymlinkTarget, SshFilesystemRequest,
-    SshFilesystemResponse, TargetResource,
+    SshFilesystemResponse, SymlinkTargetKind, TargetResource,
 };
 use commonkit_core::{Sha256Digest, StableId};
 use sha2::{Digest, Sha256};
@@ -106,6 +106,7 @@ fn helper_subprocess_routes_relative_directories_and_symlinks_without_following_
             root_id: root_id.clone(),
             path: link.clone(),
             target: relative,
+            target_kind: SymlinkTargetKind::Directory,
         },
     ] {
         let output = invoke(&home, &request);
@@ -130,7 +131,8 @@ fn helper_subprocess_routes_relative_directories_and_symlinks_without_following_
         serde_json::from_slice::<SshFilesystemResponse>(&inspected.stdout).unwrap(),
         SshFilesystemResponse::Resource {
             resource: TargetResource::Symlink {
-                target: "../../.agents/skills/tool".into()
+                target: "../../.agents/skills/tool".into(),
+                target_kind: SymlinkTargetKind::Directory,
             }
         }
     );

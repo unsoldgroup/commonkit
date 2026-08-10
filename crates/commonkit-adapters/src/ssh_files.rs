@@ -13,25 +13,41 @@ use thiserror::Error;
 use crate::{
     ArtifactStore, ContentReference, ContentSensitivity, FilesystemIntent, NormalizedResource,
     SafeSymlinkTarget, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
-    TargetResource,
+    SymlinkTargetKind, TargetResource,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum RemotePreimage {
     Absent,
-    File { digest: Sha256Digest },
-    Directory { mode: Option<u32> },
-    Symlink { target: String },
+    File {
+        digest: Sha256Digest,
+    },
+    Directory {
+        mode: Option<u32>,
+    },
+    Symlink {
+        target: String,
+        #[serde(default, skip_serializing_if = "SymlinkTargetKind::is_file")]
+        target_kind: SymlinkTargetKind,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum RemoteBackup {
     Absent,
-    File { content: ContentReference },
-    Directory { mode: Option<u32> },
-    Symlink { target: String },
+    File {
+        content: ContentReference,
+    },
+    Directory {
+        mode: Option<u32>,
+    },
+    Symlink {
+        target: String,
+        #[serde(default, skip_serializing_if = "SymlinkTargetKind::is_file")]
+        target_kind: SymlinkTargetKind,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -195,9 +211,15 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
                     digest: bytes_digest(&content)?,
                 }),
                 TargetResource::Directory { mode } => Ok(RemotePreimage::Directory { mode }),
-                TargetResource::Symlink { target } => {
+                TargetResource::Symlink {
+                    target,
+                    target_kind,
+                } => {
                     SafeSymlinkTarget::parse(&inspected_path, target.clone())?;
-                    Ok(RemotePreimage::Symlink { target })
+                    Ok(RemotePreimage::Symlink {
+                        target,
+                        target_kind,
+                    })
                 }
             },
             _ => Err(SshFileAdapterError::UnexpectedResponse),
@@ -308,13 +330,21 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
                 RemoteBackup::Directory { mode },
             ),
             SshFilesystemResponse::Resource {
-                resource: TargetResource::Symlink { target },
+                resource:
+                    TargetResource::Symlink {
+                        target,
+                        target_kind,
+                    },
             } => (
                 RemotePreimage::Symlink {
                     target: target.clone(),
+                    target_kind,
                 },
                 None,
-                RemoteBackup::Symlink { target },
+                RemoteBackup::Symlink {
+                    target,
+                    target_kind,
+                },
             ),
             _ => {
                 return Err(failure(
@@ -367,10 +397,16 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
                     mode,
                 }
             }
-            FilesystemIntent::Symlink { path, target, .. } => SshFilesystemRequest::WriteSymlink {
+            FilesystemIntent::Symlink {
+                path,
+                target,
+                target_kind,
+                ..
+            } => SshFilesystemRequest::WriteSymlink {
                 root_id: self.root_id.clone(),
                 path,
                 target,
+                target_kind,
             },
         };
         match self
@@ -416,6 +452,24 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
                 "remote backup does not match the plan",
             ));
         }
+        let mut current = self.observe(intent.path().clone()).map_err(|_| {
+            failure(
+                "remote_rollback_failed",
+                "could not inspect remote resource before rollback",
+            )
+        })?;
+        project_preimage_for_intent(&intent, &mut current);
+        let current_digest = preimage_digest(&current)
+            .map_err(|_| failure("remote_digest_failed", "could not digest remote resource"))?;
+        if current_digest == operation.before_digest {
+            return Ok(());
+        }
+        if current_digest != operation.after_digest {
+            return Err(failure(
+                "rollback_preimage_changed",
+                "remote resource changed after apply; refusing to overwrite it",
+            ));
+        }
         let backup_preimage = backup.preimage.unwrap_or(match backup.content {
             Some(content) => RemoteBackup::File { content },
             None => RemoteBackup::Absent,
@@ -436,12 +490,16 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
                     failure("backup_invalid", "remote directory backup mode is invalid")
                 })?,
             },
-            RemoteBackup::Symlink { target } => SshFilesystemRequest::WriteSymlink {
+            RemoteBackup::Symlink {
+                target,
+                target_kind,
+            } => SshFilesystemRequest::WriteSymlink {
                 root_id: self.root_id.clone(),
                 path: intent.path().clone(),
                 target: SafeSymlinkTarget::parse(intent.path(), target).map_err(|_| {
                     failure("backup_invalid", "remote symlink backup target is invalid")
                 })?,
+                target_kind,
             },
             RemoteBackup::Absent => SshFilesystemRequest::Remove {
                 root_id: self.root_id.clone(),
@@ -493,8 +551,13 @@ fn desired_preimage(intent: &FilesystemIntent) -> RemotePreimage {
         FilesystemIntent::Directory { mode, .. } => RemotePreimage::Directory {
             mode: mode.as_ref().map(crate::FileMode::value),
         },
-        FilesystemIntent::Symlink { target, .. } => RemotePreimage::Symlink {
+        FilesystemIntent::Symlink {
+            target,
+            target_kind,
+            ..
+        } => RemotePreimage::Symlink {
             target: target.as_str().to_owned(),
+            target_kind: *target_kind,
         },
     }
 }

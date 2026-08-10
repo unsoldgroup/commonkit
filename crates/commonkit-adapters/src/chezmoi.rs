@@ -16,7 +16,7 @@ use super::provider_snapshot::{
 };
 use super::resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, ResourceProvenance,
-    SafeSymlinkTarget,
+    SafeSymlinkTarget, SymlinkTargetKind,
 };
 
 pub const TESTED_CHEZMOI_VERSION: &str = "2.70.4";
@@ -507,11 +507,30 @@ fn scan_destination(
                     "{portable}: symlink target is not portable UTF-8"
                 ))
             })?;
+            let target = SafeSymlinkTarget::parse(&managed, target)
+                .map_err(|error| ProviderFailure::Materialize(format!("{portable}: {error}")))?;
+            let target_metadata = fs::metadata(
+                path.parent()
+                    .expect("collected path has a parent")
+                    .join(&target_path),
+            )
+            .map_err(|error| {
+                ProviderFailure::Materialize(format!(
+                    "{portable}: symlink target cannot be inspected: {error}"
+                ))
+            })?;
             FilesystemIntent::Symlink {
                 path: managed.clone(),
-                target: SafeSymlinkTarget::parse(&managed, target).map_err(|error| {
-                    ProviderFailure::Materialize(format!("{portable}: {error}"))
-                })?,
+                target,
+                target_kind: if target_metadata.is_dir() {
+                    SymlinkTargetKind::Directory
+                } else if target_metadata.is_file() {
+                    SymlinkTargetKind::File
+                } else {
+                    return Err(ProviderFailure::Materialize(format!(
+                        "{portable}: symlink target has unsupported resource type"
+                    )));
+                },
                 expected_before: None,
             }
         } else if metadata.is_dir() {
