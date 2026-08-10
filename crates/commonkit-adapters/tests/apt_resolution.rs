@@ -1,0 +1,515 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use commonkit_adapters::{
+    AptRepositoryConfigurationV1, AptResolutionBackend, AptResolutionCommandError,
+    AptResolutionCommandRunner, AptResolutionSnapshotV1, AptResolutionSystemRequestV1,
+    AptResolvedArchiveV1, AptResolvedPackageV1, AptTransactionRisksV1, ArtifactEvidence,
+    ArtifactStore, ManagerBindingV1, OfflineInstallRecipeV1, PackageFetch, PackageFetchHopV1,
+    PackageFetchRequestV1, PackageFetchResultV1, PackageObservationV1,
+    PackageResolutionCoordinator, PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
+    ProcessAptResolutionCommandRunner, ResolvedPackageIntent,
+};
+use commonkit_contracts::{
+    PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, Sha256Digest, StableId,
+};
+use sha2::{Digest, Sha256};
+
+fn id(value: &str) -> StableId {
+    StableId::parse(value).unwrap()
+}
+
+fn digest(byte: u8) -> Sha256Digest {
+    Sha256Digest::parse(format!(
+        "sha256:{}",
+        char::from(byte).to_string().repeat(64)
+    ))
+    .unwrap()
+}
+
+fn content_digest(bytes: &[u8]) -> Sha256Digest {
+    Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
+}
+
+fn target() -> PackageTargetV1 {
+    PackageTargetV1 {
+        os: "linux".into(),
+        os_version: "24.04".into(),
+        distro_id: Some("ubuntu".into()),
+        distro_version: Some("24.04".into()),
+        codename: Some("noble".into()),
+        arch: "amd64".into(),
+        libc: Some("glibc".into()),
+        manager_prefix: None,
+    }
+}
+
+fn manager() -> ManagerBindingV1 {
+    ManagerBindingV1 {
+        manager: PackageManager::Apt,
+        version: "apt:2.7.14;dpkg:1.22.6".into(),
+        executable_digest: digest(b'a'),
+        config_digest: digest(b'b'),
+    }
+}
+
+fn desired() -> commonkit_adapters::PackageDesiredIntent {
+    commonkit_adapters::PackageDesiredIntent::new(PackageDeclaration {
+        id: id("curl"),
+        version: "8.5.0-2ubuntu10.6".into(),
+        manager: PackageManager::Apt,
+        source: id("ubuntu-main"),
+        selector: Some(PackageSelector::AptBinary {
+            name: "curl".into(),
+            architecture: Some("amd64".into()),
+        }),
+    })
+    .unwrap()
+}
+
+fn policy() -> SecurityPolicy {
+    SecurityPolicy {
+        allowlists: BTreeMap::from([(
+            id("package_sources"),
+            BTreeSet::from(["ubuntu-main".into()]),
+        )]),
+        ..SecurityPolicy::default()
+    }
+}
+
+fn repository() -> AptRepositoryConfigurationV1 {
+    AptRepositoryConfigurationV1 {
+        source_id: id("ubuntu-main"),
+        suite: "noble".into(),
+        components: BTreeSet::from(["main".into()]),
+        signed_by: PathBuf::from("/usr/share/keyrings/ubuntu-archive-keyring.gpg"),
+        signing_authority: id("ubuntu-archive-keyring"),
+    }
+}
+
+#[derive(Clone)]
+struct FixtureRunner {
+    snapshot: AptResolutionSnapshotV1,
+    calls: usize,
+}
+
+struct PanicRunner;
+
+impl AptResolutionCommandRunner for PanicRunner {
+    fn resolve(
+        &mut self,
+        _request: &AptResolutionSystemRequestV1,
+    ) -> Result<AptResolutionSnapshotV1, AptResolutionCommandError> {
+        panic!("invalid APT authority must fail before the runner")
+    }
+}
+
+impl AptResolutionCommandRunner for FixtureRunner {
+    fn resolve(
+        &mut self,
+        _request: &AptResolutionSystemRequestV1,
+    ) -> Result<AptResolutionSnapshotV1, AptResolutionCommandError> {
+        self.calls += 1;
+        Ok(self.snapshot.clone())
+    }
+}
+
+struct FixtureFetch {
+    bytes: BTreeMap<String, Vec<u8>>,
+    calls: usize,
+}
+
+impl PackageFetch for FixtureFetch {
+    fn fetch_hop(
+        &mut self,
+        _request: &PackageFetchRequestV1,
+        locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError> {
+        self.calls += 1;
+        let bytes = self
+            .bytes
+            .get(locator)
+            .cloned()
+            .ok_or(PackageResolutionError::FetchUnavailable)?;
+        Ok(PackageFetchHopV1::Complete(PackageFetchResultV1 { bytes }))
+    }
+}
+
+fn archive(package_name: &str, version: &str, locator: &str, bytes: &[u8]) -> AptResolvedArchiveV1 {
+    AptResolvedArchiveV1 {
+        package_name: package_name.into(),
+        version: version.into(),
+        architecture: "amd64".into(),
+        immutable_locator: locator.into(),
+        upstream_checksum: content_digest(bytes),
+        size: bytes.len() as u64,
+    }
+}
+
+fn persisted(
+    intent: &ResolvedPackageIntent,
+    store: &ArtifactStore,
+) -> commonkit_adapters::PackageResolutionV1 {
+    intent.load_persisted(store).unwrap()
+}
+
+fn apt_snapshot(curl_bytes: &[u8], libc_bytes: &[u8]) -> AptResolutionSnapshotV1 {
+    AptResolutionSnapshotV1 {
+        target: target(),
+        manager: manager(),
+        before: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        repository_revision: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            .into(),
+        signed_metadata: vec![ArtifactEvidence {
+            authority: id("ubuntu-archive-keyring"),
+            metadata_digest: digest(b'c'),
+            signature_digest: digest(b'd'),
+        }],
+        closure: vec![
+            AptResolvedPackageV1 {
+                name: "libc6".into(),
+                version: "2.39-0ubuntu8.4".into(),
+                architecture: "amd64".into(),
+            },
+            AptResolvedPackageV1 {
+                name: "curl".into(),
+                version: "8.5.0-2ubuntu10.6".into(),
+                architecture: "amd64".into(),
+            },
+        ],
+        archives: vec![
+            archive(
+                "curl",
+                "8.5.0-2ubuntu10.6",
+                "https://archive.ubuntu.com/ubuntu/pool/main/c/curl/curl_8.5.0-2ubuntu10.6_amd64.deb",
+                curl_bytes,
+            ),
+            archive(
+                "libc6",
+                "2.39-0ubuntu8.4",
+                "https://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8.4_amd64.deb",
+                libc_bytes,
+            ),
+        ],
+        risks: AptTransactionRisksV1::default(),
+    }
+}
+
+#[test]
+fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let declaration = match desired() {
+        commonkit_adapters::PackageDesiredIntent::Package { declaration } => declaration,
+    };
+    let request = AptResolutionSystemRequestV1 {
+        declaration,
+        target: target(),
+        manager: manager(),
+        source_id: id("ubuntu-main"),
+        canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+        registry_definition_digest: registry
+            .source_definition_digest(&id("ubuntu-main"))
+            .unwrap(),
+        repository: repository(),
+    };
+
+    let commands = ProcessAptResolutionCommandRunner::command_snapshot(&request).unwrap();
+
+    assert_eq!(
+        commands
+            .iter()
+            .map(|command| command.executable.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "/usr/bin/apt-get",
+            "/usr/bin/dpkg",
+            "/usr/bin/dpkg",
+            "/usr/bin/apt-config",
+            "/usr/bin/dpkg-query",
+            "/usr/bin/apt-mark",
+            "/usr/bin/apt-get",
+            "/usr/bin/apt-get",
+            "/usr/bin/apt-get",
+        ]
+    );
+    let rendered = commands
+        .iter()
+        .map(|command| format!("{} {}", command.executable, command.args.join(" ")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains("Dir::State::lists=<private>/lists"));
+    assert!(rendered.contains("Dir::State::status=<private>/status"));
+    assert!(rendered.contains("Dir::Cache::archives=<private>/archives"));
+    assert!(rendered.contains("Acquire::AllowInsecureRepositories=false"));
+    assert!(rendered.contains("Acquire::AllowWeakRepositories=false"));
+    assert!(rendered.contains("Acquire::AllowDowngradeToInsecureRepositories=false"));
+    assert!(rendered.contains("APT::Get::AllowUnauthenticated=false"));
+    assert!(rendered.contains("Acquire::Check-Valid-Until=true"));
+    assert!(rendered.contains("Acquire::Check-Date=true"));
+    assert!(rendered.contains("Acquire::By-Hash=force"));
+    assert!(rendered.contains("Acquire::https::AllowRedirect=false"));
+    assert!(rendered.contains("--simulate --no-remove"));
+    assert!(rendered.contains("--print-uris --download-only --no-remove"));
+    assert!(!rendered.contains("--allow-unauthenticated"));
+    assert_eq!(
+        commands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, command)| command.network.then_some(index))
+            .collect::<Vec<_>>(),
+        vec![6]
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn process_apt_runner_fails_closed_off_linux() {
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let declaration = match desired() {
+        commonkit_adapters::PackageDesiredIntent::Package { declaration } => declaration,
+    };
+    let request = AptResolutionSystemRequestV1 {
+        declaration,
+        target: target(),
+        manager: manager(),
+        source_id: id("ubuntu-main"),
+        canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+        registry_definition_digest: registry
+            .source_definition_digest(&id("ubuntu-main"))
+            .unwrap(),
+        repository: repository(),
+    };
+    let mut runner = ProcessAptResolutionCommandRunner;
+
+    assert!(matches!(
+        runner.resolve(&request),
+        Err(AptResolutionCommandError::Unavailable(_))
+    ));
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn apt_manager_authority_probe_fails_closed_off_linux() {
+    assert!(matches!(
+        ProcessAptResolutionCommandRunner::probe_manager_binding(
+            &target(),
+            "https://archive.ubuntu.com/ubuntu",
+            &repository(),
+        ),
+        Err(AptResolutionCommandError::Unavailable(_))
+    ));
+}
+
+#[test]
+fn apt_backend_requires_an_explicit_target_architecture_before_runner_or_fetch() {
+    let mut declaration = match desired() {
+        commonkit_adapters::PackageDesiredIntent::Package { declaration } => declaration,
+    };
+    declaration.selector = Some(PackageSelector::AptBinary {
+        name: "curl".into(),
+        architecture: None,
+    });
+    let desired = commonkit_adapters::PackageDesiredIntent::new(declaration).unwrap();
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let mut backend = AptResolutionBackend::new(repository(), PanicRunner);
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::new(),
+        calls: 0,
+    };
+
+    assert!(matches!(
+        PackageResolutionCoordinator::new(
+            &policy(),
+            &registry,
+            manager(),
+            &mut backend,
+            &mut fetch,
+        )
+        .resolve(&desired, &target(), &store),
+        Err(PackageResolutionError::InvalidAptRequest)
+    ));
+    assert_eq!(fetch.calls, 0);
+}
+
+#[test]
+fn apt_backend_rejects_source_line_unsafe_architecture_before_runner_or_fetch() {
+    let mut target = target();
+    target.arch = "amd64/foreign".into();
+    let mut declaration = match desired() {
+        commonkit_adapters::PackageDesiredIntent::Package { declaration } => declaration,
+    };
+    declaration.selector = Some(PackageSelector::AptBinary {
+        name: "curl".into(),
+        architecture: Some(target.arch.clone()),
+    });
+    let desired = commonkit_adapters::PackageDesiredIntent::new(declaration).unwrap();
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let mut backend = AptResolutionBackend::new(repository(), PanicRunner);
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::new(),
+        calls: 0,
+    };
+
+    assert!(matches!(
+        PackageResolutionCoordinator::new(
+            &policy(),
+            &registry,
+            manager(),
+            &mut backend,
+            &mut fetch,
+        )
+        .resolve(&desired, &target, &store),
+        Err(PackageResolutionError::InvalidAptRequest)
+    ));
+    assert_eq!(fetch.calls, 0);
+}
+
+#[test]
+fn apt_backend_rejects_unauthenticated_or_unsafe_snapshots_before_fetch() {
+    let curl_bytes = b"exact curl deb";
+    let libc_bytes = b"exact libc deb";
+    for snapshot in {
+        let mut unauthenticated = apt_snapshot(curl_bytes, libc_bytes);
+        unauthenticated.signed_metadata.clear();
+        let mut unsafe_transaction = apt_snapshot(curl_bytes, libc_bytes);
+        unsafe_transaction.risks.removals.insert("old-lib".into());
+        [unauthenticated, unsafe_transaction]
+    } {
+        let registry = PackageSourceRegistry::builtin().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+        let mut backend =
+            AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
+        let mut fetch = FixtureFetch {
+            bytes: BTreeMap::new(),
+            calls: 0,
+        };
+
+        assert!(
+            PackageResolutionCoordinator::new(
+                &policy(),
+                &registry,
+                manager(),
+                &mut backend,
+                &mut fetch,
+            )
+            .resolve(&desired(), &target(), &store)
+            .is_err()
+        );
+        assert_eq!(fetch.calls, 0);
+    }
+}
+
+#[test]
+fn apt_archive_outside_the_controlled_repository_is_rejected_before_fetch() {
+    let curl_bytes = b"exact curl deb";
+    let libc_bytes = b"exact libc deb";
+    let mut snapshot = apt_snapshot(curl_bytes, libc_bytes);
+    snapshot.archives[0].immutable_locator =
+        "https://mirror.attacker.invalid/curl_8.5.0-2ubuntu10.6_amd64.deb".into();
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let mut backend = AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::new(),
+        calls: 0,
+    };
+
+    let error = PackageResolutionCoordinator::new(
+        &policy(),
+        &registry,
+        manager(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve(&desired(), &target(), &store)
+    .unwrap_err();
+    assert!(
+        matches!(error, PackageResolutionError::UnapprovedArtifactLocation),
+        "unexpected error: {error:?}"
+    );
+    assert_eq!(fetch.calls, 0);
+}
+
+#[test]
+fn apt_resolution_is_deterministic_across_solver_output_order() {
+    let curl_bytes = b"exact curl deb";
+    let libc_bytes = b"exact libc deb";
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let resolve = |snapshot: AptResolutionSnapshotV1| {
+        let bytes = BTreeMap::from([
+            (
+                "https://archive.ubuntu.com/ubuntu/pool/main/c/curl/curl_8.5.0-2ubuntu10.6_amd64.deb".into(),
+                curl_bytes.to_vec(),
+            ),
+            (
+                "https://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8.4_amd64.deb".into(),
+                libc_bytes.to_vec(),
+            ),
+        ]);
+        let mut backend =
+            AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
+        let mut fetch = FixtureFetch { bytes, calls: 0 };
+        PackageResolutionCoordinator::new(&policy(), &registry, manager(), &mut backend, &mut fetch)
+            .resolve(&desired(), &target(), &store)
+            .unwrap()
+    };
+
+    let first = resolve(apt_snapshot(curl_bytes, libc_bytes));
+    let mut reordered = apt_snapshot(curl_bytes, libc_bytes);
+    reordered.archives.reverse();
+    reordered.closure.reverse();
+    let second = resolve(reordered);
+
+    assert_eq!(first, second);
+}
+
+#[test]
+fn apt_backend_resolves_authenticated_exact_closure_and_fetches_every_archive() {
+    let curl_bytes = b"exact curl deb";
+    let libc_bytes = b"exact libc deb";
+    let curl_url =
+        "https://archive.ubuntu.com/ubuntu/pool/main/c/curl/curl_8.5.0-2ubuntu10.6_amd64.deb";
+    let libc_url =
+        "https://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8.4_amd64.deb";
+    let snapshot = apt_snapshot(curl_bytes, libc_bytes);
+    let mut backend = AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::from([
+            (curl_url.into(), curl_bytes.to_vec()),
+            (libc_url.into(), libc_bytes.to_vec()),
+        ]),
+        calls: 0,
+    };
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+
+    let intent = PackageResolutionCoordinator::new(
+        &policy(),
+        &registry,
+        manager(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve(&desired(), &target(), &store)
+    .unwrap();
+    let resolution = persisted(&intent, &store);
+
+    assert_eq!(resolution.closure.len(), 2);
+    assert_eq!(resolution.artifacts.len(), 2);
+    assert!(matches!(
+        resolution.recipe,
+        OfflineInstallRecipeV1::AptArchives { .. }
+    ));
+    assert_eq!(fetch.calls, 2);
+}

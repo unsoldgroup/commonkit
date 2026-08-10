@@ -1,0 +1,3 @@
+Remv old-lib [1.0-1]
+CommonKit-Replacement: replacement-lib
+CommonKit-Unresolved-Alternative: virtual-mailer
