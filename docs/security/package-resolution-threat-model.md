@@ -24,6 +24,29 @@ The coordinator verifies every fetched artifact's digest and size before it stor
 
 Planning, apply preparation, verification, and restart recovery load only the persisted resolution and artifacts. They do not invoke a provider, resolver, package source, network client, or secret resolver. A changed target, manager binding, source-registry definition, resolution reference, or artifact list invalidates the approved state.
 
+## Controlled APT resolution
+
+The production APT resolver is limited to Debian and Ubuntu targets with an
+exact binary name, version, architecture, suite, component set, and
+CommonKit-owned source-registry entry. It probes the distro, codename,
+architecture, `apt` and `dpkg` versions and executable digests, effective APT
+configuration, and the configured `Signed-By` key before repository access. A
+mismatch fails before `apt-get update`.
+
+APT receives private lists and archive-cache directories, a single generated
+source file, a scrubbed environment, and fixed arguments. Insecure, weak, or
+downgraded-to-insecure repositories, unauthenticated packages, proxies, and
+automatic redirects are disabled. Resolution invokes only metadata update,
+simulation, and `--print-uris --download-only`; it never invokes an install.
+The resolver requires one authenticated `InRelease`, binds its digest and the
+no-follow key-file digest, rejects held/removal/downgrade/replacement or
+unresolved-alternative outcomes, and accepts only exact SHA-256 `.deb`
+records. CommonKit preflights the complete locator set before the first
+request, then downloads every archive through the per-hop scoped fetch seam
+and verifies its digest and size before persistence.
+
 ## Deferred work
 
-This phase defines the controlled-resolution contract and trust boundary. Concrete Apt and Node resolution backends, consent, and package mutation remain separate work. Winget is not part of this phase.
+Concrete Node resolution backends, consent, and package mutation remain
+separate work. The APT resolver does not install packages, create operations,
+or write receipts. Winget is not part of this phase.

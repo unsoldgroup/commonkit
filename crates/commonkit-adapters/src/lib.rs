@@ -1,6 +1,7 @@
 //! Capability adapters supplied with CommonKit.
 
 mod apm;
+mod apt_resolution;
 mod artifacts;
 mod budget;
 mod chezmoi;
@@ -27,6 +28,12 @@ mod ssh_files;
 mod target;
 
 pub use apm::{ApmProvider, ApmProviderConfig, redacted_apm_diagnostic_summary};
+pub use apt_resolution::{
+    AptCommandSpecV1, AptRepositoryConfigurationV1, AptResolutionBackend,
+    AptResolutionCommandError, AptResolutionCommandRunner, AptResolutionSnapshotV1,
+    AptResolutionSystemRequestV1, AptResolvedArchiveV1, AptResolvedPackageV1,
+    AptTransactionRisksV1, ProcessAptResolutionCommandRunner,
+};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
 pub use budget::{
     BYTES_PER_TOKEN, BudgetEntry, BudgetError, CONTEXT_BUDGET_FIELD, ContextBudgetLedger,

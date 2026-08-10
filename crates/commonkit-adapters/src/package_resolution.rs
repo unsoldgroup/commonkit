@@ -621,6 +621,9 @@ impl<'a> PackageResolutionCoordinator<'a> {
             registry_definition_digest: &definition.digest,
         };
         let source_metadata_digest = source.metadata_digest()?;
+        for artifact in &draft.artifacts {
+            validate_fetch_request(artifact, &definition.approved_artifact_roots)?;
+        }
         let mut recording_fetch = RecordingPackageFetch {
             inner: self.fetch,
             fetched: Vec::new(),
@@ -1203,6 +1206,22 @@ pub enum PackageResolutionError {
     SourceBindingMismatch,
     #[error("package source metadata evidence contains a duplicate")]
     DuplicateSourceMetadata,
+    #[error("APT resolution request is unsupported or incomplete")]
+    InvalidAptRequest,
+    #[error("APT resolver target or manager authority does not match the controller binding")]
+    AptAuthorityMismatch,
+    #[error("APT repository metadata lacks required signed snapshot evidence")]
+    UnauthenticatedAptMetadata,
+    #[error(
+        "APT resolution would hold, remove, downgrade, replace, or leave an alternative unresolved"
+    )]
+    UnsafeAptTransaction,
+    #[error(
+        "APT resolution did not return one exact authenticated archive for every closure package"
+    )]
+    IncompleteAptClosure,
+    #[error("APT resolver backend failed: {reason}")]
+    AptBackend { reason: String },
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
     #[error(transparent)]
