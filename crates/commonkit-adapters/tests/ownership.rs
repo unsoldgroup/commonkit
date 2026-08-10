@@ -1,7 +1,7 @@
 use commonkit_adapters::{
     ContentReference, ContentSensitivity, FileMode, FilesystemIntent, NormalizedManagedPath,
     NormalizedResource, OwnershipError, OwnershipRules, ResourceProvenance, SafeSymlinkTarget,
-    materialized_resources_digest, validate_ownership,
+    SymlinkTargetKind, materialized_resources_digest, validate_ownership,
 };
 use commonkit_contracts::{Sha256Digest, StableId};
 
@@ -43,6 +43,18 @@ fn directory(provider: &str, path: &str, exact: bool) -> NormalizedResource {
         },
         provenance: provenance(provider, path),
     }
+}
+
+fn directory_with_mode(provider: &str, path: &str, exact: bool, mode: u32) -> NormalizedResource {
+    let mut resource = directory(provider, path, exact);
+    if let FilesystemIntent::Directory {
+        mode: resource_mode,
+        ..
+    } = &mut resource.intent
+    {
+        *resource_mode = Some(FileMode::parse(mode).unwrap());
+    }
+    resource
 }
 
 fn removal(provider: &str, path: &str) -> NormalizedResource {
@@ -220,6 +232,13 @@ fn destructive_ancestor_claims_cannot_enclose_protected_state() {
 
     validate_ownership(&[directory("native", "home/.ssh", false)], &rules(true))
         .expect("a non-exact ancestor cannot delete protected descendants");
+    assert!(matches!(
+        validate_ownership(
+            &[directory_with_mode("native", "home/.ssh", false, 0o700)],
+            &rules(true)
+        ),
+        Err(OwnershipError::ProtectedPath { .. })
+    ));
 }
 
 #[test]
@@ -229,6 +248,7 @@ fn symlink_targets_cannot_resolve_into_protected_state() {
         intent: FilesystemIntent::Symlink {
             path: link.clone(),
             target: SafeSymlinkTarget::parse(&link, "../.commonkit").unwrap(),
+            target_kind: SymlinkTargetKind::Directory,
             expected_before: None,
         },
         provenance: provenance("native", "protected-link"),
@@ -238,6 +258,51 @@ fn symlink_targets_cannot_resolve_into_protected_state() {
         validate_ownership(&[resource], &rules(true)),
         Err(OwnershipError::ProtectedPath { .. })
     ));
+}
+
+#[test]
+fn case_insensitive_targets_cannot_alias_declared_or_protected_roots() {
+    assert!(matches!(
+        validate_ownership(
+            &[file("native", "HOME/.COMMONKIT/receipts/1")],
+            &rules(false)
+        ),
+        Err(OwnershipError::ProtectedPath { .. })
+    ));
+    assert!(matches!(
+        validate_ownership(&[file("native", "OTHER/config")], &rules(false)),
+        Err(OwnershipError::OutsideDeclaredRoot { .. })
+    ));
+}
+
+#[test]
+fn legacy_file_symlink_intents_keep_their_wire_shape() {
+    let path = NormalizedManagedPath::parse("home/bin/tool").unwrap();
+    let file_target = FilesystemIntent::Symlink {
+        path: path.clone(),
+        target: SafeSymlinkTarget::parse(&path, "../lib/tool").unwrap(),
+        target_kind: SymlinkTargetKind::File,
+        expected_before: None,
+    };
+    let directory_target = FilesystemIntent::Symlink {
+        path,
+        target: SafeSymlinkTarget::parse(
+            &NormalizedManagedPath::parse("home/bin/tool").unwrap(),
+            "../lib/tool",
+        )
+        .unwrap(),
+        target_kind: SymlinkTargetKind::Directory,
+        expected_before: None,
+    };
+
+    assert!(
+        serde_json::to_value(file_target).unwrap()["target_kind"].is_null(),
+        "the default file kind must not change legacy payload bytes"
+    );
+    assert_eq!(
+        serde_json::to_value(directory_target).unwrap()["target_kind"],
+        "directory"
+    );
 }
 
 #[test]

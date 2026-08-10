@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 struct Remote {
     files: BTreeMap<String, Vec<u8>>,
     directories: BTreeMap<String, Option<u32>>,
-    symlinks: BTreeMap<String, String>,
+    symlinks: BTreeMap<String, (String, SymlinkTargetKind)>,
     writes: usize,
     fail_write: Option<usize>,
 }
@@ -28,9 +28,10 @@ impl SshFilesystemTransport for Memory {
                     }
                 } else if let Some(mode) = remote.directories.get(path.as_str()) {
                     TargetResource::Directory { mode: *mode }
-                } else if let Some(target) = remote.symlinks.get(path.as_str()) {
+                } else if let Some((target, target_kind)) = remote.symlinks.get(path.as_str()) {
                     TargetResource::Symlink {
                         target: target.clone(),
+                        target_kind: *target_kind,
                     }
                 } else {
                     TargetResource::Absent
@@ -65,12 +66,17 @@ impl SshFilesystemTransport for Memory {
                     .insert(path.to_string(), mode.as_ref().map(FileMode::value));
                 Ok(SshFilesystemResponse::Applied)
             }
-            SshFilesystemRequest::WriteSymlink { path, target, .. } => {
+            SshFilesystemRequest::WriteSymlink {
+                path,
+                target,
+                target_kind,
+                ..
+            } => {
                 remote.files.remove(path.as_str());
                 remote.directories.remove(path.as_str());
                 remote
                     .symlinks
-                    .insert(path.to_string(), target.as_str().to_owned());
+                    .insert(path.to_string(), (target.as_str().to_owned(), target_kind));
                 Ok(SshFilesystemResponse::Applied)
             }
             SshFilesystemRequest::Remove { path, .. } => {
@@ -156,6 +162,7 @@ fn relative_symlink_state() -> MaterializedState {
             intent: FilesystemIntent::Symlink {
                 path: link.clone(),
                 target: SafeSymlinkTarget::parse(&link, "../../.agents/skills/tool").unwrap(),
+                target_kind: SymlinkTargetKind::Directory,
                 expected_before: None,
             },
             provenance: ResourceProvenance {
@@ -294,7 +301,10 @@ fn relative_directories_and_symlinks_plan_apply_and_verify_over_typed_ssh() {
     );
     assert_eq!(
         resources.symlinks["home/.codex/skills/tool"],
-        "../../.agents/skills/tool"
+        (
+            "../../.agents/skills/tool".into(),
+            SymlinkTargetKind::Directory
+        )
     );
     drop(resources);
 
@@ -317,7 +327,10 @@ fn unsafe_remote_symlink_preimages_fail_before_planning() {
     let remote = Memory::default();
     remote.0.lock().unwrap().symlinks.insert(
         "home/.codex/skills/tool".into(),
-        "/outside/absolute-target".into(),
+        (
+            "/outside/absolute-target".into(),
+            SymlinkTargetKind::Directory,
+        ),
     );
     let mut adapter =
         SshFileAdapter::open(StableId::parse("home-root").unwrap(), &temp, remote).unwrap();
@@ -326,6 +339,77 @@ fn unsafe_remote_symlink_preimages_fail_before_planning() {
         adapter.observed_state_digest(desired.resources.iter().map(|resource| &resource.intent)),
         Err(SshFileAdapterError::Resource(_))
     ));
+
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn rollback_refuses_to_overwrite_substituted_remote_directory_or_symlink() {
+    let temp = root("rollback-substitution");
+    let artifacts = ArtifactStore::open(temp.join("artifacts")).unwrap();
+    let desired = relative_symlink_state();
+
+    let directory_remote = Memory::default();
+    let (directory_plan, mut directory_adapter) = build(
+        &temp.join("directory"),
+        directory_remote.clone(),
+        &desired,
+        &artifacts,
+    );
+    let directory_operation = directory_plan
+        .operations
+        .iter()
+        .find(|operation| operation.resource.resource_type.as_str() == "remote-directory")
+        .unwrap();
+    directory_adapter.prepare(directory_operation).unwrap();
+    directory_adapter.apply(directory_operation).unwrap();
+    {
+        let mut remote = directory_remote.0.lock().unwrap();
+        remote
+            .directories
+            .remove("home/.agents/skills/tool")
+            .unwrap();
+        remote
+            .files
+            .insert("home/.agents/skills/tool".into(), b"substituted".to_vec());
+    }
+    let error = directory_adapter.rollback(directory_operation).unwrap_err();
+    assert_eq!(error.code, "rollback_preimage_changed");
+    assert_eq!(
+        directory_remote.0.lock().unwrap().files["home/.agents/skills/tool"],
+        b"substituted"
+    );
+
+    let symlink_remote = Memory::default();
+    let (symlink_plan, mut symlink_adapter) = build(
+        &temp.join("symlink"),
+        symlink_remote.clone(),
+        &desired,
+        &artifacts,
+    );
+    let symlink_operation = symlink_plan
+        .operations
+        .iter()
+        .find(|operation| operation.resource.resource_type.as_str() == "remote-symlink")
+        .unwrap();
+    symlink_adapter.prepare(symlink_operation).unwrap();
+    symlink_adapter.apply(symlink_operation).unwrap();
+    symlink_remote.0.lock().unwrap().symlinks.insert(
+        "home/.codex/skills/tool".into(),
+        (
+            "../../.agents/skills/substitute".into(),
+            SymlinkTargetKind::Directory,
+        ),
+    );
+    let error = symlink_adapter.rollback(symlink_operation).unwrap_err();
+    assert_eq!(error.code, "rollback_preimage_changed");
+    assert_eq!(
+        symlink_remote.0.lock().unwrap().symlinks["home/.codex/skills/tool"],
+        (
+            "../../.agents/skills/substitute".into(),
+            SymlinkTargetKind::Directory
+        )
+    );
 
     std::fs::remove_dir_all(temp).unwrap();
 }

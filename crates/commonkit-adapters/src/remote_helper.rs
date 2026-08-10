@@ -84,8 +84,10 @@ impl TargetHelper {
                 root_id,
                 path,
                 target,
+                target_kind,
             } => {
-                self.root(&root_id)?.write_symlink(&path, &target)?;
+                self.root(&root_id)?
+                    .write_symlink(&path, &target, target_kind)?;
                 Ok(SshFilesystemResponse::Applied)
             }
             SshFilesystemRequest::Remove { root_id, path } => {

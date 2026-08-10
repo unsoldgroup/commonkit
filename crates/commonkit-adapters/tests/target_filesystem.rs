@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_adapters::{
     FileMode, LocalTargetFilesystem, NormalizedManagedPath, SafeSymlinkTarget,
-    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, TargetFilesystem,
-    TargetFilesystemError, TargetResource,
+    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, SymlinkTargetKind,
+    TargetFilesystem, TargetFilesystemError, TargetResource,
 };
 use commonkit_core::RootAccess;
 
@@ -124,7 +124,9 @@ fn local_filesystem_observes_and_applies_relative_directories_and_symlinks_witho
     target
         .write_directory(&source, Some(&FileMode::parse(0o700).unwrap()))
         .unwrap();
-    target.write_symlink(&link, &relative).unwrap();
+    target
+        .write_symlink(&link, &relative, SymlinkTargetKind::Directory)
+        .unwrap();
 
     assert!(matches!(
         target.inspect_resource(&source).unwrap(),
@@ -133,7 +135,8 @@ fn local_filesystem_observes_and_applies_relative_directories_and_symlinks_witho
     assert_eq!(
         target.inspect_resource(&link).unwrap(),
         TargetResource::Symlink {
-            target: "../../.agents/skills/tool".into()
+            target: "../../.agents/skills/tool".into(),
+            target_kind: SymlinkTargetKind::Directory,
         }
     );
     assert!(matches!(
@@ -163,6 +166,7 @@ fn ssh_boundary_exposes_typed_relative_directory_and_symlink_requests() {
             root_id: commonkit_core::StableId::parse("home").unwrap(),
             path: link.clone(),
             target: SafeSymlinkTarget::parse(&link, "../../.agents/skills/tool").unwrap(),
+            target_kind: SymlinkTargetKind::Directory,
         },
     ];
     for request in &requests {
@@ -172,4 +176,77 @@ fn ssh_boundary_exposes_typed_relative_directory_and_symlink_requests() {
         );
     }
     assert_eq!(ssh.requests, requests);
+}
+
+#[cfg(not(unix))]
+#[test]
+fn local_filesystem_rejects_modes_the_target_cannot_apply() {
+    let root = temp("unsupported-mode");
+    fs::create_dir_all(&root).unwrap();
+    let target = LocalTargetFilesystem::open(&root, RootAccess::ReadWrite).unwrap();
+    let path = NormalizedManagedPath::parse("config").unwrap();
+
+    assert!(matches!(
+        target.write_directory(&path, Some(&FileMode::parse(0o700).unwrap())),
+        Err(TargetFilesystemError::UnsupportedMode)
+    ));
+    assert!(!root.join("config").exists());
+
+    drop(target);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn local_filesystem_rejects_junction_ancestors() {
+    let root = temp("junction-root");
+    let root_junction = temp("junction-root-capability");
+    let outside = temp("junction-outside");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    let junction = |link: &std::path::Path| {
+        let status = std::process::Command::new("cmd")
+            .args([
+                "/c",
+                "mklink",
+                "/J",
+                link.to_str().unwrap(),
+                outside.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    junction(&root_junction);
+    junction(&root.join("escape"));
+    junction(&root.join("leaf"));
+    assert!(matches!(
+        LocalTargetFilesystem::open(&root_junction, RootAccess::ReadWrite),
+        Err(TargetFilesystemError::InvalidRoot)
+    ));
+    assert!(
+        !fs::symlink_metadata(root.join("escape"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let target = LocalTargetFilesystem::open(&root, RootAccess::ReadWrite).unwrap();
+
+    assert!(matches!(
+        target.write_file(&NormalizedManagedPath::parse("escape/new").unwrap(), b"bad"),
+        Err(TargetFilesystemError::SymlinkEncountered(_))
+    ));
+    assert!(!outside.join("new").exists());
+    assert!(matches!(
+        target.remove_resource(&NormalizedManagedPath::parse("leaf").unwrap()),
+        Err(TargetFilesystemError::Io(_))
+    ));
+    assert!(outside.exists());
+
+    drop(target);
+    fs::remove_dir(root_junction).unwrap();
+    fs::remove_dir(root.join("escape")).unwrap();
+    fs::remove_dir(root.join("leaf")).unwrap();
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
 }

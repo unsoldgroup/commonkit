@@ -138,7 +138,7 @@ impl SafeSymlinkTarget {
         Self::parse(link, self.0.clone()).map(|_| ())
     }
 
-    fn resolved_for(
+    pub(crate) fn resolved_for(
         &self,
         link: &NormalizedManagedPath,
     ) -> Result<NormalizedManagedPath, ResourceError> {
@@ -182,6 +182,20 @@ impl From<SafeSymlinkTarget> for String {
 
 pub type ResourceProvenance = commonkit_contracts::OperationProvenance;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymlinkTargetKind {
+    #[default]
+    File,
+    Directory,
+}
+
+impl SymlinkTargetKind {
+    pub(crate) fn is_file(value: &Self) -> bool {
+        *value == Self::File
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FilesystemIntent {
@@ -199,6 +213,8 @@ pub enum FilesystemIntent {
     Symlink {
         path: NormalizedManagedPath,
         target: SafeSymlinkTarget,
+        #[serde(default, skip_serializing_if = "SymlinkTargetKind::is_file")]
+        target_kind: SymlinkTargetKind,
         expected_before: Option<Sha256Digest>,
     },
     Remove {
@@ -281,6 +297,19 @@ impl OwnershipRules {
             &(self.case_sensitive, declared_roots, protected_roots),
         )
     }
+
+    fn contains_path(&self, path: &NormalizedManagedPath, root: &NormalizedManagedPath) -> bool {
+        if self.case_sensitive {
+            path.is_within(root)
+        } else {
+            let path = path.as_str().to_lowercase();
+            let root = root.as_str().to_lowercase();
+            path == root
+                || path
+                    .strip_prefix(&root)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,21 +336,26 @@ pub fn validate_ownership(
             if rules
                 .protected_roots
                 .iter()
-                .any(|root| resolved.is_within(root))
+                .any(|root| rules.contains_path(&resolved, root))
             {
                 return Err(OwnershipError::ProtectedPath { path: path.clone() });
             }
         }
-        if !rules.declared_roots.iter().any(|root| path.is_within(root)) {
+        if !rules
+            .declared_roots
+            .iter()
+            .any(|root| rules.contains_path(path, root))
+        {
             return Err(OwnershipError::OutsideDeclaredRoot { path: path.clone() });
         }
         if rules.protected_roots.iter().any(|root| {
-            path.is_within(root)
+            rules.contains_path(path, root)
                 || (matches!(
                     resource.intent,
                     FilesystemIntent::Remove { .. }
                         | FilesystemIntent::Directory { exact: true, .. }
-                ) && root.is_within(path))
+                        | FilesystemIntent::Directory { mode: Some(_), .. }
+                ) && rules.contains_path(root, path))
         }) {
             return Err(OwnershipError::ProtectedPath { path: path.clone() });
         }
@@ -358,7 +392,7 @@ pub fn validate_ownership(
     {
         for descendant in &claims {
             if exact.intent.path() != descendant.intent.path()
-                && descendant.intent.path().is_within(exact.intent.path())
+                && rules.contains_path(descendant.intent.path(), exact.intent.path())
                 && exact.provenance.provider_id != descendant.provenance.provider_id
             {
                 return Err(OwnershipError::ExactDirectoryConflict {
