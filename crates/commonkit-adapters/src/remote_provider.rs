@@ -5,8 +5,8 @@ use thiserror::Error;
 
 use crate::{
     ArtifactError, ArtifactStore, ContentSensitivity, DesiredStateProvider, MaterializedState,
-    ProviderContext, ProviderFailure, ProviderWorkspace, SshFilesystemRequest,
-    SshFilesystemResponse, SshFilesystemTransport, TargetFilesystemError,
+    ProviderContext, ProviderFailure, ProviderWorkspace, ResolvedMaterializedState,
+    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, TargetFilesystemError,
 };
 
 /// Durable provenance for provider artifacts copied to a remote target's private store.
@@ -54,10 +54,36 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
         run_id: StableId,
     ) -> Result<RemoteMaterializationReceipt, RemoteProviderStagingError> {
         state.verify()?;
+        self.stage_state(state, artifacts, target_id, run_id)
+    }
+
+    pub fn stage_resolved_materialized(
+        &mut self,
+        state: &ResolvedMaterializedState,
+        artifacts: &ArtifactStore,
+        target_id: StableId,
+        run_id: StableId,
+    ) -> Result<RemoteMaterializationReceipt, RemoteProviderStagingError> {
+        state.verify()?;
+        for resource in &state.resources {
+            if let crate::ResourceIntent::ResolvedPackage(intent) = &resource.intent {
+                intent.load_persisted(artifacts)?;
+            }
+        }
+        self.stage_state(state, artifacts, target_id, run_id)
+    }
+
+    fn stage_state<S: RemoteStagingState>(
+        &mut self,
+        state: &S,
+        artifacts: &ArtifactStore,
+        target_id: StableId,
+        run_id: StableId,
+    ) -> Result<RemoteMaterializationReceipt, RemoteProviderStagingError> {
         self.validate_before_remote_contact(state)?;
 
         let references = state
-            .resources
+            .resources()
             .iter()
             .flat_map(|resource| resource.artifact_references())
             .collect::<Vec<_>>();
@@ -112,25 +138,25 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
 
         Ok(RemoteMaterializationReceipt {
             target_id,
-            provider_id: state.inputs.provider_id.clone(),
-            provider_version: state.inputs.provider_version.to_string(),
-            provider_inputs_digest: state.inputs.input_set_digest.clone(),
-            materialized_state_digest: state.digest.clone(),
+            provider_id: state.inputs().provider_id.clone(),
+            provider_version: state.inputs().provider_version.to_string(),
+            provider_inputs_digest: state.inputs().input_set_digest.clone(),
+            materialized_state_digest: state.digest().clone(),
             artifact_digests,
         })
     }
 
-    fn validate_before_remote_contact(
+    fn validate_before_remote_contact<S: RemoteStagingState>(
         &self,
-        state: &MaterializedState,
+        state: &S,
     ) -> Result<(), RemoteProviderStagingError> {
-        if !state.unsupported.is_empty() {
+        if !state.unsupported().is_empty() {
             return Err(RemoteProviderStagingError::UnsupportedOutput);
         }
-        if !state.declared_side_effects.is_empty() {
+        if !state.declared_side_effects().is_empty() {
             return Err(RemoteProviderStagingError::UnplannedSideEffects);
         }
-        if state.resources.iter().any(|resource| {
+        if state.resources().iter().any(|resource| {
             resource
                 .artifact_references()
                 .into_iter()
@@ -139,6 +165,50 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
             return Err(RemoteProviderStagingError::SensitiveArtifact);
         }
         Ok(())
+    }
+}
+
+trait RemoteStagingState {
+    fn inputs(&self) -> &crate::ProviderInputs;
+    fn resources(&self) -> &[crate::NormalizedResource];
+    fn declared_side_effects(&self) -> &[crate::DeclaredSideEffect];
+    fn unsupported(&self) -> &[crate::UnsupportedCapability];
+    fn digest(&self) -> &Sha256Digest;
+}
+
+impl RemoteStagingState for MaterializedState {
+    fn inputs(&self) -> &crate::ProviderInputs {
+        &self.inputs
+    }
+    fn resources(&self) -> &[crate::NormalizedResource] {
+        &self.resources
+    }
+    fn declared_side_effects(&self) -> &[crate::DeclaredSideEffect] {
+        &self.declared_side_effects
+    }
+    fn unsupported(&self) -> &[crate::UnsupportedCapability] {
+        &self.unsupported
+    }
+    fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+}
+
+impl RemoteStagingState for ResolvedMaterializedState {
+    fn inputs(&self) -> &crate::ProviderInputs {
+        &self.inputs
+    }
+    fn resources(&self) -> &[crate::NormalizedResource] {
+        &self.resources
+    }
+    fn declared_side_effects(&self) -> &[crate::DeclaredSideEffect] {
+        &self.declared_side_effects
+    }
+    fn unsupported(&self) -> &[crate::UnsupportedCapability] {
+        &self.unsupported
+    }
+    fn digest(&self) -> &Sha256Digest {
+        &self.digest
     }
 }
 
@@ -162,6 +232,8 @@ pub enum RemoteProviderStagingError {
     ProviderContract(#[from] crate::ProviderContractError),
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
+    #[error(transparent)]
+    PackageResolution(#[from] crate::PackageResolutionError),
     #[error(transparent)]
     Target(#[from] TargetFilesystemError),
 }

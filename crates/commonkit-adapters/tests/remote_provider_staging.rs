@@ -4,7 +4,7 @@ use std::fs;
 use commonkit_adapters::{
     ArtifactStore, ContentSensitivity, DesiredStateProvider, ExactProviderVersion,
     FilesystemIntent, MaterializedState, NormalizedManagedPath, NormalizedResource,
-    PackageResourceIntent, ProviderContext, ProviderFailure, ProviderInputs, ProviderWorkspace,
+    PackageDesiredIntent, ProviderContext, ProviderFailure, ProviderInputs, ProviderWorkspace,
     RemoteProviderStager, ResourceProvenance, SshFilesystemRequest, SshFilesystemResponse,
     SshFilesystemTransport, TargetFilesystemError,
 };
@@ -189,7 +189,7 @@ fn stages_pipeline_output_without_re_running_the_provider() {
 }
 
 #[test]
-fn stages_package_resolution_and_artifacts_through_the_same_typed_transport() {
+fn provider_package_desire_cannot_stage_controller_owned_resolution_artifacts() {
     let (root, _staging, artifacts) = roots("package-output");
     let store = ArtifactStore::open(&artifacts).unwrap();
     let inputs = ProviderInputs::new(
@@ -200,23 +200,16 @@ fn stages_package_resolution_and_artifacts_through_the_same_typed_transport() {
         vec!["package".into()],
     )
     .unwrap();
-    let resolution = store
-        .put(b"resolution", ContentSensitivity::Portable)
-        .unwrap();
-    let artifact = store.put(b"package", ContentSensitivity::Portable).unwrap();
     let state = MaterializedState::finalize(
         inputs.clone(),
         vec![NormalizedResource {
-            intent: PackageResourceIntent::new(
-                PackageDeclaration {
-                    id: StableId::parse("ripgrep").unwrap(),
-                    version: "14.1.1".into(),
-                    manager: PackageManager::Homebrew,
-                    source: StableId::parse("homebrew-core").unwrap(),
-                },
-                resolution,
-                vec![artifact],
-            )
+            intent: PackageDesiredIntent::new(PackageDeclaration {
+                id: StableId::parse("ripgrep").unwrap(),
+                version: "14.1.1".into(),
+                manager: PackageManager::Homebrew,
+                source: StableId::parse("homebrew-core").unwrap(),
+                selector: None,
+            })
             .unwrap()
             .into(),
             provenance: ResourceProvenance {
@@ -240,8 +233,8 @@ fn stages_package_resolution_and_artifacts_through_the_same_typed_transport() {
         )
         .unwrap();
 
-    assert_eq!(receipt.artifact_digests.len(), 2);
-    assert_eq!(transport.requests.len(), 4);
+    assert!(receipt.artifact_digests.is_empty());
+    assert!(transport.requests.is_empty());
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -254,7 +247,7 @@ fn conflicting_metadata_for_one_digest_fails_before_remote_staging() {
         ExactProviderVersion::parse("1.0.0").unwrap(),
         "provider.v2".into(),
         BTreeMap::from([("policy".into(), digest('a'))]),
-        vec!["package".into()],
+        vec!["filesystem".into()],
     )
     .unwrap();
     let resolution = store
@@ -264,26 +257,38 @@ fn conflicting_metadata_for_one_digest_fails_before_remote_staging() {
     conflicting.bytes += 1;
     let state = MaterializedState::finalize(
         inputs.clone(),
-        vec![NormalizedResource {
-            intent: PackageResourceIntent::new(
-                PackageDeclaration {
-                    id: StableId::parse("ripgrep").unwrap(),
-                    version: "14.1.1".into(),
-                    manager: PackageManager::Homebrew,
-                    source: StableId::parse("homebrew-core").unwrap(),
+        vec![
+            NormalizedResource {
+                intent: FilesystemIntent::File {
+                    path: NormalizedManagedPath::parse("home/first").unwrap(),
+                    content: resolution,
+                    mode: None,
+                    expected_before: None,
+                }
+                .into(),
+                provenance: ResourceProvenance {
+                    provider_id: inputs.provider_id.clone(),
+                    provider_version: inputs.provider_version.to_string(),
+                    input_digest: inputs.input_set_digest.clone(),
+                    source: "file:first".into(),
                 },
-                resolution,
-                vec![conflicting],
-            )
-            .unwrap()
-            .into(),
-            provenance: ResourceProvenance {
-                provider_id: inputs.provider_id,
-                provider_version: inputs.provider_version.to_string(),
-                input_digest: inputs.input_set_digest,
-                source: "package:ripgrep".into(),
             },
-        }],
+            NormalizedResource {
+                intent: FilesystemIntent::File {
+                    path: NormalizedManagedPath::parse("home/second").unwrap(),
+                    content: conflicting,
+                    mode: None,
+                    expected_before: None,
+                }
+                .into(),
+                provenance: ResourceProvenance {
+                    provider_id: inputs.provider_id,
+                    provider_version: inputs.provider_version.to_string(),
+                    input_digest: inputs.input_set_digest,
+                    source: "file:second".into(),
+                },
+            },
+        ],
         vec![],
         vec![],
     )

@@ -8,9 +8,10 @@ use thiserror::Error;
 
 use crate::{
     ArtifactError, ArtifactStore, DeclaredSideEffect, FileAdapter, FileAdapterError,
-    MaterializedState, NormalizedResource, OwnershipError, OwnershipRules, PackageResourceIntent,
-    ProviderContractError, ResourceProvenance, ResourceType, SshFileAdapter, SshFileAdapterError,
-    SshFilesystemTransport, validate_ownership,
+    MaterializedState, NormalizedResource, OwnershipError, OwnershipRules, ProviderContractError,
+    ResolvedMaterializedState, ResolvedPackageIntent, ResourceProvenance, ResourceType,
+    SshFileAdapter, SshFileAdapterError, SshFilesystemTransport, UnsupportedCapability,
+    validate_ownership,
 };
 use commonkit_reconcile::Adapter;
 
@@ -81,7 +82,7 @@ pub trait PackageResourcePlanner {
     fn register_package_resource(
         &mut self,
         id: StableId,
-        intent: &PackageResourceIntent,
+        intent: &ResolvedPackageIntent,
         provenance: &ResourceProvenance,
         provider_artifacts: &ArtifactStore,
     ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError>;
@@ -180,6 +181,10 @@ impl<'a> ProviderResourceRouter<'a> {
                 (adapter_id, Some(route), operation)
             }
             crate::ResourceIntent::Package(intent) => {
+                let _ = intent;
+                return Err(ProviderPlanError::PackageResolutionRequired);
+            }
+            crate::ResourceIntent::ResolvedPackage(intent) => {
                 let planner = self.package.as_deref_mut().ok_or(
                     ProviderPlanError::MissingResourcePlanner(ResourceType::Package),
                 )?;
@@ -203,7 +208,13 @@ impl<'a> ProviderResourceRouter<'a> {
             });
         }
         if let Some(operation) = &operation {
-            validate_operation_binding(id, resource, filesystem_route, operation)?;
+            validate_operation_binding(
+                id,
+                resource,
+                filesystem_route,
+                operation,
+                provider_artifacts,
+            )?;
         }
         Ok(operation)
     }
@@ -214,6 +225,7 @@ fn validate_operation_binding(
     resource: &NormalizedResource,
     filesystem_route: Option<FilesystemPlannerRoute>,
     operation: &commonkit_contracts::Operation,
+    provider_artifacts: &ArtifactStore,
 ) -> Result<(), ProviderPlanError> {
     let (resource_type, managed_path, after_digest, payload_digest) = match &resource.intent {
         crate::ResourceIntent::Filesystem(intent) => {
@@ -233,6 +245,10 @@ fn validate_operation_binding(
             )
         }
         crate::ResourceIntent::Package(_) => {
+            return Err(ProviderPlanError::PackageResolutionRequired);
+        }
+        crate::ResourceIntent::ResolvedPackage(intent) => {
+            intent.load_persisted(provider_artifacts)?;
             let desired_digest = resource.desired_digest()?;
             (
                 StableId::parse("package").expect("static resource type"),
@@ -276,6 +292,22 @@ pub fn provider_plan_bindings(
     states: &[MaterializedState],
     provider_artifacts: &ArtifactStore,
 ) -> Result<PlanBindings, ProviderPlanError> {
+    authority_plan_bindings(request, states, provider_artifacts)
+}
+
+pub fn resolved_provider_plan_bindings(
+    request: ProviderPlanRequest<'_>,
+    states: &[ResolvedMaterializedState],
+    provider_artifacts: &ArtifactStore,
+) -> Result<PlanBindings, ProviderPlanError> {
+    authority_plan_bindings(request, states, provider_artifacts)
+}
+
+fn authority_plan_bindings<S: ProviderPlanningState>(
+    request: ProviderPlanRequest<'_>,
+    states: &[S],
+    provider_artifacts: &ArtifactStore,
+) -> Result<PlanBindings, ProviderPlanError> {
     struct AuthorityOnlyFilesystemPlanner {
         id: StableId,
     }
@@ -308,7 +340,7 @@ pub fn provider_plan_bindings(
         fn register_package_resource(
             &mut self,
             _id: StableId,
-            _intent: &PackageResourceIntent,
+            _intent: &ResolvedPackageIntent,
             _provenance: &ResourceProvenance,
             _provider_artifacts: &ArtifactStore,
         ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
@@ -325,7 +357,7 @@ pub fn provider_plan_bindings(
         ProviderPlannerRoute::Filesystem(&mut filesystem),
         ProviderPlannerRoute::Package(&mut package),
     ])?;
-    Ok(build_provider_plan_with_router(request, states, provider_artifacts, &mut router)?.bindings)
+    Ok(build_provider_plan_from_states(request, states, provider_artifacts, &mut router)?.bindings)
 }
 
 pub fn build_provider_plan<P: ProviderResourcePlanner>(
@@ -344,18 +376,87 @@ pub fn build_provider_plan_with_router(
     provider_artifacts: &ArtifactStore,
     router: &mut ProviderResourceRouter<'_>,
 ) -> Result<Plan, ProviderPlanError> {
+    build_provider_plan_from_states(request, states, provider_artifacts, router)
+}
+
+pub fn build_resolved_provider_plan_with_router(
+    request: ProviderPlanRequest<'_>,
+    states: &[ResolvedMaterializedState],
+    provider_artifacts: &ArtifactStore,
+    router: &mut ProviderResourceRouter<'_>,
+) -> Result<Plan, ProviderPlanError> {
+    build_provider_plan_from_states(request, states, provider_artifacts, router)
+}
+
+trait ProviderPlanningState {
+    fn verify_state(&self) -> Result<(), ProviderContractError>;
+    fn inputs(&self) -> &crate::ProviderInputs;
+    fn resources(&self) -> &[NormalizedResource];
+    fn declared_side_effects(&self) -> &[DeclaredSideEffect];
+    fn unsupported(&self) -> &[UnsupportedCapability];
+    fn digest(&self) -> &Sha256Digest;
+}
+
+impl ProviderPlanningState for MaterializedState {
+    fn verify_state(&self) -> Result<(), ProviderContractError> {
+        self.verify()
+    }
+    fn inputs(&self) -> &crate::ProviderInputs {
+        &self.inputs
+    }
+    fn resources(&self) -> &[NormalizedResource] {
+        &self.resources
+    }
+    fn declared_side_effects(&self) -> &[DeclaredSideEffect] {
+        &self.declared_side_effects
+    }
+    fn unsupported(&self) -> &[UnsupportedCapability] {
+        &self.unsupported
+    }
+    fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+}
+
+impl ProviderPlanningState for ResolvedMaterializedState {
+    fn verify_state(&self) -> Result<(), ProviderContractError> {
+        self.verify()
+    }
+    fn inputs(&self) -> &crate::ProviderInputs {
+        &self.inputs
+    }
+    fn resources(&self) -> &[NormalizedResource] {
+        &self.resources
+    }
+    fn declared_side_effects(&self) -> &[DeclaredSideEffect] {
+        &self.declared_side_effects
+    }
+    fn unsupported(&self) -> &[UnsupportedCapability] {
+        &self.unsupported
+    }
+    fn digest(&self) -> &Sha256Digest {
+        &self.digest
+    }
+}
+
+fn build_provider_plan_from_states<S: ProviderPlanningState>(
+    request: ProviderPlanRequest<'_>,
+    states: &[S],
+    provider_artifacts: &ArtifactStore,
+    router: &mut ProviderResourceRouter<'_>,
+) -> Result<Plan, ProviderPlanError> {
     let mut resources = Vec::new();
     let mut state_digests = Vec::new();
     let mut input_digests = Vec::new();
     let mut provider_ids = BTreeSet::new();
     for state in states {
-        state.verify()?;
-        if !provider_ids.insert(state.inputs.provider_id.as_str().to_owned()) {
+        state.verify_state()?;
+        if !provider_ids.insert(state.inputs().provider_id.as_str().to_owned()) {
             return Err(ProviderPlanError::DuplicateProvider(
-                state.inputs.provider_id.clone(),
+                state.inputs().provider_id.clone(),
             ));
         }
-        if let Some(unsupported) = state.unsupported.first() {
+        if let Some(unsupported) = state.unsupported().first() {
             return Err(ProviderPlanError::UnsupportedCapability {
                 entry: unsupported.source.clone(),
                 capability: unsupported.capability.clone(),
@@ -363,15 +464,15 @@ pub fn build_provider_plan_with_router(
             });
         }
         if let Some(effect) = state
-            .declared_side_effects
+            .declared_side_effects()
             .iter()
             .find(|effect| !request.mapped_side_effects.contains(*effect))
         {
             return Err(ProviderPlanError::UnmappedSideEffect(effect.clone()));
         }
-        state_digests.push(state.digest.clone());
-        input_digests.push(state.inputs.digest().clone());
-        resources.extend(state.resources.iter().cloned());
+        state_digests.push(state.digest().clone());
+        input_digests.push(state.inputs().digest().clone());
+        resources.extend(state.resources().iter().cloned());
     }
     validate_ownership(&resources, request.ownership_rules)?;
     let filesystem_only = resources
@@ -402,6 +503,17 @@ pub fn build_provider_plan_with_router(
                 right.provenance.source.as_str(),
             ))
     });
+    for resource in &ordered {
+        match &resource.intent {
+            crate::ResourceIntent::Package(_) => {
+                return Err(ProviderPlanError::PackageResolutionRequired);
+            }
+            crate::ResourceIntent::ResolvedPackage(intent) => {
+                intent.load_persisted(provider_artifacts)?;
+            }
+            crate::ResourceIntent::Filesystem(_) => {}
+        }
+    }
     let resource_map_digest = digest_domain_json(
         if filesystem_only {
             "commonkit.ownership-map.v1"
@@ -494,6 +606,8 @@ pub enum ProviderPlanError {
     DuplicateProvider(StableId),
     #[error("resource planner is not installed for {0:?}")]
     MissingResourcePlanner(ResourceType),
+    #[error("package desired intent must be resolved by the trusted controller before planning")]
+    PackageResolutionRequired,
     #[error("more than one resource planner is installed for {0:?}")]
     DuplicateResourcePlanner(ResourceType),
     #[error("adapter {adapter_id} is not a fixed route for {resource_type:?}")]
@@ -532,6 +646,8 @@ pub enum ProviderPlanError {
     Adapter(#[from] FileAdapterError),
     #[error(transparent)]
     RemoteAdapter(#[from] SshFileAdapterError),
+    #[error(transparent)]
+    PackageResolution(#[from] crate::PackageResolutionError),
     #[error(transparent)]
     Plan(#[from] PlanBuildError),
     #[error(transparent)]

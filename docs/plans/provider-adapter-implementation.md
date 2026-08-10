@@ -22,6 +22,8 @@ native providers ─┘              |
 
 Providers compute. Adapters mutate. Recovery consumes only durable plans, artifact manifests, artifacts, backup records, and receipts; it never re-runs a provider, downloads content, evaluates templates, or resolves credentials.
 
+Package resolution is a controller step after provider materialization. Providers emit `PackageDesiredIntent` with an exact declaration and typed selector. `PackageResolutionCoordinator` validates policy, target, manager, and the CommonKit-owned source registry before it gives a fetch capability to a registered resolution backend. It persists `PackageResolutionV1` and all verified artifacts in the private artifact store. Package planners accept only `ResolvedPackageIntent`; they cannot fetch or re-resolve.
+
 SkillOpt is adjacent to, not inside, this desired-target provider fan-in. It computes immutable skill candidates under an independent evidence/policy harness. After human promotion into Git, APM materializes the approved source through this pipeline. See `docs/plans/skillopt-v1-integration.md`.
 
 ## Cold inventory

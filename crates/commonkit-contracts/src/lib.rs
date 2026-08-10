@@ -844,7 +844,76 @@ pub enum PackageManager {
     Rustup,
 }
 
-/// An exact, observe-only package declaration.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RustToolchainProfile {
+    Minimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PackageSelector {
+    HomebrewFormula {
+        name: String,
+    },
+    AptBinary {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        architecture: Option<String>,
+    },
+    NodeRuntime {},
+    RustToolchain {
+        profile: RustToolchainProfile,
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        components: BTreeSet<String>,
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        targets: BTreeSet<String>,
+    },
+}
+
+impl PackageSelector {
+    fn validate_for(&self, manager: PackageManager) -> Result<(), ContractError> {
+        let valid = match (manager, self) {
+            (PackageManager::Homebrew, Self::HomebrewFormula { name }) => safe_selector(name),
+            (PackageManager::Apt, Self::AptBinary { name, architecture }) => {
+                safe_selector(name) && architecture.as_deref().is_none_or(safe_selector)
+            }
+            (PackageManager::Fnm | PackageManager::Nvm, Self::NodeRuntime {}) => true,
+            (
+                PackageManager::Rustup,
+                Self::RustToolchain {
+                    profile: RustToolchainProfile::Minimal,
+                    components,
+                    targets,
+                },
+            ) => {
+                components.iter().all(|value| safe_selector(value))
+                    && targets.iter().all(|value| safe_selector(value))
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ContractError::InvalidPackageDeclaration)
+        }
+    }
+}
+
+fn safe_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.contains("..")
+        && !value.starts_with(['/', '-', '.'])
+        && !value.ends_with('/')
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._+@/-".contains(character))
+}
+
+/// An exact package declaration resolved only by the trusted controller.
 ///
 /// `id` is the stable merge and report identity, `version` is an exact pin,
 /// `manager` selects the fixed read-only query backend, and `source` is matched
@@ -856,6 +925,8 @@ pub struct PackageDeclaration {
     pub version: String,
     pub manager: PackageManager,
     pub source: StableId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<PackageSelector>,
 }
 
 impl PackageDeclaration {
@@ -866,11 +937,27 @@ impl PackageDeclaration {
                 .version
                 .chars()
                 .any(|character| "*^~<>=,|".contains(character))
+            || is_floating_package_version(&self.version)
         {
             return Err(ContractError::InvalidPackageDeclaration);
         }
+        if let Some(selector) = &self.selector {
+            selector.validate_for(self.manager)?;
+        }
         Ok(())
     }
+}
+
+fn is_floating_package_version(version: &str) -> bool {
+    let version = version.to_ascii_lowercase();
+    matches!(
+        version.as_str(),
+        "latest" | "stable" | "default" | "node" | "current"
+    ) || version.starts_with("stable-")
+        || version.starts_with("latest-")
+        || version.starts_with("default-")
+        || version.starts_with("lts-")
+        || version.starts_with("lts/")
 }
 
 /// Closed top-level vocabulary for a CommonKit v1 layer.
@@ -1506,7 +1593,10 @@ pub fn layer_schema() -> Result<Value, ContractError> {
     for (field, pattern) in [
         ("id", r"^[a-z][a-z0-9_-]{0,62}$"),
         ("source", r"^[a-z][a-z0-9_-]{0,62}$"),
-        ("version", r"^(?!.*[\s*^~<>=,|]).+$"),
+        (
+            "version",
+            r"^(?!.*[\s*^~<>=,|])(?!latest$)(?!stable(?:-|$))(?!default(?:-|$))(?!node$)(?!current$)(?!lts[-/]).+$",
+        ),
     ] {
         package_schema
             .pointer_mut(&format!("/properties/{field}"))

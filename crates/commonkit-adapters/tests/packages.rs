@@ -87,6 +87,7 @@ fn package(id_value: &str, version: &str) -> PackageDeclaration {
         version: version.into(),
         manager: PackageManager::Homebrew,
         source: id("homebrew_core"),
+        selector: None,
     }
 }
 

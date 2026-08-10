@@ -3,10 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use commonkit_adapters::{
-    ContentReference, ContentSensitivity, DeclaredSideEffect, ExactProviderVersion,
-    FilesystemIntent, MaterializedState, NormalizedManagedPath, NormalizedResource,
-    PackageResourceIntent, ProviderInputs, ProviderWorkspace, ResourceProvenance,
-    UnsupportedCapability,
+    DeclaredSideEffect, ExactProviderVersion, FilesystemIntent, MaterializedState,
+    NormalizedManagedPath, NormalizedResource, PackageDesiredIntent, ProviderInputs,
+    ProviderWorkspace, ResourceIntent, ResourceProvenance, UnsupportedCapability,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, Sha256Digest, StableId, digest_domain_json,
@@ -108,24 +107,13 @@ fn materialized_state_is_deterministic_and_reconstructable() {
 fn mixed_materialized_state_is_deterministic_and_uses_typed_package_data() {
     let inputs = provider_inputs();
     let package = NormalizedResource {
-        intent: PackageResourceIntent::new(
-            PackageDeclaration {
-                id: StableId::parse("ripgrep").unwrap(),
-                version: "14.1.1".into(),
-                manager: PackageManager::Homebrew,
-                source: StableId::parse("homebrew-core").unwrap(),
-            },
-            ContentReference {
-                digest: digest('c'),
-                bytes: 10,
-                sensitivity: ContentSensitivity::Portable,
-            },
-            vec![ContentReference {
-                digest: digest('d'),
-                bytes: 20,
-                sensitivity: ContentSensitivity::Portable,
-            }],
-        )
+        intent: PackageDesiredIntent::new(PackageDeclaration {
+            id: StableId::parse("ripgrep").unwrap(),
+            version: "14.1.1".into(),
+            manager: PackageManager::Homebrew,
+            source: StableId::parse("homebrew-core").unwrap(),
+            selector: None,
+        })
         .unwrap()
         .into(),
         provenance: ResourceProvenance {
@@ -153,6 +141,34 @@ fn mixed_materialized_state_is_deterministic_and_uses_typed_package_data() {
             .contains("\"type\":\"package\"")
     );
     forward.verify().unwrap();
+}
+
+#[test]
+fn provider_json_cannot_submit_package_resolution_or_artifacts() {
+    let provider_selected_resolution = serde_json::json!({
+        "type": "package",
+        "declaration": {
+            "id": "ripgrep",
+            "version": "14.1.1",
+            "manager": "homebrew",
+            "source": "homebrew-core"
+        },
+        "resolution": {
+            "digest": digest('c'),
+            "bytes": 10,
+            "sensitivity": "portable"
+        },
+        "artifacts": [{
+            "digest": digest('d'),
+            "bytes": 20,
+            "sensitivity": "portable"
+        }]
+    });
+
+    assert!(
+        serde_json::from_value::<ResourceIntent>(provider_selected_resolution).is_err(),
+        "provider wire input must not cross the controller-owned resolution boundary"
+    );
 }
 
 #[test]

@@ -11,6 +11,7 @@ mod git_sync;
 mod github_onboarding;
 mod mcp_clients;
 mod native;
+mod package_resolution;
 mod packages;
 mod pipeline;
 mod planning;
@@ -60,6 +61,14 @@ pub use github_onboarding::{
 };
 pub use mcp_clients::{McpClientMaterializationError, materialize_mcp_client_state};
 pub use native::NativeProvider;
+pub use package_resolution::{
+    ArtifactEvidence, ControlledPackageSourceV1, ManagerBindingV1, OfflineInstallRecipeV1,
+    OfflinePackageBackend, PackageArtifactV1, PackageFetch, PackageFetchRequestV1,
+    PackageObservationV1, PackageResolutionBackend, PackageResolutionCoordinator,
+    PackageResolutionDraftV1, PackageResolutionError, PackageResolutionProbeV1,
+    PackageResolutionRequestV1, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
+    ResolvedPackage, ResolvedPackageIntent, SourceBindingV1, package_resolution_schema,
+};
 pub use packages::{
     PackageBackendEvidence, PackageCommandError, PackageCommandOutput, PackageCommandRunner,
     PackageDriftEntry, PackageDriftReport, PackageDriftState, PackageObserver,
@@ -69,12 +78,14 @@ pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutp
 pub use planning::{
     FilesystemPlannerRoute, PackageResourcePlanner, ProviderPlanError, ProviderPlanRequest,
     ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter, build_provider_plan,
-    build_provider_plan_with_router, provider_plan_bindings,
+    build_provider_plan_with_router, build_resolved_provider_plan_with_router,
+    provider_plan_bindings, resolved_provider_plan_bindings,
 };
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,
     ProviderCapability, ProviderCapabilityResource, ProviderContext, ProviderContractError,
-    ProviderFailure, ProviderInputs, ProviderWorkspace, UnsupportedCapability,
+    ProviderFailure, ProviderInputs, ProviderWorkspace, ResolvedMaterializedState,
+    UnsupportedCapability,
 };
 pub use remote_helper::TargetHelper;
 pub use remote_provider::{
@@ -82,7 +93,7 @@ pub use remote_provider::{
 };
 pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
-    OwnershipRules, PackageResourceIntent, ResourceAddress, ResourceError, ResourceIntent,
+    OwnershipRules, PackageDesiredIntent, ResourceAddress, ResourceError, ResourceIntent,
     ResourceProvenance, ResourceType, SafeSymlinkTarget, SymlinkTargetKind,
     materialized_resources_digest, validate_ownership,
 };

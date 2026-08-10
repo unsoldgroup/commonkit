@@ -21,6 +21,100 @@
       ],
       "type": "string"
     },
+    "PackageSelector": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "homebrew_formula",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "apt_binary",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "node_runtime",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "components": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "profile": {
+              "$ref": "#/$defs/RustToolchainProfile"
+            },
+            "targets": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "rust_toolchain",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "profile"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RustToolchainProfile": {
+      "enum": [
+        "minimal"
+      ],
+      "type": "string"
+    },
     "SourceMetadata": {
       "additionalProperties": false,
       "properties": {
@@ -75,7 +169,7 @@
         "packages": {
           "items": {
             "additionalProperties": false,
-            "description": "An exact, observe-only package declaration.\n\n`id` is the stable merge and report identity, `version` is an exact pin,\n`manager` selects the fixed read-only query backend, and `source` is matched\nagainst `securityPolicy.allowlists.package_sources`.",
+            "description": "An exact package declaration resolved only by the trusted controller.\n\n`id` is the stable merge and report identity, `version` is an exact pin,\n`manager` selects the fixed read-only query backend, and `source` is matched\nagainst `securityPolicy.allowlists.package_sources`.",
             "properties": {
               "id": {
                 "pattern": "^[a-z][a-z0-9_-]{0,62}$",
@@ -84,12 +178,22 @@
               "manager": {
                 "$ref": "#/$defs/PackageManager"
               },
+              "selector": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/PackageSelector"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "source": {
                 "pattern": "^[a-z][a-z0-9_-]{0,62}$",
                 "type": "string"
               },
               "version": {
-                "pattern": "^(?!.*[\\s*^~<>=,|]).+$",
+                "pattern": "^(?!.*[\\s*^~<>=,|])(?!latest$)(?!stable(?:-|$))(?!default(?:-|$))(?!node$)(?!current$)(?!lts[-/]).+$",
                 "type": "string"
               }
             },

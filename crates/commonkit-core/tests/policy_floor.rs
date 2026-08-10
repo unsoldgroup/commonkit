@@ -16,6 +16,7 @@ fn package_source_must_belong_to_the_effective_allowlist() {
         version: "14.1.1".into(),
         manager: PackageManager::Homebrew,
         source: id("untrusted_tap"),
+        selector: None,
     };
     let mut policy = SecurityPolicy::default();
     policy.allowlists.insert(

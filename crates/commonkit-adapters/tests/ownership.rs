@@ -1,6 +1,6 @@
 use commonkit_adapters::{
     ContentReference, ContentSensitivity, FileMode, FilesystemIntent, NormalizedManagedPath,
-    NormalizedResource, OwnershipError, OwnershipRules, PackageResourceIntent, ResourceAddress,
+    NormalizedResource, OwnershipError, OwnershipRules, PackageDesiredIntent, ResourceAddress,
     ResourceIntent, ResourceProvenance, SafeSymlinkTarget, SymlinkTargetKind,
     materialized_resources_digest, validate_ownership,
 };
@@ -86,26 +86,15 @@ fn rules(case_sensitive: bool) -> OwnershipRules {
     .expect("rules")
 }
 
-fn package(provider: &str, id: &str, artifact: char) -> NormalizedResource {
+fn package(provider: &str, id: &str, _artifact: char) -> NormalizedResource {
     NormalizedResource {
-        intent: PackageResourceIntent::new(
-            PackageDeclaration {
-                id: StableId::parse(id).unwrap(),
-                version: "1.2.3".into(),
-                manager: PackageManager::Homebrew,
-                source: StableId::parse("homebrew-core").unwrap(),
-            },
-            ContentReference {
-                digest: digest('d'),
-                bytes: 12,
-                sensitivity: ContentSensitivity::Portable,
-            },
-            vec![ContentReference {
-                digest: digest(artifact),
-                bytes: 42,
-                sensitivity: ContentSensitivity::Portable,
-            }],
-        )
+        intent: PackageDesiredIntent::new(PackageDeclaration {
+            id: StableId::parse(id).unwrap(),
+            version: "1.2.3".into(),
+            manager: PackageManager::Homebrew,
+            source: StableId::parse("homebrew-core").unwrap(),
+            selector: None,
+        })
         .unwrap()
         .into(),
         provenance: provenance(provider, id),
@@ -405,23 +394,23 @@ fn filesystem_and_package_claims_share_one_deterministic_ownership_digest() {
         package.resource_type(),
         commonkit_adapters::ResourceType::Package
     );
-    assert_eq!(package.artifact_references().len(), 2);
+    assert!(package.artifact_references().is_empty());
     assert_eq!(
         package.recovery_capability(),
         commonkit_contracts::RecoveryCapability::ConvergeForwardOnly
     );
     assert!(package.desired_digest().is_ok());
 
-    let mut changed_artifact = package.clone();
-    let ResourceIntent::Package(PackageResourceIntent::Package { artifacts, .. }) =
-        &mut changed_artifact.intent
+    let mut changed_declaration = package.clone();
+    let ResourceIntent::Package(PackageDesiredIntent::Package { declaration }) =
+        &mut changed_declaration.intent
     else {
         panic!("package intent")
     };
-    artifacts[0].digest = digest('c');
+    declaration.version = "1.2.4".into();
     assert_ne!(
         materialized_resources_digest(&[filesystem, package]).unwrap(),
-        materialized_resources_digest(&[changed_artifact]).unwrap()
+        materialized_resources_digest(&[changed_declaration]).unwrap()
     );
 }
 
