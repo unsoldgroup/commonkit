@@ -1097,6 +1097,66 @@ fn reopens_4c7b3a7_v1_resolution_without_closure_source() {
 }
 
 #[test]
+fn schema_valid_hybrid_v1_closure_migrates_each_missing_source_and_rejects_mismatch() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let bytes = include_bytes!("fixtures/package-resolution-v1-hybrid.json");
+    let fixture: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let schema = commonkit_adapters::package_resolution_schema().unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(
+        validator.is_valid(&fixture),
+        "the published v1 schema admits per-entry legacy/current closure sources"
+    );
+    let resolution = store
+        .put(bytes, commonkit_adapters::ContentSensitivity::Portable)
+        .unwrap();
+    let intent = commonkit_adapters::ResolvedPackageIntent {
+        declaration: match desired() {
+            PackageDesiredIntent::Package { declaration } => declaration,
+        },
+        resolution,
+        artifacts: vec![],
+    };
+
+    let reopened = intent
+        .load_persisted(&store)
+        .expect("a schema-valid hybrid v1 closure must reopen deterministically");
+    assert!(
+        reopened
+            .closure
+            .iter()
+            .all(|package| package.source == reopened.source)
+    );
+
+    let mut mismatched = fixture.clone();
+    mismatched["closure"][1]["source"]["canonicalRepository"] =
+        "https://example.invalid/substituted".into();
+    assert!(validator.is_valid(&mismatched));
+    let mismatched_resolution = store
+        .put(
+            &serde_json::to_vec(&mismatched).unwrap(),
+            commonkit_adapters::ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let mismatched_intent = commonkit_adapters::ResolvedPackageIntent {
+        resolution: mismatched_resolution,
+        ..intent
+    };
+    assert!(matches!(
+        mismatched_intent.load_persisted(&store),
+        Err(PackageResolutionError::SourceBindingMismatch)
+    ));
+
+    let mut unknown = fixture;
+    unknown["closure"][0]["unexpected"] = true.into();
+    assert!(
+        !validator.is_valid(&unknown),
+        "v1 compatibility must continue to deny unknown closure fields"
+    );
+}
+
+#[test]
 fn resolved_materialized_state_roundtrips_for_offline_reopen() {
     let root = tempfile::tempdir().unwrap();
     let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();

@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "declaration": {
+    "id": "ripgrep",
+    "version": "14.1.1",
+    "manager": "homebrew",
+    "source": "homebrew-core",
+    "selector": {
+      "type": "homebrew_formula",
+      "name": "ripgrep"
+    }
+  },
+  "target": {
+    "os": "macos",
+    "osVersion": "15.6",
+    "arch": "aarch64",
+    "managerPrefix": "/opt/homebrew"
+  },
+  "manager": {
+    "manager": "homebrew",
+    "version": "4.5.0",
+    "executableDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "configDigest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "source": {
+    "sourceId": "homebrew-core",
+    "registryDefinitionDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "canonicalRepository": "https://github.com/Homebrew/homebrew-core",
+    "repositoryRevision": "0123456789abcdef0123456789abcdef01234567",
+    "signedMetadata": []
+  },
+  "before": {
+    "installedVersions": []
+  },
+  "closure": [
+    {
+      "declaration": {
+        "id": "ripgrep",
+        "version": "14.1.1",
+        "manager": "homebrew",
+        "source": "homebrew-core",
+        "selector": {
+          "type": "homebrew_formula",
+          "name": "ripgrep"
+        }
+      }
+    },
+    {
+      "declaration": {
+        "id": "zz-dependency",
+        "version": "1.2.3",
+        "manager": "homebrew",
+        "source": "homebrew-core",
+        "selector": {
+          "type": "homebrew_formula",
+          "name": "zz-dependency"
+        }
+      },
+      "source": {
+        "sourceId": "homebrew-core",
+        "registryDefinitionDigest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "canonicalRepository": "https://github.com/Homebrew/homebrew-core",
+        "repositoryRevision": "0123456789abcdef0123456789abcdef01234567",
+        "signedMetadata": []
+      }
+    }
+  ],
+  "artifacts": [],
+  "recipe": {
+    "type": "homebrew_bottle",
+    "artifact_roles": []
+  }
+}

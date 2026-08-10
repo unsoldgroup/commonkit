@@ -119,26 +119,28 @@ pub struct PackageResolutionV1 {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LegacyResolvedPackageV1 {
+struct CompatibleResolvedPackageV1 {
     declaration: PackageDeclaration,
+    #[serde(default)]
+    source: Option<SourceBindingV1>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LegacyPackageResolutionV1 {
+struct CompatiblePackageResolutionV1 {
     schema_version: SchemaVersion,
     declaration: PackageDeclaration,
     target: PackageTargetV1,
     manager: ManagerBindingV1,
     source: SourceBindingV1,
     before: PackageObservationV1,
-    closure: Vec<LegacyResolvedPackageV1>,
+    closure: Vec<CompatibleResolvedPackageV1>,
     artifacts: Vec<PackageArtifactV1>,
     recipe: OfflineInstallRecipeV1,
 }
 
-impl LegacyPackageResolutionV1 {
-    fn inherit_parent_source(self) -> PackageResolutionV1 {
+impl CompatiblePackageResolutionV1 {
+    fn inherit_missing_parent_sources(self) -> PackageResolutionV1 {
         let source = self.source;
         PackageResolutionV1 {
             schema_version: self.schema_version,
@@ -150,7 +152,7 @@ impl LegacyPackageResolutionV1 {
                 .into_iter()
                 .map(|package| ResolvedPackage {
                     declaration: package.declaration,
-                    source: source.clone(),
+                    source: package.source.unwrap_or_else(|| source.clone()),
                 })
                 .collect(),
             source,
@@ -790,8 +792,8 @@ impl ResolvedPackageIntent {
     ) -> Result<PackageResolutionV1, PackageResolutionError> {
         let bytes = store.load(&self.resolution)?;
         let resolution = serde_json::from_slice::<PackageResolutionV1>(&bytes).or_else(|_| {
-            serde_json::from_slice::<LegacyPackageResolutionV1>(&bytes)
-                .map(LegacyPackageResolutionV1::inherit_parent_source)
+            serde_json::from_slice::<CompatiblePackageResolutionV1>(&bytes)
+                .map(CompatiblePackageResolutionV1::inherit_missing_parent_sources)
         })?;
         if resolution.schema_version != SchemaVersion(1)
             || resolution.declaration != self.declaration
