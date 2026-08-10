@@ -3,11 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use commonkit_adapters::{
     ArtifactEvidence, ArtifactStore, ControlledPackageSourceV1, ExactProviderVersion,
     ManagerBindingV1, MaterializedState, NormalizedResource, OfflineInstallRecipeV1,
-    PackageDesiredIntent, PackageFetch, PackageFetchRequestV1, PackageFetchResultV1,
-    PackageObservationV1, PackageResolutionBackend, PackageResolutionCoordinator,
-    PackageResolutionDraftV1, PackageResolutionError, PackageResolutionProbeV1,
-    PackageResolutionRequestV1, PackageSourceRegistry, PackageTargetV1, ProviderInputs,
-    ResolvedPackage, ResourceProvenance, SourceBindingV1,
+    PackageDesiredIntent, PackageFetch, PackageFetchHopV1, PackageFetchRequestV1,
+    PackageFetchResultV1, PackageObservationV1, PackageResolutionBackend,
+    PackageResolutionCoordinator, PackageResolutionDraftV1, PackageResolutionError,
+    PackageResolutionProbeV1, PackageResolutionRequestV1, PackageSourceRegistry, PackageTargetV1,
+    ProviderInputs, ResolvedPackage, ResourceProvenance, SourceBindingV1,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, Sha256Digest, StableId,
@@ -49,10 +49,11 @@ impl PackageResolutionBackend for PanicBackend {
 struct PanicFetch;
 
 impl PackageFetch for PanicFetch {
-    fn fetch(
+    fn fetch_hop(
         &mut self,
         _request: &PackageFetchRequestV1,
-    ) -> Result<PackageFetchResultV1, PackageResolutionError> {
+        _locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError> {
         panic!("policy rejection must happen before fetch")
     }
 }
@@ -119,6 +120,53 @@ struct FixtureBackend {
     signed_metadata: Vec<ArtifactEvidence>,
 }
 
+struct LaterInvalidClosureBackend {
+    fixture: FixtureBackend,
+    resolves: usize,
+}
+
+impl PackageResolutionBackend for LaterInvalidClosureBackend {
+    fn manager(&self) -> PackageManager {
+        PackageManager::Homebrew
+    }
+
+    fn probe(
+        &mut self,
+        request: &PackageResolutionRequestV1<'_>,
+    ) -> Result<PackageResolutionProbeV1, PackageResolutionError> {
+        self.fixture.probe(request)
+    }
+
+    fn resolve(
+        &mut self,
+        request: &PackageResolutionRequestV1<'_>,
+        source: &SourceBindingV1,
+    ) -> Result<PackageResolutionDraftV1, PackageResolutionError> {
+        self.resolves += 1;
+        let PackageDesiredIntent::Package { declaration } = request.desired;
+        let mut draft = self.fixture.draft.clone();
+        draft.closure = vec![ResolvedPackage {
+            declaration: declaration.clone(),
+            source: source.clone(),
+        }];
+        if self.resolves == 2 {
+            draft.closure.push(ResolvedPackage {
+                declaration: PackageDeclaration {
+                    id: id("transitive-denied"),
+                    version: "1.2.3".into(),
+                    manager: PackageManager::Homebrew,
+                    source: id("unapproved-source"),
+                    selector: Some(PackageSelector::HomebrewFormula {
+                        name: "transitive-denied".into(),
+                    }),
+                },
+                source: source.clone(),
+            });
+        }
+        Ok(draft)
+    }
+}
+
 impl PackageResolutionBackend for FixtureBackend {
     fn manager(&self) -> PackageManager {
         PackageManager::Homebrew
@@ -151,7 +199,12 @@ impl PackageResolutionBackend for FixtureBackend {
         fetch: &mut dyn PackageFetch,
     ) -> Result<(), PackageResolutionError> {
         for artifact in &self.fetch_requests {
-            fetch.fetch(artifact)?;
+            match fetch.fetch_hop(artifact, &artifact.immutable_locator)? {
+                PackageFetchHopV1::Complete(_) => {}
+                PackageFetchHopV1::Redirect { .. } => {
+                    return Err(PackageResolutionError::UnvalidatedRedirect);
+                }
+            }
         }
         Ok(())
     }
@@ -163,39 +216,61 @@ struct FixtureFetch {
 }
 
 struct RedirectFetch {
-    bytes: Vec<u8>,
     final_locator: String,
     calls: usize,
 }
 
-impl PackageFetch for RedirectFetch {
-    fn fetch(
+struct ChainedRedirectFetch {
+    approved_final: String,
+    denied_intermediate: String,
+    contacted: Vec<String>,
+}
+
+impl PackageFetch for ChainedRedirectFetch {
+    fn fetch_hop(
         &mut self,
         _request: &PackageFetchRequestV1,
-    ) -> Result<PackageFetchResultV1, PackageResolutionError> {
+        locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError> {
+        self.contacted.push(locator.into());
+        if self.contacted.len() == 1 {
+            Ok(PackageFetchHopV1::Redirect {
+                location: self.denied_intermediate.clone(),
+            })
+        } else {
+            Ok(PackageFetchHopV1::Redirect {
+                location: self.approved_final.clone(),
+            })
+        }
+    }
+}
+
+impl PackageFetch for RedirectFetch {
+    fn fetch_hop(
+        &mut self,
+        _request: &PackageFetchRequestV1,
+        _locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError> {
         self.calls += 1;
-        Ok(PackageFetchResultV1 {
-            bytes: self.bytes.clone(),
-            final_locator: self.final_locator.clone(),
+        Ok(PackageFetchHopV1::Redirect {
+            location: self.final_locator.clone(),
         })
     }
 }
 
 impl PackageFetch for FixtureFetch {
-    fn fetch(
+    fn fetch_hop(
         &mut self,
-        request: &PackageFetchRequestV1,
-    ) -> Result<PackageFetchResultV1, PackageResolutionError> {
+        _request: &PackageFetchRequestV1,
+        locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError> {
         self.calls += 1;
         let bytes = self
             .bytes
-            .get(&request.immutable_locator)
+            .get(locator)
             .cloned()
             .ok_or(PackageResolutionError::FetchUnavailable)?;
-        Ok(PackageFetchResultV1 {
-            bytes,
-            final_locator: request.immutable_locator.clone(),
-        })
+        Ok(PackageFetchHopV1::Complete(PackageFetchResultV1 { bytes }))
     }
 }
 
@@ -622,7 +697,6 @@ fn artifact_fetch_redirect_must_remain_within_controlled_source_roots() {
     let bytes = b"immutable package archive";
     let mut backend = fixture_backend(bytes);
     let mut fetch = RedirectFetch {
-        bytes: bytes.to_vec(),
         final_locator: "https://evil.invalid/redirected.tar.gz".into(),
         calls: 0,
     };
@@ -641,6 +715,37 @@ fn artifact_fetch_redirect_must_remain_within_controlled_source_roots() {
         PackageResolutionError::UnapprovedArtifactLocation
     ));
     assert_eq!(fetch.calls, 1);
+}
+
+#[test]
+fn artifact_fetch_rejects_unapproved_intermediate_redirect_before_contact() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let bytes = b"immutable package archive";
+    let mut backend = fixture_backend(bytes);
+    let initial = backend.fetch_requests[0].immutable_locator.clone();
+    let mut fetch = ChainedRedirectFetch {
+        approved_final: initial.clone(),
+        denied_intermediate: "https://evil.invalid/intermediate.tar.gz".into(),
+        contacted: vec![],
+    };
+
+    let error = PackageResolutionCoordinator::new(
+        &allowed_policy(),
+        &registry,
+        manager_binding(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve(&desired(), &target(), &store)
+    .expect_err("an unapproved intermediate redirect must fail before following it");
+
+    assert!(matches!(
+        error,
+        PackageResolutionError::UnapprovedArtifactLocation
+    ));
+    assert_eq!(fetch.contacted, vec![initial]);
 }
 
 #[test]
@@ -839,6 +944,80 @@ fn later_denied_package_preflights_before_any_backend_or_fetch_call() {
 }
 
 #[test]
+fn later_invalid_closure_draft_preflights_before_any_artifact_fetch() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let inputs = ProviderInputs::new(
+        id("native"),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "provider.v3".into(),
+        BTreeMap::from([("source".into(), digest('8'))]),
+        vec!["package".into()],
+    )
+    .unwrap();
+    let package = |declaration: PackageDeclaration| NormalizedResource {
+        provenance: ResourceProvenance {
+            provider_id: inputs.provider_id.clone(),
+            provider_version: inputs.provider_version.to_string(),
+            input_digest: inputs.input_set_digest.clone(),
+            source: format!("package:{}", declaration.id),
+        },
+        intent: PackageDesiredIntent::new(declaration).unwrap().into(),
+    };
+    let first = match desired() {
+        PackageDesiredIntent::Package { declaration } => declaration,
+    };
+    let second = PackageDeclaration {
+        id: id("zz-second"),
+        version: "2.3.4".into(),
+        manager: PackageManager::Homebrew,
+        source: id("homebrew-core"),
+        selector: Some(PackageSelector::HomebrewFormula {
+            name: "zz-second".into(),
+        }),
+    };
+    let state = MaterializedState::finalize(
+        inputs.clone(),
+        vec![package(first), package(second)],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let bytes = b"immutable package archive";
+    let fixture = fixture_backend(bytes);
+    let locator = fixture.fetch_requests[0].immutable_locator.clone();
+    let mut backend = LaterInvalidClosureBackend {
+        fixture,
+        resolves: 0,
+    };
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::from([(locator, bytes.to_vec())]),
+        calls: 0,
+    };
+
+    let error = PackageResolutionCoordinator::new(
+        &allowed_policy(),
+        &registry,
+        manager_binding(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve_state(&state, &target(), &store)
+    .expect_err("all closure drafts must validate before any artifact fetch");
+
+    assert!(matches!(
+        error,
+        PackageResolutionError::PackageSourceNotAllowed { .. }
+            | PackageResolutionError::UnknownSource { .. }
+    ));
+    assert_eq!(
+        fetch.calls, 0,
+        "a later invalid closure must prevent every fetch"
+    );
+}
+
+#[test]
 fn fresh_process_reconstructs_resolved_intent_from_artifacts_without_fetch() {
     let root = tempfile::tempdir().unwrap();
     let artifact_root = root.path().join("artifacts");
@@ -881,6 +1060,29 @@ fn fresh_process_reconstructs_resolved_intent_from_artifacts_without_fetch() {
             PackageDesiredIntent::Package { declaration } => declaration,
         }
     );
+}
+
+#[test]
+fn reopens_4c7b3a7_v1_resolution_without_closure_source() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let bytes = include_bytes!("fixtures/package-resolution-v1-4c7b3a7.json");
+    let resolution = store
+        .put(bytes, commonkit_adapters::ContentSensitivity::Portable)
+        .unwrap();
+    let intent = commonkit_adapters::ResolvedPackageIntent {
+        declaration: match desired() {
+            PackageDesiredIntent::Package { declaration } => declaration,
+        },
+        resolution,
+        artifacts: vec![],
+    };
+
+    let reopened = intent
+        .load_persisted(&store)
+        .expect("the 4c7b3a7 v1 artifact must remain reopenable");
+
+    assert_eq!(reopened.closure[0].source, reopened.source);
 }
 
 #[test]

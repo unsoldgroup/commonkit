@@ -12,8 +12,19 @@ use commonkit_adapters::{
     SshFilesystemResponse, SshFilesystemTransport, TargetFilesystemError,
 };
 use commonkit_contracts::{
-    PackageDeclaration, PackageManager, PackageSelector, SchemaVersion, Sha256Digest, StableId,
+    PackageDeclaration, PackageManager, PackageSelector, SchemaVersion, SecurityPolicy,
+    Sha256Digest, StableId,
 };
+
+fn package_policy() -> SecurityPolicy {
+    SecurityPolicy {
+        allowlists: BTreeMap::from([(
+            StableId::parse("package_sources").unwrap(),
+            BTreeSet::from(["homebrew-core".into()]),
+        )]),
+        ..SecurityPolicy::default()
+    }
+}
 
 struct FixtureProvider {
     id: StableId,
@@ -256,7 +267,9 @@ fn resolved_remote_staging_rejects_stale_manager_before_remote_contact() {
         executable_digest: digest('e'),
         config_digest: digest('f'),
     };
-    let authority = PackageResolutionAuthority::new(&target, &stale_manager, &registry).unwrap();
+    let authority =
+        PackageResolutionAuthority::new(&target, &stale_manager, &registry, &package_policy())
+            .unwrap();
     let mut transport = RecordingTransport::default();
     let error = RemoteProviderStager::new(&mut transport)
         .stage_resolved_materialized(
@@ -282,8 +295,39 @@ fn resolved_remote_staging_rejects_stale_manager_before_remote_contact() {
         executable_digest: digest('e'),
         config_digest: digest('f'),
     };
+    let removed_policy_authority = PackageResolutionAuthority::new(
+        &target,
+        &current_manager,
+        &registry,
+        &SecurityPolicy::default(),
+    )
+    .unwrap();
+    let mut transport = RecordingTransport::default();
+    let error = RemoteProviderStager::new(&mut transport)
+        .stage_resolved_materialized(
+            &state,
+            &removed_policy_authority,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-removed-policy").unwrap(),
+        )
+        .expect_err("removed source policy must fail before remote contact");
+    assert!(matches!(
+        error,
+        commonkit_adapters::RemoteProviderStagingError::PackageResolution(
+            commonkit_adapters::PackageResolutionError::PackageSourceNotAllowed { .. }
+        )
+    ));
+    assert!(transport.requests.is_empty());
+
     let current_authority =
-        PackageResolutionAuthority::new(&target, &current_manager, &registry).unwrap();
+        PackageResolutionAuthority::new(&target, &current_manager, &registry, &package_policy())
+            .unwrap();
+    assert_ne!(
+        removed_policy_authority.digest(),
+        current_authority.digest(),
+        "effective package-source policy must participate in authority binding"
+    );
     let mut transport = RecordingTransport::default();
     let receipt = RemoteProviderStager::new(&mut transport)
         .stage_resolved_materialized(

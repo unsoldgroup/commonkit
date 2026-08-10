@@ -71,8 +71,8 @@ pub use mcp_clients::{McpClientMaterializationError, materialize_mcp_client_stat
 pub use native::NativeProvider;
 pub use package_resolution::{
     ArtifactEvidence, ControlledPackageSourceV1, ManagerBindingV1, OfflineInstallRecipeV1,
-    OfflinePackageBackend, PackageArtifactV1, PackageFetch, PackageFetchRequestV1,
-    PackageFetchResultV1, PackageObservationV1, PackageResolutionAuthority,
+    OfflinePackageBackend, PackageArtifactV1, PackageFetch, PackageFetchHopV1,
+    PackageFetchRequestV1, PackageFetchResultV1, PackageObservationV1, PackageResolutionAuthority,
     PackageResolutionBackend, PackageResolutionCoordinator, PackageResolutionDraftV1,
     PackageResolutionError, PackageResolutionProbeV1, PackageResolutionRequestV1,
     PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ResolvedPackage,

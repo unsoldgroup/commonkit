@@ -117,6 +117,50 @@ pub struct PackageResolutionV1 {
     pub recipe: OfflineInstallRecipeV1,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyResolvedPackageV1 {
+    declaration: PackageDeclaration,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyPackageResolutionV1 {
+    schema_version: SchemaVersion,
+    declaration: PackageDeclaration,
+    target: PackageTargetV1,
+    manager: ManagerBindingV1,
+    source: SourceBindingV1,
+    before: PackageObservationV1,
+    closure: Vec<LegacyResolvedPackageV1>,
+    artifacts: Vec<PackageArtifactV1>,
+    recipe: OfflineInstallRecipeV1,
+}
+
+impl LegacyPackageResolutionV1 {
+    fn inherit_parent_source(self) -> PackageResolutionV1 {
+        let source = self.source;
+        PackageResolutionV1 {
+            schema_version: self.schema_version,
+            declaration: self.declaration,
+            target: self.target,
+            manager: self.manager,
+            closure: self
+                .closure
+                .into_iter()
+                .map(|package| ResolvedPackage {
+                    declaration: package.declaration,
+                    source: source.clone(),
+                })
+                .collect(),
+            source,
+            before: self.before,
+            artifacts: self.artifacts,
+            recipe: self.recipe,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResolvedPackageIntent {
@@ -147,7 +191,12 @@ pub struct PackageFetchRequestV1 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageFetchResultV1 {
     pub bytes: Vec<u8>,
-    pub final_locator: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageFetchHopV1 {
+    Complete(PackageFetchResultV1),
+    Redirect { location: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -168,10 +217,13 @@ pub struct PackageResolutionRequestV1<'a> {
 }
 
 pub trait PackageFetch {
-    fn fetch(
+    /// Fetches exactly one HTTP response. Implementations must disable
+    /// automatic redirect following and return every redirect as a hop.
+    fn fetch_hop(
         &mut self,
         request: &PackageFetchRequestV1,
-    ) -> Result<PackageFetchResultV1, PackageResolutionError>;
+        locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError>;
 }
 
 pub trait PackageResolutionBackend {
@@ -196,7 +248,12 @@ pub trait PackageResolutionBackend {
         fetch: &mut dyn PackageFetch,
     ) -> Result<(), PackageResolutionError> {
         for artifact in artifacts {
-            fetch.fetch(artifact)?;
+            match fetch.fetch_hop(artifact, &artifact.immutable_locator)? {
+                PackageFetchHopV1::Complete(_) => {}
+                PackageFetchHopV1::Redirect { .. } => {
+                    return Err(PackageResolutionError::UnvalidatedRedirect);
+                }
+            }
         }
         Ok(())
     }
@@ -252,6 +309,7 @@ pub struct PackageResolutionAuthority {
     target: PackageTargetV1,
     manager: ManagerBindingV1,
     registry: PackageSourceRegistry,
+    package_sources: BTreeSet<String>,
     digest: Sha256Digest,
 }
 
@@ -260,17 +318,20 @@ impl PackageResolutionAuthority {
         target: &PackageTargetV1,
         manager: &ManagerBindingV1,
         registry: &PackageSourceRegistry,
+        policy: &SecurityPolicy,
     ) -> Result<Self, PackageResolutionError> {
         validate_target(target)?;
         validate_manager(manager)?;
+        let package_sources = effective_package_sources(policy);
         let digest = digest_domain_json(
             "commonkit.package-resolution-authority.v1",
-            &(target, manager, registry.digest()),
+            &(target, manager, registry.digest(), &package_sources),
         )?;
         Ok(Self {
             target: target.clone(),
             manager: manager.clone(),
             registry: registry.clone(),
+            package_sources,
             digest,
         })
     }
@@ -284,7 +345,31 @@ impl PackageResolutionAuthority {
         intent: &ResolvedPackageIntent,
         store: &ArtifactStore,
     ) -> Result<PackageResolutionV1, PackageResolutionError> {
-        intent.load_and_validate(&self.target, &self.manager, &self.registry, store)
+        let resolution =
+            intent.load_and_validate(&self.target, &self.manager, &self.registry, store)?;
+        enforce_current_package_sources(&self.package_sources, &resolution.declaration)?;
+        for package in &resolution.closure {
+            enforce_current_package_sources(&self.package_sources, &package.declaration)?;
+        }
+        Ok(resolution)
+    }
+}
+
+fn effective_package_sources(policy: &SecurityPolicy) -> BTreeSet<String> {
+    let key = StableId::parse("package_sources").expect("static stable ID");
+    policy.allowlists.get(&key).cloned().unwrap_or_default()
+}
+
+fn enforce_current_package_sources(
+    allowed: &BTreeSet<String>,
+    declaration: &PackageDeclaration,
+) -> Result<(), PackageResolutionError> {
+    if allowed.contains(declaration.source.as_str()) {
+        Ok(())
+    } else {
+        Err(PackageResolutionError::PackageSourceNotAllowed {
+            source_id: declaration.source.clone(),
+        })
     }
 }
 
@@ -416,6 +501,14 @@ pub struct PackageResolutionCoordinator<'a> {
     fetch: &'a mut dyn PackageFetch,
 }
 
+struct PreparedPackageResolution {
+    desired: PackageDesiredIntent,
+    definition: PackageSourceDefinition,
+    source: SourceBindingV1,
+    before: PackageObservationV1,
+    draft: PackageResolutionDraftV1,
+}
+
 impl<'a> PackageResolutionCoordinator<'a> {
     pub fn new(
         policy: &'a SecurityPolicy,
@@ -439,6 +532,15 @@ impl<'a> PackageResolutionCoordinator<'a> {
         target: &PackageTargetV1,
         store: &ArtifactStore,
     ) -> Result<ResolvedPackageIntent, PackageResolutionError> {
+        let prepared = self.prepare_resolution(desired, target)?;
+        self.persist_prepared(prepared, target, store)
+    }
+
+    fn prepare_resolution(
+        &mut self,
+        desired: &PackageDesiredIntent,
+        target: &PackageTargetV1,
+    ) -> Result<PreparedPackageResolution, PackageResolutionError> {
         let definition = self.preflight_desired(desired, target)?;
         let PackageDesiredIntent::Package { declaration } = desired;
         let request = PackageResolutionRequestV1 {
@@ -466,7 +568,6 @@ impl<'a> PackageResolutionCoordinator<'a> {
             signed_metadata: probe.signed_metadata,
         };
         validate_source(&source)?;
-        let source_metadata_digest = source.metadata_digest()?;
         let mut draft = self.backend.resolve(&request, &source)?;
         canonicalize_draft(&mut draft)?;
         self.validate_closure(&draft.closure, declaration, &source)?;
@@ -474,6 +575,38 @@ impl<'a> PackageResolutionCoordinator<'a> {
             &draft.recipe,
             draft.artifacts.iter().map(|artifact| artifact.role.clone()),
         )?;
+        Ok(PreparedPackageResolution {
+            desired: desired.clone(),
+            definition,
+            source,
+            before: probe.before,
+            draft,
+        })
+    }
+
+    fn persist_prepared(
+        &mut self,
+        prepared: PreparedPackageResolution,
+        target: &PackageTargetV1,
+        store: &ArtifactStore,
+    ) -> Result<ResolvedPackageIntent, PackageResolutionError> {
+        let PreparedPackageResolution {
+            desired,
+            definition,
+            source,
+            before,
+            draft,
+        } = prepared;
+        let PackageDesiredIntent::Package { declaration } = &desired;
+        let request = PackageResolutionRequestV1 {
+            desired: &desired,
+            target,
+            manager: &self.manager,
+            source_id: &definition.source_id,
+            canonical_repository: &definition.canonical_repository,
+            registry_definition_digest: &definition.digest,
+        };
+        let source_metadata_digest = source.metadata_digest()?;
         let mut recording_fetch = RecordingPackageFetch {
             inner: self.fetch,
             fetched: Vec::new(),
@@ -493,7 +626,7 @@ impl<'a> PackageResolutionCoordinator<'a> {
             target: target.clone(),
             manager: self.manager.clone(),
             source,
-            before: probe.before,
+            before,
             closure: draft.closure,
             artifacts,
             recipe: draft.recipe,
@@ -523,12 +656,25 @@ impl<'a> PackageResolutionCoordinator<'a> {
                 self.preflight_desired(desired, target)?;
             }
         }
+        let mut prepared = Vec::new();
+        for resource in &state.resources {
+            if let ResourceIntent::Package(desired) = &resource.intent {
+                prepared.push(self.prepare_resolution(desired, target)?);
+            }
+        }
+        let mut prepared = prepared.into_iter();
         let mut resources = Vec::with_capacity(state.resources.len());
         for resource in &state.resources {
             let intent = match &resource.intent {
                 ResourceIntent::Filesystem(intent) => ResourceIntent::Filesystem(intent.clone()),
                 ResourceIntent::Package(desired) => {
-                    ResourceIntent::ResolvedPackage(self.resolve(desired, target, store)?)
+                    let prepared = prepared
+                        .next()
+                        .ok_or(PackageResolutionError::ResolutionBindingMismatch)?;
+                    if &prepared.desired != desired {
+                        return Err(PackageResolutionError::ResolutionBindingMismatch);
+                    }
+                    ResourceIntent::ResolvedPackage(self.persist_prepared(prepared, target, store)?)
                 }
                 ResourceIntent::ResolvedPackage(_) => {
                     return Err(PackageResolutionError::ResolutionBindingMismatch);
@@ -638,7 +784,10 @@ impl ResolvedPackageIntent {
         store: &ArtifactStore,
     ) -> Result<PackageResolutionV1, PackageResolutionError> {
         let bytes = store.load(&self.resolution)?;
-        let resolution: PackageResolutionV1 = serde_json::from_slice(&bytes)?;
+        let resolution = serde_json::from_slice::<PackageResolutionV1>(&bytes).or_else(|_| {
+            serde_json::from_slice::<LegacyPackageResolutionV1>(&bytes)
+                .map(LegacyPackageResolutionV1::inherit_parent_source)
+        })?;
         if resolution.schema_version != SchemaVersion(1)
             || resolution.declaration != self.declaration
         {
@@ -763,15 +912,34 @@ struct RecordingPackageFetch<'a> {
 }
 
 impl PackageFetch for RecordingPackageFetch<'_> {
-    fn fetch(
+    fn fetch_hop(
         &mut self,
         request: &PackageFetchRequestV1,
-    ) -> Result<PackageFetchResultV1, PackageResolutionError> {
+        locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError> {
+        if locator != request.immutable_locator {
+            return Err(PackageResolutionError::ResolutionBindingMismatch);
+        }
         validate_fetch_request(request, self.approved_artifact_roots)?;
-        let result = self.inner.fetch(request)?;
-        validate_fetch_locator(&result.final_locator, self.approved_artifact_roots)?;
-        self.fetched.push((request.clone(), result.bytes.clone()));
-        Ok(result)
+        let mut current = locator.to_owned();
+        let mut visited = BTreeSet::new();
+        for _ in 0..=10 {
+            if !visited.insert(current.clone()) {
+                return Err(PackageResolutionError::RedirectLoop);
+            }
+            let result = self.inner.fetch_hop(request, &current)?;
+            match result {
+                PackageFetchHopV1::Complete(result) => {
+                    self.fetched.push((request.clone(), result.bytes.clone()));
+                    return Ok(PackageFetchHopV1::Complete(result));
+                }
+                PackageFetchHopV1::Redirect { location } => {
+                    validate_fetch_locator(&location, self.approved_artifact_roots)?;
+                    current = location;
+                }
+            }
+        }
+        Err(PackageResolutionError::TooManyRedirects)
     }
 }
 
@@ -993,6 +1161,12 @@ pub enum PackageResolutionError {
     MutableArtifactLocator,
     #[error("package artifact locator is outside the controlled source roots")]
     UnapprovedArtifactLocation,
+    #[error("package fetch returned a redirect outside the validated per-hop fetch seam")]
+    UnvalidatedRedirect,
+    #[error("package artifact redirect chain contains a loop")]
+    RedirectLoop,
+    #[error("package artifact redirect chain exceeds the maximum hop count")]
+    TooManyRedirects,
     #[error("package resolution omitted the requested root package")]
     MissingRootPackage,
     #[error("package resolution closure contains a duplicate")]
