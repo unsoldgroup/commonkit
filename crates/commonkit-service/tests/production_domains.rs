@@ -1238,7 +1238,12 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
     std::fs::write(target.join("home/config.txt"), b"managed\n").unwrap();
 
     let rolled_back = sync
-        .rollback(serde_json::json!({"confirmed":true,"confirmationId":"test","runId":run_id}))
+        .rollback(serde_json::json!({
+            "confirmed":true,
+            "confirmationId":"test",
+            "runId":run_id,
+            "planId":plan_contract.id
+        }))
         .unwrap();
     assert_eq!(rolled_back["outcome"], "rolledback");
     assert!(!target.join("home/config.txt").exists());
@@ -1324,9 +1329,12 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
         .unwrap();
     std::fs::write(latest_receipt, b"{}").unwrap();
     assert_eq!(
-        sync.rollback(
-            serde_json::json!({"confirmed":true,"confirmationId":"test","runId":authenticated_run})
-        ),
+        sync.rollback(serde_json::json!({
+            "confirmed":true,
+            "confirmationId":"test",
+            "runId":authenticated_run,
+            "planId":authenticated_plan.id
+        })),
         Err(commonkit_service::DomainFailure::InvalidRequest)
     );
 

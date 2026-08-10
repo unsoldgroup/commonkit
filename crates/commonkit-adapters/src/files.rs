@@ -646,11 +646,105 @@ impl FileAdapter {
             ))
         }
     }
+
+    fn apply_bound(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        if Self::is_semantic(operation) {
+            return self.apply_semantic(operation);
+        }
+        let managed = self.managed(operation)?;
+        let content = self.artifacts.load(&managed.content).map_err(|_| {
+            failure(
+                "artifact_invalid",
+                "operation content artifact is missing or invalid",
+            )
+        })?;
+        self.validate_target_binding()
+            .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
+        let (parent, leaf) = open_parent_nofollow(&self.target, &managed.path.portable(), true)
+            .map_err(|_| failure("unsafe_path", "managed file has an unsafe ancestor"))?;
+        let observed = read_optional_in(&parent, &leaf)
+            .map_err(|_| failure("unsafe_path", "managed file path is unsafe"))?;
+        let observed_digest = observed
+            .as_deref()
+            .map(digest_bytes)
+            .transpose()
+            .map_err(|_| failure("preimage_changed", "managed file cannot be digested"))?;
+        if observed_digest != operation.before_digest {
+            return Err(failure(
+                "preimage_changed",
+                "managed file changed after prepare",
+            ));
+        }
+        replace_file_in(&parent, &leaf, &content, None)
+            .map_err(|_| failure("apply_failed", "could not replace managed file"))
+    }
 }
 
 impl Adapter for FileAdapter {
     fn id(&self) -> &StableId {
         &self.id
+    }
+
+    fn supports_recovery(&self, capability: commonkit_contracts::RecoveryCapability) -> bool {
+        capability == commonkit_contracts::RecoveryCapability::ExactRollback
+    }
+
+    fn supports_offline_recovery(&self, _operation: &Operation) -> bool {
+        true
+    }
+
+    fn observe_recovery(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<commonkit_reconcile::RecoveryObservation, AdapterFailure> {
+        let current = if Self::is_semantic(operation) {
+            let intent = self.semantic(operation)?;
+            let mut current =
+                inspect_resource(&self.target, &self.artifacts, intent.path().as_str()).map_err(
+                    |_| failure("recovery_observe_failed", "managed resource is unsafe"),
+                )?;
+            project_preimage_for_intent(&intent, &mut current);
+            semantic_digest(&current)
+                .map_err(|_| failure("recovery_observe_failed", "resource digest failed"))?
+        } else {
+            let managed = self.managed(operation)?;
+            self.inspect_legacy_file(&managed.path)
+                .map_err(|_| failure("recovery_observe_failed", "managed file is unsafe"))?
+                .as_deref()
+                .map(digest_bytes)
+                .transpose()
+                .map_err(|_| failure("recovery_observe_failed", "file digest failed"))?
+        };
+        Ok(if current == operation.after_digest {
+            commonkit_reconcile::RecoveryObservation::After
+        } else if current == operation.before_digest {
+            commonkit_reconcile::RecoveryObservation::Before
+        } else {
+            commonkit_reconcile::RecoveryObservation::Other
+        })
+    }
+
+    fn prepare_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.validate_target_binding()
+            .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
+        if Self::is_semantic(operation) {
+            let intent = self.semantic(operation)?;
+            if let FilesystemIntent::File { content, .. } = intent {
+                self.artifacts.load(&content).map_err(|_| {
+                    failure("artifact_invalid", "durable operation artifact is invalid")
+                })?;
+            }
+        } else {
+            let managed = self.managed(operation)?;
+            self.artifacts.load(&managed.content).map_err(|_| {
+                failure("artifact_invalid", "durable operation artifact is invalid")
+            })?;
+        }
+        Ok(())
+    }
+
+    fn converge_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.apply_bound(operation)
     }
 
     fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
@@ -695,35 +789,7 @@ impl Adapter for FileAdapter {
     }
 
     fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
-        if Self::is_semantic(operation) {
-            return self.apply_semantic(operation);
-        }
-        let managed = self.managed(operation)?;
-        let content = self.artifacts.load(&managed.content).map_err(|_| {
-            failure(
-                "artifact_invalid",
-                "operation content artifact is missing or invalid",
-            )
-        })?;
-        self.validate_target_binding()
-            .map_err(|_| failure("unsafe_path", "managed target root was substituted"))?;
-        let (parent, leaf) = open_parent_nofollow(&self.target, &managed.path.portable(), true)
-            .map_err(|_| failure("unsafe_path", "managed file has an unsafe ancestor"))?;
-        let observed = read_optional_in(&parent, &leaf)
-            .map_err(|_| failure("unsafe_path", "managed file path is unsafe"))?;
-        let observed_digest = observed
-            .as_deref()
-            .map(digest_bytes)
-            .transpose()
-            .map_err(|_| failure("preimage_changed", "managed file cannot be digested"))?;
-        if observed_digest != operation.before_digest {
-            return Err(failure(
-                "preimage_changed",
-                "managed file changed after prepare",
-            ));
-        }
-        replace_file_in(&parent, &leaf, &content, None)
-            .map_err(|_| failure("apply_failed", "could not replace managed file"))
+        self.apply_bound(operation)
     }
 
     fn verify(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {

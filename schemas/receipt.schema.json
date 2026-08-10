@@ -71,6 +71,7 @@
         "prepared",
         "applying",
         "verifying",
+        "applying_forward",
         "succeeded",
         "recovery_required",
         "forward_recovery_required",

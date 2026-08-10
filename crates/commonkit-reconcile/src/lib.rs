@@ -169,9 +169,23 @@ impl ReceiptJournal {
     }
 
     pub fn verify_chain(&self) -> Result<(), ReceiptError> {
+        if self
+            .receipt
+            .transitions
+            .first()
+            .is_none_or(|transition| transition.state != ReceiptState::Prepared)
+        {
+            return Err(ReceiptError::InvalidHashChain);
+        }
         let mut previous = None;
+        let mut previous_state = None;
         for (sequence, transition) in self.receipt.transitions.iter().enumerate() {
             if transition.sequence != sequence as u64 || transition.previous_digest != previous {
+                return Err(ReceiptError::InvalidHashChain);
+            }
+            if previous_state.is_some_and(|state| {
+                state != transition.state && !legal_transition(state, transition.state)
+            }) {
                 return Err(ReceiptError::InvalidHashChain);
             }
             let expected = make_transition(
@@ -184,6 +198,7 @@ impl ReceiptJournal {
                 return Err(ReceiptError::InvalidHashChain);
             }
             previous = Some(transition.entry_digest.clone());
+            previous_state = Some(transition.state);
         }
         if previous.as_ref() != Some(&self.receipt.receipt_id) {
             return Err(ReceiptError::InvalidHashChain);
@@ -198,6 +213,9 @@ impl ReceiptJournal {
             .last()
             .is_none_or(|transition| transition.progress_digest != progress_digest)
         {
+            return Err(ReceiptError::InvalidHashChain);
+        }
+        if previous_state != Some(self.receipt.state) {
             return Err(ReceiptError::InvalidHashChain);
         }
         Ok(())
@@ -347,8 +365,8 @@ impl AdapterFailure {
 
 pub trait Adapter {
     fn id(&self) -> &StableId;
-    fn supports_recovery(&self, capability: RecoveryCapability) -> bool {
-        capability == RecoveryCapability::ExactRollback
+    fn supports_recovery(&self, _capability: RecoveryCapability) -> bool {
+        false
     }
     fn supports_operation(&self, operation: &Operation) -> bool {
         self.supports_recovery(operation.recovery_capability)
@@ -360,6 +378,21 @@ pub trait Adapter {
         Err(AdapterFailure::new(
             "recovery_observation_unsupported",
             "adapter does not expose recovery observation",
+        ))
+    }
+    fn supports_offline_recovery(&self, _operation: &Operation) -> bool {
+        false
+    }
+    fn prepare_recovery(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Err(AdapterFailure::new(
+            "offline_recovery_unsupported",
+            "adapter does not expose offline recovery preparation",
+        ))
+    }
+    fn converge_recovery(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Err(AdapterFailure::new(
+            "offline_recovery_unsupported",
+            "adapter does not expose offline recovery convergence",
         ))
     }
     fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
@@ -494,6 +527,8 @@ impl<'a> Reconciler<'a> {
             applied.push((*operation).clone());
             self.persist(&journal)?;
         }
+        journal.transition(ReceiptState::Verifying)?;
+        self.persist(&journal)?;
         for operation in &exact {
             let adapter = adapter_for(adapters, &operation.adapter_id)?;
             match adapter.verify(operation) {
@@ -515,6 +550,10 @@ impl<'a> Reconciler<'a> {
             self.persist(&journal)?;
         }
 
+        if !forward.is_empty() {
+            journal.transition(ReceiptState::ApplyingForward)?;
+            self.persist(&journal)?;
+        }
         for operation in forward {
             // This durable checkpoint is the one-way recovery barrier. No
             // rollback path is reachable after it has been persisted.
@@ -546,8 +585,6 @@ impl<'a> Reconciler<'a> {
             self.persist(&journal)?;
         }
 
-        journal.transition(ReceiptState::Verifying)?;
-        self.persist(&journal)?;
         journal.transition(ReceiptState::Succeeded)?;
         self.persist(&journal)?;
         Ok(ReconcileOutcome::Succeeded)
@@ -591,7 +628,9 @@ impl<'a> Reconciler<'a> {
                 })
         }) || matches!(
             receipt.state,
-            ReceiptState::ForwardRecoveryRequired | ReceiptState::ConvergingForward
+            ReceiptState::ForwardRecoveryRequired
+                | ReceiptState::ConvergingForward
+                | ReceiptState::ForwardRecoveryFailed
         );
         if after_forward_barrier {
             return self.converge_forward(&mut journal, plan, adapters);
@@ -603,7 +642,7 @@ impl<'a> Reconciler<'a> {
                 self.persist(&journal)?;
                 return Ok(ReconcileOutcome::Canceled);
             }
-            ReceiptState::Applying | ReceiptState::Verifying => {
+            ReceiptState::Applying | ReceiptState::Verifying | ReceiptState::ApplyingForward => {
                 journal.transition(ReceiptState::RecoveryRequired)?;
                 self.persist(&journal)?;
             }
@@ -697,15 +736,19 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         match journal.receipt().state {
-            ReceiptState::Applying | ReceiptState::Verifying => {
+            ReceiptState::Applying | ReceiptState::Verifying | ReceiptState::ApplyingForward => {
                 journal.transition(ReceiptState::ForwardRecoveryRequired)?;
                 self.persist(journal)?;
             }
             ReceiptState::ForwardRecoveryRequired => {}
             ReceiptState::ConvergingForward => {}
+            ReceiptState::ForwardRecoveryFailed => {}
             state => return Err(ReconcileError::RunAlreadyTerminal(state)),
         }
-        if journal.receipt().state == ReceiptState::ForwardRecoveryRequired {
+        if matches!(
+            journal.receipt().state,
+            ReceiptState::ForwardRecoveryRequired | ReceiptState::ForwardRecoveryFailed
+        ) {
             journal.transition(ReceiptState::ConvergingForward)?;
             self.persist(journal)?;
         }
@@ -723,19 +766,26 @@ impl<'a> Reconciler<'a> {
             let result = match observation {
                 Ok(RecoveryObservation::After) => Ok(()),
                 Ok(RecoveryObservation::Before) => {
-                    let apply = adapter_for(adapters, &operation.adapter_id)?.apply(operation);
-                    if let Err(failure) = apply {
+                    let prepare =
+                        adapter_for(adapters, &operation.adapter_id)?.prepare_recovery(operation);
+                    if let Err(failure) = prepare {
                         Err(stable_failure_code(&failure))
                     } else {
-                        match adapter_for(adapters, &operation.adapter_id)?
-                            .observe_recovery(operation)
-                        {
-                            Ok(RecoveryObservation::After) => Ok(()),
-                            Ok(RecoveryObservation::Before | RecoveryObservation::Other) => {
-                                Err(StableId::parse("recovery_ambiguous")
-                                    .expect("static stable ID"))
+                        let converge = adapter_for(adapters, &operation.adapter_id)?
+                            .converge_recovery(operation);
+                        if let Err(failure) = converge {
+                            Err(stable_failure_code(&failure))
+                        } else {
+                            match adapter_for(adapters, &operation.adapter_id)?
+                                .observe_recovery(operation)
+                            {
+                                Ok(RecoveryObservation::After) => Ok(()),
+                                Ok(RecoveryObservation::Before | RecoveryObservation::Other) => {
+                                    Err(StableId::parse("recovery_ambiguous")
+                                        .expect("static stable ID"))
+                                }
+                                Err(failure) => Err(stable_failure_code(&failure)),
                             }
-                            Err(failure) => Err(stable_failure_code(&failure)),
                         }
                     }
                 }
@@ -831,6 +881,10 @@ fn adapter_for<'a>(
 }
 
 fn preflight_adapters(plan: &Plan, adapters: &[Box<dyn Adapter>]) -> Result<(), ReconcileError> {
+    let crosses_forward_barrier = plan
+        .operations
+        .iter()
+        .any(|operation| operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly);
     for operation in &plan.operations {
         let adapter = adapters
             .iter()
@@ -840,6 +894,11 @@ fn preflight_adapters(plan: &Plan, adapters: &[Box<dyn Adapter>]) -> Result<(), 
             return Err(ReconcileError::AdapterCapabilityUnsupported {
                 adapter_id: operation.adapter_id.clone(),
                 capability: operation.recovery_capability,
+            });
+        }
+        if crosses_forward_barrier && !adapter.supports_offline_recovery(operation) {
+            return Err(ReconcileError::AdapterOfflineRecoveryUnsupported {
+                adapter_id: operation.adapter_id.clone(),
             });
         }
     }
@@ -876,6 +935,8 @@ pub enum ReconcileError {
         adapter_id: StableId,
         capability: RecoveryCapability,
     },
+    #[error("adapter {adapter_id} does not support bound offline forward recovery")]
+    AdapterOfflineRecoveryUnsupported { adapter_id: StableId },
     #[error("explicit rollback is unsupported for a forward-only plan")]
     RollbackUnsupported,
     #[error("durable receipt store is required for restart recovery")]
@@ -1106,6 +1167,10 @@ fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool 
                 OperationPhase::Prepared,
                 OperationPhase::ForwardRecovered | OperationPhase::ForwardRecoveryFailed
             )
+            | (
+                OperationPhase::ForwardRecoveryFailed,
+                OperationPhase::ForwardRecovered | OperationPhase::ForwardRecoveryFailed
+            )
     )
 }
 
@@ -1123,6 +1188,12 @@ fn legal_transition(from: ReceiptState, to: ReceiptState) -> bool {
         ) | (
             ReceiptState::Verifying,
             ReceiptState::Succeeded
+                | ReceiptState::ApplyingForward
+                | ReceiptState::RecoveryRequired
+                | ReceiptState::ForwardRecoveryRequired
+        ) | (
+            ReceiptState::ApplyingForward,
+            ReceiptState::Succeeded
                 | ReceiptState::RecoveryRequired
                 | ReceiptState::ForwardRecoveryRequired
         ) | (ReceiptState::RecoveryRequired, ReceiptState::RollingBack)
@@ -1133,6 +1204,10 @@ fn legal_transition(from: ReceiptState, to: ReceiptState) -> bool {
             | (
                 ReceiptState::ConvergingForward,
                 ReceiptState::ForwardRecovered | ReceiptState::ForwardRecoveryFailed
+            )
+            | (
+                ReceiptState::ForwardRecoveryFailed,
+                ReceiptState::ConvergingForward
             )
             | (ReceiptState::Succeeded, ReceiptState::RollingBack)
             | (
@@ -1176,4 +1251,83 @@ pub enum ReceiptError {
         persisted_sequence: u64,
         attempted_sequence: u64,
     },
+}
+
+#[cfg(test)]
+mod receipt_chain_tests {
+    use super::*;
+
+    fn digest(character: char) -> Sha256Digest {
+        Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
+    }
+
+    fn journal() -> ReceiptJournal {
+        ReceiptJournal::new(
+            StableId::parse("tampered-run").unwrap(),
+            digest('a'),
+            StableId::parse("target").unwrap(),
+            digest('b'),
+            digest('c'),
+            digest('d'),
+            PlanBindings {
+                target_identity_digest: digest('e'),
+                composed_loadout_digest: digest('f'),
+                provider_inputs_digest: digest('1'),
+                ownership_map_digest: digest('2'),
+                artifact_set_digest: digest('3'),
+            },
+        )
+        .unwrap()
+    }
+
+    fn replace_states(journal: &mut ReceiptJournal, states: &[ReceiptState]) {
+        let progress_digest = digest_domain_json(
+            "commonkit.operation-progress.v1",
+            &journal.receipt.operation_progress,
+        )
+        .unwrap();
+        let mut transitions = Vec::new();
+        let mut previous = None;
+        for (sequence, state) in states.iter().copied().enumerate() {
+            let transition =
+                make_transition(sequence as u64, state, previous, progress_digest.clone()).unwrap();
+            previous = Some(transition.entry_digest.clone());
+            transitions.push(transition);
+        }
+        journal.receipt.receipt_id = previous.unwrap();
+        journal.receipt.transitions = transitions;
+    }
+
+    #[test]
+    fn hash_valid_receipts_reject_invalid_state_history_and_top_level_state() {
+        let mut invalid_first = journal();
+        replace_states(&mut invalid_first, &[ReceiptState::Applying]);
+        invalid_first.receipt.state = ReceiptState::Applying;
+        assert!(matches!(
+            invalid_first.verify_chain(),
+            Err(ReceiptError::InvalidHashChain)
+        ));
+
+        let mut illegal_adjacent = journal();
+        replace_states(
+            &mut illegal_adjacent,
+            &[ReceiptState::Prepared, ReceiptState::Succeeded],
+        );
+        illegal_adjacent.receipt.state = ReceiptState::Succeeded;
+        assert!(matches!(
+            illegal_adjacent.verify_chain(),
+            Err(ReceiptError::InvalidHashChain)
+        ));
+
+        let mut mismatched_top = journal();
+        replace_states(
+            &mut mismatched_top,
+            &[ReceiptState::Prepared, ReceiptState::Applying],
+        );
+        mismatched_top.receipt.state = ReceiptState::Prepared;
+        assert!(matches!(
+            mismatched_top.verify_chain(),
+            Err(ReceiptError::InvalidHashChain)
+        ));
+    }
 }

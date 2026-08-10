@@ -199,6 +199,28 @@ impl RelayAdapter {
         }
         Ok(())
     }
+
+    fn apply_bound(&self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let payload = self.payload(operation)?;
+        let bytes = serde_jcs::to_vec(&payload.desired).map_err(|_| {
+            failure(
+                "relay_apply_failed",
+                "could not serialize relay configuration",
+            )
+        })?;
+        atomic_replace(&self.live, &bytes).map_err(|_| {
+            failure(
+                "relay_apply_failed",
+                "could not replace relay configuration",
+            )
+        })?;
+        if let Some(lifecycle) = &self.lifecycle {
+            lifecycle
+                .reload(&payload.desired)
+                .map_err(|_| failure("relay_reload_failed", "could not reload relay runtime"))?;
+        }
+        Ok(())
+    }
 }
 
 pub fn plan_relay_operation(
@@ -254,6 +276,42 @@ impl Adapter for RelayAdapter {
         &self.id
     }
 
+    fn supports_recovery(&self, capability: commonkit_contracts::RecoveryCapability) -> bool {
+        capability == commonkit_contracts::RecoveryCapability::ExactRollback
+    }
+
+    fn supports_offline_recovery(&self, operation: &Operation) -> bool {
+        self.payload(operation).is_ok()
+    }
+
+    fn observe_recovery(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<commonkit_reconcile::RecoveryObservation, AdapterFailure> {
+        self.payload(operation)?;
+        let current = read_optional_regular(&self.live)
+            .map_err(|_| failure("relay_recovery_observe_failed", "relay inspection failed"))?
+            .as_deref()
+            .map(digest_bytes)
+            .transpose()
+            .map_err(|_| failure("relay_recovery_observe_failed", "relay digest failed"))?;
+        Ok(if current == operation.after_digest {
+            commonkit_reconcile::RecoveryObservation::After
+        } else if current == operation.before_digest {
+            commonkit_reconcile::RecoveryObservation::Before
+        } else {
+            commonkit_reconcile::RecoveryObservation::Other
+        })
+    }
+
+    fn prepare_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.payload(operation).map(|_| ())
+    }
+
+    fn converge_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.apply_bound(operation)
+    }
+
     fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
         self.payload(operation)?;
         let bytes = read_optional_regular(&self.live).map_err(|_| {
@@ -290,25 +348,7 @@ impl Adapter for RelayAdapter {
     }
 
     fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
-        let payload = self.payload(operation)?;
-        let bytes = serde_jcs::to_vec(&payload.desired).map_err(|_| {
-            failure(
-                "relay_apply_failed",
-                "could not serialize relay configuration",
-            )
-        })?;
-        atomic_replace(&self.live, &bytes).map_err(|_| {
-            failure(
-                "relay_apply_failed",
-                "could not replace relay configuration",
-            )
-        })?;
-        if let Some(lifecycle) = &self.lifecycle {
-            lifecycle
-                .reload(&payload.desired)
-                .map_err(|_| failure("relay_reload_failed", "could not reload relay runtime"))?;
-        }
-        Ok(())
+        self.apply_bound(operation)
     }
 
     fn verify(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {

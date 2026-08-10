@@ -78,6 +78,28 @@ struct RecordingAdapter {
     observations: Arc<Mutex<BTreeMap<String, RecoveryObservation>>>,
 }
 
+struct ImplicitCapabilityAdapter {
+    id: StableId,
+}
+
+impl Adapter for ImplicitCapabilityAdapter {
+    fn id(&self) -> &StableId {
+        &self.id
+    }
+    fn prepare(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    fn apply(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    fn verify(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    fn rollback(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+}
+
 impl Adapter for RecordingAdapter {
     fn id(&self) -> &StableId {
         &self.id
@@ -129,6 +151,25 @@ impl Adapter for RecordingAdapter {
             .get(operation.resource.resource_id.as_str())
             .copied()
             .unwrap_or(RecoveryObservation::Before))
+    }
+
+    fn supports_offline_recovery(&self, _operation: &Operation) -> bool {
+        self.supports_forward
+    }
+
+    fn prepare_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.record("recovery_prepare", operation);
+        Ok(())
+    }
+
+    fn converge_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.record("converge", operation);
+        self.fail_if(&self.fail_apply_for, operation)?;
+        self.observations.lock().unwrap().insert(
+            operation.resource.resource_id.to_string(),
+            RecoveryObservation::After,
+        );
+        Ok(())
     }
 }
 
@@ -458,6 +499,27 @@ fn adapter_capability_preflight_fails_before_creating_a_receipt() {
 }
 
 #[test]
+fn adapter_capability_defaults_fail_closed_for_exact_rollback() {
+    let directory = temporary_directory("implicit-capability");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let before = store_snapshot(&directory);
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(ImplicitCapabilityAdapter {
+        id: StableId::parse("files").unwrap(),
+    })];
+
+    assert!(matches!(
+        Reconciler::with_store(&store).execute(
+            &plan(),
+            StableId::parse("implicit-exact").unwrap(),
+            &mut adapters,
+        ),
+        Err(ReconcileError::AdapterCapabilityUnsupported { .. })
+    ));
+    assert_eq!(store_snapshot(&directory), before);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn forward_barrier_never_rolls_back_and_records_forward_recovery_required() {
     let directory = temporary_directory("forward-barrier");
     let store = ReceiptStore::open(&directory).unwrap();
@@ -488,9 +550,27 @@ fn forward_barrier_never_rolls_back_and_records_forward_recovery_required() {
             "apply:forward",
         ]
     );
+    let receipt = store.load(run_id.clone()).unwrap();
     assert_eq!(
-        store.load(run_id).unwrap().receipt().state,
+        receipt.receipt().state,
         ReceiptState::ForwardRecoveryRequired
+    );
+    let mut stages = receipt
+        .receipt()
+        .transitions
+        .iter()
+        .map(|transition| transition.state)
+        .collect::<Vec<_>>();
+    stages.dedup();
+    assert_eq!(
+        stages,
+        [
+            ReceiptState::Prepared,
+            ReceiptState::Applying,
+            ReceiptState::Verifying,
+            ReceiptState::ApplyingForward,
+            ReceiptState::ForwardRecoveryRequired,
+        ]
     );
     fs::remove_dir_all(directory).unwrap();
 }
@@ -569,7 +649,8 @@ fn restart_after_forward_barrier_converges_bound_before_and_after_states_without
         [
             "observe:exact",
             "observe:forward",
-            "apply:forward",
+            "recovery_prepare:forward",
+            "converge:forward",
             "observe:forward",
         ]
     );
@@ -622,8 +703,33 @@ fn ambiguous_forward_recovery_fails_without_apply_or_rollback() {
         ["observe:exact", "observe:forward"]
     );
     assert_eq!(
-        store.load(run_id).unwrap().receipt().state,
+        store.load(run_id.clone()).unwrap().receipt().state,
         ReceiptState::ForwardRecoveryFailed
+    );
+
+    let retry_events = Arc::new(Mutex::new(Vec::new()));
+    let mut retrying = adapter(retry_events.clone());
+    retrying.supports_forward = true;
+    retrying
+        .observations
+        .lock()
+        .unwrap()
+        .insert("exact".into(), RecoveryObservation::After);
+    retrying
+        .observations
+        .lock()
+        .unwrap()
+        .insert("forward".into(), RecoveryObservation::After);
+    let mut retry_adapters: Vec<Box<dyn Adapter>> = vec![Box::new(retrying)];
+    assert_eq!(
+        Reconciler::with_store(&store)
+            .recover_run(run_id.clone(), &mixed, &mut retry_adapters)
+            .unwrap(),
+        ReconcileOutcome::ForwardRecovered
+    );
+    assert_eq!(
+        store.load(run_id).unwrap().receipt().state,
+        ReceiptState::ForwardRecovered
     );
     fs::remove_dir_all(directory).unwrap();
 }

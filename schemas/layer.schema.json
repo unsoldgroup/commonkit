@@ -78,19 +78,19 @@
             "description": "An exact, observe-only package declaration.\n\n`id` is the stable merge and report identity, `version` is an exact pin,\n`manager` selects the fixed read-only query backend, and `source` is matched\nagainst `securityPolicy.allowlists.package_sources`.",
             "properties": {
               "id": {
-                "type": "string",
-                "pattern": "^[a-z][a-z0-9_-]{0,62}$"
+                "pattern": "^[a-z][a-z0-9_-]{0,62}$",
+                "type": "string"
               },
               "manager": {
                 "$ref": "#/$defs/PackageManager"
               },
               "source": {
-                "type": "string",
-                "pattern": "^[a-z][a-z0-9_-]{0,62}$"
+                "pattern": "^[a-z][a-z0-9_-]{0,62}$",
+                "type": "string"
               },
               "version": {
-                "type": "string",
-                "pattern": "^(?!.*[\\s*^~<>=,|]).+$"
+                "pattern": "^(?!.*[\\s*^~<>=,|]).+$",
+                "type": "string"
               }
             },
             "required": [

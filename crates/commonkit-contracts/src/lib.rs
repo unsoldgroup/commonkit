@@ -1064,6 +1064,12 @@ pub enum RecoveryCapability {
     ConvergeForwardOnly,
 }
 
+impl RecoveryCapability {
+    pub fn is_exact_rollback(value: &Self) -> bool {
+        *value == Self::ExactRollback
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceRef {
@@ -1091,7 +1097,7 @@ pub struct Operation {
     pub resource: ResourceRef,
     pub risk: Risk,
     pub requires_confirmation: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "RecoveryCapability::is_exact_rollback")]
     pub recovery_capability: RecoveryCapability,
     pub depends_on: Vec<Sha256Digest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1134,6 +1140,7 @@ pub enum ReceiptState {
     Prepared,
     Applying,
     Verifying,
+    ApplyingForward,
     Succeeded,
     RecoveryRequired,
     ForwardRecoveryRequired,

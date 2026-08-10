@@ -286,11 +286,105 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
             id,
         ))?)?)
     }
+
+    fn apply_bound(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let intent = self.intent(operation)?;
+        let request = match intent {
+            FilesystemIntent::File { path, content, .. } => SshFilesystemRequest::WriteFile {
+                root_id: self.root_id.clone(),
+                path,
+                content: self.artifacts.load(&content).map_err(|_| {
+                    failure("artifact_invalid", "remote content artifact is invalid")
+                })?,
+            },
+            FilesystemIntent::Remove { path, .. } => SshFilesystemRequest::Remove {
+                root_id: self.root_id.clone(),
+                path,
+            },
+            FilesystemIntent::Directory { path, mode, .. } => {
+                SshFilesystemRequest::WriteDirectory {
+                    root_id: self.root_id.clone(),
+                    path,
+                    mode,
+                }
+            }
+            FilesystemIntent::Symlink {
+                path,
+                target,
+                target_kind,
+                ..
+            } => SshFilesystemRequest::WriteSymlink {
+                root_id: self.root_id.clone(),
+                path,
+                target,
+                target_kind,
+            },
+        };
+        match self
+            .transport
+            .perform(request)
+            .map_err(|_| failure("remote_apply_failed", "remote helper apply failed"))?
+        {
+            SshFilesystemResponse::Applied => Ok(()),
+            _ => Err(failure(
+                "remote_response_invalid",
+                "remote helper returned an unexpected response",
+            )),
+        }
+    }
 }
 
 impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
     fn id(&self) -> &StableId {
         &self.id
+    }
+
+    fn supports_recovery(&self, capability: commonkit_contracts::RecoveryCapability) -> bool {
+        capability == commonkit_contracts::RecoveryCapability::ExactRollback
+    }
+
+    fn supports_offline_recovery(&self, _operation: &Operation) -> bool {
+        true
+    }
+
+    fn observe_recovery(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<commonkit_reconcile::RecoveryObservation, AdapterFailure> {
+        let intent = self.intent(operation)?;
+        let mut current = self.observe(intent.path().clone()).map_err(|_| {
+            failure(
+                "remote_recovery_observe_failed",
+                "remote observation failed",
+            )
+        })?;
+        project_preimage_for_intent(&intent, &mut current);
+        let current = preimage_digest(&current)
+            .map_err(|_| failure("remote_digest_failed", "remote resource digest failed"))?;
+        Ok(if current == operation.after_digest {
+            commonkit_reconcile::RecoveryObservation::After
+        } else if current == operation.before_digest {
+            commonkit_reconcile::RecoveryObservation::Before
+        } else {
+            commonkit_reconcile::RecoveryObservation::Other
+        })
+    }
+
+    fn prepare_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let intent = self.intent(operation)?;
+        if let FilesystemIntent::File { content, .. } = intent {
+            self.artifacts.load(&content).map_err(|_| {
+                failure(
+                    "artifact_invalid",
+                    "durable remote content artifact is invalid",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    fn converge_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.apply_bound(operation)
     }
 
     fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
@@ -377,49 +471,7 @@ impl<T: SshFilesystemTransport + Send> Adapter for SshFileAdapter<T> {
     }
 
     fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
-        let intent = self.intent(operation)?;
-        let request = match intent {
-            FilesystemIntent::File { path, content, .. } => SshFilesystemRequest::WriteFile {
-                root_id: self.root_id.clone(),
-                path,
-                content: self.artifacts.load(&content).map_err(|_| {
-                    failure("artifact_invalid", "remote content artifact is invalid")
-                })?,
-            },
-            FilesystemIntent::Remove { path, .. } => SshFilesystemRequest::Remove {
-                root_id: self.root_id.clone(),
-                path,
-            },
-            FilesystemIntent::Directory { path, mode, .. } => {
-                SshFilesystemRequest::WriteDirectory {
-                    root_id: self.root_id.clone(),
-                    path,
-                    mode,
-                }
-            }
-            FilesystemIntent::Symlink {
-                path,
-                target,
-                target_kind,
-                ..
-            } => SshFilesystemRequest::WriteSymlink {
-                root_id: self.root_id.clone(),
-                path,
-                target,
-                target_kind,
-            },
-        };
-        match self
-            .transport
-            .perform(request)
-            .map_err(|_| failure("remote_apply_failed", "remote helper apply failed"))?
-        {
-            SshFilesystemResponse::Applied => Ok(()),
-            _ => Err(failure(
-                "remote_response_invalid",
-                "remote helper returned an unexpected response",
-            )),
-        }
+        self.apply_bound(operation)
     }
 
     fn verify(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
