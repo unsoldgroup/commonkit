@@ -44,8 +44,8 @@ fn materializes_only_into_isolated_destination_with_fixed_flags() {
     assert_eq!(state.inputs.provider_version.as_str(), "2.70.4");
     assert!(state.unsupported.is_empty());
     assert!(state.resources.iter().any(|resource| matches!(
-        &resource.intent,
-        FilesystemIntent::File { path, .. } if path.as_str() == "home/.gitconfig"
+        resource.intent.filesystem(),
+        Some(FilesystemIntent::File { path, .. }) if path.as_str() == "home/.gitconfig"
     )));
 
     let calls = fs::read_to_string(&fixture.calls).unwrap();
@@ -244,8 +244,10 @@ mv "$dest/dot_value" "$dest/.value"
     let content = state
         .resources
         .iter()
-        .find_map(|resource| match &resource.intent {
-            FilesystemIntent::File { path, content, .. } if path.as_str() == "home/.value" => {
+        .find_map(|resource| match resource.intent.filesystem() {
+            Some(FilesystemIntent::File { path, content, .. })
+                if path.as_str() == "home/.value" =>
+            {
                 Some(artifacts.load(content).unwrap())
             }
             _ => None,
@@ -368,8 +370,10 @@ fn real_chezmoi_release_materializes_supported_fixtures_deterministically() {
     let machine = first
         .resources
         .iter()
-        .find_map(|resource| match &resource.intent {
-            FilesystemIntent::File { path, content, .. } if path.as_str() == "home/.machine" => {
+        .find_map(|resource| match resource.intent.filesystem() {
+            Some(FilesystemIntent::File { path, content, .. })
+                if path.as_str() == "home/.machine" =>
+            {
                 Some(fixture.artifacts().load(content).unwrap())
             }
             _ => None,
@@ -377,16 +381,16 @@ fn real_chezmoi_release_materializes_supported_fixtures_deterministically() {
         .expect("machine-conditional output");
     assert_eq!(machine, format!("{go_os}-{go_arch}\n").as_bytes());
     assert!(first.resources.iter().any(|resource| matches!(
-        &resource.intent,
-        FilesystemIntent::Symlink { path, target, .. }
+        resource.intent.filesystem(),
+        Some(FilesystemIntent::Symlink { path, target, .. })
             if path.as_str() == "home/.link" && target.as_str() == ".regular"
     )));
-    assert!(
-        !first
-            .resources
-            .iter()
-            .any(|resource| { resource.intent.path().as_str() == "home/.ignored" })
-    );
+    assert!(!first.resources.iter().any(|resource| {
+        resource
+            .intent
+            .filesystem()
+            .is_some_and(|intent| intent.path().as_str() == "home/.ignored")
+    }));
     for (path, expected_mode) in [
         ("home/.regular", 0o644),
         ("home/.tool", 0o755),
@@ -395,16 +399,16 @@ fn real_chezmoi_release_materializes_supported_fixtures_deterministically() {
     ] {
         assert!(
             first.resources.iter().any(|resource| matches!(
-                &resource.intent,
-                FilesystemIntent::File { path: actual, mode: Some(mode), .. }
+                resource.intent.filesystem(),
+                Some(FilesystemIntent::File { path: actual, mode: Some(mode), .. })
                     if actual.as_str() == path && mode.value() == expected_mode
             )),
             "missing {path} with mode {expected_mode:o}"
         );
     }
     assert!(first.resources.iter().any(|resource| matches!(
-        &resource.intent,
-        FilesystemIntent::Directory { path, exact: false, .. }
+        resource.intent.filesystem(),
+        Some(FilesystemIntent::Directory { path, exact: false, .. })
             if path.as_str() == "home/.config"
     )));
     assert_eq!(fs::read_dir(&fixture.live).unwrap().count(), 0);
@@ -471,12 +475,17 @@ fn scans_regular_files_directories_and_safe_symlinks_from_staging() {
         .materialize(&context(), &fixture.workspace(), &fixture.artifacts())
         .unwrap();
     assert!(
-        state.resources.iter().any(|r| matches!(&r.intent,
-        FilesystemIntent::Directory { path, exact: false, .. } if path.as_str() == "home/.config"))
+        state.resources.iter().any(|r| matches!(r.intent.filesystem(),
+        Some(FilesystemIntent::Directory { path, exact: false, .. }) if path.as_str() == "home/.config"))
     );
-    assert!(state.resources.iter().any(|r| matches!(&r.intent,
-        FilesystemIntent::Symlink { path, target, .. }
-            if path.as_str() == "home/.gitconfig-link" && target.as_str() == ".gitconfig")));
+    assert!(
+        state
+            .resources
+            .iter()
+            .any(|r| matches!(r.intent.filesystem(),
+        Some(FilesystemIntent::Symlink { path, target, .. })
+            if path.as_str() == "home/.gitconfig-link" && target.as_str() == ".gitconfig"))
+    );
 }
 
 struct Fixture {

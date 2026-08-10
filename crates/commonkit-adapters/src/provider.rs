@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::artifacts::ArtifactStore;
-use super::resources::{NormalizedManagedPath, NormalizedResource};
+use super::resources::{NormalizedManagedPath, NormalizedResource, ResourceType};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
@@ -222,8 +222,8 @@ impl MaterializedState {
             }
         }
         resources.sort_by(|left, right| {
-            (left.intent.path().as_str(), &left.provenance.source)
-                .cmp(&(right.intent.path().as_str(), &right.provenance.source))
+            (left.sort_key(), &left.provenance.source)
+                .cmp(&(right.sort_key(), &right.provenance.source))
         });
         declared_side_effects.sort();
         declared_side_effects.dedup();
@@ -244,8 +244,16 @@ impl MaterializedState {
             (&left.provenance.source, left_id).cmp(&(&right.provenance.source, right_id))
         });
         capabilities.dedup();
+        let digest_domain = if resources
+            .iter()
+            .all(|resource| resource.resource_type() == ResourceType::Filesystem)
+        {
+            "commonkit.materialized-state.v1"
+        } else {
+            "commonkit.materialized-state.v2"
+        };
         let digest = digest_domain_json(
-            "commonkit.materialized-state.v1",
+            digest_domain,
             &MaterializedSemantic {
                 inputs_digest: &inputs.input_set_digest,
                 resources: &resources,

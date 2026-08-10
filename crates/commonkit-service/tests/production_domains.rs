@@ -477,7 +477,8 @@ fn styleguide_binding_participates_in_plans_and_invalidates_existing_authority()
                 content: skill,
                 mode: None,
                 expected_before: None,
-            },
+            }
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),
@@ -596,7 +597,8 @@ fn configured_registry_materializes_real_plans_credentials_and_snapshots() {
                 content: content.clone(),
                 mode: None,
                 expected_before: None,
-            },
+            }
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),

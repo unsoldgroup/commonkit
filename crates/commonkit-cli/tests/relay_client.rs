@@ -69,9 +69,14 @@ fn generated_command(root: &std::path::Path) -> (String, Vec<String>) {
     let resource = state
         .resources
         .iter()
-        .find(|resource| resource.intent.path().as_str() == "home/.mcp.json")
+        .find(|resource| {
+            resource
+                .intent
+                .filesystem()
+                .is_some_and(|intent| intent.path().as_str() == "home/.mcp.json")
+        })
         .unwrap();
-    let FilesystemIntent::File { content, .. } = &resource.intent else {
+    let Some(FilesystemIntent::File { content, .. }) = resource.intent.filesystem() else {
         panic!("generated client must be a file")
     };
     let value: serde_json::Value =

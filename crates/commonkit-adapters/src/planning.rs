@@ -8,12 +8,15 @@ use thiserror::Error;
 
 use crate::{
     ArtifactError, ArtifactStore, DeclaredSideEffect, FileAdapter, FileAdapterError,
-    FilesystemIntent, MaterializedState, NormalizedResource, OwnershipError, OwnershipRules,
-    ProviderContractError, SshFileAdapter, SshFileAdapterError, SshFilesystemTransport,
-    validate_ownership,
+    MaterializedState, NormalizedResource, OwnershipError, OwnershipRules, PackageResourceIntent,
+    ProviderContractError, ResourceProvenance, ResourceType, SshFileAdapter, SshFileAdapterError,
+    SshFilesystemTransport, validate_ownership,
 };
+use commonkit_reconcile::Adapter;
 
 pub trait ProviderResourcePlanner {
+    fn adapter_id(&self) -> &StableId;
+
     fn register_provider_resource(
         &mut self,
         id: StableId,
@@ -23,6 +26,10 @@ pub trait ProviderResourcePlanner {
 }
 
 impl ProviderResourcePlanner for FileAdapter {
+    fn adapter_id(&self) -> &StableId {
+        Adapter::id(self)
+    }
+
     fn register_provider_resource(
         &mut self,
         id: StableId,
@@ -37,7 +44,11 @@ impl ProviderResourcePlanner for FileAdapter {
     }
 }
 
-impl<T: SshFilesystemTransport> ProviderResourcePlanner for SshFileAdapter<T> {
+impl<T: SshFilesystemTransport + Send> ProviderResourcePlanner for SshFileAdapter<T> {
+    fn adapter_id(&self) -> &StableId {
+        Adapter::id(self)
+    }
+
     fn register_provider_resource(
         &mut self,
         id: StableId,
@@ -46,6 +57,125 @@ impl<T: SshFilesystemTransport> ProviderResourcePlanner for SshFileAdapter<T> {
     ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
         self.register_materialized_resource(id, resource, provider_artifacts)
             .map_err(Into::into)
+    }
+}
+
+pub trait PackageResourcePlanner {
+    fn adapter_id(&self) -> &StableId;
+
+    fn register_package_resource(
+        &mut self,
+        id: StableId,
+        intent: &PackageResourceIntent,
+        provenance: &ResourceProvenance,
+        provider_artifacts: &ArtifactStore,
+    ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError>;
+}
+
+pub enum ProviderPlannerRoute<'a> {
+    Filesystem(&'a mut dyn ProviderResourcePlanner),
+    Package(&'a mut dyn PackageResourcePlanner),
+}
+
+pub struct ProviderResourceRouter<'a> {
+    filesystem: Option<&'a mut dyn ProviderResourcePlanner>,
+    package: Option<&'a mut dyn PackageResourcePlanner>,
+}
+
+impl<'a> ProviderResourceRouter<'a> {
+    pub fn new(routes: Vec<ProviderPlannerRoute<'a>>) -> Result<Self, ProviderPlanError> {
+        let mut router = Self {
+            filesystem: None,
+            package: None,
+        };
+        for route in routes {
+            match route {
+                ProviderPlannerRoute::Filesystem(planner) => {
+                    if !matches!(planner.adapter_id().as_str(), "files" | "ssh-files") {
+                        return Err(ProviderPlanError::InvalidResourcePlanner {
+                            resource_type: ResourceType::Filesystem,
+                            adapter_id: planner.adapter_id().clone(),
+                        });
+                    }
+                    if router.filesystem.replace(planner).is_some() {
+                        return Err(ProviderPlanError::DuplicateResourcePlanner(
+                            ResourceType::Filesystem,
+                        ));
+                    }
+                }
+                ProviderPlannerRoute::Package(planner) => {
+                    if planner.adapter_id().as_str() != "packages" {
+                        return Err(ProviderPlanError::InvalidResourcePlanner {
+                            resource_type: ResourceType::Package,
+                            adapter_id: planner.adapter_id().clone(),
+                        });
+                    }
+                    if router.package.replace(planner).is_some() {
+                        return Err(ProviderPlanError::DuplicateResourcePlanner(
+                            ResourceType::Package,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(router)
+    }
+
+    fn preflight(&self, resources: &[&NormalizedResource]) -> Result<(), ProviderPlanError> {
+        for resource in resources {
+            let missing = match resource.resource_type() {
+                ResourceType::Filesystem => self.filesystem.is_none(),
+                ResourceType::Package => self.package.is_none(),
+            };
+            if missing {
+                return Err(ProviderPlanError::MissingResourcePlanner(
+                    resource.resource_type(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn register(
+        &mut self,
+        id: StableId,
+        resource: &NormalizedResource,
+        provider_artifacts: &ArtifactStore,
+    ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
+        let (declared_adapter, operation) = match &resource.intent {
+            crate::ResourceIntent::Filesystem(_) => {
+                let planner = self.filesystem.as_deref_mut().ok_or(
+                    ProviderPlanError::MissingResourcePlanner(ResourceType::Filesystem),
+                )?;
+                let adapter_id = planner.adapter_id().clone();
+                let operation =
+                    planner.register_provider_resource(id, resource, provider_artifacts)?;
+                (adapter_id, operation)
+            }
+            crate::ResourceIntent::Package(intent) => {
+                let planner = self.package.as_deref_mut().ok_or(
+                    ProviderPlanError::MissingResourcePlanner(ResourceType::Package),
+                )?;
+                let adapter_id = planner.adapter_id().clone();
+                let operation = planner.register_package_resource(
+                    id,
+                    intent,
+                    &resource.provenance,
+                    provider_artifacts,
+                )?;
+                (adapter_id, operation)
+            }
+        };
+        if let Some(operation) = &operation
+            && operation.adapter_id != declared_adapter
+        {
+            return Err(ProviderPlanError::UnexpectedAdapterRoute {
+                resource_type: resource.resource_type(),
+                expected: declared_adapter,
+                actual: operation.adapter_id.clone(),
+            });
+        }
+        Ok(operation)
     }
 }
 
@@ -67,8 +197,14 @@ pub fn provider_plan_bindings(
     states: &[MaterializedState],
     provider_artifacts: &ArtifactStore,
 ) -> Result<PlanBindings, ProviderPlanError> {
-    struct AuthorityOnlyPlanner;
-    impl ProviderResourcePlanner for AuthorityOnlyPlanner {
+    struct AuthorityOnlyFilesystemPlanner {
+        id: StableId,
+    }
+    impl ProviderResourcePlanner for AuthorityOnlyFilesystemPlanner {
+        fn adapter_id(&self) -> &StableId {
+            &self.id
+        }
+
         fn register_provider_resource(
             &mut self,
             _id: StableId,
@@ -78,15 +214,52 @@ pub fn provider_plan_bindings(
             Ok(None)
         }
     }
-    let mut planner = AuthorityOnlyPlanner;
-    Ok(build_provider_plan(request, states, provider_artifacts, &mut planner)?.bindings)
+    struct AuthorityOnlyPackagePlanner {
+        id: StableId,
+    }
+    impl PackageResourcePlanner for AuthorityOnlyPackagePlanner {
+        fn adapter_id(&self) -> &StableId {
+            &self.id
+        }
+
+        fn register_package_resource(
+            &mut self,
+            _id: StableId,
+            _intent: &PackageResourceIntent,
+            _provenance: &ResourceProvenance,
+            _provider_artifacts: &ArtifactStore,
+        ) -> Result<Option<commonkit_contracts::Operation>, ProviderPlanError> {
+            Ok(None)
+        }
+    }
+    let mut filesystem = AuthorityOnlyFilesystemPlanner {
+        id: StableId::parse("files").expect("static adapter ID"),
+    };
+    let mut package = AuthorityOnlyPackagePlanner {
+        id: StableId::parse("packages").expect("static adapter ID"),
+    };
+    let mut router = ProviderResourceRouter::new(vec![
+        ProviderPlannerRoute::Filesystem(&mut filesystem),
+        ProviderPlannerRoute::Package(&mut package),
+    ])?;
+    Ok(build_provider_plan_with_router(request, states, provider_artifacts, &mut router)?.bindings)
 }
 
-pub fn build_provider_plan<P: ProviderResourcePlanner + ?Sized>(
+pub fn build_provider_plan<P: ProviderResourcePlanner>(
     request: ProviderPlanRequest<'_>,
     states: &[MaterializedState],
     provider_artifacts: &ArtifactStore,
     files: &mut P,
+) -> Result<Plan, ProviderPlanError> {
+    let mut router = ProviderResourceRouter::new(vec![ProviderPlannerRoute::Filesystem(files)])?;
+    build_provider_plan_with_router(request, states, provider_artifacts, &mut router)
+}
+
+pub fn build_provider_plan_with_router(
+    request: ProviderPlanRequest<'_>,
+    states: &[MaterializedState],
+    provider_artifacts: &ArtifactStore,
+    router: &mut ProviderResourceRouter<'_>,
 ) -> Result<Plan, ProviderPlanError> {
     let mut resources = Vec::new();
     let mut state_digests = Vec::new();
@@ -118,27 +291,48 @@ pub fn build_provider_plan<P: ProviderResourcePlanner + ?Sized>(
         resources.extend(state.resources.iter().cloned());
     }
     validate_ownership(&resources, request.ownership_rules)?;
+    let filesystem_only = resources
+        .iter()
+        .all(|resource| resource.resource_type() == ResourceType::Filesystem);
     state_digests.sort();
     input_digests.sort();
-    let desired_digest = digest_domain_json("commonkit.provider-desired-set.v1", &state_digests)?;
+    let desired_digest = digest_domain_json(
+        if filesystem_only {
+            "commonkit.provider-desired-set.v1"
+        } else {
+            "commonkit.provider-desired-set.v2"
+        },
+        &state_digests,
+    )?;
     let provider_inputs_digest =
         digest_domain_json("commonkit.provider-input-set.v1", &input_digests)?;
     let mut ordered: Vec<&NormalizedResource> = resources.iter().collect();
     ordered.sort_by(|left, right| {
         (
-            left.intent.path().as_str(),
+            left.sort_key(),
             left.provenance.provider_id.as_str(),
             left.provenance.source.as_str(),
         )
             .cmp(&(
-                right.intent.path().as_str(),
+                right.sort_key(),
                 right.provenance.provider_id.as_str(),
                 right.provenance.source.as_str(),
             ))
     });
-    let resource_map_digest = digest_domain_json("commonkit.ownership-map.v1", &ordered)?;
+    let resource_map_digest = digest_domain_json(
+        if filesystem_only {
+            "commonkit.ownership-map.v1"
+        } else {
+            "commonkit.ownership-map.v2"
+        },
+        &ordered,
+    )?;
     let ownership_map_digest = digest_domain_json(
-        "commonkit.ownership-map.v2",
+        if filesystem_only {
+            "commonkit.ownership-map.v2"
+        } else {
+            "commonkit.ownership-map.v3"
+        },
         &(
             resource_map_digest,
             request.ownership_rules.authority_digest()?,
@@ -146,26 +340,28 @@ pub fn build_provider_plan<P: ProviderResourcePlanner + ?Sized>(
     )?;
     let mut artifact_references = ordered
         .iter()
-        .filter_map(|resource| match &resource.intent {
-            FilesystemIntent::File { content, .. } => Some(content.clone()),
-            _ => None,
-        })
+        .flat_map(|resource| resource.artifact_references().into_iter().cloned())
         .collect::<Vec<_>>();
+    router.preflight(&ordered)?;
     artifact_references.sort_by(|left, right| left.digest.cmp(&right.digest));
     artifact_references.dedup();
     for reference in &artifact_references {
         provider_artifacts.load(reference)?;
     }
-    let artifact_set_digest =
-        digest_domain_json("commonkit.provider-artifact-set.v1", &artifact_references)?;
+    let artifact_set_digest = digest_domain_json(
+        if filesystem_only {
+            "commonkit.provider-artifact-set.v1"
+        } else {
+            "commonkit.provider-artifact-set.v2"
+        },
+        &artifact_references,
+    )?;
 
     let mut operations = Vec::new();
     for resource in ordered {
-        if let Some(operation) = files.register_provider_resource(
-            resource_id(resource)?,
-            resource,
-            provider_artifacts,
-        )? {
+        if let Some(operation) =
+            router.register(resource_id(resource)?, resource, provider_artifacts)?
+        {
             operations.push(operation);
         }
     }
@@ -187,14 +383,24 @@ pub fn build_provider_plan<P: ProviderResourcePlanner + ?Sized>(
 }
 
 fn resource_id(resource: &NormalizedResource) -> Result<StableId, ProviderPlanError> {
-    let digest = digest_domain_json(
-        "commonkit.provider-resource-id.v1",
-        &(
-            &resource.provenance.provider_id,
-            resource.intent.path(),
-            &resource.provenance.source,
-        ),
-    )?;
+    let digest = match resource.intent.filesystem() {
+        Some(intent) => digest_domain_json(
+            "commonkit.provider-resource-id.v1",
+            &(
+                &resource.provenance.provider_id,
+                intent.path(),
+                &resource.provenance.source,
+            ),
+        )?,
+        None => digest_domain_json(
+            "commonkit.provider-resource-id.v2",
+            &(
+                &resource.provenance.provider_id,
+                resource.address(),
+                &resource.provenance.source,
+            ),
+        )?,
+    };
     StableId::parse(format!("resource-{}", &digest.as_str()[7..61]))
         .map_err(ProviderPlanError::Contract)
 }
@@ -203,6 +409,21 @@ fn resource_id(resource: &NormalizedResource) -> Result<StableId, ProviderPlanEr
 pub enum ProviderPlanError {
     #[error("provider appears more than once in the materialized set: {0}")]
     DuplicateProvider(StableId),
+    #[error("resource planner is not installed for {0:?}")]
+    MissingResourcePlanner(ResourceType),
+    #[error("more than one resource planner is installed for {0:?}")]
+    DuplicateResourcePlanner(ResourceType),
+    #[error("adapter {adapter_id} is not a fixed route for {resource_type:?}")]
+    InvalidResourcePlanner {
+        resource_type: ResourceType,
+        adapter_id: StableId,
+    },
+    #[error("resource route for {resource_type:?} returned adapter {actual}, expected {expected}")]
+    UnexpectedAdapterRoute {
+        resource_type: ResourceType,
+        expected: StableId,
+        actual: StableId,
+    },
     #[error("unsupported provider capability {capability} at {entry}: {remediation}")]
     UnsupportedCapability {
         entry: String,

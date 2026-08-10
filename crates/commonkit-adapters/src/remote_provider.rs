@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ArtifactError, ArtifactStore, ContentSensitivity, DesiredStateProvider, FilesystemIntent,
-    MaterializedState, ProviderContext, ProviderFailure, ProviderWorkspace, SshFilesystemRequest,
+    ArtifactError, ArtifactStore, ContentSensitivity, DesiredStateProvider, MaterializedState,
+    ProviderContext, ProviderFailure, ProviderWorkspace, SshFilesystemRequest,
     SshFilesystemResponse, SshFilesystemTransport, TargetFilesystemError,
 };
 
@@ -58,10 +58,7 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
         let mut references = state
             .resources
             .iter()
-            .filter_map(|resource| match &resource.intent {
-                FilesystemIntent::File { content, .. } => Some(content),
-                _ => None,
-            })
+            .flat_map(|resource| resource.artifact_references())
             .collect::<Vec<_>>();
         references.sort_by(|left, right| left.digest.cmp(&right.digest));
         references.dedup_by(|left, right| left.digest == right.digest);
@@ -121,11 +118,10 @@ impl<'a, T: SshFilesystemTransport> RemoteProviderStager<'a, T> {
             return Err(RemoteProviderStagingError::UnplannedSideEffects);
         }
         if state.resources.iter().any(|resource| {
-            matches!(
-                &resource.intent,
-                FilesystemIntent::File { content, .. }
-                    if content.sensitivity != ContentSensitivity::Portable
-            )
+            resource
+                .artifact_references()
+                .into_iter()
+                .any(|content| content.sensitivity != ContentSensitivity::Portable)
         }) {
             return Err(RemoteProviderStagingError::SensitiveArtifact);
         }

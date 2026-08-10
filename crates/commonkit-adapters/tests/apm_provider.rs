@@ -266,8 +266,8 @@ if [ "$1" = "audit" ]; then printf '{"ok":true}\n'; fi
     let content = state
         .resources
         .iter()
-        .find_map(|resource| match &resource.intent {
-            FilesystemIntent::File { path, content, .. }
+        .find_map(|resource| match resource.intent.filesystem() {
+            Some(FilesystemIntent::File { path, content, .. })
                 if path.as_str() == "home/.claude/CLAUDE.md" =>
             {
                 Some(artifacts.load(content).unwrap())
@@ -399,17 +399,20 @@ if [ "$1" = "audit" ]; then printf '{"ok":true}\n'; fi
         .unwrap();
     state.verify().unwrap();
     assert_eq!(state.resources.len(), 3);
-    assert!(
-        state
-            .resources
-            .iter()
-            .any(|resource| resource.intent.path().as_str() == "home/AGENTS.md")
-    );
+    assert!(state.resources.iter().any(|resource| {
+        resource
+            .intent
+            .filesystem()
+            .is_some_and(|intent| intent.path().as_str() == "home/AGENTS.md")
+    }));
     assert!(state.resources.iter().all(|resource| {
         resource.provenance.provider_id.as_str() == "apm"
             && resource.provenance.provider_version == "0.25.0"
             && resource.provenance.input_digest == *inputs.digest()
-            && matches!(resource.intent, FilesystemIntent::File { .. })
+            && matches!(
+                resource.intent.filesystem(),
+                Some(FilesystemIntent::File { .. })
+            )
     }));
     assert!(!live.join(".claude/CLAUDE.md").exists());
     assert!(!live.join(".codex/AGENTS.md").exists());
@@ -648,19 +651,18 @@ fn real_apm_025_release_materializes_only_in_disposable_staging_when_enabled() {
         .materialize(&context(), &workspace, &artifacts)
         .unwrap();
     state.verify().unwrap();
-    assert!(
-        state
-            .resources
-            .iter()
-            .any(|resource| resource.intent.path().as_str() == "home/AGENTS.md")
-    );
-    assert!(
-        state.resources.iter().any(|resource| resource
+    assert!(state.resources.iter().any(|resource| {
+        resource
             .intent
-            .path()
-            .as_str()
-            .starts_with("home/.claude/"))
-    );
+            .filesystem()
+            .is_some_and(|intent| intent.path().as_str() == "home/AGENTS.md")
+    }));
+    assert!(state.resources.iter().any(|resource| {
+        resource
+            .intent
+            .filesystem()
+            .is_some_and(|intent| intent.path().as_str().starts_with("home/.claude/"))
+    }));
     assert_eq!(
         fs::read_dir(&live).unwrap().count(),
         0,

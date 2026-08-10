@@ -180,7 +180,8 @@ fn setup_with_capabilities(
                     .unwrap(),
                 mode: None,
                 expected_before: None,
-            },
+            }
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),

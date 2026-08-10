@@ -229,7 +229,12 @@ impl ProductionApmCompiler {
         let mut files = FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
             .map_err(fail)?;
         let observed_digest = files
-            .observed_state_digest(state.resources.iter().map(|resource| &resource.intent))
+            .observed_state_digest(
+                state
+                    .resources
+                    .iter()
+                    .filter_map(|resource| resource.intent.filesystem()),
+            )
             .map_err(fail)?;
         let rules = OwnershipRules::new(
             self.config.case_sensitive,

@@ -4,11 +4,11 @@ use std::fs;
 use commonkit_adapters::{
     ArtifactStore, ContentSensitivity, DesiredStateProvider, ExactProviderVersion,
     FilesystemIntent, MaterializedState, NormalizedManagedPath, NormalizedResource,
-    ProviderContext, ProviderFailure, ProviderInputs, ProviderWorkspace, RemoteProviderStager,
-    ResourceProvenance, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
-    TargetFilesystemError,
+    PackageResourceIntent, ProviderContext, ProviderFailure, ProviderInputs, ProviderWorkspace,
+    RemoteProviderStager, ResourceProvenance, SshFilesystemRequest, SshFilesystemResponse,
+    SshFilesystemTransport, TargetFilesystemError,
 };
-use commonkit_contracts::{Sha256Digest, StableId};
+use commonkit_contracts::{PackageDeclaration, PackageManager, Sha256Digest, StableId};
 
 struct FixtureProvider {
     id: StableId,
@@ -44,12 +44,13 @@ impl DesiredStateProvider for FixtureProvider {
             .put(&self.content, self.sensitivity)
             .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
         let resource = NormalizedResource {
-            intent: FilesystemIntent::File {
+            intent: (FilesystemIntent::File {
                 path: NormalizedManagedPath::parse("home/.config/agent/settings.json").unwrap(),
                 content,
                 mode: None,
                 expected_before: None,
-            },
+            })
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: self.id.clone(),
                 provider_version: "1.2.3".into(),
@@ -184,6 +185,63 @@ fn stages_pipeline_output_without_re_running_the_provider() {
     assert_eq!(receipt.materialized_state_digest, state.digest);
     assert_eq!(receipt.target_id.as_str(), "remote-linux");
     assert_eq!(transport.requests.len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn stages_package_resolution_and_artifacts_through_the_same_typed_transport() {
+    let (root, _staging, artifacts) = roots("package-output");
+    let store = ArtifactStore::open(&artifacts).unwrap();
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "provider.v2".into(),
+        BTreeMap::from([("policy".into(), digest('a'))]),
+        vec!["package".into()],
+    )
+    .unwrap();
+    let resolution = store
+        .put(b"resolution", ContentSensitivity::Portable)
+        .unwrap();
+    let artifact = store.put(b"package", ContentSensitivity::Portable).unwrap();
+    let state = MaterializedState::finalize(
+        inputs.clone(),
+        vec![NormalizedResource {
+            intent: PackageResourceIntent::new(
+                PackageDeclaration {
+                    id: StableId::parse("ripgrep").unwrap(),
+                    version: "14.1.1".into(),
+                    manager: PackageManager::Homebrew,
+                    source: StableId::parse("homebrew-core").unwrap(),
+                },
+                resolution,
+                vec![artifact],
+            )
+            .unwrap()
+            .into(),
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id,
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest,
+                source: "package:ripgrep".into(),
+            },
+        }],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let mut transport = RecordingTransport::default();
+    let receipt = RemoteProviderStager::new(&mut transport)
+        .stage_materialized(
+            &state,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-package").unwrap(),
+        )
+        .unwrap();
+
+    assert_eq!(receipt.artifact_digests.len(), 2);
+    assert_eq!(transport.requests.len(), 4);
     fs::remove_dir_all(root).unwrap();
 }
 

@@ -120,12 +120,13 @@ fn state(artifacts: &ArtifactStore) -> MaterializedState {
     let resources = [("home/a", b"a\n".as_slice()), ("home/b", b"b\n".as_slice())]
         .into_iter()
         .map(|(path, bytes)| NormalizedResource {
-            intent: FilesystemIntent::File {
+            intent: (FilesystemIntent::File {
                 path: NormalizedManagedPath::parse(path).unwrap(),
                 content: artifacts.put(bytes, ContentSensitivity::Portable).unwrap(),
                 mode: None,
                 expected_before: None,
-            },
+            })
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),
@@ -154,7 +155,8 @@ fn relative_symlink_state() -> MaterializedState {
                 path: source,
                 mode: Some(FileMode::parse(0o700).unwrap()),
                 exact: false,
-            },
+            }
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),
@@ -168,7 +170,8 @@ fn relative_symlink_state() -> MaterializedState {
                 target: SafeSymlinkTarget::parse(&link, "../../.agents/skills/tool").unwrap(),
                 target_kind: SymlinkTargetKind::Directory,
                 expected_before: None,
-            },
+            }
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),
@@ -193,7 +196,12 @@ fn build(
     )
     .unwrap();
     let observed = adapter
-        .observed_state_digest(desired.resources.iter().map(|r| &r.intent))
+        .observed_state_digest(
+            desired
+                .resources
+                .iter()
+                .filter_map(|resource| resource.intent.filesystem()),
+        )
         .unwrap();
     let rules = OwnershipRules::new(
         true,
@@ -244,8 +252,12 @@ fn modeful_resources_require_bound_remote_capability_before_planning() {
     .unwrap();
 
     assert!(matches!(
-        fail_closed
-            .observed_state_digest(desired.resources.iter().map(|resource| &resource.intent)),
+        fail_closed.observed_state_digest(
+            desired
+                .resources
+                .iter()
+                .filter_map(|resource| resource.intent.filesystem()),
+        ),
         Err(SshFileAdapterError::UnsupportedMode)
     ));
 
@@ -257,7 +269,12 @@ fn modeful_resources_require_bound_remote_capability_before_planning() {
     )
     .unwrap();
     linux
-        .observed_state_digest(desired.resources.iter().map(|resource| &resource.intent))
+        .observed_state_digest(
+            desired
+                .resources
+                .iter()
+                .filter_map(|resource| resource.intent.filesystem()),
+        )
         .expect("declared Linux capability supports modes");
 
     std::fs::remove_dir_all(temp).unwrap();
@@ -480,7 +497,12 @@ fn unsafe_remote_symlink_preimages_fail_before_planning() {
     .unwrap();
 
     assert!(matches!(
-        adapter.observed_state_digest(desired.resources.iter().map(|resource| &resource.intent)),
+        adapter.observed_state_digest(
+            desired
+                .resources
+                .iter()
+                .filter_map(|resource| resource.intent.filesystem()),
+        ),
         Err(SshFileAdapterError::Resource(_))
     ));
 

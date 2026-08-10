@@ -1036,12 +1036,13 @@ fn scan_outputs(
                 .put(&bytes, ContentSensitivity::Portable)
                 .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
             resources.push(NormalizedResource {
-                intent: FilesystemIntent::File {
+                intent: (FilesystemIntent::File {
                     path,
                     content,
                     mode: None,
                     expected_before: None,
-                },
+                })
+                .into(),
                 provenance: ResourceProvenance {
                     provider_id: inputs.provider_id.clone(),
                     provider_version: inputs.provider_version.to_string(),
@@ -1069,7 +1070,7 @@ fn scan_outputs(
             )
             .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
         resources.push(NormalizedResource {
-            intent: FilesystemIntent::File {
+            intent: (FilesystemIntent::File {
                 path: NormalizedManagedPath::parse(format!(
                     "{}/{output_file}",
                     managed_root.as_str()
@@ -1078,7 +1079,8 @@ fn scan_outputs(
                 content,
                 mode: None,
                 expected_before: None,
-            },
+            })
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),
@@ -1087,7 +1089,7 @@ fn scan_outputs(
             },
         });
     }
-    resources.sort_by(|left, right| left.intent.path().cmp(right.intent.path()));
+    resources.sort_by_key(NormalizedResource::sort_key);
     Ok(resources)
 }
 
