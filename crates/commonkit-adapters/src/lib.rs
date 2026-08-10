@@ -94,5 +94,5 @@ pub use ssh::{
 pub use ssh_files::{SshFileAdapter, SshFileAdapterError};
 pub use target::{
     LocalTargetFilesystem, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
-    TargetFilesystem, TargetFilesystemError,
+    SshTargetFilesystem, TargetFilesystem, TargetFilesystemError, TargetResource,
 };

@@ -59,6 +59,11 @@ impl TargetHelper {
                     None => SshFilesystemResponse::Absent,
                 })
             }
+            SshFilesystemRequest::InspectResource { root_id, path } => {
+                Ok(SshFilesystemResponse::Resource {
+                    resource: self.root(&root_id)?.inspect_resource(&path)?,
+                })
+            }
             SshFilesystemRequest::WriteFile {
                 root_id,
                 path,
@@ -67,8 +72,24 @@ impl TargetHelper {
                 self.root(&root_id)?.write_file(&path, &content)?;
                 Ok(SshFilesystemResponse::Applied)
             }
+            SshFilesystemRequest::WriteDirectory {
+                root_id,
+                path,
+                mode,
+            } => {
+                self.root(&root_id)?.write_directory(&path, mode.as_ref())?;
+                Ok(SshFilesystemResponse::Applied)
+            }
+            SshFilesystemRequest::WriteSymlink {
+                root_id,
+                path,
+                target,
+            } => {
+                self.root(&root_id)?.write_symlink(&path, &target)?;
+                Ok(SshFilesystemResponse::Applied)
+            }
             SshFilesystemRequest::Remove { root_id, path } => {
-                self.root(&root_id)?.remove(&path)?;
+                self.root(&root_id)?.remove_resource(&path)?;
                 Ok(SshFilesystemResponse::Applied)
             }
             SshFilesystemRequest::StageArtifact {
