@@ -6,7 +6,7 @@ use commonkit_contracts::{
 };
 use commonkit_core::enforce_package_source_policy;
 use schemars::{JsonSchema, schema_for};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -121,8 +121,15 @@ pub struct PackageResolutionV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CompatibleResolvedPackageV1 {
     declaration: PackageDeclaration,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_present_source")]
     source: Option<SourceBindingV1>,
+}
+
+fn deserialize_present_source<'de, D>(deserializer: D) -> Result<Option<SourceBindingV1>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    SourceBindingV1::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Deserialize)]
