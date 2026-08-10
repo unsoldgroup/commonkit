@@ -339,13 +339,10 @@ impl FileAdapter {
         if expected.is_some() && expected != &before_digest {
             return Err(FileAdapterError::PreimageMismatch);
         }
-        let desired = desired_preimage(&intent);
-        let after_digest = semantic_digest(&desired)?;
+        let (resource_type, after_digest, payload_digest) = provider_operation_binding(&intent)?;
         if before_digest == after_digest {
             return Err(FileAdapterError::NoChange);
         }
-        let payload_digest =
-            digest_domain_json("commonkit.filesystem-resource-payload.v1", &intent)?;
         let kind = match (&observed, &intent) {
             (ResourcePreimage::Absent, FilesystemIntent::Remove { .. }) => {
                 return Err(FileAdapterError::NoChange);
@@ -355,17 +352,11 @@ impl FileAdapter {
             _ => OperationKind::Update,
         };
         let path = intent.path().as_str().to_owned();
-        let resource_type = match intent {
-            FilesystemIntent::Directory { .. } => "directory",
-            FilesystemIntent::Symlink { .. } => "symlink",
-            FilesystemIntent::Remove { .. } => "removal",
-            FilesystemIntent::File { .. } => "filesystem-file",
-        };
         let operation = finalize_operation(OperationDraft {
             adapter_id: self.id.clone(),
             kind,
             resource: ResourceRef {
-                resource_type: StableId::parse(resource_type).expect("static ID"),
+                resource_type,
                 resource_id: id,
                 managed_path: Some(path.clone()),
             },
@@ -953,6 +944,22 @@ fn desired_preimage(intent: &FilesystemIntent) -> ResourcePreimage {
             mode: mode.as_ref().map(FileMode::value),
         },
     }
+}
+
+pub(crate) fn provider_operation_binding(
+    intent: &FilesystemIntent,
+) -> Result<(StableId, Option<Sha256Digest>, Sha256Digest), FileAdapterError> {
+    validate_semantic_intent(intent)?;
+    let resource_type = StableId::parse(match intent {
+        FilesystemIntent::Directory { .. } => "directory",
+        FilesystemIntent::Symlink { .. } => "symlink",
+        FilesystemIntent::Remove { .. } => "removal",
+        FilesystemIntent::File { .. } => "filesystem-file",
+    })
+    .expect("static resource type");
+    let after_digest = semantic_digest(&desired_preimage(intent))?;
+    let payload_digest = digest_domain_json("commonkit.filesystem-resource-payload.v1", intent)?;
+    Ok((resource_type, after_digest, payload_digest))
 }
 
 fn semantic_digest(

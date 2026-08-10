@@ -129,6 +129,7 @@ struct NoopPackagePlanner {
 struct SpoofPackagePlanner {
     declared: StableId,
     returned: StableId,
+    spoof_resource_binding: bool,
 }
 
 impl PackageResourcePlanner for SpoofPackagePlanner {
@@ -143,31 +144,49 @@ impl PackageResourcePlanner for SpoofPackagePlanner {
         provenance: &ResourceProvenance,
         _provider_artifacts: &ArtifactStore,
     ) -> Result<Option<Operation>, ProviderPlanError> {
-        Ok(Some(finalize_operation(OperationDraft {
-            adapter_id: self.returned.clone(),
-            kind: OperationKind::Create,
-            resource: ResourceRef {
+        let desired_digest =
+            commonkit_adapters::ResourceIntent::Package(intent.clone()).desired_digest()?;
+        let resource = if self.spoof_resource_binding {
+            ResourceRef {
+                resource_type: StableId::parse("service").unwrap(),
+                resource_id: StableId::parse("provider-chosen-resource").unwrap(),
+                managed_path: Some("home/provider-chosen".into()),
+            }
+        } else {
+            ResourceRef {
                 resource_type: StableId::parse("package").unwrap(),
                 resource_id: id,
                 managed_path: None,
-            },
+            }
+        };
+        let operation = finalize_operation(OperationDraft {
+            adapter_id: self.returned.clone(),
+            kind: OperationKind::Create,
+            resource,
             risk: Risk::Medium,
             requires_confirmation: true,
-            recovery_capability: RecoveryCapability::ConvergeForwardOnly,
+            recovery_capability: if self.spoof_resource_binding {
+                RecoveryCapability::ExactRollback
+            } else {
+                RecoveryCapability::ConvergeForwardOnly
+            },
             depends_on: vec![],
             before_digest: None,
-            after_digest: Some(
-                commonkit_adapters::ResourceIntent::Package(intent.clone()).desired_digest()?,
-            ),
-            payload_digest: intent_digest(intent)?,
-            provenance: Some(provenance.clone()),
+            after_digest: Some(if self.spoof_resource_binding {
+                digest('e')
+            } else {
+                desired_digest.clone()
+            }),
+            payload_digest: if self.spoof_resource_binding {
+                digest('f')
+            } else {
+                desired_digest
+            },
+            provenance: (!self.spoof_resource_binding).then(|| provenance.clone()),
             summary: "install package".into(),
-        })?))
+        })?;
+        Ok(Some(operation))
     }
-}
-
-fn intent_digest(intent: &PackageResourceIntent) -> Result<Sha256Digest, ProviderPlanError> {
-    commonkit_contracts::digest_domain_json("test.package-payload.v1", intent).map_err(Into::into)
 }
 
 impl NoopPackagePlanner {
@@ -374,6 +393,7 @@ fn resource_planner_cannot_choose_an_unregistered_adapter_id() {
     let mut planner = SpoofPackagePlanner {
         declared: StableId::parse("packages").unwrap(),
         returned: StableId::parse("provider-chosen-adapter").unwrap(),
+        spoof_resource_binding: false,
     };
     let mut router =
         ProviderResourceRouter::new(vec![ProviderPlannerRoute::Package(&mut planner)]).unwrap();
@@ -395,6 +415,62 @@ fn resource_planner_cannot_choose_an_unregistered_adapter_id() {
     assert!(matches!(
         error,
         ProviderPlanError::UnexpectedAdapterRoute {
+            resource_type: ResourceType::Package,
+            ..
+        }
+    ));
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resource_planner_cannot_spoof_the_routed_resource_binding() {
+    let root = temporary_directory("provider-plan-resource-spoof");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let mixed = mixed_state(&artifacts);
+    let package_resources = mixed
+        .resources
+        .into_iter()
+        .filter(|resource| resource.resource_type() == ResourceType::Package)
+        .collect();
+    let state = MaterializedState::finalize(
+        mixed.inputs,
+        package_resources,
+        mixed.declared_side_effects,
+        mixed.unsupported,
+    )
+    .unwrap();
+    let rules = OwnershipRules::new(
+        true,
+        vec![NormalizedManagedPath::parse("home").unwrap()],
+        vec![],
+    )
+    .unwrap();
+    let mut planner = SpoofPackagePlanner {
+        declared: StableId::parse("packages").unwrap(),
+        returned: StableId::parse("packages").unwrap(),
+        spoof_resource_binding: true,
+    };
+    let mut router =
+        ProviderResourceRouter::new(vec![ProviderPlannerRoute::Package(&mut planner)]).unwrap();
+    let error = build_provider_plan_with_router(
+        ProviderPlanRequest {
+            target_id: StableId::parse("local").unwrap(),
+            target_identity_digest: digest('9'),
+            composed_loadout_digest: digest('a'),
+            observed_digest: digest('b'),
+            policy_digest: digest('c'),
+            ownership_rules: &rules,
+            mapped_side_effects: BTreeSet::new(),
+        },
+        &[state],
+        &artifacts,
+        &mut router,
+    )
+    .expect_err("provider-selected resource binding");
+    assert!(matches!(
+        error,
+        ProviderPlanError::UnexpectedResourceBinding {
             resource_type: ResourceType::Package,
             ..
         }

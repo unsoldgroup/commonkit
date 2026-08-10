@@ -136,6 +136,10 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
         })
     }
 
+    pub(crate) fn target_capabilities(&self) -> SshTargetCapabilities {
+        self.capabilities
+    }
+
     pub fn into_transport(self) -> T {
         self.transport
     }
@@ -181,16 +185,12 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
         }
         let mut observed = self.observe(intent.path().clone())?;
         project_preimage_for_intent(&intent, &mut observed, self.capabilities);
-        let desired = desired_preimage(&intent);
         let before_digest = preimage_digest(&observed, self.capabilities)?;
-        let after_digest = preimage_digest(&desired, self.capabilities)?;
+        let (resource_type, after_digest, payload_digest) =
+            provider_operation_binding(&intent, self.capabilities)?;
         if before_digest == after_digest {
             return Ok(None);
         }
-        let payload_digest = digest_domain_json(
-            "commonkit.ssh-filesystem-payload.v2",
-            &(self.capabilities, &intent),
-        )?;
         let kind = match (&observed, &intent) {
             (RemotePreimage::Absent, FilesystemIntent::Remove { .. }) => return Ok(None),
             (RemotePreimage::Absent, _) => OperationKind::Create,
@@ -202,13 +202,7 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
             adapter_id: self.id.clone(),
             kind,
             resource: ResourceRef {
-                resource_type: StableId::parse(match intent {
-                    FilesystemIntent::Directory { .. } => "remote-directory",
-                    FilesystemIntent::Symlink { .. } => "remote-symlink",
-                    FilesystemIntent::Remove { .. } => "remote-removal",
-                    FilesystemIntent::File { .. } => "remote-file",
-                })
-                .expect("static stable ID"),
+                resource_type,
                 resource_id: id,
                 managed_path: Some(path.clone()),
             },
@@ -682,6 +676,26 @@ fn desired_preimage(intent: &FilesystemIntent) -> RemotePreimage {
             target_kind: *target_kind,
         },
     }
+}
+
+pub(crate) fn provider_operation_binding(
+    intent: &FilesystemIntent,
+    capabilities: SshTargetCapabilities,
+) -> Result<(StableId, Option<Sha256Digest>, Sha256Digest), SshFileAdapterError> {
+    ensure_supported(intent, capabilities)?;
+    let resource_type = StableId::parse(match intent {
+        FilesystemIntent::Directory { .. } => "remote-directory",
+        FilesystemIntent::Symlink { .. } => "remote-symlink",
+        FilesystemIntent::Remove { .. } => "remote-removal",
+        FilesystemIntent::File { .. } => "remote-file",
+    })
+    .expect("static resource type");
+    let after_digest = preimage_digest(&desired_preimage(intent), capabilities)?;
+    let payload_digest = digest_domain_json(
+        "commonkit.ssh-filesystem-payload.v2",
+        &(capabilities, intent),
+    )?;
+    Ok((resource_type, after_digest, payload_digest))
 }
 fn project_preimage_for_intent(
     intent: &FilesystemIntent,

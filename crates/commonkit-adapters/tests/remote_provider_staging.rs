@@ -246,6 +246,67 @@ fn stages_package_resolution_and_artifacts_through_the_same_typed_transport() {
 }
 
 #[test]
+fn conflicting_metadata_for_one_digest_fails_before_remote_staging() {
+    let (root, _staging, artifacts) = roots("conflicting-reference-metadata");
+    let store = ArtifactStore::open(&artifacts).unwrap();
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "provider.v2".into(),
+        BTreeMap::from([("policy".into(), digest('a'))]),
+        vec!["package".into()],
+    )
+    .unwrap();
+    let resolution = store
+        .put(b"same digest", ContentSensitivity::Portable)
+        .unwrap();
+    let mut conflicting = resolution.clone();
+    conflicting.bytes += 1;
+    let state = MaterializedState::finalize(
+        inputs.clone(),
+        vec![NormalizedResource {
+            intent: PackageResourceIntent::new(
+                PackageDeclaration {
+                    id: StableId::parse("ripgrep").unwrap(),
+                    version: "14.1.1".into(),
+                    manager: PackageManager::Homebrew,
+                    source: StableId::parse("homebrew-core").unwrap(),
+                },
+                resolution,
+                vec![conflicting],
+            )
+            .unwrap()
+            .into(),
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id,
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest,
+                source: "package:ripgrep".into(),
+            },
+        }],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let mut transport = RecordingTransport::default();
+    let error = RemoteProviderStager::new(&mut transport)
+        .stage_materialized(
+            &state,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-conflict").unwrap(),
+        )
+        .expect_err("conflicting metadata for one digest");
+
+    assert!(matches!(
+        error,
+        commonkit_adapters::RemoteProviderStagingError::ConflictingArtifactReference { .. }
+    ));
+    assert!(transport.requests.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn unsupported_or_sensitive_output_never_reaches_remote_target() {
     for (name, sensitivity, unsupported) in [
         ("unsupported", ContentSensitivity::Portable, true),
