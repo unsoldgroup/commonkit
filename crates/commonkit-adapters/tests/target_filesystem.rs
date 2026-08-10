@@ -3,8 +3,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_adapters::{
-    LocalTargetFilesystem, NormalizedManagedPath, SshFilesystemRequest, SshFilesystemResponse,
-    SshFilesystemTransport, TargetFilesystem, TargetFilesystemError,
+    FileMode, LocalTargetFilesystem, NormalizedManagedPath, SafeSymlinkTarget,
+    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, TargetFilesystem,
+    TargetFilesystemError, TargetResource,
 };
 use commonkit_core::RootAccess;
 
@@ -159,4 +160,67 @@ fn ssh_boundary_exposes_typed_directory_inventory_requests() {
         SshFilesystemResponse::Absent
     );
     assert_eq!(ssh.requests, vec![request]);
+}
+
+#[cfg(unix)]
+#[test]
+fn local_filesystem_observes_and_applies_relative_directories_and_symlinks_without_following() {
+    let root = temp("typed-resources");
+    fs::create_dir_all(&root).unwrap();
+    let target = LocalTargetFilesystem::open(&root, RootAccess::ReadWrite).unwrap();
+    let source = NormalizedManagedPath::parse(".agents/skills/tool").unwrap();
+    let link = NormalizedManagedPath::parse(".codex/skills/tool").unwrap();
+    let relative = SafeSymlinkTarget::parse(&link, "../../.agents/skills/tool").unwrap();
+
+    target
+        .write_directory(&source, Some(&FileMode::parse(0o700).unwrap()))
+        .unwrap();
+    target.write_symlink(&link, &relative).unwrap();
+
+    assert!(matches!(
+        target.inspect_resource(&source).unwrap(),
+        TargetResource::Directory { mode: Some(0o700) }
+    ));
+    assert_eq!(
+        target.inspect_resource(&link).unwrap(),
+        TargetResource::Symlink {
+            target: "../../.agents/skills/tool".into()
+        }
+    );
+    assert!(matches!(
+        target.read_file(&link),
+        Err(TargetFilesystemError::SymlinkEncountered(_))
+    ));
+
+    drop(target);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn ssh_boundary_exposes_typed_relative_directory_and_symlink_requests() {
+    let mut ssh = FakeSsh::default();
+    let link = NormalizedManagedPath::parse(".codex/skills/tool").unwrap();
+    let requests = vec![
+        SshFilesystemRequest::InspectResource {
+            root_id: commonkit_core::StableId::parse("home").unwrap(),
+            path: link.clone(),
+        },
+        SshFilesystemRequest::WriteDirectory {
+            root_id: commonkit_core::StableId::parse("home").unwrap(),
+            path: NormalizedManagedPath::parse(".agents/skills/tool").unwrap(),
+            mode: Some(FileMode::parse(0o700).unwrap()),
+        },
+        SshFilesystemRequest::WriteSymlink {
+            root_id: commonkit_core::StableId::parse("home").unwrap(),
+            path: link.clone(),
+            target: SafeSymlinkTarget::parse(&link, "../../.agents/skills/tool").unwrap(),
+        },
+    ];
+    for request in &requests {
+        assert_eq!(
+            ssh.perform(request.clone()).unwrap(),
+            SshFilesystemResponse::Absent
+        );
+    }
+    assert_eq!(ssh.requests, requests);
 }

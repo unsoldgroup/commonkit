@@ -249,6 +249,68 @@ fn provider_policy_failures_stop_before_operation_registration() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn protected_roots_are_deterministically_bound_into_plan_authority() {
+    let root = temporary_directory("provider-plan-protected-roots");
+    let target = root.join("target");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let desired = state(
+        "native",
+        "1.0.0",
+        "native-v1",
+        "home/native.txt",
+        artifacts
+            .put(b"native\n", ContentSensitivity::Portable)
+            .unwrap(),
+    );
+    let roots = |protected: &[&str]| {
+        OwnershipRules::new(
+            true,
+            vec![NormalizedManagedPath::parse("home").unwrap()],
+            protected
+                .iter()
+                .map(|path| NormalizedManagedPath::parse(*path).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    };
+    let build = |rules: &OwnershipRules, state_dir: &str| {
+        build_provider_plan(
+            ProviderPlanRequest {
+                target_id: StableId::parse("local").unwrap(),
+                target_identity_digest: digest('9'),
+                composed_loadout_digest: digest('a'),
+                observed_digest: digest('b'),
+                policy_digest: digest('c'),
+                ownership_rules: rules,
+                mapped_side_effects: BTreeSet::new(),
+            },
+            std::slice::from_ref(&desired),
+            &artifacts,
+            &mut FileAdapter::open(&target, &root.join(state_dir)).unwrap(),
+        )
+        .unwrap()
+    };
+
+    let forward = build(&roots(&["home/.commonkit", "home/.ssh/control"]), "forward");
+    let reverse = build(&roots(&["home/.ssh/control", "home/.commonkit"]), "reverse");
+    assert_eq!(forward.id, reverse.id);
+    assert_eq!(
+        forward.bindings.ownership_map_digest,
+        reverse.bindings.ownership_map_digest
+    );
+
+    let changed = build(&roots(&["home/.commonkit"]), "changed");
+    assert_ne!(forward.id, changed.id);
+    assert_ne!(
+        forward.bindings.ownership_map_digest,
+        changed.bindings.ownership_map_digest
+    );
+
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn temporary_directory(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
         "commonkit-{label}-{}-{:?}",

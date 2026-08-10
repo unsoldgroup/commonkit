@@ -207,6 +207,40 @@ fn rejects_claims_outside_roots_and_below_protected_state() {
 }
 
 #[test]
+fn destructive_ancestor_claims_cannot_enclose_protected_state() {
+    for resource in [
+        removal("native", "home"),
+        directory("native", "home/.ssh", true),
+    ] {
+        assert!(matches!(
+            validate_ownership(&[resource], &rules(true)),
+            Err(OwnershipError::ProtectedPath { .. })
+        ));
+    }
+
+    validate_ownership(&[directory("native", "home/.ssh", false)], &rules(true))
+        .expect("a non-exact ancestor cannot delete protected descendants");
+}
+
+#[test]
+fn symlink_targets_cannot_resolve_into_protected_state() {
+    let link = NormalizedManagedPath::parse("home/bin/commonkit-state").unwrap();
+    let resource = NormalizedResource {
+        intent: FilesystemIntent::Symlink {
+            path: link.clone(),
+            target: SafeSymlinkTarget::parse(&link, "../.commonkit").unwrap(),
+            expected_before: None,
+        },
+        provenance: provenance("native", "protected-link"),
+    };
+
+    assert!(matches!(
+        validate_ownership(&[resource], &rules(true)),
+        Err(OwnershipError::ProtectedPath { .. })
+    ));
+}
+
+#[test]
 fn canonical_materialization_digest_is_order_independent_and_semantic() {
     let first = file("native", "home/a");
     let second = directory("chezmoi", "home/b", true);

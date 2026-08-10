@@ -137,6 +137,23 @@ impl SafeSymlinkTarget {
     fn validate_for(&self, link: &NormalizedManagedPath) -> Result<(), ResourceError> {
         Self::parse(link, self.0.clone()).map(|_| ())
     }
+
+    fn resolved_for(
+        &self,
+        link: &NormalizedManagedPath,
+    ) -> Result<NormalizedManagedPath, ResourceError> {
+        self.validate_for(link)?;
+        let mut resolved: Vec<&str> = link.as_str().split('/').collect();
+        resolved.pop();
+        for segment in self.0.split('/') {
+            if segment == ".." {
+                resolved.pop();
+            } else {
+                resolved.push(segment);
+            }
+        }
+        NormalizedManagedPath::parse(resolved.join("/"))
+    }
 }
 
 impl TryFrom<String> for SafeSymlinkTarget {
@@ -243,6 +260,27 @@ impl OwnershipRules {
             protected_roots,
         })
     }
+
+    pub(crate) fn authority_digest(&self) -> Result<Sha256Digest, ContractError> {
+        let mut declared_roots = self
+            .declared_roots
+            .iter()
+            .map(NormalizedManagedPath::as_str)
+            .collect::<Vec<_>>();
+        declared_roots.sort_unstable();
+        declared_roots.dedup();
+        let mut protected_roots = self
+            .protected_roots
+            .iter()
+            .map(NormalizedManagedPath::as_str)
+            .collect::<Vec<_>>();
+        protected_roots.sort_unstable();
+        protected_roots.dedup();
+        digest_domain_json(
+            "commonkit.ownership-authority.v1",
+            &(self.case_sensitive, declared_roots, protected_roots),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,18 +301,28 @@ pub fn validate_ownership(
     for resource in resources {
         let path = resource.intent.path();
         if let FilesystemIntent::Symlink { target, .. } = &resource.intent {
-            target
-                .validate_for(path)
+            let resolved = target
+                .resolved_for(path)
                 .map_err(|_| OwnershipError::UnsafeSymlinkTarget { path: path.clone() })?;
+            if rules
+                .protected_roots
+                .iter()
+                .any(|root| resolved.is_within(root))
+            {
+                return Err(OwnershipError::ProtectedPath { path: path.clone() });
+            }
         }
         if !rules.declared_roots.iter().any(|root| path.is_within(root)) {
             return Err(OwnershipError::OutsideDeclaredRoot { path: path.clone() });
         }
-        if rules
-            .protected_roots
-            .iter()
-            .any(|root| path.is_within(root))
-        {
+        if rules.protected_roots.iter().any(|root| {
+            path.is_within(root)
+                || (matches!(
+                    resource.intent,
+                    FilesystemIntent::Remove { .. }
+                        | FilesystemIntent::Directory { exact: true, .. }
+                ) && root.is_within(path))
+        }) {
             return Err(OwnershipError::ProtectedPath { path: path.clone() });
         }
         if let Some(existing) = paths.insert(path.as_str().into(), resource) {

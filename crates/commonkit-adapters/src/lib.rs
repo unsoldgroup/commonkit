@@ -103,5 +103,5 @@ pub use ssh_files::{SshFileAdapter, SshFileAdapterError};
 pub use target::{
     EngramTargetRuntime, EngramTargetSyncMode, LocalTargetFilesystem, SshFilesystemRequest,
     SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem, TargetFilesystem,
-    TargetFilesystemError,
+    TargetFilesystemError, TargetResource,
 };

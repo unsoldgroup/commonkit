@@ -136,7 +136,14 @@ pub fn build_provider_plan<P: ProviderResourcePlanner + ?Sized>(
                 right.provenance.source.as_str(),
             ))
     });
-    let ownership_map_digest = digest_domain_json("commonkit.ownership-map.v1", &ordered)?;
+    let resource_map_digest = digest_domain_json("commonkit.ownership-map.v1", &ordered)?;
+    let ownership_map_digest = digest_domain_json(
+        "commonkit.ownership-map.v2",
+        &(
+            resource_map_digest,
+            request.ownership_rules.authority_digest()?,
+        ),
+    )?;
     let mut artifact_references = ordered
         .iter()
         .filter_map(|resource| match &resource.intent {
