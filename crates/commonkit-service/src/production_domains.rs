@@ -3337,15 +3337,26 @@ impl SyncDomain for ProductionSyncDomain {
             // newest immutable plan; this remains entirely offline.
             None => match self
                 .plan_store
-                .load_latest_for_target(&self.config.target_id)
+                .load_latest_for_target_with_bindings(
+                    &self.config.target_id,
+                    &self.config.target_identity_digest,
+                    &self.config.composed_loadout_digest,
+                    &self.config.policy_digest,
+                )
                 .map_err(|_| DomainFailure::InvalidRequest)?
             {
                 Some(plan) => plan,
                 None => {
+                    let has_target_plan = self
+                        .plan_store
+                        .load_latest_for_target(&self.config.target_id)
+                        .map_err(|_| DomainFailure::InvalidRequest)?
+                        .is_some();
                     // Legacy inventory checks may run before a plan has been
                     // persisted. Preserve their offline file-only path, but
                     // never materialize providers or resolve packages here.
-                    if self.config.provider_pipeline.is_none()
+                    if !has_target_plan
+                        && self.config.provider_pipeline.is_none()
                         && self.config.package_resolution.is_none()
                     {
                         return Ok(serde_json::json!({
@@ -3364,6 +3375,7 @@ impl SyncDomain for ProductionSyncDomain {
                 .as_ref()
                 .is_some_and(|target| target != &self.config.target_id)
             || plan.bindings.target_identity_digest != self.config.target_identity_digest
+            || plan.bindings.composed_loadout_digest != self.config.composed_loadout_digest
             || plan.policy_digest != self.config.policy_digest
         {
             return Err(DomainFailure::InvalidRequest);
@@ -6341,5 +6353,157 @@ mod package_resolution_tests {
             );
         }
         assert!(unsafe_destination("::ffff:10.0.0.1".parse().unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod production_verify_binding_tests {
+    use super::*;
+    use commonkit_contracts::{PlanBindings, digest_domain_json};
+    use commonkit_core::{PlanDraft, build_plan};
+
+    fn config(
+        root: &std::path::Path,
+        target_id: &str,
+        target_identity: char,
+        loadout: char,
+        policy: char,
+    ) -> SyncConfig {
+        SyncConfig {
+            target_id: StableId::parse(target_id).expect("target"),
+            target_root: root.join("target"),
+            adapter_state: root.join("adapter"),
+            provider_artifacts: root.join("provider-artifacts"),
+            materialized_states: Vec::new(),
+            provider_pipeline: None,
+            styleguide: None,
+            target_transport: Some(SyncTargetTransport::Local),
+            target_platform: None,
+            declared_roots: vec![NormalizedManagedPath::parse("home").expect("root")],
+            relay_client_root: None,
+            protected_roots: Vec::new(),
+            case_sensitive: true,
+            target_identity_digest: digest_domain_json("fixture", &target_identity)
+                .expect("target identity"),
+            composed_loadout_digest: digest_domain_json("fixture", &loadout).expect("loadout"),
+            policy_digest: digest_domain_json("fixture", &policy).expect("policy"),
+            package_resolution: None,
+            relay_endpoint: None,
+        }
+    }
+
+    fn plan(target_id: &str, target_identity: char, loadout: char, policy: char) -> Plan {
+        build_plan(PlanDraft {
+            target_id: StableId::parse(target_id).expect("target"),
+            desired_digest: digest_domain_json("fixture", &"desired").expect("desired"),
+            observed_digest: digest_domain_json("fixture", &"observed").expect("observed"),
+            policy_digest: digest_domain_json("fixture", &policy).expect("policy"),
+            bindings: PlanBindings {
+                target_identity_digest: digest_domain_json("fixture", &target_identity)
+                    .expect("target identity"),
+                composed_loadout_digest: digest_domain_json("fixture", &loadout).expect("loadout"),
+                provider_inputs_digest: digest_domain_json("fixture", &"providers")
+                    .expect("providers"),
+                ownership_map_digest: digest_domain_json("fixture", &"ownership")
+                    .expect("ownership"),
+                artifact_set_digest: digest_domain_json("fixture", &"artifacts")
+                    .expect("artifacts"),
+                package_resolution_authority_digest: None,
+            },
+            operations: Vec::new(),
+        })
+        .expect("plan")
+    }
+
+    fn domain(
+        root: &std::path::Path,
+        target_id: &str,
+        target_identity: char,
+        loadout: char,
+        policy: char,
+    ) -> ProductionSyncDomain {
+        let plan_root = root.join("plans");
+        ProductionSyncDomain {
+            config: config(root, target_id, target_identity, loadout, policy),
+            plan_store: Arc::new(PlanStore::open(plan_root).expect("plan store")),
+            receipt_root: root.join("receipts"),
+            ssh_factory: Arc::new(ProcessSshTransportFactory),
+        }
+    }
+
+    fn set_mtime(root: &std::path::Path, plan: &Plan, timestamp: u64) {
+        let path = root.join("plans").join(format!(
+            "{}.json",
+            plan.id.as_str().trim_start_matches("sha256:")
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open plan");
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp)),
+        )
+        .expect("set plan mtime");
+    }
+
+    #[test]
+    fn production_verify_rejects_a_stale_composed_loadout_before_adapter_work() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let domain = domain(root, "local-target", 't', 'c', 'p');
+        let stale = plan("local-target", 't', 's', 'p');
+        domain
+            .plan_store
+            .persist(&stale)
+            .expect("persist stale plan");
+
+        assert_eq!(
+            domain.verify(serde_json::json!({"planId": stale.id})),
+            Err(DomainFailure::InvalidRequest)
+        );
+        assert_eq!(
+            domain.verify(serde_json::json!({})),
+            Err(DomainFailure::InvalidRequest)
+        );
+        assert!(
+            !domain.config.target_root.exists(),
+            "stale plans must be rejected before opening an adapter"
+        );
+    }
+
+    #[test]
+    fn legacy_verify_selects_the_latest_plan_matching_target_and_policy_bindings() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let domain = domain(root, "local-target", 't', 'c', 'p');
+        std::fs::create_dir_all(&domain.config.target_root).expect("target");
+        let matching = plan("local-target", 't', 'c', 'p');
+        let wrong_policy = plan("local-target", 't', 'c', 'x');
+        let wrong_target = plan("other-target", 't', 'c', 'p');
+        for candidate in [&matching, &wrong_policy, &wrong_target] {
+            domain.plan_store.persist(candidate).expect("persist plan");
+        }
+        set_mtime(root, &matching, 60);
+        set_mtime(root, &wrong_policy, 120);
+        set_mtime(root, &wrong_target, 180);
+
+        let result = domain.verify(serde_json::json!({})).expect("verify");
+        assert_eq!(result["planId"], matching.id.to_string());
+        assert_eq!(result["verified"], true);
+    }
+
+    #[test]
+    fn legacy_verify_without_a_plan_stays_offline_without_providers_or_resolution() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let domain = domain(root, "local-target", 't', 'c', 'p');
+
+        let result = domain
+            .verify(serde_json::json!({}))
+            .expect("offline verify");
+        assert_eq!(result["verified"], true);
+        assert_eq!(result["offline"], true);
+        assert!(!domain.config.target_root.exists());
     }
 }

@@ -435,21 +435,39 @@ impl PlanStore {
     /// drift checks which intentionally do not carry a plan id in their
     /// legacy request shape.
     pub fn load_latest(&self) -> Result<Option<Plan>, PlanStoreError> {
-        self.load_latest_matching(None)
+        self.load_latest_matching(None, None)
     }
 
     pub fn load_latest_for_target(
         &self,
         target_id: &StableId,
     ) -> Result<Option<Plan>, PlanStoreError> {
-        self.load_latest_matching(Some(target_id))
+        self.load_latest_matching(Some(target_id), None)
+    }
+
+    pub fn load_latest_for_target_with_bindings(
+        &self,
+        target_id: &StableId,
+        target_identity_digest: &Sha256Digest,
+        composed_loadout_digest: &Sha256Digest,
+        policy_digest: &Sha256Digest,
+    ) -> Result<Option<Plan>, PlanStoreError> {
+        self.load_latest_matching(
+            Some(target_id),
+            Some((
+                target_identity_digest,
+                composed_loadout_digest,
+                policy_digest,
+            )),
+        )
     }
 
     fn load_latest_matching(
         &self,
         target_id: Option<&StableId>,
+        bindings: Option<(&Sha256Digest, &Sha256Digest, &Sha256Digest)>,
     ) -> Result<Option<Plan>, PlanStoreError> {
-        let mut latest: Option<(std::time::SystemTime, Plan)> = None;
+        let mut latest: Option<(std::time::SystemTime, Sha256Digest, Plan)> = None;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
@@ -471,15 +489,21 @@ impl PlanStore {
             if target_id.is_some_and(|target| target != &plan.target_id) {
                 continue;
             }
+            if bindings.is_some_and(|(target, loadout, policy)| {
+                plan.bindings.target_identity_digest != *target
+                    || plan.bindings.composed_loadout_digest != *loadout
+                    || plan.policy_digest != *policy
+            }) {
+                continue;
+            }
             let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-            if latest
-                .as_ref()
-                .is_none_or(|(current, _)| modified > *current)
-            {
-                latest = Some((modified, plan));
+            if latest.as_ref().is_none_or(|(current, current_id, _)| {
+                modified > *current || (modified == *current && plan.id > *current_id)
+            }) {
+                latest = Some((modified, plan.id.clone(), plan));
             }
         }
-        Ok(latest.map(|(_, plan)| plan))
+        Ok(latest.map(|(_, _, plan)| plan))
     }
 
     fn path(&self, id: &Sha256Digest) -> PathBuf {

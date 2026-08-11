@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use commonkit_contracts::{OperationKind, PlanBindings, ResourceRef, Risk, Sha256Digest, StableId};
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
@@ -26,6 +26,25 @@ fn plan() -> commonkit_contracts::Plan {
         policy_digest: digest('c'),
         bindings: PlanBindings {
             target_identity_digest: digest('3'),
+            composed_loadout_digest: digest('d'),
+            provider_inputs_digest: digest('e'),
+            ownership_map_digest: digest('f'),
+            artifact_set_digest: digest('1'),
+            package_resolution_authority_digest: None,
+        },
+        operations: Vec::new(),
+    })
+    .expect("plan")
+}
+
+fn plan_for(target: &str, target_binding: char, policy: char) -> commonkit_contracts::Plan {
+    build_plan(PlanDraft {
+        target_id: StableId::parse(target).expect("target"),
+        desired_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: digest(policy),
+        bindings: PlanBindings {
+            target_identity_digest: digest(target_binding),
             composed_loadout_digest: digest('d'),
             provider_inputs_digest: digest('e'),
             ownership_map_digest: digest('f'),
@@ -114,5 +133,37 @@ fn reloads_a_pre_provenance_v1_operation_without_changing_its_identity() {
     store.persist(&plan).expect("persist");
     assert_eq!(store.load(&plan.id).expect("reload"), plan);
 
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn equal_mtime_plans_choose_the_stable_immutable_identity_tiebreaker() {
+    let root = temporary_directory("plan-store-equal-mtime");
+    let store = PlanStore::open(&root).expect("store");
+    let first = plan_for("local-target", '3', 'c');
+    let second = plan_for("local-target", '3', 'd');
+    let (first, second) = if first.id < second.id {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    store.persist(&first).expect("persist first");
+    store.persist(&second).expect("persist second");
+
+    for entry in fs::read_dir(&root).expect("plans") {
+        let path = entry.expect("entry").path();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open plan");
+        file.set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(60)))
+            .expect("set equal mtime");
+    }
+
+    let selected = store
+        .load_latest_for_target(&StableId::parse("local-target").expect("target"))
+        .expect("load latest")
+        .expect("matching plan");
+    assert_eq!(selected.id, second.id);
     fs::remove_dir_all(root).expect("cleanup");
 }
