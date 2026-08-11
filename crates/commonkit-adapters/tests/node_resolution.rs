@@ -742,7 +742,11 @@ fn process_host_fixture() -> (tempfile::TempDir, ProcessNodeRuntimeHost, Package
     let root = tempfile::tempdir().unwrap();
     let nvm_dir = root.path().join(".nvm");
     std::fs::create_dir_all(&nvm_dir).unwrap();
-    std::fs::write(nvm_dir.join("nvm.sh"), b"NVM_VERSION='0.40.6'\n").unwrap();
+    std::fs::write(
+        nvm_dir.join("nvm.sh"),
+        include_bytes!("fixtures/node/nvm-version-dispatch-0.40.6.sh"),
+    )
+    .unwrap();
     let shell = root.path().join("bash");
     let keyring = root.path().join("node-release-keyring.kbx");
     std::fs::write(&shell, b"bash fixture").unwrap();
@@ -778,6 +782,33 @@ fn process_nvm_probe_requires_nvm_and_rejects_default_packages_or_prefix() {
     let (root, mut host, target) = process_host_fixture();
     std::fs::remove_file(root.path().join(".nvm/nvm.sh")).unwrap();
     assert!(host.probe(&target).is_err());
+}
+
+#[test]
+fn process_nvm_probe_rejects_ambiguous_or_executable_version_dispatches() {
+    let valid = include_str!("fixtures/node/nvm-version-dispatch-0.40.6.sh");
+    let cases = [
+        format!("NVM_VERSION='9.9.9'\n{valid}"),
+        format!("nvm_echo '9.9.9'\n{valid}"),
+        format!("{valid}{valid}"),
+        valid.replace("    ;;\n", ""),
+        valid.replace("'0.40.6'", "\"$NVM_VERSION\""),
+        valid.replace("'0.40.6'", "'$(printf 0.40.6)'"),
+        valid.replace("'0.40.6'", "'0.40.6'; touch /tmp/spoof"),
+        valid.replace("0.40.6", "0.040.6"),
+        valid.replace("0.40.6", "0.40.5"),
+        valid.replace("\"--version\" | \"-v\")", "\"--version\" | \"-v\") # spoof"),
+    ];
+
+    for script in cases {
+        let (root, mut host, target) = process_host_fixture();
+        std::fs::write(root.path().join(".nvm/nvm.sh"), script).unwrap();
+
+        assert!(matches!(
+            host.probe(&target),
+            Err(NodeRuntimeHostError::UnsafeConfiguration(_))
+        ));
+    }
 }
 
 #[test]
