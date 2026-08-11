@@ -110,8 +110,11 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
   const spawn = options.spawn ?? ((cmd, spawnOptions) => Bun.spawn(cmd, spawnOptions));
   const processEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", ...(options.apiKey ? { CODEX_API_KEY: options.apiKey } : {}), ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {}) };
   const child = spawn(command, { cwd: options.cwd, env: processEnv, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-  const timeoutMs = options.timeoutMs ?? 120_000;
-  const timer = setTimeout(() => child.kill(), timeoutMs);
+  // A killed child still reports exitCode 0, so without this flag a timeout
+  // surfaces as "Codex returned no structured analysis" from the truncated stream.
+  const timeoutMs = options.timeoutMs ?? 600_000;
+  let timedOut = false;
+  const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs);
   try {
     // Codex accepts a prompt from stdin when the final argument is '-'.
     const stdin = child.stdin;
@@ -131,6 +134,7 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
       stdoutStream ? new Response(stdoutStream).text() : Promise.resolve(""),
       stderrStream ? new Response(stderrStream).text() : Promise.resolve(""),
     ]);
+    if (timedOut) throw new Error(`Codex timed out after ${timeoutMs}ms with ${input.issues.length} issues; raise LINEAR_GRAPH_CODEX_TIMEOUT_MS or reduce the candidate set`);
     if (exitCode !== 0) {
       const diagnostic = (stderr.trim() || stdout.trim()).slice(-1200);
       throw new Error(`Codex exited with ${exitCode}${diagnostic ? `: ${diagnostic}` : ""}`);

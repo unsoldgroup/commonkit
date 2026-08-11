@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { applyCodexAnalysis, focusSnapshot } from "../src/analysis.js";
-import { parseCodexEvents, sanitizeAnalysis } from "../src/codex.js";
+import { parseCodexEvents, runCodexAnalysis, sanitizeAnalysis } from "../src/codex.js";
 import { inferTopicAssignment, normalizeLinearEdges, normalizeLinearIssue, summarizeTeams } from "../src/normalizer.js";
 import { startGraphHub, trustedNonDestructiveMutation } from "../src/server.js";
 
@@ -44,6 +44,21 @@ describe("linear graph hub", () => {
       normalizeLinearIssue({ ...raw("cancelled"), state: { id: "state-cancelled", name: "Cancelled", type: "canceled" } }),
     ];
     expect(summarizeTeams(issues)).toEqual([{ id: "team", key: "USG", name: "Unsold", issueCount: 3, activeIssueCount: 1, completedIssueCount: 1, canceledIssueCount: 1 }]);
+  });
+
+  test("names the timeout instead of blaming the output when the child is killed", async () => {
+    // A killed child still reports exitCode 0, so the truncated stream used to
+    // surface as "Codex returned no structured analysis".
+    let resolveExit: (code: number) => void = () => {};
+    const child = {
+      stdin: { write: () => {}, end: () => {} },
+      stdout: undefined, stderr: undefined,
+      exited: new Promise<number>((resolve) => { resolveExit = resolve; }),
+      kill: () => resolveExit(0),
+    };
+    await expect(
+      runCodexAnalysis({ issues: [], edges: [] }, { timeoutMs: 10, spawn: () => child as never }),
+    ).rejects.toThrow(/timed out after 10ms/);
   });
 
   test("keeps a Codex run alive when individual rows are malformed", () => {
