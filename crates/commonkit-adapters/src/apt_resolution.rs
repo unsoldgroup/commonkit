@@ -508,10 +508,21 @@ fn validate_snapshot(
             )
         })
         .collect::<Vec<_>>();
+    let mut closure_architectures = BTreeMap::<(&str, &str), BTreeSet<&str>>::new();
+    for package in &snapshot.closure {
+        closure_architectures
+            .entry((&package.name, &package.version))
+            .or_default()
+            .insert(&package.architecture);
+    }
+    let has_native_all_ambiguity = closure_architectures.values().any(|architectures| {
+        architectures.contains("all") && architectures.contains(request.target.arch.as_str())
+    });
     if closure_keys.is_empty()
         || closure_keys.windows(2).any(|pair| pair[0] == pair[1])
         || archive_keys.windows(2).any(|pair| pair[0] == pair[1])
         || closure_keys != archive_keys
+        || has_native_all_ambiguity
         || snapshot.archives.iter().any(|archive| archive.size == 0)
     {
         return Err(PackageResolutionError::IncompleteAptClosure);
@@ -529,7 +540,7 @@ fn validate_snapshot(
     if !snapshot.closure.iter().any(|package| {
         package.name == *name
             && package.version == request.declaration.version
-            && package.architecture == root_architecture
+            && apt_architecture_matches(&package.architecture, root_architecture)
     }) {
         return Err(PackageResolutionError::MissingRootPackage);
     }
@@ -547,8 +558,10 @@ fn draft_from_snapshot(
     let mut artifacts = Vec::with_capacity(snapshot.archives.len());
     let mut roles = BTreeSet::new();
     for package in snapshot.closure {
-        let key = (&package.name, &package.architecture, &package.version);
-        let declaration = if key == (&root_key.0, &root_key.1, &root.version) {
+        let is_root = package.name == root_key.0
+            && package.version == root.version
+            && apt_architecture_matches(&package.architecture, &root_key.1);
+        let declaration = if is_root {
             root.clone()
         } else {
             let id = stable_hashed_id(
@@ -612,6 +625,10 @@ fn apt_declaration_key(
         name.clone(),
         architecture.clone().unwrap_or_else(|| "all".into()),
     ))
+}
+
+fn apt_architecture_matches(resolved: &str, requested: &str) -> bool {
+    resolved == requested || resolved == "all"
 }
 
 fn stable_hashed_id(prefix: &str, value: &str) -> Result<StableId, PackageResolutionError> {
