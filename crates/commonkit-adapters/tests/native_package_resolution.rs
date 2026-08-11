@@ -12,11 +12,11 @@ use std::time::Duration;
 
 #[cfg(unix)]
 use commonkit_adapters::{
-    AptRepositoryConfigurationV1, AptResolutionBackend, AptResolutionSystemRequestV1,
-    ArtifactStore, ControlledPackageSourceV1, NodeResolutionBackend, NodeRuntimeHost,
-    PackageDesiredIntent, PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1,
-    PackageFetchRequestV1, PackageFetchResultV1, PackageResolutionCoordinator,
-    PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
+    AptCommandSpecV1, AptRepositoryConfigurationV1, AptResolutionBackend,
+    AptResolutionSystemRequestV1, ArtifactStore, ControlledPackageSourceV1, NodeResolutionBackend,
+    NodeRuntimeHost, NodeRuntimeHostError, PackageDesiredIntent, PackageDiscoveryFetchRequestV1,
+    PackageFetch, PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1,
+    PackageResolutionCoordinator, PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
     ProcessAptResolutionCommandRunner, ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost,
 };
 #[cfg(unix)]
@@ -38,6 +38,106 @@ fn native_resolution_harness_requires_an_exact_opt_in() {
     assert!(native_harness_enabled(Some(OsStr::new("1"))));
 }
 
+#[test]
+#[should_panic(expected = "set COMMONKIT_NATIVE_PACKAGE_RESOLUTION=1")]
+fn explicitly_running_native_evidence_without_opt_in_fails() {
+    require_native_harness_opt_in(None);
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_apt_plan_accepts_only_safe_install_modes_in_private_state() {
+    let simulated = apt_install_command(&["--simulate"]);
+    let downloaded = apt_install_command(&["--print-uris", "--download-only"]);
+
+    assert!(validate_read_only_apt_commands(&[simulated]).is_ok());
+    assert!(validate_read_only_apt_commands(&[downloaded]).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_apt_plan_rejects_real_or_ambiguously_safe_install_commands() {
+    let real_install = apt_install_command(&[]);
+    let conflicting_modes = apt_install_command(&["--simulate", "--print-uris", "--download-only"]);
+    let mut public_state = apt_install_command(&["--simulate"]);
+    public_state
+        .environment
+        .insert("APT_CONFIG".into(), "/etc/apt/apt.conf".into());
+    let mut build_dependencies = apt_install_command(&["--simulate"]);
+    let action = build_dependencies
+        .args
+        .iter_mut()
+        .find(|argument| argument.as_str() == "install")
+        .unwrap();
+    *action = "build-dep".into();
+    let dpkg_install = AptCommandSpecV1 {
+        executable: "/usr/bin/dpkg".into(),
+        args: vec!["-i".into(), "<private>/curl.deb".into()],
+        environment: BTreeMap::new(),
+        network: false,
+    };
+
+    for unsafe_command in [
+        real_install,
+        conflicting_modes,
+        public_state,
+        build_dependencies,
+        dpkg_install,
+    ] {
+        assert!(validate_read_only_apt_commands(&[unsafe_command]).is_err());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_nvm_negative_control_rejects_default_packages_with_exact_reason() {
+    let root = tempfile::tempdir().unwrap();
+    let shell = root.path().join("bash");
+    let keyring = root.path().join("node-release-keyring.kbx");
+    let target = PackageTargetV1 {
+        os: "linux".into(),
+        os_version: "24.04".into(),
+        distro_id: Some("ubuntu".into()),
+        distro_version: Some("24.04".into()),
+        codename: Some("noble".into()),
+        arch: "amd64".into(),
+        libc: Some("glibc".into()),
+        manager_prefix: None,
+    };
+
+    assert_generated_unsafe_nvm_control(
+        root.path(),
+        b"NVM_VERSION='0.40.6'\n",
+        &shell,
+        &keyring,
+        &target,
+    );
+}
+
+#[cfg(unix)]
+fn apt_install_command(safety_flags: &[&str]) -> AptCommandSpecV1 {
+    let mut args = vec![
+        "-o".into(),
+        "Dir::Etc::sourcelist=<private>/sources.list".into(),
+        "-o".into(),
+        "Dir::Etc::sourceparts=-".into(),
+        "-o".into(),
+        "Dir::State::lists=<private>/lists".into(),
+        "-o".into(),
+        "Dir::Cache::archives=<private>/archives".into(),
+        "-o".into(),
+        "Dir::State::status=<private>/status".into(),
+    ];
+    args.extend(safety_flags.iter().map(|flag| (*flag).to_owned()));
+    args.extend(["--no-remove".into(), "install".into(), "curl=1".into()]);
+    AptCommandSpecV1 {
+        executable: "/usr/bin/apt-get".into(),
+        args,
+        environment: BTreeMap::from([("APT_CONFIG".into(), "<private>/apt.conf".into())]),
+        network: false,
+    }
+}
+
 #[cfg(all(unix, not(target_os = "linux")))]
 #[test]
 fn native_linux_harness_remains_compile_checked_off_target() {
@@ -55,10 +155,15 @@ fn native_harness_enabled(value: Option<&OsStr>) -> bool {
     value == Some(OsStr::new("1"))
 }
 
+fn require_native_harness_opt_in(value: Option<&OsStr>) {
+    assert!(
+        native_harness_enabled(value),
+        "set COMMONKIT_NATIVE_PACKAGE_RESOLUTION=1 to run native package-resolution evidence"
+    );
+}
+
 fn run_native_read_only_resolution_harness() {
-    if !native_harness_enabled(std::env::var_os(OPT_IN_ENV).as_deref()) {
-        return;
-    }
+    require_native_harness_opt_in(std::env::var_os(OPT_IN_ENV).as_deref());
     #[cfg(not(target_os = "linux"))]
     panic!("native package-resolution evidence requires Linux");
     #[cfg(target_os = "linux")]
@@ -164,24 +269,18 @@ fn run_linux_harness() {
         read_regular_no_follow(&config.node_nvm_script),
         "pinned nvm script read",
     );
+    assert_generated_unsafe_nvm_control(
+        root.path(),
+        &nvm_script,
+        &config.node_shell,
+        &config.node_release_keyring,
+        &config.apt_target(),
+    );
     redacted(
         fs::write(isolated_nvm.join("nvm.sh"), nvm_script),
         "isolated nvm script copy",
     );
     let node_target = config.node_target(&isolated_nvm);
-    if let Some(existing_nvm) = &config.existing_nvm_dir {
-        let mut old_target = node_target.clone();
-        old_target.manager_prefix = Some(path_text(existing_nvm, "existing nvm path"));
-        let mut existing_host = ProcessNodeRuntimeHost::new(
-            existing_nvm,
-            &config.node_shell,
-            &config.node_release_keyring,
-        );
-        assert!(
-            existing_host.probe(&old_target).is_err(),
-            "the explicitly supplied unsafe nvm authority unexpectedly passed"
-        );
-    }
     let mut host_probe = ProcessNodeRuntimeHost::new(
         &isolated_nvm,
         &config.node_shell,
@@ -240,6 +339,40 @@ fn run_linux_harness() {
 }
 
 #[cfg(unix)]
+fn assert_generated_unsafe_nvm_control(
+    root: &Path,
+    nvm_script: &[u8],
+    shell: &Path,
+    release_keyring: &Path,
+    target_template: &PackageTargetV1,
+) {
+    let unsafe_nvm = root.join("unsafe-nvm-home/.nvm");
+    redacted(
+        fs::create_dir_all(&unsafe_nvm),
+        "unsafe nvm control workspace creation",
+    );
+    redacted(
+        fs::write(unsafe_nvm.join("nvm.sh"), nvm_script),
+        "unsafe nvm control script creation",
+    );
+    redacted(
+        fs::write(unsafe_nvm.join("default-packages"), b"typescript\n"),
+        "unsafe nvm control configuration creation",
+    );
+    let mut unsafe_target = target_template.clone();
+    unsafe_target.manager_prefix = Some(path_text(&unsafe_nvm, "unsafe nvm control path"));
+    let mut unsafe_host = ProcessNodeRuntimeHost::new(&unsafe_nvm, shell, release_keyring);
+
+    assert_eq!(
+        unsafe_host.probe(&unsafe_target),
+        Err(NodeRuntimeHostError::UnsafeConfiguration(
+            "nvm default-packages is not allowed".into()
+        )),
+        "generated unsafe nvm control did not reach the expected policy rejection"
+    );
+}
+
+#[cfg(unix)]
 fn assert_read_only_apt_plan(
     declaration: &PackageDeclaration,
     target: &PackageTargetV1,
@@ -266,15 +399,136 @@ fn assert_read_only_apt_plan(
         ProcessAptResolutionCommandRunner::command_snapshot(&request),
         "APT read-only command plan",
     );
+    assert!(
+        validate_read_only_apt_commands(&commands).is_ok(),
+        "native evidence command plan could mutate target state"
+    );
+}
+
+#[cfg(unix)]
+fn validate_read_only_apt_commands(commands: &[AptCommandSpecV1]) -> Result<(), &'static str> {
     for command in commands {
-        assert!(
-            !command.args.iter().any(|argument| matches!(
+        if command.args.iter().any(|argument| {
+            matches!(
                 argument.as_str(),
-                "install" | "remove" | "purge" | "upgrade" | "dist-upgrade"
-            )),
-            "native evidence command plan contains a target mutation verb"
-        );
+                "remove"
+                    | "purge"
+                    | "upgrade"
+                    | "dist-upgrade"
+                    | "full-upgrade"
+                    | "autoremove"
+                    | "--install"
+                    | "--unpack"
+                    | "--configure"
+            )
+        }) {
+            return Err("target mutation verb is not allowed");
+        }
+
+        let is_apt_get = command.executable == "/usr/bin/apt-get";
+        let is_apt_cache = command.executable == "/usr/bin/apt-cache";
+        let is_version_probe = is_apt_get && command.args.as_slice() == ["--version"];
+        if (is_apt_get && !is_version_probe) || is_apt_cache {
+            let required_private_options = [
+                "Dir::Etc::sourcelist=<private>/sources.list",
+                "Dir::Etc::sourceparts=-",
+                "Dir::State::lists=<private>/lists",
+                "Dir::Cache::archives=<private>/archives",
+            ];
+            if command.environment
+                != BTreeMap::from([("APT_CONFIG".into(), "<private>/apt.conf".into())])
+                || required_private_options
+                    .iter()
+                    .any(|required| !command.args.iter().any(|argument| argument == required))
+            {
+                return Err("APT command is not bound to private state");
+            }
+        }
+
+        match command.executable.as_str() {
+            "/usr/bin/apt-get" if is_version_probe => {}
+            "/usr/bin/apt-get" => match apt_command_action(&command.args) {
+                Some("update" | "install") => {}
+                _ => return Err("apt-get action is not read-only"),
+            },
+            "/usr/bin/apt-cache" => {
+                if apt_command_action(&command.args) != Some("depends") {
+                    return Err("apt-cache action is not approved");
+                }
+            }
+            "/usr/bin/dpkg" => {
+                if !matches!(command.args.as_slice(), [argument] if matches!(argument.as_str(), "--version" | "--print-architecture"))
+                {
+                    return Err("dpkg action is not read-only");
+                }
+            }
+            "/usr/bin/apt-config" => {
+                if command.args.as_slice() != ["dump"] {
+                    return Err("apt-config action is not read-only");
+                }
+            }
+            "/usr/bin/dpkg-query" => {
+                if command.args.first().map(String::as_str) != Some("-W") {
+                    return Err("dpkg-query action is not read-only");
+                }
+            }
+            "/usr/bin/apt-mark" => {
+                if command.args.as_slice() != ["showhold"] {
+                    return Err("apt-mark action is not read-only");
+                }
+            }
+            _ => return Err("command executable is not approved for APT evidence"),
+        }
+
+        let install_count = command
+            .args
+            .iter()
+            .filter(|argument| argument.as_str() == "install")
+            .count();
+        if install_count == 0 {
+            continue;
+        }
+        if !is_apt_get || install_count != 1 {
+            return Err("install is only allowed as one apt-get action");
+        }
+
+        let flag_count = |flag: &str| {
+            command
+                .args
+                .iter()
+                .filter(|argument| argument.as_str() == flag)
+                .count()
+        };
+        let simulation = flag_count("--simulate") == 1
+            && flag_count("--print-uris") == 0
+            && flag_count("--download-only") == 0;
+        let download_plan = flag_count("--simulate") == 0
+            && flag_count("--print-uris") == 1
+            && flag_count("--download-only") == 1;
+        let private_status = command
+            .args
+            .iter()
+            .any(|argument| argument == "Dir::State::status=<private>/status");
+        if !(simulation || download_plan) || !private_status {
+            return Err("install lacks one exact read-only mode in private state");
+        }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn apt_command_action(args: &[String]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == "-o" {
+            index += 2;
+        } else if args[index].starts_with('-') {
+            index += 1;
+        } else {
+            return Some(args[index].as_str());
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -295,7 +549,6 @@ struct NativeHarnessConfig {
     node_source_id: StableId,
     node_version: String,
     node_nvm_script: PathBuf,
-    existing_nvm_dir: Option<PathBuf>,
     node_shell: PathBuf,
     node_release_keyring: PathBuf,
     node_gpgv: PathBuf,
@@ -325,7 +578,6 @@ impl NativeHarnessConfig {
             node_source_id: required_id("COMMONKIT_NATIVE_NODE_SOURCE_ID"),
             node_version: required_text("COMMONKIT_NATIVE_NODE_VERSION"),
             node_nvm_script: required_path("COMMONKIT_NATIVE_NVM_SCRIPT"),
-            existing_nvm_dir: optional_path("COMMONKIT_NATIVE_EXISTING_NVM_DIR"),
             node_shell: required_path("COMMONKIT_NATIVE_NODE_SHELL"),
             node_release_keyring: required_path("COMMONKIT_NATIVE_NODE_RELEASE_KEYRING"),
             node_gpgv: required_path("COMMONKIT_NATIVE_NODE_GPGV"),
@@ -496,18 +748,6 @@ fn required_path(name: &'static str) -> PathBuf {
         "required harness path {name} is not absolute"
     );
     path
-}
-
-#[cfg(unix)]
-fn optional_path(name: &'static str) -> Option<PathBuf> {
-    std::env::var_os(name).map(|value| {
-        let path = PathBuf::from(value);
-        assert!(
-            path.is_absolute(),
-            "optional harness path {name} is not absolute"
-        );
-        path
-    })
 }
 
 #[cfg(unix)]
