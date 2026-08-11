@@ -71,8 +71,38 @@ exact SHA-256 `.deb` records. CommonKit preflights the complete locator set
 before the first request, then downloads every archive through the per-hop
 scoped fetch seam and verifies its digest and size before persistence.
 
+## Controlled nvm/Node resolution
+
+The production Node resolver is limited to an exact `NodeRuntime` selector,
+the `nodejs-nvm` source, nvm 0.40.6 or newer, and Node's version-specific
+`nodejs.org/dist/vX.Y.Z` release directory. It supports only mapped macOS and
+glibc Linux binary targets. Windows, musl, aliases, ranges, moving release
+paths, custom mirrors, and source-build fallback fail closed.
+
+Before network access, CommonKit opens `nvm.sh`, the configured shell, and the
+Node release keyring without following the leaf and binds their digests with
+the target tuple and nvm directory. It rejects `default-packages`, a user
+`.npmrc` prefix, prefix or mirror environment overrides, package migration,
+and latest-npm behavior. nvm remains a sourced shell function; CommonKit never
+treats it as a standalone executable.
+
+The resolver preflights the checksum, armored-signature, and exact archive
+locators together. It fetches each response through the scoped per-hop seam,
+extracts the signed checksum payload with a fixed typed `gpgv` invocation, and
+requires the signer (including a signing subkey's primary fingerprint) to be
+in CommonKit's pinned Node release-key set. The exact platform archive must
+appear once in that signed manifest and its downloaded bytes must match the
+signed SHA-256 digest.
+
+Node resolutions use the package-resolution v2 schema. The durable recipe
+binds the exact cache materialization path, nvm and shell digests, offline mode,
+`NVM_NO_SOURCE_FALLBACK=1`, and nvm's per-version lock while disabling npm
+upgrade and package migration. The signed checksums, signature, and archive are
+all persisted. Planning and restart recovery reopen only those artifacts; no
+resolver, verifier, provider, shell, or network capability is available.
+
 ## Deferred work
 
-Concrete Node resolution backends, consent, and package mutation remain
-separate work. The APT resolver does not install packages, create operations,
-or write receipts. Winget is not part of this phase.
+Package consent and target mutation remain separate work. Neither the APT nor
+Node resolver installs packages, creates operations, or writes receipts.
+Winget is not part of this phase.
