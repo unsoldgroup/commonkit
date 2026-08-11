@@ -1161,6 +1161,7 @@ fn validate_staging_directory(staging: &Dir) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn staging_usage(staging: &Dir) -> Result<(usize, u64), std::io::Error> {
     let mut count = 0;
     let mut bytes: u64 = 0;
