@@ -672,14 +672,10 @@ impl<T> SshOfflinePackageBackend<T> {
     where
         T: crate::SshFilesystemTransport,
     {
-        let _ = artifacts;
-        let transferred = resolution
-            .artifacts
-            .iter()
-            .map(|artifact| crate::PackageMutationArtifact {
-                reference: artifact.content.clone(),
-            })
-            .collect::<Vec<_>>();
+        let transferred = match artifacts {
+            Some(artifacts) => self.stage_artifacts(resolution, artifacts)?,
+            None => Vec::new(),
+        };
         self.transport
             .perform(crate::SshFilesystemRequest::PackageMutation {
                 root_id: self.root_id.clone(),
@@ -688,6 +684,121 @@ impl<T> SshOfflinePackageBackend<T> {
                 artifacts: transferred,
             })
             .map_err(|_| PackageMutationError::Backend)
+    }
+
+    fn stage_artifacts(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<Vec<crate::PackageMutationArtifact>, PackageMutationError>
+    where
+        T: crate::SshFilesystemTransport,
+    {
+        if resolution.artifacts.len() > crate::MAX_ARTIFACT_TRANSFER_COUNT {
+            return Err(PackageMutationError::Backend);
+        }
+        let aggregate = resolution
+            .artifacts
+            .iter()
+            .try_fold(0u64, |total, artifact| {
+                total.checked_add(artifact.content.bytes)
+            });
+        if aggregate.is_none_or(|bytes| bytes > crate::MAX_ARTIFACT_TRANSFER_BYTES) {
+            return Err(PackageMutationError::Backend);
+        }
+        let run_digest =
+            digest_domain_json("commonkit.ssh-package-mutation-transfer.v1", resolution)
+                .map_err(|_| PackageMutationError::Backend)?;
+        let run_id = crate::artifact_transfer_id("mutation-run", &run_digest)
+            .map_err(|_| PackageMutationError::Backend)?;
+        let mut transferred = Vec::with_capacity(resolution.artifacts.len());
+        for artifact in &resolution.artifacts {
+            let reference = &artifact.content;
+            if reference.bytes == 0
+                || reference.bytes > crate::MAX_ARTIFACT_TRANSFER_BYTES
+                || reference.sensitivity != crate::ContentSensitivity::Portable
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            let transfer_id = crate::artifact_transfer_id("mutation", &reference.digest)
+                .map_err(|_| PackageMutationError::Backend)?;
+            let total_chunks = u32::try_from(
+                reference
+                    .bytes
+                    .div_ceil(u64::from(crate::ARTIFACT_CHUNK_SIZE)),
+            )
+            .map_err(|_| PackageMutationError::Backend)?;
+            for sequence in 0..total_chunks {
+                let offset = u64::from(sequence) * u64::from(crate::ARTIFACT_CHUNK_SIZE);
+                let content = artifacts
+                    .read_chunk(reference, offset, crate::ARTIFACT_CHUNK_SIZE)
+                    .map_err(|_| PackageMutationError::Backend)?;
+                let expected_response_digest = crate::artifact_chunk_response_digest(
+                    &run_id,
+                    &transfer_id,
+                    &reference.digest,
+                    reference.bytes,
+                    crate::ARTIFACT_CHUNK_SIZE,
+                    sequence,
+                    offset,
+                    total_chunks,
+                    &content,
+                )
+                .map_err(|_| PackageMutationError::Backend)?;
+                match self
+                    .transport
+                    .perform(crate::SshFilesystemRequest::StageArtifactChunk {
+                        run_id: run_id.clone(),
+                        transfer_id: transfer_id.clone(),
+                        digest: reference.digest.clone(),
+                        byte_count: reference.bytes,
+                        chunk_size: crate::ARTIFACT_CHUNK_SIZE,
+                        sequence,
+                        offset,
+                        total_chunks,
+                        content,
+                    })
+                    .map_err(|_| PackageMutationError::Backend)?
+                {
+                    crate::SshFilesystemResponse::ArtifactChunkStaged {
+                        run_id: response_run,
+                        transfer_id: response_transfer,
+                        digest,
+                        byte_count,
+                        chunk_size,
+                        sequence: response_sequence,
+                        offset: response_offset,
+                        total_chunks: response_total,
+                        response_digest,
+                    } if response_run == run_id
+                        && response_transfer == transfer_id
+                        && digest == reference.digest
+                        && byte_count == reference.bytes
+                        && chunk_size == crate::ARTIFACT_CHUNK_SIZE
+                        && response_sequence == sequence
+                        && response_offset == offset
+                        && response_total == total_chunks
+                        && response_digest == expected_response_digest => {}
+                    _ => return Err(PackageMutationError::Backend),
+                }
+            }
+            match self
+                .transport
+                .perform(crate::SshFilesystemRequest::VerifyArtifact {
+                    run_id: run_id.clone(),
+                    digest: reference.digest.clone(),
+                })
+                .map_err(|_| PackageMutationError::Backend)?
+            {
+                crate::SshFilesystemResponse::ArtifactVerified { digest }
+                    if digest == reference.digest => {}
+                _ => return Err(PackageMutationError::Backend),
+            }
+            transferred.push(crate::PackageMutationArtifact {
+                reference: reference.clone(),
+            });
+        }
+        Ok(transferred)
     }
 }
 

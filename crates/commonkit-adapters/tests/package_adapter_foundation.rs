@@ -2,10 +2,12 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
-    ArtifactStore, ContentSensitivity, ManagerBindingV1, OfflineInstallRecipeV1, PackageAdapter,
-    PackageMutationBackend, PackageMutationError, PackageObservationV1, PackageResolutionAuthority,
-    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ProcessOfflinePackageBackend,
-    ResolvedPackage, SourceBindingV1,
+    ARTIFACT_CHUNK_SIZE, ArtifactStore, ContentSensitivity, ManagerBindingV1,
+    OfflineInstallRecipeV1, PackageAdapter, PackageArtifactV1, PackageMutationBackend,
+    PackageMutationError, PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1,
+    PackageSourceRegistry, PackageTargetV1, ProcessOfflinePackageBackend, ResolvedPackage,
+    SourceBindingV1, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
+    SshOfflinePackageBackend, TargetFilesystemError, artifact_chunk_response_digest,
 };
 use commonkit_contracts::{
     Operation, OperationKind, PackageDeclaration, PackageManager, PackageSelector,
@@ -148,6 +150,117 @@ fn apt_resolution() -> (PackageResolutionV1, PackageResolutionAuthority) {
         },
     };
     (resolution, authority)
+}
+
+#[derive(Clone)]
+struct RecordingSshTransport {
+    requests: Arc<Mutex<Vec<SshFilesystemRequest>>>,
+}
+
+impl SshFilesystemTransport for RecordingSshTransport {
+    fn perform(
+        &mut self,
+        request: SshFilesystemRequest,
+    ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+        let response = match &request {
+            SshFilesystemRequest::StageArtifactChunk {
+                run_id,
+                transfer_id,
+                digest,
+                byte_count,
+                chunk_size,
+                sequence,
+                offset,
+                total_chunks,
+                content,
+            } => SshFilesystemResponse::ArtifactChunkStaged {
+                run_id: run_id.clone(),
+                transfer_id: transfer_id.clone(),
+                digest: digest.clone(),
+                byte_count: *byte_count,
+                chunk_size: *chunk_size,
+                sequence: *sequence,
+                offset: *offset,
+                total_chunks: *total_chunks,
+                response_digest: artifact_chunk_response_digest(
+                    run_id,
+                    transfer_id,
+                    digest,
+                    *byte_count,
+                    *chunk_size,
+                    *sequence,
+                    *offset,
+                    *total_chunks,
+                    content,
+                )
+                .unwrap(),
+            },
+            SshFilesystemRequest::PackageMutation { .. } => SshFilesystemResponse::Applied,
+            SshFilesystemRequest::VerifyArtifact { digest, .. } => {
+                SshFilesystemResponse::ArtifactVerified {
+                    digest: digest.clone(),
+                }
+            }
+            _ => return Err(TargetFilesystemError::InvalidRemoteResponse),
+        };
+        self.requests.lock().unwrap().push(request);
+        Ok(response)
+    }
+}
+
+#[test]
+fn ssh_package_backend_stages_chunked_artifacts_before_reference_only_mutation() {
+    let (mut resolution, _) = apt_resolution();
+    let store_root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(store_root.path()).unwrap();
+    let bytes = vec![0x5a; ARTIFACT_CHUNK_SIZE as usize * 2 + 17];
+    let reference = artifacts.put(&bytes, ContentSensitivity::Portable).unwrap();
+    let role = StableId::parse("apt-archive-ripgrep").unwrap();
+    resolution.artifacts = vec![PackageArtifactV1 {
+        role: role.clone(),
+        content: reference.clone(),
+        upstream_checksum: reference.digest.clone(),
+        size: reference.bytes,
+        materialization_key: StableId::parse("ripgrep-deb").unwrap(),
+        source_metadata_digest: digest('d'),
+    }];
+    resolution.recipe = OfflineInstallRecipeV1::AptArchives {
+        artifact_roles: BTreeSet::from([role]),
+    };
+
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingSshTransport {
+        requests: requests.clone(),
+    };
+    let mut backend = SshOfflinePackageBackend::with_target_platform(
+        StableId::parse("home").unwrap(),
+        transport,
+        "linux",
+        "amd64",
+    );
+
+    backend.prepare_offline(&resolution, &artifacts).unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    let staged = requests[..3]
+        .iter()
+        .flat_map(|request| match request {
+            SshFilesystemRequest::StageArtifactChunk { content, .. } => content.as_slice(),
+            other => panic!("expected staged chunk, got {other:?}"),
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    assert_eq!(staged, bytes);
+    assert!(matches!(
+        &requests[4],
+        SshFilesystemRequest::PackageMutation { artifacts: refs, .. }
+            if refs == &vec![commonkit_adapters::PackageMutationArtifact { reference }]
+    ));
+    assert!(matches!(
+        &requests[3],
+        SshFilesystemRequest::VerifyArtifact { .. }
+    ));
 }
 
 fn operation(resolution_digest: Sha256Digest) -> Operation {
