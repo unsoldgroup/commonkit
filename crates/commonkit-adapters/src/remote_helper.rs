@@ -882,7 +882,12 @@ impl TargetHelper {
                     .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
                 let mut backend =
                     ProcessOfflinePackageBackend::new_with_bound_root(root_path, root_handle)
-                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
+                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?
+                        .with_target_package_resolution(
+                            self.package_resolution
+                                .clone()
+                                .ok_or(TargetFilesystemError::PackageCommandFailed)?,
+                        );
                 match phase {
                     PackageMutationPhase::Observe => {
                         let observed = PackageMutationBackend::observe(&mut backend, &resolution)

@@ -23,6 +23,7 @@ use commonkit_adapters::{
     FileAdapter, LocalCredentialReadinessInspector, MaterializedState, PackageAdapter,
     PackageDriftReport, PackageMutationBackendRegistry, PackageObserver,
     ProcessOfflinePackageBackend, ProcessPackageCommandRunner, ProviderCapability,
+    TargetPackageResolutionConfig,
 };
 use commonkit_contracts::{
     CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, PackageConsent,
@@ -1727,6 +1728,7 @@ pub struct LocalPlanExecutor {
     receipt_store: ReceiptStore,
     target_root: PathBuf,
     adapter_state: PathBuf,
+    package_resolution: Option<TargetPackageResolutionConfig>,
     relay: Option<RelayExecutorConfig>,
     execution_lock: std::sync::Mutex<()>,
 }
@@ -1749,9 +1751,18 @@ impl LocalPlanExecutor {
             receipt_store: ReceiptStore::open(receipt_root)?,
             target_root: target_root.as_ref().to_path_buf(),
             adapter_state: adapter_state.as_ref().to_path_buf(),
+            package_resolution: None,
             relay: None,
             execution_lock: std::sync::Mutex::new(()),
         })
+    }
+
+    pub fn with_package_resolution(
+        mut self,
+        package_resolution: Option<TargetPackageResolutionConfig>,
+    ) -> Self {
+        self.package_resolution = package_resolution;
+        self
     }
 
     pub fn with_relay(
@@ -1771,10 +1782,14 @@ impl LocalPlanExecutor {
     fn adapters(&self) -> Result<Vec<Box<dyn Adapter>>, LocalExecutionError> {
         let package_artifacts = ArtifactStore::open(self.adapter_state.join("packages"))
             .map_err(LocalExecutionError::PackageArtifact)?;
-        let package_backend = PackageMutationBackendRegistry::new([Box::new(
-            ProcessOfflinePackageBackend::new(&self.target_root),
-        )
-            as Box<dyn commonkit_adapters::PackageMutationBackend>])
+        let process_backend = match &self.package_resolution {
+            Some(config) => ProcessOfflinePackageBackend::new(&self.target_root)
+                .with_target_package_resolution(config.clone()),
+            None => ProcessOfflinePackageBackend::new(&self.target_root),
+        };
+        let package_backend = PackageMutationBackendRegistry::new([
+            Box::new(process_backend) as Box<dyn commonkit_adapters::PackageMutationBackend>
+        ])
         .map_err(LocalExecutionError::PackageBackend)?;
         let mut adapters: Vec<Box<dyn Adapter>> = vec![
             Box::new(FileAdapter::open(&self.target_root, &self.adapter_state)?),

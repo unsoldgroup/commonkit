@@ -29,9 +29,10 @@ use commonkit_adapters::{
     ProviderPlanRequest, ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter,
     RemoteProviderStager, ResolvedMaterializedState, ResolvedPackageIntent, ResourceIntent,
     ResourceProvenance, SecretValue, SshFileAdapter, SshFilesystemRequest, SshFilesystemResponse,
-    SshOfflinePackageBackend, SshTargetCapabilities, build_provider_plan,
-    build_resolved_provider_plan_with_router, materialize_mcp_client_state,
-    package_resolution_request_digest, package_resolution_response_digest, validate_ownership,
+    SshOfflinePackageBackend, SshTargetCapabilities, TargetNodeResolutionConfig,
+    TargetPackageResolutionConfig, build_provider_plan, build_resolved_provider_plan_with_router,
+    materialize_mcp_client_state, package_resolution_request_digest,
+    package_resolution_response_digest, validate_ownership,
 };
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
@@ -164,6 +165,31 @@ struct NodeResolutionConfig {
     gpgv_executable: PathBuf,
     #[serde(default)]
     gpgv_executable_digest: Option<Sha256Digest>,
+}
+
+impl SyncConfig {
+    fn target_package_resolution(&self) -> Option<TargetPackageResolutionConfig> {
+        let config = self.package_resolution.as_ref()?;
+        let node = config.node.as_ref().and_then(|node| {
+            node.gpgv_executable_digest
+                .clone()
+                .map(|digest| TargetNodeResolutionConfig {
+                    nvm_dir: node.nvm_dir.clone(),
+                    shell_executable: node.shell_executable.clone(),
+                    release_keyring: node.release_keyring.clone(),
+                    gpgv_executable: node.gpgv_executable.clone(),
+                    gpgv_executable_digest: digest,
+                })
+        });
+        Some(TargetPackageResolutionConfig {
+            target: config.target.clone(),
+            manager: config.manager.clone(),
+            policy: config.policy.clone(),
+            apt: config.apt.clone(),
+            node,
+            target_identity_digest: self.target_identity_digest.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -709,7 +735,8 @@ impl ProductionDomainRegistry {
                         &config.target_root,
                         &config.adapter_state,
                     )
-                    .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                    .map_err(|_| ProductionDomainError::UnsafeConfig)?
+                    .with_package_resolution(config.target_package_resolution()),
                 ),
                 transport @ SyncTargetTransport::Ssh { .. } => {
                     let capabilities = config
@@ -2728,7 +2755,12 @@ impl ProductionSyncDomain {
                             ArtifactStore::open(self.config.adapter_state.join("packages"))
                                 .map_err(|_| DomainFailure::OperationFailed)?;
                         let backend = PackageMutationBackendRegistry::new([Box::new(
-                            ProcessOfflinePackageBackend::new(&self.config.target_root),
+                            ProcessOfflinePackageBackend::new(&self.config.target_root)
+                                .with_target_package_resolution(
+                                    self.config
+                                        .target_package_resolution()
+                                        .ok_or(DomainFailure::OperationFailed)?,
+                                ),
                         )
                             as Box<dyn commonkit_adapters::PackageMutationBackend>])
                         .map_err(|_| DomainFailure::OperationFailed)?;
@@ -3649,7 +3681,12 @@ impl SyncDomain for ProductionSyncDomain {
                         .clone()
                         .ok_or(DomainFailure::InvalidRequest)?;
                     let backend = PackageMutationBackendRegistry::new([Box::new(
-                        ProcessOfflinePackageBackend::new(&self.config.target_root),
+                        ProcessOfflinePackageBackend::new(&self.config.target_root)
+                            .with_target_package_resolution(
+                                self.config
+                                    .target_package_resolution()
+                                    .ok_or(DomainFailure::OperationFailed)?,
+                            ),
                     )
                         as Box<dyn commonkit_adapters::PackageMutationBackend>])
                     .map_err(|_| DomainFailure::OperationFailed)?;

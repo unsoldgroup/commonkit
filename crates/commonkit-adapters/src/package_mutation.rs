@@ -20,9 +20,10 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ArtifactStore, NodeOfflineInstallRecipeV1, OfflineInstallRecipeV1, PackageObservationV1,
-    PackageResolutionAuthority, PackageResolutionV1, PackageResourcePlanner, ProviderPlanError,
-    ResolvedPackageIntent, ResourceProvenance, apt_resolution::apt_package_identity,
+    ArtifactStore, NodeOfflineInstallRecipeV1, NodeRuntimeHost, OfflineInstallRecipeV1,
+    PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1, PackageResourcePlanner,
+    ProviderPlanError, ResolvedPackageIntent, ResourceProvenance,
+    apt_resolution::apt_package_identity,
 };
 
 const CLOSED_NVM_PATH: &str = "/usr/bin:/bin";
@@ -666,6 +667,7 @@ fn runtime_authority(
 pub struct ProcessOfflinePackageBackend {
     logical_root: PathBuf,
     process_root: PathBuf,
+    package_resolution: Option<crate::TargetPackageResolutionConfig>,
     #[cfg(unix)]
     _root_dir: Option<Dir>,
 }
@@ -932,9 +934,31 @@ impl ProcessOfflinePackageBackend {
         Self {
             logical_root: target_root.clone(),
             process_root: target_root,
+            package_resolution: None,
             #[cfg(unix)]
             _root_dir: None,
         }
+    }
+
+    /// Opens the offline backend with the target-local manager authority that
+    /// was used to create the persisted resolution. Every mutation phase then
+    /// re-probes that authority before it observes or changes packages.
+    pub fn with_package_resolution(
+        target_root: impl Into<PathBuf>,
+        package_resolution: crate::TargetPackageResolutionConfig,
+    ) -> Self {
+        let backend = Self::new(target_root);
+        backend.with_target_package_resolution(package_resolution)
+    }
+
+    /// Attaches the target-local manager authority to an already root-bound
+    /// backend, as used by the remote helper after it opens its root handle.
+    pub fn with_target_package_resolution(
+        mut self,
+        package_resolution: crate::TargetPackageResolutionConfig,
+    ) -> Self {
+        self.package_resolution = Some(package_resolution);
+        self
     }
 
     #[cfg(unix)]
@@ -963,6 +987,7 @@ impl ProcessOfflinePackageBackend {
         Ok(Self {
             logical_root: _target_root.into(),
             process_root,
+            package_resolution: None,
             _root_dir: Some(Dir::from_std_file(root_handle)),
         })
     }
@@ -973,6 +998,70 @@ impl ProcessOfflinePackageBackend {
         _root_handle: std::fs::File,
     ) -> Result<Self, PackageMutationError> {
         Err(PackageMutationError::Backend)
+    }
+
+    fn revalidate_live_manager_binding(
+        &self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<(), PackageMutationError> {
+        let Some(config) = &self.package_resolution else {
+            // Legacy/test-only constructors do not carry target-local paths.
+            // Production constructors are wired with the persisted target
+            // configuration before they are exposed to a plan executor.
+            return Ok(());
+        };
+        if config.target != resolution.target || config.manager != resolution.manager {
+            return Err(PackageMutationError::Backend);
+        }
+        match resolution.manager.manager {
+            PackageManager::Apt => {
+                let repository = config.apt.as_ref().ok_or(PackageMutationError::Backend)?;
+                if repository.source_id != resolution.source.source_id {
+                    return Err(PackageMutationError::Backend);
+                }
+                if resolution
+                    .source
+                    .signed_metadata
+                    .iter()
+                    .any(|evidence| evidence.authority != repository.signing_authority)
+                {
+                    return Err(PackageMutationError::Backend);
+                }
+                let actual = crate::ProcessAptResolutionCommandRunner::probe_manager_binding(
+                    &config.target,
+                    &resolution.source.canonical_repository,
+                    repository,
+                )
+                .map_err(|_| PackageMutationError::Backend)?;
+                (actual == resolution.manager)
+                    .then_some(())
+                    .ok_or(PackageMutationError::Backend)
+            }
+            PackageManager::Nvm => {
+                let node = config.node.as_ref().ok_or(PackageMutationError::Backend)?;
+                let mut host = crate::ProcessNodeRuntimeHost::new_with_gpgv(
+                    node.nvm_dir.clone(),
+                    node.shell_executable.clone(),
+                    node.release_keyring.clone(),
+                    node.gpgv_executable.clone(),
+                );
+                let actual = host
+                    .probe(&config.target)
+                    .map_err(|_| PackageMutationError::Backend)?;
+                (actual.manager == resolution.manager)
+                    .then_some(())
+                    .ok_or(PackageMutationError::Backend)
+            }
+            _ => Err(PackageMutationError::UnsupportedRecipe),
+        }
+    }
+
+    fn nvm_shell_executable(&self) -> PathBuf {
+        self.package_resolution
+            .as_ref()
+            .and_then(|config| config.node.as_ref())
+            .map(|node| node.shell_executable.clone())
+            .unwrap_or_else(|| PathBuf::from("/bin/bash"))
     }
 
     fn observe_apt(
@@ -1014,7 +1103,7 @@ impl ProcessOfflinePackageBackend {
         let nvm_dir = self.process_root.join(".nvm");
         let script = self.validate_nvm_script(resolution)?;
         let script_copy = script.materialize()?;
-        let mut command = Command::new("/bin/bash");
+        let mut command = Command::new(self.nvm_shell_executable());
         command
             .arg("-c")
             .arg("set -eu; . \"$1\"; nvm ls --no-colors")
@@ -1123,6 +1212,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         &mut self,
         resolution: &PackageResolutionV1,
     ) -> Result<PackageObservationV1, PackageMutationError> {
+        self.revalidate_live_manager_binding(resolution)?;
         match resolution.manager.manager {
             PackageManager::Apt => self.observe_apt(resolution),
             PackageManager::Nvm => self.observe_nvm(resolution),
@@ -1135,6 +1225,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         resolution: &PackageResolutionV1,
         artifacts: &ArtifactStore,
     ) -> Result<(), PackageMutationError> {
+        self.revalidate_live_manager_binding(resolution)?;
         if resolution.manager.manager == PackageManager::Nvm {
             self.ensure_nvm_target(resolution)?;
         }
@@ -1159,6 +1250,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         resolution: &PackageResolutionV1,
         artifacts: &ArtifactStore,
     ) -> Result<(), PackageMutationError> {
+        self.revalidate_live_manager_binding(resolution)?;
         match resolution.manager.manager {
             PackageManager::Apt => {
                 let OfflineInstallRecipeV1::AptArchives { artifact_roles } = &resolution.recipe
@@ -1212,7 +1304,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                     .unwrap_or_else(|| self.process_root.join(".nvm"));
                 #[cfg(not(unix))]
                 let nvm_dir = self.process_root.join(".nvm");
-                let mut command = Command::new("/bin/bash");
+                let mut command = Command::new(self.nvm_shell_executable());
                 command
                     .arg("-c")
                     .arg("set -eu; export NVM_NO_SOURCE_FALLBACK=1 NVM_OFFLINE=1; . \"$1\"; nvm install --offline \"$2\"")
@@ -1243,6 +1335,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         resolution: &PackageResolutionV1,
         _artifacts: &ArtifactStore,
     ) -> Result<(), PackageMutationError> {
+        self.revalidate_live_manager_binding(resolution)?;
         let observed = self.observe(resolution)?;
         if PackageAdapter::after_resolution(resolution, &observed) {
             Ok(())

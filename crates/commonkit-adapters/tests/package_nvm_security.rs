@@ -3,10 +3,12 @@ use std::fs;
 use std::path::Path;
 
 use commonkit_adapters::{
-    ManagerBindingV1, NodeOfflineInstallRecipeV1, OfflineInstallRecipeV1, PackageMutationBackend,
-    PackageObservationV1, PackageResolutionV1, PackageTargetV1, ProcessOfflinePackageBackend,
-    ResolvedPackage, SourceBindingV1,
+    ManagerBindingV1, NodeOfflineInstallRecipeV1, NodeRuntimeHost, OfflineInstallRecipeV1,
+    PackageMutationBackend, PackageObservationV1, PackageResolutionV1, PackageTargetV1,
+    ProcessNodeRuntimeHost, ProcessOfflinePackageBackend, ResolvedPackage, SourceBindingV1,
+    TargetNodeResolutionConfig, TargetPackageResolutionConfig,
 };
+use commonkit_contracts::SecurityPolicy;
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SchemaVersion, Sha256Digest, StableId,
 };
@@ -77,6 +79,144 @@ fn resolution(target_root: &Path, script_digest: Sha256Digest) -> PackageResolut
             }),
         },
     }
+}
+
+fn live_binding_fixture(
+    root: &Path,
+) -> (
+    PackageResolutionV1,
+    TargetPackageResolutionConfig,
+    std::path::PathBuf,
+) {
+    let nvm = root.join(".nvm");
+    fs::create_dir_all(&nvm).unwrap();
+    let script = include_bytes!("fixtures/node/nvm-v0.40.6.sh").to_vec();
+    fs::write(nvm.join("nvm.sh"), &script).unwrap();
+    let shell = Path::new("/bin/bash").to_path_buf();
+    let keyring = root.join("node-release-keyring.kbx");
+    let gpgv = root.join("gpgv");
+    fs::write(&keyring, b"fixture keyring").unwrap();
+    fs::copy("/bin/bash", &gpgv).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gpgv, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let target = PackageTargetV1 {
+        os: "linux".into(),
+        os_version: "24.04".into(),
+        distro_id: Some("ubuntu".into()),
+        distro_version: Some("24.04".into()),
+        codename: Some("noble".into()),
+        arch: "x86_64".into(),
+        libc: Some("glibc".into()),
+        manager_prefix: Some(nvm.to_string_lossy().into_owned()),
+    };
+    let mut host = ProcessNodeRuntimeHost::new_with_gpgv(
+        nvm.clone(),
+        shell.clone(),
+        keyring.clone(),
+        gpgv.clone(),
+    );
+    let snapshot = host.probe(&target).unwrap();
+    let config = TargetPackageResolutionConfig {
+        target: target.clone(),
+        manager: snapshot.manager.clone(),
+        policy: SecurityPolicy::default(),
+        apt: None,
+        node: Some(TargetNodeResolutionConfig {
+            nvm_dir: nvm.clone(),
+            shell_executable: shell,
+            release_keyring: keyring,
+            gpgv_executable: gpgv,
+            gpgv_executable_digest: snapshot.gpgv_executable_digest,
+        }),
+        target_identity_digest: digest(b"target"),
+    };
+    let mut resolution = resolution(root, snapshot.nvm_script_digest.clone());
+    resolution.target = target;
+    resolution.manager = snapshot.manager;
+    resolution.recipe = match resolution.recipe {
+        OfflineInstallRecipeV1::NodeArchive {
+            artifact_roles,
+            install: Some(mut install),
+        } => {
+            install.nvm_version = resolution.manager.version.clone();
+            install.nvm_script_digest = snapshot.nvm_script_digest.clone();
+            install.shell_executable_digest = snapshot.shell_executable_digest;
+            OfflineInstallRecipeV1::NodeArchive {
+                artifact_roles,
+                install: Some(install),
+            }
+        }
+        recipe => recipe,
+    };
+    (resolution, config, nvm.join("nvm.sh"))
+}
+
+#[test]
+fn nvm_observe_revalidates_the_unchanged_live_manager_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let (resolution, config, _) = live_binding_fixture(root.path());
+    let node = config.node.as_ref().unwrap();
+    let mut host = ProcessNodeRuntimeHost::new_with_gpgv(
+        node.nvm_dir.clone(),
+        node.shell_executable.clone(),
+        node.release_keyring.clone(),
+        node.gpgv_executable.clone(),
+    );
+    assert_eq!(
+        host.probe(&config.target).unwrap().manager,
+        resolution.manager
+    );
+    let mut backend = ProcessOfflinePackageBackend::with_package_resolution(root.path(), config);
+
+    let artifacts =
+        commonkit_adapters::ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    backend.prepare_offline(&resolution, &artifacts).unwrap();
+}
+
+#[test]
+fn nvm_observe_rejects_live_nvm_script_drift_before_sourcing() {
+    let root = tempfile::tempdir().unwrap();
+    let (resolution, config, script) = live_binding_fixture(root.path());
+    fs::write(&script, b"nvm() { touch drifted; }\n").unwrap();
+    let mut backend = ProcessOfflinePackageBackend::with_package_resolution(root.path(), config);
+
+    let artifacts =
+        commonkit_adapters::ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
+    assert!(!root.path().join("drifted").exists());
+}
+
+#[test]
+fn nvm_observe_rejects_live_manager_config_and_shell_drift() {
+    let root = tempfile::tempdir().unwrap();
+    let (resolution, config, _) = live_binding_fixture(root.path());
+    fs::write(
+        config.node.as_ref().unwrap().release_keyring.as_path(),
+        b"changed",
+    )
+    .unwrap();
+    let mut backend = ProcessOfflinePackageBackend::with_package_resolution(root.path(), config);
+    let artifacts =
+        commonkit_adapters::ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
+
+    let root = tempfile::tempdir().unwrap();
+    let (resolution, mut config, _) = live_binding_fixture(root.path());
+    let shell = root.path().join("shell");
+    fs::copy("/bin/sh", &shell).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    config.node.as_mut().unwrap().shell_executable = shell;
+    let mut backend = ProcessOfflinePackageBackend::with_package_resolution(root.path(), config);
+    let artifacts =
+        commonkit_adapters::ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
 }
 
 #[test]
