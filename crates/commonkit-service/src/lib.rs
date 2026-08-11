@@ -20,8 +20,9 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use commonkit_adapters::{
     ArtifactStore, ContextBudgetLedger, CredentialReadinessInspector, CredentialReference,
-    FileAdapter, LocalCredentialReadinessInspector, MaterializedState, PackageDriftReport,
-    PackageObserver, ProcessPackageCommandRunner, ProviderCapability,
+    FileAdapter, LocalCredentialReadinessInspector, MaterializedState, PackageAdapter,
+    PackageDriftReport, PackageMutationBackendRegistry, PackageObserver,
+    ProcessOfflinePackageBackend, ProcessPackageCommandRunner, ProviderCapability,
 };
 use commonkit_contracts::{
     CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Operation,
@@ -1707,9 +1708,19 @@ impl LocalPlanExecutor {
     }
 
     fn adapters(&self) -> Result<Vec<Box<dyn Adapter>>, LocalExecutionError> {
+        let package_artifacts = ArtifactStore::open(self.adapter_state.join("packages"))
+            .map_err(LocalExecutionError::PackageArtifact)?;
+        let package_backend = PackageMutationBackendRegistry::new([Box::new(
+            ProcessOfflinePackageBackend::new(&self.target_root),
+        )
+            as Box<dyn commonkit_adapters::PackageMutationBackend>])
+        .map_err(LocalExecutionError::PackageBackend)?;
         let mut adapters: Vec<Box<dyn Adapter>> = vec![
             Box::new(FileAdapter::open(&self.target_root, &self.adapter_state)?),
-            Box::new(UnavailablePackageAdapter),
+            Box::new(PackageAdapter::new_offline(
+                package_artifacts,
+                Box::new(package_backend),
+            )),
         ];
         if let Some(relay) = &self.relay {
             adapters.push(Box::new(
@@ -1846,74 +1857,6 @@ impl PlanExecutor for LocalPlanExecutor {
             .map_err(|_| LocalExecutionError::Lock)
             .and_then(|_guard| self.execute_durable(plan, confirmation_id, None, Some(consent)));
         execution_result(result)
-    }
-}
-
-/// Package mutation is intentionally unavailable until a concrete offline
-/// backend is registered. Keeping the route in the service's closed registry
-/// means a package plan cannot fall through to a filesystem or generic
-/// executor when that backend is absent.
-struct UnavailablePackageAdapter;
-
-impl Adapter for UnavailablePackageAdapter {
-    fn id(&self) -> &StableId {
-        static ID: std::sync::OnceLock<StableId> = std::sync::OnceLock::new();
-        ID.get_or_init(|| StableId::parse("packages").expect("static adapter ID"))
-    }
-
-    fn supports_operation(&self, operation: &Operation) -> bool {
-        operation.adapter_id.as_str() == "packages"
-            && operation.resource.resource_type.as_str() == "package"
-            && operation.kind == commonkit_contracts::OperationKind::Create
-            && operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
-    }
-
-    fn supports_offline_recovery(&self, operation: &Operation) -> bool {
-        self.supports_operation(operation)
-    }
-
-    fn preflight(
-        &mut self,
-        _operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        Err(commonkit_reconcile::AdapterFailure::new(
-            "package_adapter_unavailable",
-            "no concrete offline package adapter is registered",
-        ))
-    }
-
-    fn prepare(
-        &mut self,
-        _operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        Err(commonkit_reconcile::AdapterFailure::new(
-            "package_adapter_unavailable",
-            "no concrete offline package adapter is registered",
-        ))
-    }
-    fn apply(&mut self, _operation: &Operation) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        Err(commonkit_reconcile::AdapterFailure::new(
-            "package_adapter_unavailable",
-            "no concrete offline package adapter is registered",
-        ))
-    }
-    fn verify(
-        &mut self,
-        _operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        Err(commonkit_reconcile::AdapterFailure::new(
-            "package_adapter_unavailable",
-            "no concrete offline package adapter is registered",
-        ))
-    }
-    fn rollback(
-        &mut self,
-        _operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        Err(commonkit_reconcile::AdapterFailure::new(
-            "package_adapter_unavailable",
-            "no concrete offline package adapter is registered",
-        ))
     }
 }
 
@@ -2098,6 +2041,10 @@ pub enum LocalExecutionError {
     Reconcile(#[from] commonkit_reconcile::ReconcileError),
     #[error(transparent)]
     Adapter(#[from] commonkit_adapters::FileAdapterError),
+    #[error(transparent)]
+    PackageArtifact(#[from] commonkit_adapters::ArtifactError),
+    #[error(transparent)]
+    PackageBackend(#[from] commonkit_adapters::PackageMutationError),
     #[error(transparent)]
     Relay(#[from] commonkit_relay::RelayPlanError),
 }

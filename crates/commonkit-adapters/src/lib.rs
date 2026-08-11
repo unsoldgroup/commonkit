@@ -84,7 +84,10 @@ pub use node_resolution::{
     ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, VerifiedNodeReleaseSignatureV1,
     validate_nvm_environment, validate_nvm_environment_os,
 };
-pub use package_mutation::{PackageAdapter, PackageMutationBackend, PackageMutationError};
+pub use package_mutation::{
+    PackageAdapter, PackageMutationBackend, PackageMutationBackendRegistry, PackageMutationError,
+    ProcessOfflinePackageBackend, SshOfflinePackageBackend,
+};
 pub use package_resolution::{
     AptSourceAuthorityV1, ArtifactEvidence, COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS,
     COMMONKIT_NVM_SCRIPT_RELEASES, ControlledPackageSourceV1, ManagerBindingV1,
@@ -134,7 +137,7 @@ pub use ssh::{
 };
 pub use ssh_files::{SshFileAdapter, SshFileAdapterError, SshTargetCapabilities};
 pub use target::{
-    EngramTargetRuntime, EngramTargetSyncMode, LocalTargetFilesystem, SshFilesystemRequest,
-    SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem, TargetFilesystem,
-    TargetFilesystemError, TargetResource,
+    EngramTargetRuntime, EngramTargetSyncMode, LocalTargetFilesystem, PackageMutationArtifact,
+    PackageMutationPhase, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
+    SshTargetFilesystem, TargetFilesystem, TargetFilesystemError, TargetResource,
 };
