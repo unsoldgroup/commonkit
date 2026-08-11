@@ -220,6 +220,21 @@ fn nvm_observe_rejects_live_manager_config_and_shell_drift() {
 }
 
 #[test]
+fn production_backend_rejects_package_phases_without_target_manager_authority() {
+    let root = tempfile::tempdir().unwrap();
+    let script = b"nvm() { printf '%s\\n' '-> v20.0.0'; }\\n";
+    fs::create_dir(root.path().join(".nvm")).unwrap();
+    fs::write(root.path().join(".nvm/nvm.sh"), script).unwrap();
+    let resolution = resolution(root.path(), digest(script));
+    let artifacts =
+        commonkit_adapters::ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    let mut backend =
+        ProcessOfflinePackageBackend::new(root.path()).require_target_package_resolution();
+
+    assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
+}
+
+#[test]
 fn nvm_observe_rejects_script_drift_before_sourcing_or_side_effects() {
     let root = tempfile::tempdir().unwrap();
     let nvm = root.path().join(".nvm");

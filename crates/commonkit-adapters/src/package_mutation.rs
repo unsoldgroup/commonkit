@@ -668,6 +668,7 @@ pub struct ProcessOfflinePackageBackend {
     logical_root: PathBuf,
     process_root: PathBuf,
     package_resolution: Option<crate::TargetPackageResolutionConfig>,
+    require_package_resolution: bool,
     #[cfg(unix)]
     _root_dir: Option<Dir>,
 }
@@ -935,6 +936,7 @@ impl ProcessOfflinePackageBackend {
             logical_root: target_root.clone(),
             process_root: target_root,
             package_resolution: None,
+            require_package_resolution: false,
             #[cfg(unix)]
             _root_dir: None,
         }
@@ -958,6 +960,13 @@ impl ProcessOfflinePackageBackend {
         package_resolution: crate::TargetPackageResolutionConfig,
     ) -> Self {
         self.package_resolution = Some(package_resolution);
+        self
+    }
+
+    /// Makes a production executor fail closed if no target-local manager
+    /// authority was attached before a package phase starts.
+    pub fn require_target_package_resolution(mut self) -> Self {
+        self.require_package_resolution = true;
         self
     }
 
@@ -988,6 +997,7 @@ impl ProcessOfflinePackageBackend {
             logical_root: _target_root.into(),
             process_root,
             package_resolution: None,
+            require_package_resolution: false,
             _root_dir: Some(Dir::from_std_file(root_handle)),
         })
     }
@@ -1005,6 +1015,9 @@ impl ProcessOfflinePackageBackend {
         resolution: &PackageResolutionV1,
     ) -> Result<(), PackageMutationError> {
         let Some(config) = &self.package_resolution else {
+            if self.require_package_resolution {
+                return Err(PackageMutationError::Backend);
+            }
             // Legacy/test-only constructors do not carry target-local paths.
             // Production constructors are wired with the persisted target
             // configuration before they are exposed to a plan executor.

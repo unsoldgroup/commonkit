@@ -1729,6 +1729,7 @@ pub struct LocalPlanExecutor {
     target_root: PathBuf,
     adapter_state: PathBuf,
     package_resolution: Option<TargetPackageResolutionConfig>,
+    require_package_resolution: bool,
     relay: Option<RelayExecutorConfig>,
     execution_lock: std::sync::Mutex<()>,
 }
@@ -1752,6 +1753,7 @@ impl LocalPlanExecutor {
             target_root: target_root.as_ref().to_path_buf(),
             adapter_state: adapter_state.as_ref().to_path_buf(),
             package_resolution: None,
+            require_package_resolution: false,
             relay: None,
             execution_lock: std::sync::Mutex::new(()),
         })
@@ -1762,6 +1764,11 @@ impl LocalPlanExecutor {
         package_resolution: Option<TargetPackageResolutionConfig>,
     ) -> Self {
         self.package_resolution = package_resolution;
+        self
+    }
+
+    pub fn require_package_resolution(mut self) -> Self {
+        self.require_package_resolution = true;
         self
     }
 
@@ -1786,6 +1793,11 @@ impl LocalPlanExecutor {
             Some(config) => ProcessOfflinePackageBackend::new(&self.target_root)
                 .with_target_package_resolution(config.clone()),
             None => ProcessOfflinePackageBackend::new(&self.target_root),
+        };
+        let process_backend = if self.require_package_resolution {
+            process_backend.require_target_package_resolution()
+        } else {
+            process_backend
         };
         let package_backend = PackageMutationBackendRegistry::new([
             Box::new(process_backend) as Box<dyn commonkit_adapters::PackageMutationBackend>
@@ -4640,6 +4652,11 @@ impl RuntimeReloader for ProductionRuntimeReloader {
                 self.paths.state.join("filesystem"),
             )
             .map_err(|_| ServiceError::ReloadFailed)?
+            .with_package_resolution(registry.local_package_resolution_for(
+                &self.paths.config,
+                &self.paths.state.join("filesystem"),
+            ))
+            .require_package_resolution()
             .with_relay(
                 self.paths.config.join("relay.json"),
                 self.paths.state.join("relay"),
@@ -4738,20 +4755,6 @@ impl BoundServer {
             token.expose_for_client().into(),
             paths.config.join("relay.json"),
         ));
-        let local_executor = Arc::new(
-            LocalPlanExecutor::open(
-                plan_store.clone(),
-                &paths.receipts,
-                &paths.config,
-                paths.state.join("filesystem"),
-            )
-            .map_err(|_| ServiceError::UnsafeDiscoveryPath)?
-            .with_relay(
-                paths.config.join("relay.json"),
-                paths.state.join("relay"),
-                relay_runtime.clone(),
-            ),
-        );
         let production_domains = match relay_address {
             Some(address) => ProductionDomainRegistry::load_optional_with_relay_endpoint(
                 &paths.config.join("headless.json"),
@@ -4765,6 +4768,25 @@ impl BoundServer {
                 paths.receipts.clone(),
             )?,
         };
+        let local_executor = Arc::new(
+            LocalPlanExecutor::open(
+                plan_store.clone(),
+                &paths.receipts,
+                &paths.config,
+                paths.state.join("filesystem"),
+            )
+            .map_err(|_| ServiceError::UnsafeDiscoveryPath)?
+            .with_package_resolution(
+                production_domains
+                    .local_package_resolution_for(&paths.config, &paths.state.join("filesystem")),
+            )
+            .require_package_resolution()
+            .with_relay(
+                paths.config.join("relay.json"),
+                paths.state.join("relay"),
+                relay_runtime.clone(),
+            ),
+        );
         let target_executors =
             production_domains.target_executors(plan_store.clone(), &paths.receipts)?;
         let fallback = Arc::new(TargetDispatchPlanExecutor::new(local_executor, None));

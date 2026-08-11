@@ -703,6 +703,25 @@ impl PlanExecutor for ProductionSshPlanExecutor {
 }
 
 impl ProductionDomainRegistry {
+    pub fn local_package_resolution_for(
+        &self,
+        target_root: &Path,
+        adapter_state: &Path,
+    ) -> Option<TargetPackageResolutionConfig> {
+        self.sync_configs.values().find_map(|config| {
+            if !config
+                .target_transport
+                .as_ref()
+                .is_none_or(|transport| matches!(transport, SyncTargetTransport::Local))
+                || config.target_root != target_root
+                || config.adapter_state != adapter_state
+            {
+                return None;
+            }
+            config.target_package_resolution()
+        })
+    }
+
     pub fn target_executors(
         &self,
         plan_store: Arc<PlanStore>,
@@ -736,7 +755,8 @@ impl ProductionDomainRegistry {
                         &config.adapter_state,
                     )
                     .map_err(|_| ProductionDomainError::UnsafeConfig)?
-                    .with_package_resolution(config.target_package_resolution()),
+                    .with_package_resolution(config.target_package_resolution())
+                    .require_package_resolution(),
                 ),
                 transport @ SyncTargetTransport::Ssh { .. } => {
                     let capabilities = config
