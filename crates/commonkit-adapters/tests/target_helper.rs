@@ -32,6 +32,12 @@ struct NvmEnvironmentGuard {
 #[cfg(unix)]
 impl Drop for NvmEnvironmentGuard {
     fn drop(&mut self) {
+        for name in std::env::vars_os()
+            .filter_map(|(name, _)| is_prohibited_nvm_environment_name(&name).then_some(name))
+        {
+            // Environment mutation is synchronized for this test process.
+            unsafe { std::env::remove_var(name) };
+        }
         for (name, value) in &self.previous {
             // Environment mutation is synchronized for this test process.
             unsafe { std::env::set_var(name, value) };
@@ -40,26 +46,28 @@ impl Drop for NvmEnvironmentGuard {
 }
 
 #[cfg(unix)]
+fn is_prohibited_nvm_environment_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return true;
+    };
+    let canonical = name.to_ascii_uppercase();
+    canonical.starts_with("NPM_CONFIG_")
+        || matches!(
+            canonical.as_str(),
+            "PREFIX"
+                | "NVM_NODEJS_ORG_MIRROR"
+                | "NVM_IOJS_ORG_MIRROR"
+                | "NVM_REINSTALL_PACKAGES_FROM"
+                | "NVM_INSTALL_LATEST_NPM"
+        )
+}
+
+#[cfg(unix)]
 fn clean_nvm_environment() -> NvmEnvironmentGuard {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    fn prohibited(name: &OsStr) -> bool {
-        let Some(name) = name.to_str() else {
-            return true;
-        };
-        let canonical = name.to_ascii_uppercase();
-        canonical.starts_with("NPM_CONFIG_")
-            || matches!(
-                canonical.as_str(),
-                "PREFIX"
-                    | "NVM_NODEJS_ORG_MIRROR"
-                    | "NVM_IOJS_ORG_MIRROR"
-                    | "NVM_REINSTALL_PACKAGES_FROM"
-                    | "NVM_INSTALL_LATEST_NPM"
-            )
-    }
     let lock = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let previous = std::env::vars_os()
-        .filter(|(name, _)| prohibited(name))
+        .filter(|(name, _)| is_prohibited_nvm_environment_name(name))
         .collect::<Vec<_>>();
     for (name, _) in &previous {
         // Environment mutation is synchronized for this test process.
@@ -69,6 +77,29 @@ fn clean_nvm_environment() -> NvmEnvironmentGuard {
         previous,
         _lock: lock,
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn nvm_environment_guard_removes_created_prohibited_variants() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let prefix_before = std::env::var_os("PREFIX");
+    let lowercase_before = std::env::var_os("npm_config_registry");
+    let non_utf8_name = OsString::from_vec(b"NPM_CONFIG_\xff".to_vec());
+    let non_utf8_before = std::env::var_os(&non_utf8_name);
+    {
+        let _guard = clean_nvm_environment();
+        // Environment mutation is synchronized by the guard.
+        unsafe {
+            std::env::set_var("PREFIX", "created-by-guard-regression");
+            std::env::set_var("npm_config_registry", "created-by-guard-regression");
+            std::env::set_var(&non_utf8_name, "created-by-guard-regression");
+        }
+    }
+    assert_eq!(std::env::var_os("PREFIX"), prefix_before);
+    assert_eq!(std::env::var_os("npm_config_registry"), lowercase_before);
+    assert_eq!(std::env::var_os(&non_utf8_name), non_utf8_before);
 }
 
 fn invoke(home: &std::path::Path, request: &SshFilesystemRequest) -> std::process::Output {
