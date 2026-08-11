@@ -13,7 +13,7 @@ pub use skill_deployment::{
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -471,20 +471,17 @@ impl PlanStore {
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || path.extension().and_then(|value| value.to_str()) != Some("json")
-            {
+            if path.extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = read_plan_bytes(&path)?;
-            let plan: Plan = match serde_json::from_slice(&bytes) {
-                Ok(plan) => plan,
-                Err(_) => continue,
-            };
+            let (bytes, modified) = read_plan_file(&path)?;
+            let plan: Plan = serde_json::from_slice(&bytes)?;
             if validate_plan(&plan).is_err() {
-                continue;
+                return Err(PlanStoreError::InvalidPlan);
+            }
+            let expected_name = format!("{}.json", plan.id.as_str().trim_start_matches("sha256:"));
+            if path.file_name().and_then(|value| value.to_str()) != Some(&expected_name) {
+                return Err(PlanStoreError::InvalidPlan);
             }
             if target_id.is_some_and(|target| target != &plan.target_id) {
                 continue;
@@ -496,7 +493,6 @@ impl PlanStore {
             }) {
                 continue;
             }
-            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
             if latest.as_ref().is_none_or(|(current, current_id, _)| {
                 modified > *current || (modified == *current && plan.id > *current_id)
             }) {
@@ -515,11 +511,56 @@ impl PlanStore {
 }
 
 fn read_plan_bytes(path: &Path) -> Result<Vec<u8>, PlanStoreError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let (bytes, _) = read_plan_file(path)?;
+    Ok(bytes)
+}
+
+fn read_plan_file(path: &Path) -> Result<(Vec<u8>, std::time::SystemTime), PlanStoreError> {
+    let (mut file, metadata) = open_plan_file(path)?;
+    let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok((bytes, modified))
+}
+
+fn open_plan_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), PlanStoreError> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path).map_err(|error| {
+        if no_follow_open_error(&error) {
+            PlanStoreError::UnsafeEntry
+        } else {
+            error.into()
+        }
+    })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(PlanStoreError::UnsafeEntry);
     }
-    Ok(fs::read(path)?)
+    Ok((file, metadata))
+}
+
+fn no_follow_open_error(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::ELOOP)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
 }
 
 #[cfg(unix)]
@@ -1948,5 +1989,33 @@ mod receipt_chain_tests {
             mismatched_top.verify_chain(),
             Err(ReceiptError::InvalidHashChain)
         ));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod plan_file_tests {
+    use super::*;
+
+    #[test]
+    fn opened_plan_descriptor_is_not_affected_by_path_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "commonkit-plan-descriptor-{}-{}",
+            std::process::id(),
+            PLAN_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("temporary directory");
+        let path = root.join("plan.json");
+        fs::write(&path, b"original").expect("original plan");
+        let (mut descriptor, _) = open_plan_file(&path).expect("open plan");
+
+        fs::rename(&path, root.join("old-plan.json")).expect("replace original path");
+        fs::write(&path, b"replacement").expect("replacement plan");
+
+        let mut bytes = Vec::new();
+        descriptor
+            .read_to_end(&mut bytes)
+            .expect("read opened descriptor");
+        assert_eq!(bytes, b"original");
+        fs::remove_dir_all(root).expect("cleanup");
     }
 }

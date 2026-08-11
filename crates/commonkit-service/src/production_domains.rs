@@ -6498,10 +6498,7 @@ mod production_verify_binding_tests {
     }
 
     fn set_mtime(root: &std::path::Path, plan: &Plan, timestamp: u64) {
-        let path = root.join("plans").join(format!(
-            "{}.json",
-            plan.id.as_str().trim_start_matches("sha256:")
-        ));
+        let path = plan_path(root, plan);
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(path)
@@ -6511,6 +6508,13 @@ mod production_verify_binding_tests {
                 .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(timestamp)),
         )
         .expect("set plan mtime");
+    }
+
+    fn plan_path(root: &std::path::Path, plan: &Plan) -> std::path::PathBuf {
+        root.join("plans").join(format!(
+            "{}.json",
+            plan.id.as_str().trim_start_matches("sha256:")
+        ))
     }
 
     #[test]
@@ -6571,5 +6575,36 @@ mod production_verify_binding_tests {
         assert_eq!(result["verified"], true);
         assert_eq!(result["offline"], true);
         assert!(!domain.config.target_root.exists());
+    }
+
+    #[test]
+    fn legacy_verify_rejects_a_corrupt_known_plan_instead_of_reporting_offline_health() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let domain = domain(root, "local-target", 't', 'c', 'p');
+        let plan = plan("local-target", 't', 'c', 'p');
+        domain.plan_store.persist(&plan).expect("persist plan");
+        std::fs::write(plan_path(root, &plan), b"corrupt").expect("corrupt plan");
+
+        assert_eq!(
+            domain.verify(serde_json::json!({})),
+            Err(DomainFailure::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn legacy_verify_rejects_a_plan_under_the_wrong_filename() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let domain = domain(root, "local-target", 't', 'c', 'p');
+        let plan = plan("local-target", 't', 'c', 'p');
+        domain.plan_store.persist(&plan).expect("persist plan");
+        std::fs::rename(plan_path(root, &plan), root.join("plans/wrong-plan.json"))
+            .expect("rename plan");
+
+        assert_eq!(
+            domain.verify(serde_json::json!({})),
+            Err(DomainFailure::InvalidRequest)
+        );
     }
 }

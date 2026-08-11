@@ -708,6 +708,7 @@ version = "0.2.0"
 dependencies = [
  "commonkit-contracts",
  "commonkit-core",
+ "libc",
  "rand 0.9.5",
  "serde",
  "serde_json",

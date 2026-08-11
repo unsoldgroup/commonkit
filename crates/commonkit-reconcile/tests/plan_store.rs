@@ -167,3 +167,73 @@ fn equal_mtime_plans_choose_the_stable_immutable_identity_tiebreaker() {
     assert_eq!(selected.id, second.id);
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn latest_matching_rejects_a_corrupt_known_plan_entry() {
+    let root = temporary_directory("plan-store-corrupt-latest");
+    let store = PlanStore::open(&root).expect("store");
+    let plan = plan_for("local-target", '3', 'c');
+    store.persist(&plan).expect("persist");
+    let path = root.join(format!(
+        "{}.json",
+        plan.id.as_str().trim_start_matches("sha256:")
+    ));
+    fs::write(path, b"not a plan").expect("corrupt plan");
+
+    assert!(matches!(
+        store.load_latest_for_target(&StableId::parse("local-target").expect("target")),
+        Err(PlanStoreError::InvalidPlan | PlanStoreError::Serialization(_))
+    ));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn latest_matching_rejects_a_valid_plan_under_the_wrong_filename() {
+    let root = temporary_directory("plan-store-wrong-filename");
+    let store = PlanStore::open(&root).expect("store");
+    let plan = plan_for("local-target", '3', 'c');
+    store.persist(&plan).expect("persist");
+    let path = root.join(format!(
+        "{}.json",
+        plan.id.as_str().trim_start_matches("sha256:")
+    ));
+    fs::rename(path, root.join("wrong-plan.json")).expect("rename plan");
+
+    assert!(matches!(
+        store.load_latest_for_target(&StableId::parse("local-target").expect("target")),
+        Err(PlanStoreError::InvalidPlan)
+    ));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn latest_matching_rejects_a_symlink_plan_entry() {
+    use std::os::unix::fs::symlink;
+
+    let root = temporary_directory("plan-store-symlink-latest");
+    let store = PlanStore::open(&root).expect("store");
+    let plan = plan_for("local-target", '3', 'c');
+    store.persist(&plan).expect("persist");
+    let destination = root.join(format!(
+        "{}.json",
+        plan.id.as_str().trim_start_matches("sha256:")
+    ));
+    let target = root.join("outside.json");
+    fs::rename(destination, &target).expect("move plan");
+    symlink(
+        &target,
+        root.join(format!(
+            "{}.json",
+            plan.id.as_str().trim_start_matches("sha256:")
+        )),
+    )
+    .expect("symlink plan");
+    fs::remove_file(target).expect("remove symlink target");
+
+    assert!(matches!(
+        store.load_latest_for_target(&StableId::parse("local-target").expect("target")),
+        Err(PlanStoreError::UnsafeEntry)
+    ));
+    fs::remove_dir_all(root).expect("cleanup");
+}
