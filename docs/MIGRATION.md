@@ -44,6 +44,11 @@ Writer promotions persist `prepared`, `cas_confirmed`, or `aborted` state outsid
 6. Migrate relay and mutable snapshots only after filesystem parity.
 7. Retain native fallback until APM/chezmoi output parity is demonstrated for the loadout.
 
+The installed restore and migration rehearsal is documented in
+[`docs/runbooks/restore-rehearsal.md`](runbooks/restore-rehearsal.md). It uses
+isolated target roots and never treats Linux evidence as acceptance of the
+macOS link inventory or native lifecycle.
+
 ## Release and update migration
 
 Choose an explicit update channel and review its signed release notes before migration. Do not switch an existing installation to desktop auto-update until updater metadata signature verification and rollback guidance have been exercised on that platform. Standalone CLI users update through the matching signed release artifact; installers must preserve portable kit data by default while removing application-managed services and startup entries on uninstall.

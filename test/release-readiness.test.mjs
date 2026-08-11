@@ -133,7 +133,7 @@ test("manual harness exercises an unsigned installed CLI and daemon lifecycle", 
   assert.match(harness, /"\$commonkit" apply/);
   assert.match(harness, /"\$commonkit" verify/);
   assert.match(harness, /apply_run_id=.*runId/);
-  assert.match(harness, /"\$commonkit" rollback "\$apply_run_id" --confirmed/);
+  assert.match(harness, /"\$commonkit" rollback "\$apply_run_id" .*--confirmed/);
   assert.match(harness, /commonkit\.layer-content\.v1/);
   for (const layer of [
     "public-base",
@@ -164,6 +164,20 @@ test("manual harness exercises an unsigned installed CLI and daemon lifecycle", 
   for (const command of ["install", "start", "status", "restart", "uninstall"]) {
     assert.match(harness, new RegExp(`"\\$commonkit" daemon ${command}`));
   }
+});
+
+test("installed rehearsal proves deterministic snapshots, exact bytes, and crash recovery", async () => {
+  const harness = await read("scripts/installed-lifecycle.sh");
+  const recovery = await read("crates/commonkit-snapshots/src/bin/commonkit-snapshot-recovery-fixture.rs");
+
+  assert.match(harness, /snapshot_id.*startsWith\("snapshot-"\)/);
+  assert.match(harness, /Buffer\.from\(\[0, 255, 1, 2, 0, 255\]\)/);
+  assert.match(harness, /empty\.bin/);
+  assert.match(harness, /test ! -s .*database/);
+  assert.match(harness, /clean.*operations|operations.*clean/s);
+  assert.match(harness, /protectedRoots/);
+  assert.match(harness, /sigkill/);
+  assert.match(recovery, /SIGKILL/);
 });
 
 test("eight-flow qualification binds native evidence to commit and binary digests", async () => {
