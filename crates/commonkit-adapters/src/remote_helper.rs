@@ -132,6 +132,13 @@ impl TargetHelper {
         state_root: &Path,
         protected_paths: &[PathBuf],
     ) -> Result<Vec<ValidatedRoot>, TargetFilesystemError> {
+        #[cfg(windows)]
+        {
+            let _ = (roots, state_root, protected_paths);
+            return Err(TargetFilesystemError::InvalidSshConfig(
+                "target helper filesystem roots are unsupported on Windows",
+            ));
+        }
         let state_identity = validate_secure_path(state_root, true, true)?;
         if std::fs::symlink_metadata(state_root).is_ok() && !owned_by_effective_user(state_root) {
             return Err(TargetFilesystemError::InvalidSshConfig(
@@ -819,7 +826,7 @@ impl TargetHelper {
                 resolution,
                 artifacts,
             } => {
-                let (_, root_path, access) = self
+                let (filesystem, root_path, access) = self
                     .roots
                     .get(&root_id)
                     .ok_or_else(|| TargetFilesystemError::UnknownRoot(root_id.clone()))?;
@@ -840,7 +847,12 @@ impl TargetHelper {
                         return Err(TargetFilesystemError::RemoteArtifact);
                     }
                 }
-                let mut backend = ProcessOfflinePackageBackend::new(root_path);
+                let root_handle = filesystem
+                    .clone_root_handle()
+                    .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
+                let mut backend =
+                    ProcessOfflinePackageBackend::new_with_bound_root(root_path, root_handle)
+                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
                 match phase {
                     PackageMutationPhase::Observe => {
                         let observed = PackageMutationBackend::observe(&mut backend, &resolution)

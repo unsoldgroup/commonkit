@@ -130,6 +130,10 @@ impl LocalTargetFilesystem {
         })
     }
 
+    pub(crate) fn clone_root_handle(&self) -> Result<std::fs::File, std::io::Error> {
+        Ok(self.root.try_clone()?.into_std_file())
+    }
+
     fn ensure_safe_ancestors(
         &self,
         path: &NormalizedManagedPath,
@@ -192,7 +196,10 @@ fn open_absolute_directory_nofollow(path: &Path) -> Result<Dir, std::io::Error> 
     }
     #[cfg(windows)]
     {
-        return Dir::open_ambient_dir(path, ambient_authority());
+        let _ = path;
+        return Err(std::io::Error::other(
+            "target helper filesystem roots are unsupported on Windows",
+        ));
     }
     #[allow(unreachable_code)]
     Err(std::io::Error::other("unsupported target platform"))
@@ -865,7 +872,7 @@ fn open_target_parent_nofollow(
     Ok((current, leaf))
 }
 
-fn open_target_dir_nofollow(parent: &Dir, name: &Path) -> Result<Dir, std::io::Error> {
+pub(crate) fn open_target_dir_nofollow(parent: &Dir, name: &Path) -> Result<Dir, std::io::Error> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -891,7 +898,7 @@ fn open_target_dir_nofollow(parent: &Dir, name: &Path) -> Result<Dir, std::io::E
     Ok(Dir::from_std_file(file.into_std()))
 }
 
-fn open_target_file_nofollow(
+pub(crate) fn open_target_file_nofollow(
     parent: &Dir,
     name: &Path,
 ) -> Result<cap_std::fs::File, std::io::Error> {
