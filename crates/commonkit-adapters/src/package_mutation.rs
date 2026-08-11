@@ -682,7 +682,12 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
 
     fn supports_target(&self, resolution: &PackageResolutionV1) -> bool {
         self.target_platform.as_ref().is_some_and(|(os, arch)| {
-            package_target_matches_platform(&resolution.target, resolution.manager.manager, os, arch)
+            package_target_matches_platform(
+                &resolution.target,
+                resolution.manager.manager,
+                os,
+                arch,
+            )
         })
     }
 
