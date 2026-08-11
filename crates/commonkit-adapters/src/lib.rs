@@ -1,6 +1,7 @@
 //! Capability adapters supplied with CommonKit.
 
 mod apm;
+mod apt_resolution;
 mod artifacts;
 mod budget;
 mod chezmoi;
@@ -12,6 +13,9 @@ mod git_sync;
 mod github_onboarding;
 mod mcp_clients;
 mod native;
+mod node_resolution;
+mod package_mutation;
+mod package_resolution;
 mod packages;
 mod pipeline;
 mod planning;
@@ -27,6 +31,12 @@ mod ssh_files;
 mod target;
 
 pub use apm::{ApmProvider, ApmProviderConfig, redacted_apm_diagnostic_summary};
+pub use apt_resolution::{
+    AptCommandSpecV1, AptRepositoryConfigurationV1, AptResolutionBackend,
+    AptResolutionCommandError, AptResolutionCommandRunner, AptResolutionSnapshotV1,
+    AptResolutionSystemRequestV1, AptResolvedArchiveV1, AptResolvedPackageV1,
+    AptTransactionRisksV1, ProcessAptResolutionCommandRunner,
+};
 pub use artifacts::{ArtifactError, ArtifactStore, ContentReference, ContentSensitivity};
 pub use budget::{
     BYTES_PER_TOKEN, BudgetEntry, BudgetError, CONTEXT_BUDGET_FIELD, ContextBudgetLedger,
@@ -68,6 +78,25 @@ pub use github_onboarding::{
 };
 pub use mcp_clients::{McpClientMaterializationError, materialize_mcp_client_state};
 pub use native::NativeProvider;
+pub use node_resolution::{
+    NodeReleaseSignatureError, NodeReleaseSignatureVerifier, NodeResolutionBackend,
+    NodeRuntimeHost, NodeRuntimeHostError, NodeRuntimeHostSnapshotV1, NodeSignatureCommandSpecV1,
+    ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, VerifiedNodeReleaseSignatureV1,
+    validate_nvm_environment, validate_nvm_environment_os,
+};
+pub use package_mutation::{PackageAdapter, PackageMutationBackend, PackageMutationError};
+pub use package_resolution::{
+    AptSourceAuthorityV1, ArtifactEvidence, COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS,
+    COMMONKIT_NVM_SCRIPT_RELEASES, ControlledPackageSourceV1, ManagerBindingV1,
+    NodeOfflineInstallRecipeV1, NodeSourceAuthorityV1, OfflineInstallRecipeV1,
+    OfflinePackageBackend, PackageArtifactV1, PackageDiscoveryFetchRequestV1, PackageFetch,
+    PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1, PackageFetchedResolutionV1,
+    PackageObservationV1, PackageResolutionAuthority, PackageResolutionBackend,
+    PackageResolutionCoordinator, PackageResolutionDraftV1, PackageResolutionError,
+    PackageResolutionProbeV1, PackageResolutionRequestV1, PackageResolutionV1,
+    PackageSourceRegistry, PackageTargetV1, ResolvedPackage, ResolvedPackageIntent,
+    SourceBindingV1, package_resolution_schema, package_resolution_v2_schema,
+};
 pub use packages::{
     PackageBackendEvidence, PackageCommandError, PackageCommandOutput, PackageCommandRunner,
     PackageDriftEntry, PackageDriftReport, PackageDriftState, PackageObserver,
@@ -75,13 +104,16 @@ pub use packages::{
 };
 pub use pipeline::{ProviderPipeline, ProviderPipelineError, ProviderPipelineOutput};
 pub use planning::{
-    ProviderPlanError, ProviderPlanRequest, ProviderResourcePlanner, build_provider_plan,
-    provider_plan_bindings,
+    FilesystemPlannerRoute, PackageResourcePlanner, ProviderPlanError, ProviderPlanRequest,
+    ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter, build_provider_plan,
+    build_provider_plan_with_router, build_resolved_provider_plan_with_router,
+    provider_plan_bindings, resolved_provider_plan_bindings,
 };
 pub use provider::{
     DeclaredSideEffect, DesiredStateProvider, ExactProviderVersion, MaterializedState,
     ProviderCapability, ProviderCapabilityResource, ProviderContext, ProviderContractError,
-    ProviderFailure, ProviderInputs, ProviderWorkspace, UnsupportedCapability,
+    ProviderFailure, ProviderInputs, ProviderWorkspace, ResolvedMaterializedState,
+    UnsupportedCapability,
 };
 pub use remote_helper::TargetHelper;
 pub use remote_provider::{
@@ -89,7 +121,8 @@ pub use remote_provider::{
 };
 pub use resources::{
     FileMode, FilesystemIntent, NormalizedManagedPath, NormalizedResource, OwnershipError,
-    OwnershipRules, ResourceError, ResourceProvenance, SafeSymlinkTarget,
+    OwnershipRules, PackageDesiredIntent, ProviderResourceIntent, ResourceAddress, ResourceError,
+    ResourceIntent, ResourceProvenance, ResourceType, SafeSymlinkTarget, SymlinkTargetKind,
     materialized_resources_digest, validate_ownership,
 };
 pub use service_lifecycle::{
@@ -99,9 +132,9 @@ pub use service_lifecycle::{
 pub use ssh::{
     OpenSshConfig, OpenSshTransport, ProcessOutput, ProcessRemoteRunner, RemoteProcessRunner,
 };
-pub use ssh_files::{SshFileAdapter, SshFileAdapterError};
+pub use ssh_files::{SshFileAdapter, SshFileAdapterError, SshTargetCapabilities};
 pub use target::{
     EngramTargetRuntime, EngramTargetSyncMode, LocalTargetFilesystem, SshFilesystemRequest,
     SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem, TargetFilesystem,
-    TargetFilesystemError,
+    TargetFilesystemError, TargetResource,
 };

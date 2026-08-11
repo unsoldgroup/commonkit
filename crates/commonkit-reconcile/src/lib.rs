@@ -18,9 +18,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use commonkit_contracts::{
-    CONTRACT_VERSION, ContractError, Operation, OperationPhase, OperationProgress, Plan,
-    PlanBindings, ReceiptState, ReceiptTransition, RunReceipt, SCHEMA_VERSION, SchemaVersion,
-    Sha256Digest, StableId, canonical_json, digest_domain_json,
+    CONTRACT_VERSION, ContractError, FORWARD_CONTRACT_VERSION, FORWARD_SCHEMA_VERSION, Operation,
+    OperationPhase, OperationProgress, PACKAGE_RECEIPT_CONTRACT_VERSION,
+    PACKAGE_RECEIPT_SCHEMA_VERSION, PackageConsent, PackageExitClassification,
+    PackageOperationConsentBinding, PackageReceiptAuthorization, PackageReceiptEvidence, Plan,
+    PlanBindings, ReceiptState, ReceiptTransition, RecoveryCapability, RunReceipt, SCHEMA_VERSION,
+    SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use serde::{Deserialize, Serialize};
@@ -42,13 +45,84 @@ impl ReceiptJournal {
         policy_digest: Sha256Digest,
         bindings: PlanBindings,
     ) -> Result<Self, ReceiptError> {
+        Self::new_versioned(
+            run_id,
+            plan_id,
+            target_id,
+            desired_digest,
+            observed_digest,
+            policy_digest,
+            bindings,
+            SchemaVersion(SCHEMA_VERSION),
+            CONTRACT_VERSION.into(),
+            None,
+        )
+    }
+
+    pub fn for_plan(run_id: StableId, plan: &Plan) -> Result<Self, ReceiptError> {
+        Self::new_versioned(
+            run_id,
+            plan.id.clone(),
+            plan.target_id.clone(),
+            plan.desired_digest.clone(),
+            plan.observed_digest.clone(),
+            plan.policy_digest.clone(),
+            plan.bindings.clone(),
+            plan.schema_version,
+            plan.contract_version.clone(),
+            None,
+        )
+    }
+
+    pub fn for_package_plan(
+        run_id: StableId,
+        plan: &Plan,
+        authorization: PackageReceiptAuthorization,
+    ) -> Result<Self, ReceiptError> {
+        validate_package_receipt_authorization(plan, &authorization)?;
+        Self::new_versioned(
+            run_id,
+            plan.id.clone(),
+            plan.target_id.clone(),
+            plan.desired_digest.clone(),
+            plan.observed_digest.clone(),
+            plan.policy_digest.clone(),
+            plan.bindings.clone(),
+            SchemaVersion(PACKAGE_RECEIPT_SCHEMA_VERSION),
+            PACKAGE_RECEIPT_CONTRACT_VERSION.into(),
+            Some(authorization),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_versioned(
+        run_id: StableId,
+        plan_id: Sha256Digest,
+        target_id: StableId,
+        desired_digest: Sha256Digest,
+        observed_digest: Sha256Digest,
+        policy_digest: Sha256Digest,
+        bindings: PlanBindings,
+        schema_version: SchemaVersion,
+        contract_version: String,
+        package_authorization: Option<PackageReceiptAuthorization>,
+    ) -> Result<Self, ReceiptError> {
+        validate_receipt_version(schema_version, &contract_version)?;
         let progress = Vec::new();
-        let progress_digest = digest_domain_json("commonkit.operation-progress.v1", &progress)?;
-        let first = make_transition(0, ReceiptState::Prepared, None, progress_digest)?;
+        validate_package_authorization_shape(schema_version, package_authorization.as_ref())?;
+        let progress_digest =
+            progress_digest(schema_version, &progress, package_authorization.as_ref())?;
+        let first = make_transition_for_schema(
+            schema_version,
+            0,
+            ReceiptState::Prepared,
+            None,
+            progress_digest,
+        )?;
         Ok(Self {
             receipt: RunReceipt {
-                schema_version: SchemaVersion(SCHEMA_VERSION),
-                contract_version: CONTRACT_VERSION.into(),
+                schema_version,
+                contract_version,
                 receipt_id: first.entry_digest.clone(),
                 run_id,
                 plan_id,
@@ -57,6 +131,7 @@ impl ReceiptJournal {
                 observed_digest,
                 policy_digest,
                 bindings,
+                package_authorization,
                 state: ReceiptState::Prepared,
                 operation_progress: progress,
                 transitions: vec![first],
@@ -65,7 +140,9 @@ impl ReceiptJournal {
     }
 
     pub fn transition(&mut self, next: ReceiptState) -> Result<(), ReceiptError> {
-        if !legal_transition(self.receipt.state, next) {
+        if !receipt_state_supported(self.receipt.schema_version, next)
+            || !legal_transition(self.receipt.state, next)
+        {
             return Err(ReceiptError::IllegalTransition {
                 from: self.receipt.state,
                 to: next,
@@ -76,11 +153,13 @@ impl ReceiptJournal {
             .transitions
             .last()
             .map(|entry| entry.entry_digest.clone());
-        let progress_digest = digest_domain_json(
-            "commonkit.operation-progress.v1",
+        let progress_digest = progress_digest(
+            self.receipt.schema_version,
             &self.receipt.operation_progress,
+            self.receipt.package_authorization.as_ref(),
         )?;
-        let transition = make_transition(
+        let transition = make_transition_for_schema(
+            self.receipt.schema_version,
             self.receipt.transitions.len() as u64,
             next,
             previous,
@@ -98,6 +177,9 @@ impl ReceiptJournal {
         phase: OperationPhase,
         failure_code: Option<StableId>,
     ) -> Result<(), ReceiptError> {
+        if !operation_phase_supported(self.receipt.schema_version, phase) {
+            return Err(ReceiptError::InvalidOperationProgress);
+        }
         if failure_code.is_some()
             != matches!(
                 phase,
@@ -105,6 +187,7 @@ impl ReceiptJournal {
                     | OperationPhase::ApplyFailed
                     | OperationPhase::VerifyFailed
                     | OperationPhase::RollbackFailed
+                    | OperationPhase::ForwardRecoveryFailed
             )
         {
             return Err(ReceiptError::InvalidOperationProgress);
@@ -136,17 +219,45 @@ impl ReceiptJournal {
         self.append_progress_transition()
     }
 
+    pub fn record_package_exit(
+        &mut self,
+        operation_id: &Sha256Digest,
+        exit_classification: PackageExitClassification,
+        final_digest: Option<Sha256Digest>,
+    ) -> Result<(), ReceiptError> {
+        let authorization = self
+            .receipt
+            .package_authorization
+            .as_mut()
+            .ok_or(ReceiptError::InvalidPackageAuthorization)?;
+        let evidence = authorization
+            .evidence
+            .iter_mut()
+            .find(|evidence| &evidence.operation_id == operation_id)
+            .ok_or(ReceiptError::InvalidPackageAuthorization)?;
+        if matches!(exit_classification, PackageExitClassification::Succeeded)
+            != final_digest.is_some()
+        {
+            return Err(ReceiptError::InvalidPackageAuthorization);
+        }
+        evidence.exit_classification = exit_classification;
+        evidence.final_digest = final_digest;
+        self.append_progress_transition()
+    }
+
     fn append_progress_transition(&mut self) -> Result<(), ReceiptError> {
         let previous = self
             .receipt
             .transitions
             .last()
             .map(|entry| entry.entry_digest.clone());
-        let progress_digest = digest_domain_json(
-            "commonkit.operation-progress.v1",
+        let progress_digest = progress_digest(
+            self.receipt.schema_version,
             &self.receipt.operation_progress,
+            self.receipt.package_authorization.as_ref(),
         )?;
-        let transition = make_transition(
+        let transition = make_transition_for_schema(
+            self.receipt.schema_version,
             self.receipt.transitions.len() as u64,
             self.receipt.state,
             previous,
@@ -168,12 +279,35 @@ impl ReceiptJournal {
     }
 
     pub fn verify_chain(&self) -> Result<(), ReceiptError> {
+        validate_receipt_version(self.receipt.schema_version, &self.receipt.contract_version)?;
+        validate_package_authorization_shape(
+            self.receipt.schema_version,
+            self.receipt.package_authorization.as_ref(),
+        )?;
+        if self
+            .receipt
+            .transitions
+            .first()
+            .is_none_or(|transition| transition.state != ReceiptState::Prepared)
+        {
+            return Err(ReceiptError::InvalidHashChain);
+        }
         let mut previous = None;
+        let mut previous_state = None;
         for (sequence, transition) in self.receipt.transitions.iter().enumerate() {
+            if !receipt_state_supported(self.receipt.schema_version, transition.state) {
+                return Err(ReceiptError::InvalidHashChain);
+            }
             if transition.sequence != sequence as u64 || transition.previous_digest != previous {
                 return Err(ReceiptError::InvalidHashChain);
             }
-            let expected = make_transition(
+            if previous_state.is_some_and(|state| {
+                state != transition.state && !legal_transition(state, transition.state)
+            }) {
+                return Err(ReceiptError::InvalidHashChain);
+            }
+            let expected = make_transition_for_schema(
+                self.receipt.schema_version,
                 transition.sequence,
                 transition.state,
                 previous.clone(),
@@ -183,20 +317,33 @@ impl ReceiptJournal {
                 return Err(ReceiptError::InvalidHashChain);
             }
             previous = Some(transition.entry_digest.clone());
+            previous_state = Some(transition.state);
         }
         if previous.as_ref() != Some(&self.receipt.receipt_id) {
             return Err(ReceiptError::InvalidHashChain);
         }
-        let progress_digest = digest_domain_json(
-            "commonkit.operation-progress.v1",
+        let progress_digest = progress_digest(
+            self.receipt.schema_version,
             &self.receipt.operation_progress,
+            self.receipt.package_authorization.as_ref(),
         )?;
+        if self
+            .receipt
+            .operation_progress
+            .iter()
+            .any(|progress| !operation_phase_supported(self.receipt.schema_version, progress.phase))
+        {
+            return Err(ReceiptError::InvalidHashChain);
+        }
         if self
             .receipt
             .transitions
             .last()
             .is_none_or(|transition| transition.progress_digest != progress_digest)
         {
+            return Err(ReceiptError::InvalidHashChain);
+        }
+        if previous_state != Some(self.receipt.state) {
             return Err(ReceiptError::InvalidHashChain);
         }
         Ok(())
@@ -346,10 +493,66 @@ impl AdapterFailure {
 
 pub trait Adapter {
     fn id(&self) -> &StableId;
+    fn supports_recovery(&self, _capability: RecoveryCapability) -> bool {
+        false
+    }
+    fn supports_operation(&self, operation: &Operation) -> bool {
+        self.supports_recovery(operation.recovery_capability)
+    }
+    /// Read-only execution preflight. This runs before any receipt is created.
+    fn preflight(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    /// Returns consent binding and sanitized before-evidence for package operations.
+    fn package_authorization_binding(
+        &self,
+        _operation: &Operation,
+    ) -> Result<Option<(PackageOperationConsentBinding, PackageReceiptEvidence)>, AdapterFailure>
+    {
+        Ok(None)
+    }
+    /// Returns sanitized final package-state evidence for the v3 receipt.
+    fn package_final_digest(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<Option<Sha256Digest>, AdapterFailure> {
+        Ok(None)
+    }
+    fn observe_recovery(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<RecoveryObservation, AdapterFailure> {
+        Err(AdapterFailure::new(
+            "recovery_observation_unsupported",
+            "adapter does not expose recovery observation",
+        ))
+    }
+    fn supports_offline_recovery(&self, _operation: &Operation) -> bool {
+        false
+    }
+    fn prepare_recovery(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Err(AdapterFailure::new(
+            "offline_recovery_unsupported",
+            "adapter does not expose offline recovery preparation",
+        ))
+    }
+    fn converge_recovery(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Err(AdapterFailure::new(
+            "offline_recovery_unsupported",
+            "adapter does not expose offline recovery convergence",
+        ))
+    }
     fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
     fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
     fn verify(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
     fn rollback(&mut self, operation: &Operation) -> Result<(), AdapterFailure>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryObservation {
+    Before,
+    After,
+    Other,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +562,9 @@ pub enum ReconcileOutcome {
     Canceled,
     RolledBack,
     RollbackFailed,
+    ForwardRecoveryRequired,
+    ForwardRecovered,
+    ForwardRecoveryFailed,
 }
 
 impl ReconcileOutcome {
@@ -368,6 +574,9 @@ impl ReconcileOutcome {
             Self::Canceled => ReceiptState::Canceled,
             Self::RolledBack => ReceiptState::RolledBack,
             Self::RollbackFailed => ReceiptState::RollbackFailed,
+            Self::ForwardRecoveryRequired => ReceiptState::ForwardRecoveryRequired,
+            Self::ForwardRecovered => ReceiptState::ForwardRecovered,
+            Self::ForwardRecoveryFailed => ReceiptState::ForwardRecoveryFailed,
         }
     }
 }
@@ -393,15 +602,62 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
-        let mut journal = ReceiptJournal::new(
-            run_id,
-            plan.id.clone(),
-            plan.target_id.clone(),
-            plan.desired_digest.clone(),
-            plan.observed_digest.clone(),
-            plan.policy_digest.clone(),
-            plan.bindings.clone(),
-        )?;
+        preflight_adapters(plan, adapters)?;
+        if plan.operations.iter().any(is_package_operation) {
+            return Err(ReconcileError::PackageConsentRequired);
+        }
+        let journal = ReceiptJournal::for_plan(run_id, plan)?;
+        self.execute_preflighted(plan, adapters, journal)
+    }
+
+    pub fn execute_with_package_consent(
+        &self,
+        plan: &Plan,
+        run_id: StableId,
+        consent: &PackageConsent,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        validate_plan(plan)?;
+        preflight_adapters(plan, adapters)?;
+        let mut bindings = Vec::new();
+        let mut evidence = Vec::new();
+        for operation in plan
+            .operations
+            .iter()
+            .filter(|operation| is_package_operation(operation))
+        {
+            let adapter = adapters
+                .iter()
+                .find(|adapter| adapter.id() == &operation.adapter_id)
+                .ok_or_else(|| ReconcileError::AdapterNotFound(operation.adapter_id.clone()))?;
+            let (binding, operation_evidence) = adapter
+                .package_authorization_binding(operation)
+                .map_err(ReconcileError::AdapterPreflightFailed)?
+                .ok_or_else(|| ReconcileError::PackageAuthorizationUnavailable {
+                    adapter_id: operation.adapter_id.clone(),
+                })?;
+            bindings.push(binding);
+            evidence.push(operation_evidence);
+        }
+        consent
+            .validate(plan, &bindings)
+            .map_err(ReceiptError::from)?;
+        let authorization = PackageReceiptAuthorization {
+            consent_digest: consent.digest().map_err(ReceiptError::from)?,
+            confirmation_id: consent.confirmation_id.clone(),
+            operation_set_digest: consent.operation_set_digest.clone(),
+            evidence,
+        };
+        let journal = ReceiptJournal::for_package_plan(run_id, plan, authorization)?;
+        self.execute_preflighted(plan, adapters, journal)
+    }
+
+    fn execute_preflighted(
+        &self,
+        plan: &Plan,
+        adapters: &mut [Box<dyn Adapter>],
+        mut journal: ReceiptJournal,
+    ) -> Result<ReconcileOutcome, ReconcileError> {
         self.persist(&journal)?;
 
         for operation in &plan.operations {
@@ -419,6 +675,8 @@ impl<'a> Reconciler<'a> {
                         Some(stable_failure_code(&failure)),
                     )?;
                     self.persist(&journal)?;
+                    record_package_failure(&mut journal, operation, &failure)?;
+                    self.persist(&journal)?;
                     journal.transition(ReceiptState::Canceled)?;
                     self.persist(&journal)?;
                     return Ok(ReconcileOutcome::Canceled);
@@ -429,8 +687,20 @@ impl<'a> Reconciler<'a> {
 
         journal.transition(ReceiptState::Applying)?;
         self.persist(&journal)?;
+        let exact = plan
+            .operations
+            .iter()
+            .filter(|operation| operation.recovery_capability == RecoveryCapability::ExactRollback)
+            .collect::<Vec<_>>();
+        let forward = plan
+            .operations
+            .iter()
+            .filter(|operation| {
+                operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
+            })
+            .collect::<Vec<_>>();
         let mut applied = Vec::new();
-        for operation in &plan.operations {
+        for operation in &exact {
             journal.record_operation(operation.id.clone(), OperationPhase::ApplyStarted, None)?;
             self.persist(&journal)?;
             let adapter = adapter_for(adapters, &operation.adapter_id)?;
@@ -445,17 +715,18 @@ impl<'a> Reconciler<'a> {
                         Some(stable_failure_code(&failure)),
                     )?;
                     self.persist(&journal)?;
-                    applied.push(operation.clone());
+                    record_package_failure(&mut journal, operation, &failure)?;
+                    self.persist(&journal)?;
+                    applied.push((*operation).clone());
                     return self.recover(&mut journal, &applied, adapters);
                 }
             }
-            applied.push(operation.clone());
+            applied.push((*operation).clone());
             self.persist(&journal)?;
         }
-
         journal.transition(ReceiptState::Verifying)?;
         self.persist(&journal)?;
-        for operation in &plan.operations {
+        for operation in &exact {
             let adapter = adapter_for(adapters, &operation.adapter_id)?;
             match adapter.verify(operation) {
                 Ok(()) => journal.record_operation(
@@ -470,9 +741,52 @@ impl<'a> Reconciler<'a> {
                         Some(stable_failure_code(&failure)),
                     )?;
                     self.persist(&journal)?;
+                    record_package_failure(&mut journal, operation, &failure)?;
+                    self.persist(&journal)?;
                     return self.recover(&mut journal, &applied, adapters);
                 }
             }
+            self.persist(&journal)?;
+        }
+
+        if !forward.is_empty() {
+            journal.transition(ReceiptState::ApplyingForward)?;
+            self.persist(&journal)?;
+        }
+        for operation in forward {
+            // This durable checkpoint is the one-way recovery barrier. No
+            // rollback path is reachable after it has been persisted.
+            journal.record_operation(operation.id.clone(), OperationPhase::ApplyStarted, None)?;
+            self.persist(&journal)?;
+            let adapter = adapter_for(adapters, &operation.adapter_id)?;
+            if let Err(failure) = adapter.apply(operation) {
+                journal.record_operation(
+                    operation.id.clone(),
+                    OperationPhase::ApplyFailed,
+                    Some(stable_failure_code(&failure)),
+                )?;
+                self.persist(&journal)?;
+                record_package_failure(&mut journal, operation, &failure)?;
+                self.persist(&journal)?;
+                return self.require_forward_recovery(&mut journal);
+            }
+            journal.record_operation(operation.id.clone(), OperationPhase::Applied, None)?;
+            self.persist(&journal)?;
+            let adapter = adapter_for(adapters, &operation.adapter_id)?;
+            if let Err(failure) = adapter.verify(operation) {
+                journal.record_operation(
+                    operation.id.clone(),
+                    OperationPhase::VerifyFailed,
+                    Some(stable_failure_code(&failure)),
+                )?;
+                self.persist(&journal)?;
+                record_package_failure(&mut journal, operation, &failure)?;
+                self.persist(&journal)?;
+                return self.require_forward_recovery(&mut journal);
+            }
+            journal.record_operation(operation.id.clone(), OperationPhase::Verified, None)?;
+            self.persist(&journal)?;
+            record_package_success(&mut journal, operation, adapters)?;
             self.persist(&journal)?;
         }
 
@@ -488,10 +802,13 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
+        preflight_adapters(plan, adapters)?;
         let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
         let mut journal = store.load(run_id)?;
         let receipt = journal.receipt();
         if receipt.plan_id != plan.id
+            || receipt.schema_version != plan.schema_version
+            || receipt.contract_version != plan.contract_version
             || receipt.target_id != plan.target_id
             || receipt.desired_digest != plan.desired_digest
             || receipt.observed_digest != plan.observed_digest
@@ -501,13 +818,38 @@ impl<'a> Reconciler<'a> {
             return Err(ReconcileError::ReceiptPlanMismatch);
         }
 
+        let after_forward_barrier = plan.operations.iter().any(|operation| {
+            operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
+                && receipt.operation_progress.iter().any(|progress| {
+                    progress.operation_id == operation.id
+                        && matches!(
+                            progress.phase,
+                            OperationPhase::ApplyStarted
+                                | OperationPhase::Applied
+                                | OperationPhase::ApplyFailed
+                                | OperationPhase::Verified
+                                | OperationPhase::VerifyFailed
+                                | OperationPhase::ForwardRecovered
+                                | OperationPhase::ForwardRecoveryFailed
+                        )
+                })
+        }) || matches!(
+            receipt.state,
+            ReceiptState::ForwardRecoveryRequired
+                | ReceiptState::ConvergingForward
+                | ReceiptState::ForwardRecoveryFailed
+        );
+        if after_forward_barrier {
+            return self.converge_forward(&mut journal, plan, adapters);
+        }
+
         match receipt.state {
             ReceiptState::Prepared => {
                 journal.transition(ReceiptState::Canceled)?;
                 self.persist(&journal)?;
                 return Ok(ReconcileOutcome::Canceled);
             }
-            ReceiptState::Applying | ReceiptState::Verifying => {
+            ReceiptState::Applying | ReceiptState::Verifying | ReceiptState::ApplyingForward => {
                 journal.transition(ReceiptState::RecoveryRequired)?;
                 self.persist(&journal)?;
             }
@@ -552,9 +894,19 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
+        if plan.operations.iter().any(|operation| {
+            operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
+        }) {
+            return Err(ReconcileError::RollbackUnsupported);
+        }
+        preflight_adapters(plan, adapters)?;
         let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
         let mut journal = store.load(run_id)?;
-        if journal.receipt().plan_id != plan.id || journal.receipt().target_id != plan.target_id {
+        if journal.receipt().plan_id != plan.id
+            || journal.receipt().schema_version != plan.schema_version
+            || journal.receipt().contract_version != plan.contract_version
+            || journal.receipt().target_id != plan.target_id
+        {
             return Err(ReconcileError::ReceiptPlanMismatch);
         }
         if journal.receipt().state != ReceiptState::Succeeded {
@@ -577,6 +929,111 @@ impl<'a> Reconciler<'a> {
         self.persist(journal)?;
 
         self.rollback_from_rolling_back(journal, applied, adapters)
+    }
+
+    fn require_forward_recovery(
+        &self,
+        journal: &mut ReceiptJournal,
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        journal.transition(ReceiptState::ForwardRecoveryRequired)?;
+        self.persist(journal)?;
+        Ok(ReconcileOutcome::ForwardRecoveryRequired)
+    }
+
+    fn converge_forward(
+        &self,
+        journal: &mut ReceiptJournal,
+        plan: &Plan,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        match journal.receipt().state {
+            ReceiptState::Applying | ReceiptState::Verifying | ReceiptState::ApplyingForward => {
+                journal.transition(ReceiptState::ForwardRecoveryRequired)?;
+                self.persist(journal)?;
+            }
+            ReceiptState::ForwardRecoveryRequired => {}
+            ReceiptState::ConvergingForward => {}
+            ReceiptState::ForwardRecoveryFailed => {}
+            state => return Err(ReconcileError::RunAlreadyTerminal(state)),
+        }
+        if matches!(
+            journal.receipt().state,
+            ReceiptState::ForwardRecoveryRequired | ReceiptState::ForwardRecoveryFailed
+        ) {
+            journal.transition(ReceiptState::ConvergingForward)?;
+            self.persist(journal)?;
+        }
+
+        for operation in &plan.operations {
+            if journal.receipt().operation_progress.iter().any(|progress| {
+                progress.operation_id == operation.id
+                    && progress.phase == OperationPhase::ForwardRecovered
+            }) {
+                continue;
+            }
+            let observation = adapter_for(adapters, &operation.adapter_id)?
+                .observe_recovery(operation)
+                .map_err(|failure| stable_failure_code(&failure));
+            let result = match observation {
+                Ok(RecoveryObservation::After) => Ok(()),
+                Ok(RecoveryObservation::Before) => {
+                    let prepare =
+                        adapter_for(adapters, &operation.adapter_id)?.prepare_recovery(operation);
+                    if let Err(failure) = prepare {
+                        Err(stable_failure_code(&failure))
+                    } else {
+                        let converge = adapter_for(adapters, &operation.adapter_id)?
+                            .converge_recovery(operation);
+                        if let Err(failure) = converge {
+                            Err(stable_failure_code(&failure))
+                        } else {
+                            match adapter_for(adapters, &operation.adapter_id)?
+                                .observe_recovery(operation)
+                            {
+                                Ok(RecoveryObservation::After) => Ok(()),
+                                Ok(RecoveryObservation::Before | RecoveryObservation::Other) => {
+                                    Err(StableId::parse("recovery_ambiguous")
+                                        .expect("static stable ID"))
+                                }
+                                Err(failure) => Err(stable_failure_code(&failure)),
+                            }
+                        }
+                    }
+                }
+                Ok(RecoveryObservation::Other) => {
+                    Err(StableId::parse("recovery_ambiguous").expect("static stable ID"))
+                }
+                Err(code) => Err(code),
+            };
+            match result {
+                Ok(()) => {
+                    journal.record_operation(
+                        operation.id.clone(),
+                        OperationPhase::ForwardRecovered,
+                        None,
+                    )?;
+                    self.persist(journal)?;
+                    record_package_success(journal, operation, adapters)?;
+                }
+                Err(code) => {
+                    journal.record_operation(
+                        operation.id.clone(),
+                        OperationPhase::ForwardRecoveryFailed,
+                        Some(code.clone()),
+                    )?;
+                    self.persist(journal)?;
+                    record_package_failure_code(journal, operation, code)?;
+                    self.persist(journal)?;
+                    journal.transition(ReceiptState::ForwardRecoveryFailed)?;
+                    self.persist(journal)?;
+                    return Ok(ReconcileOutcome::ForwardRecoveryFailed);
+                }
+            }
+            self.persist(journal)?;
+        }
+        journal.transition(ReceiptState::ForwardRecovered)?;
+        self.persist(journal)?;
+        Ok(ReconcileOutcome::ForwardRecovered)
     }
 
     fn rollback_from_rolling_back(
@@ -623,6 +1080,50 @@ impl<'a> Reconciler<'a> {
     }
 }
 
+fn record_package_failure(
+    journal: &mut ReceiptJournal,
+    operation: &Operation,
+    failure: &AdapterFailure,
+) -> Result<(), ReceiptError> {
+    record_package_failure_code(journal, operation, stable_failure_code(failure))
+}
+
+fn record_package_failure_code(
+    journal: &mut ReceiptJournal,
+    operation: &Operation,
+    code: StableId,
+) -> Result<(), ReceiptError> {
+    if is_package_operation(operation) && journal.receipt().package_authorization.is_some() {
+        journal.record_package_exit(
+            &operation.id,
+            PackageExitClassification::Failed { code },
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn record_package_success(
+    journal: &mut ReceiptJournal,
+    operation: &Operation,
+    adapters: &mut [Box<dyn Adapter>],
+) -> Result<(), ReconcileError> {
+    if !is_package_operation(operation) || journal.receipt().package_authorization.is_none() {
+        return Ok(());
+    }
+    let digest = adapter_for(adapters, &operation.adapter_id)?
+        .package_final_digest(operation)
+        .map_err(ReconcileError::AdapterPreflightFailed)?;
+    if let Some(digest) = digest {
+        journal.record_package_exit(
+            &operation.id,
+            PackageExitClassification::Succeeded,
+            Some(digest),
+        )?;
+    }
+    Ok(())
+}
+
 fn stable_failure_code(failure: &AdapterFailure) -> StableId {
     StableId::parse(failure.code.clone())
         .unwrap_or_else(|_| StableId::parse("adapter_failure").expect("static stable ID"))
@@ -638,6 +1139,42 @@ fn adapter_for<'a>(
         }
     }
     Err(ReconcileError::AdapterNotFound(id.clone()))
+}
+
+fn preflight_adapters(
+    plan: &Plan,
+    adapters: &mut [Box<dyn Adapter>],
+) -> Result<(), ReconcileError> {
+    let crosses_forward_barrier = plan
+        .operations
+        .iter()
+        .any(|operation| operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly);
+    for operation in &plan.operations {
+        let adapter = adapters
+            .iter_mut()
+            .find(|adapter| adapter.id() == &operation.adapter_id)
+            .ok_or_else(|| ReconcileError::AdapterNotFound(operation.adapter_id.clone()))?;
+        if !adapter.supports_operation(operation) {
+            return Err(ReconcileError::AdapterCapabilityUnsupported {
+                adapter_id: operation.adapter_id.clone(),
+                capability: operation.recovery_capability,
+            });
+        }
+        if crosses_forward_barrier && !adapter.supports_offline_recovery(operation) {
+            return Err(ReconcileError::AdapterOfflineRecoveryUnsupported {
+                adapter_id: operation.adapter_id.clone(),
+            });
+        }
+        adapter
+            .preflight(operation)
+            .map_err(ReconcileError::AdapterPreflightFailed)?;
+    }
+    Ok(())
+}
+
+fn is_package_operation(operation: &Operation) -> bool {
+    operation.adapter_id.as_str() == "packages"
+        || operation.resource.resource_type.as_str() == "package"
 }
 
 fn validate_plan(plan: &Plan) -> Result<(), ReconcileError> {
@@ -663,8 +1200,23 @@ pub enum ReconcileError {
     Plan(#[from] PlanBuildError),
     #[error("plan content does not match its content-addressed identity")]
     PlanMismatch,
+    #[error("package operations require explicit package consent")]
+    PackageConsentRequired,
+    #[error("package authorization evidence is unavailable from adapter {adapter_id}")]
+    PackageAuthorizationUnavailable { adapter_id: StableId },
+    #[error("adapter preflight failed: {0:?}")]
+    AdapterPreflightFailed(AdapterFailure),
     #[error("adapter is not registered: {0}")]
     AdapterNotFound(StableId),
+    #[error("adapter {adapter_id} does not support recovery capability {capability:?}")]
+    AdapterCapabilityUnsupported {
+        adapter_id: StableId,
+        capability: RecoveryCapability,
+    },
+    #[error("adapter {adapter_id} does not support bound offline forward recovery")]
+    AdapterOfflineRecoveryUnsupported { adapter_id: StableId },
+    #[error("explicit rollback is unsupported for a forward-only plan")]
+    RollbackUnsupported,
     #[error("durable receipt store is required for restart recovery")]
     DurableStoreRequired,
     #[error("receipt is not bound to the supplied plan")]
@@ -822,14 +1374,35 @@ struct TransitionSemantic<'a> {
     progress_digest: &'a Sha256Digest,
 }
 
+#[cfg(test)]
 fn make_transition(
     sequence: u64,
     state: ReceiptState,
     previous_digest: Option<Sha256Digest>,
     progress_digest: Sha256Digest,
 ) -> Result<ReceiptTransition, ContractError> {
+    make_transition_for_schema(
+        SchemaVersion(SCHEMA_VERSION),
+        sequence,
+        state,
+        previous_digest,
+        progress_digest,
+    )
+}
+
+fn make_transition_for_schema(
+    schema_version: SchemaVersion,
+    sequence: u64,
+    state: ReceiptState,
+    previous_digest: Option<Sha256Digest>,
+    progress_digest: Sha256Digest,
+) -> Result<ReceiptTransition, ContractError> {
     let entry_digest = digest_domain_json(
-        "commonkit.receipt-transition.v1",
+        match schema_version.0 {
+            PACKAGE_RECEIPT_SCHEMA_VERSION => "commonkit.receipt-transition.v3",
+            FORWARD_SCHEMA_VERSION => "commonkit.receipt-transition.v2",
+            _ => "commonkit.receipt-transition.v1",
+        },
         &TransitionSemantic {
             sequence,
             state,
@@ -846,6 +1419,122 @@ fn make_transition(
     })
 }
 
+fn progress_digest(
+    schema_version: SchemaVersion,
+    progress: &[OperationProgress],
+    package_authorization: Option<&PackageReceiptAuthorization>,
+) -> Result<Sha256Digest, ContractError> {
+    if schema_version.0 == PACKAGE_RECEIPT_SCHEMA_VERSION {
+        return digest_domain_json(
+            "commonkit.operation-progress.v3",
+            &(progress, package_authorization),
+        );
+    }
+    digest_domain_json(
+        if schema_version.0 == FORWARD_SCHEMA_VERSION {
+            "commonkit.operation-progress.v2"
+        } else {
+            "commonkit.operation-progress.v1"
+        },
+        progress,
+    )
+}
+
+fn validate_receipt_version(
+    schema_version: SchemaVersion,
+    contract_version: &str,
+) -> Result<(), ReceiptError> {
+    if (schema_version.0 == SCHEMA_VERSION && contract_version == CONTRACT_VERSION)
+        || (schema_version.0 == FORWARD_SCHEMA_VERSION
+            && contract_version == FORWARD_CONTRACT_VERSION)
+        || (schema_version.0 == PACKAGE_RECEIPT_SCHEMA_VERSION
+            && contract_version == PACKAGE_RECEIPT_CONTRACT_VERSION)
+    {
+        Ok(())
+    } else {
+        Err(ReceiptError::UnsupportedSchemaVersion(schema_version.0))
+    }
+}
+
+fn receipt_state_supported(schema_version: SchemaVersion, state: ReceiptState) -> bool {
+    schema_version.0 >= FORWARD_SCHEMA_VERSION
+        || !matches!(
+            state,
+            ReceiptState::ApplyingForward
+                | ReceiptState::ForwardRecoveryRequired
+                | ReceiptState::ConvergingForward
+                | ReceiptState::ForwardRecovered
+                | ReceiptState::ForwardRecoveryFailed
+        )
+}
+
+fn operation_phase_supported(schema_version: SchemaVersion, phase: OperationPhase) -> bool {
+    schema_version.0 >= FORWARD_SCHEMA_VERSION
+        || !matches!(
+            phase,
+            OperationPhase::ForwardRecovered | OperationPhase::ForwardRecoveryFailed
+        )
+}
+
+fn validate_package_authorization_shape(
+    schema_version: SchemaVersion,
+    authorization: Option<&PackageReceiptAuthorization>,
+) -> Result<(), ReceiptError> {
+    if schema_version.0 != PACKAGE_RECEIPT_SCHEMA_VERSION {
+        return if authorization.is_none() {
+            Ok(())
+        } else {
+            Err(ReceiptError::InvalidPackageAuthorization)
+        };
+    }
+    let authorization = authorization.ok_or(ReceiptError::InvalidPackageAuthorization)?;
+    if authorization.evidence.is_empty() {
+        return Err(ReceiptError::InvalidPackageAuthorization);
+    }
+    let mut operation_ids = std::collections::BTreeSet::new();
+    for evidence in &authorization.evidence {
+        if !operation_ids.insert(&evidence.operation_id) {
+            return Err(ReceiptError::InvalidPackageAuthorization);
+        }
+        match (&evidence.exit_classification, &evidence.final_digest) {
+            (PackageExitClassification::Succeeded, Some(_))
+            | (PackageExitClassification::NotRun, None)
+            | (PackageExitClassification::Failed { .. }, None) => {}
+            _ => return Err(ReceiptError::InvalidPackageAuthorization),
+        }
+    }
+    Ok(())
+}
+
+fn validate_package_receipt_authorization(
+    plan: &Plan,
+    authorization: &PackageReceiptAuthorization,
+) -> Result<(), ReceiptError> {
+    validate_package_authorization_shape(
+        SchemaVersion(PACKAGE_RECEIPT_SCHEMA_VERSION),
+        Some(authorization),
+    )?;
+    let package_operations = plan
+        .operations
+        .iter()
+        .filter(|operation| {
+            operation.adapter_id.as_str() == "packages"
+                || operation.resource.resource_type.as_str() == "package"
+        })
+        .collect::<Vec<_>>();
+    if package_operations.len() != authorization.evidence.len()
+        || package_operations.iter().any(|operation| {
+            !authorization
+                .evidence
+                .iter()
+                .any(|evidence| evidence.operation_id == operation.id)
+        })
+    {
+        return Err(ReceiptError::InvalidPackageAuthorization);
+    }
+    Ok(())
+}
+
 fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool {
     matches!(
         (from, to),
@@ -856,6 +1545,8 @@ fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool 
                     | OperationPhase::ApplyFailed
                     | OperationPhase::RolledBack
                     | OperationPhase::RollbackFailed
+                    | OperationPhase::ForwardRecovered
+                    | OperationPhase::ForwardRecoveryFailed
             )
             | (
                 OperationPhase::Applied,
@@ -863,18 +1554,37 @@ fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool 
                     | OperationPhase::VerifyFailed
                     | OperationPhase::RolledBack
                     | OperationPhase::RollbackFailed
+                    | OperationPhase::ForwardRecovered
+                    | OperationPhase::ForwardRecoveryFailed
             )
             | (
                 OperationPhase::Verified,
-                OperationPhase::RolledBack | OperationPhase::RollbackFailed
+                OperationPhase::RolledBack
+                    | OperationPhase::RollbackFailed
+                    | OperationPhase::ForwardRecovered
+                    | OperationPhase::ForwardRecoveryFailed
             )
             | (
                 OperationPhase::VerifyFailed,
-                OperationPhase::RolledBack | OperationPhase::RollbackFailed
+                OperationPhase::RolledBack
+                    | OperationPhase::RollbackFailed
+                    | OperationPhase::ForwardRecovered
+                    | OperationPhase::ForwardRecoveryFailed
             )
             | (
                 OperationPhase::ApplyFailed,
-                OperationPhase::RolledBack | OperationPhase::RollbackFailed
+                OperationPhase::RolledBack
+                    | OperationPhase::RollbackFailed
+                    | OperationPhase::ForwardRecovered
+                    | OperationPhase::ForwardRecoveryFailed
+            )
+            | (
+                OperationPhase::Prepared,
+                OperationPhase::ForwardRecovered | OperationPhase::ForwardRecoveryFailed
+            )
+            | (
+                OperationPhase::ForwardRecoveryFailed,
+                OperationPhase::ForwardRecovered | OperationPhase::ForwardRecoveryFailed
             )
     )
 }
@@ -887,11 +1597,33 @@ fn legal_transition(from: ReceiptState, to: ReceiptState) -> bool {
             ReceiptState::Applying | ReceiptState::Canceled
         ) | (
             ReceiptState::Applying,
-            ReceiptState::Verifying | ReceiptState::RecoveryRequired
+            ReceiptState::Verifying
+                | ReceiptState::RecoveryRequired
+                | ReceiptState::ForwardRecoveryRequired
         ) | (
             ReceiptState::Verifying,
-            ReceiptState::Succeeded | ReceiptState::RecoveryRequired
+            ReceiptState::Succeeded
+                | ReceiptState::ApplyingForward
+                | ReceiptState::RecoveryRequired
+                | ReceiptState::ForwardRecoveryRequired
+        ) | (
+            ReceiptState::ApplyingForward,
+            ReceiptState::Succeeded
+                | ReceiptState::RecoveryRequired
+                | ReceiptState::ForwardRecoveryRequired
         ) | (ReceiptState::RecoveryRequired, ReceiptState::RollingBack)
+            | (
+                ReceiptState::ForwardRecoveryRequired,
+                ReceiptState::ConvergingForward
+            )
+            | (
+                ReceiptState::ConvergingForward,
+                ReceiptState::ForwardRecovered | ReceiptState::ForwardRecoveryFailed
+            )
+            | (
+                ReceiptState::ForwardRecoveryFailed,
+                ReceiptState::ConvergingForward
+            )
             | (ReceiptState::Succeeded, ReceiptState::RollingBack)
             | (
                 ReceiptState::RollingBack,
@@ -902,6 +1634,8 @@ fn legal_transition(from: ReceiptState, to: ReceiptState) -> bool {
 
 #[derive(Debug, Error)]
 pub enum ReceiptError {
+    #[error("receipt schema/contract version is unsupported: {0}")]
+    UnsupportedSchemaVersion(u32),
     #[error(transparent)]
     Contract(#[from] ContractError),
     #[error("illegal receipt transition from {from:?} to {to:?}")]
@@ -913,6 +1647,8 @@ pub enum ReceiptError {
     InvalidHashChain,
     #[error("operation progress transition is invalid")]
     InvalidOperationProgress,
+    #[error("package receipt authorization or evidence is invalid")]
+    InvalidPackageAuthorization,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -934,4 +1670,84 @@ pub enum ReceiptError {
         persisted_sequence: u64,
         attempted_sequence: u64,
     },
+}
+
+#[cfg(test)]
+mod receipt_chain_tests {
+    use super::*;
+
+    fn digest(character: char) -> Sha256Digest {
+        Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
+    }
+
+    fn journal() -> ReceiptJournal {
+        ReceiptJournal::new(
+            StableId::parse("tampered-run").unwrap(),
+            digest('a'),
+            StableId::parse("target").unwrap(),
+            digest('b'),
+            digest('c'),
+            digest('d'),
+            PlanBindings {
+                target_identity_digest: digest('e'),
+                composed_loadout_digest: digest('f'),
+                provider_inputs_digest: digest('1'),
+                ownership_map_digest: digest('2'),
+                artifact_set_digest: digest('3'),
+                package_resolution_authority_digest: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn replace_states(journal: &mut ReceiptJournal, states: &[ReceiptState]) {
+        let progress_digest = digest_domain_json(
+            "commonkit.operation-progress.v1",
+            &journal.receipt.operation_progress,
+        )
+        .unwrap();
+        let mut transitions = Vec::new();
+        let mut previous = None;
+        for (sequence, state) in states.iter().copied().enumerate() {
+            let transition =
+                make_transition(sequence as u64, state, previous, progress_digest.clone()).unwrap();
+            previous = Some(transition.entry_digest.clone());
+            transitions.push(transition);
+        }
+        journal.receipt.receipt_id = previous.unwrap();
+        journal.receipt.transitions = transitions;
+    }
+
+    #[test]
+    fn hash_valid_receipts_reject_invalid_state_history_and_top_level_state() {
+        let mut invalid_first = journal();
+        replace_states(&mut invalid_first, &[ReceiptState::Applying]);
+        invalid_first.receipt.state = ReceiptState::Applying;
+        assert!(matches!(
+            invalid_first.verify_chain(),
+            Err(ReceiptError::InvalidHashChain)
+        ));
+
+        let mut illegal_adjacent = journal();
+        replace_states(
+            &mut illegal_adjacent,
+            &[ReceiptState::Prepared, ReceiptState::Succeeded],
+        );
+        illegal_adjacent.receipt.state = ReceiptState::Succeeded;
+        assert!(matches!(
+            illegal_adjacent.verify_chain(),
+            Err(ReceiptError::InvalidHashChain)
+        ));
+
+        let mut mismatched_top = journal();
+        replace_states(
+            &mut mismatched_top,
+            &[ReceiptState::Prepared, ReceiptState::Applying],
+        );
+        mismatched_top.receipt.state = ReceiptState::Prepared;
+        assert!(matches!(
+            mismatched_top.verify_chain(),
+            Err(ReceiptError::InvalidHashChain)
+        ));
+    }
 }
