@@ -1,0 +1,349 @@
+{
+  "$defs": {
+    "OperationPhase": {
+      "enum": [
+        "prepared",
+        "prepare_failed",
+        "apply_started",
+        "applied",
+        "apply_failed",
+        "verified",
+        "verify_failed",
+        "rolled_back",
+        "rollback_failed",
+        "forward_recovered",
+        "forward_recovery_failed"
+      ],
+      "type": "string"
+    },
+    "OperationProgress": {
+      "additionalProperties": false,
+      "properties": {
+        "failureCode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "phase": {
+          "$ref": "#/$defs/OperationPhase"
+        }
+      },
+      "required": [
+        "operationId",
+        "phase"
+      ],
+      "type": "object"
+    },
+    "PackageExitClassification": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "not_run",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "succeeded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "type": {
+              "const": "failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PackageManager": {
+      "description": "A package/toolchain backend supported by read-only package observation.",
+      "enum": [
+        "homebrew",
+        "apt",
+        "fnm",
+        "nvm",
+        "rustup"
+      ],
+      "type": "string"
+    },
+    "PackageNoPreimageReason": {
+      "enum": [
+        "additive_forward_only"
+      ],
+      "type": "string"
+    },
+    "PackageReceiptAuthorization": {
+      "additionalProperties": false,
+      "properties": {
+        "confirmationId": {
+          "type": "string"
+        },
+        "consentDigest": {
+          "type": "string"
+        },
+        "evidence": {
+          "items": {
+            "$ref": "#/$defs/PackageReceiptEvidence"
+          },
+          "type": "array"
+        },
+        "operationSetDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "consentDigest",
+        "confirmationId",
+        "operationSetDigest",
+        "evidence"
+      ],
+      "type": "object"
+    },
+    "PackageReceiptEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "beforeInstalledVersions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "exitClassification": {
+          "$ref": "#/$defs/PackageExitClassification"
+        },
+        "finalDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "manager": {
+          "$ref": "#/$defs/PackageManager"
+        },
+        "managerAuthorityDigest": {
+          "type": "string"
+        },
+        "noPreimageReason": {
+          "$ref": "#/$defs/PackageNoPreimageReason"
+        },
+        "operationId": {
+          "type": "string"
+        },
+        "resolutionDigest": {
+          "type": "string"
+        },
+        "sourceAuthorityDigest": {
+          "type": "string"
+        },
+        "sourceId": {
+          "type": "string"
+        },
+        "targetAuthorityDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "operationId",
+        "resolutionDigest",
+        "targetAuthorityDigest",
+        "manager",
+        "managerAuthorityDigest",
+        "sourceId",
+        "sourceAuthorityDigest",
+        "beforeInstalledVersions",
+        "noPreimageReason",
+        "exitClassification"
+      ],
+      "type": "object"
+    },
+    "PlanBindings": {
+      "additionalProperties": false,
+      "properties": {
+        "artifactSetDigest": {
+          "type": "string"
+        },
+        "composedLoadoutDigest": {
+          "type": "string"
+        },
+        "ownershipMapDigest": {
+          "type": "string"
+        },
+        "packageResolutionAuthorityDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "providerInputsDigest": {
+          "type": "string"
+        },
+        "targetIdentityDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "targetIdentityDigest",
+        "composedLoadoutDigest",
+        "providerInputsDigest",
+        "ownershipMapDigest",
+        "artifactSetDigest"
+      ],
+      "type": "object"
+    },
+    "ReceiptState": {
+      "enum": [
+        "prepared",
+        "applying",
+        "verifying",
+        "applying_forward",
+        "succeeded",
+        "recovery_required",
+        "forward_recovery_required",
+        "converging_forward",
+        "forward_recovered",
+        "forward_recovery_failed",
+        "rolling_back",
+        "rolled_back",
+        "rollback_failed",
+        "canceled"
+      ],
+      "type": "string"
+    },
+    "ReceiptTransition": {
+      "additionalProperties": false,
+      "properties": {
+        "entryDigest": {
+          "type": "string"
+        },
+        "previousDigest": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "progressDigest": {
+          "type": "string"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "$ref": "#/$defs/ReceiptState"
+        }
+      },
+      "required": [
+        "sequence",
+        "state",
+        "progressDigest",
+        "entryDigest"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v3/receipt.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bindings": {
+      "$ref": "#/$defs/PlanBindings"
+    },
+    "contractVersion": {
+      "const": "3.0",
+      "type": "string"
+    },
+    "desiredDigest": {
+      "type": "string"
+    },
+    "observedDigest": {
+      "type": "string"
+    },
+    "operationProgress": {
+      "items": {
+        "$ref": "#/$defs/OperationProgress"
+      },
+      "type": "array"
+    },
+    "packageAuthorization": {
+      "$ref": "#/$defs/PackageReceiptAuthorization"
+    },
+    "planId": {
+      "type": "string"
+    },
+    "policyDigest": {
+      "type": "string"
+    },
+    "receiptId": {
+      "type": "string"
+    },
+    "runId": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "const": 3,
+      "type": "integer"
+    },
+    "state": {
+      "$ref": "#/$defs/ReceiptState"
+    },
+    "targetId": {
+      "type": "string"
+    },
+    "transitions": {
+      "items": {
+        "$ref": "#/$defs/ReceiptTransition"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "contractVersion",
+    "receiptId",
+    "runId",
+    "planId",
+    "targetId",
+    "desiredDigest",
+    "observedDigest",
+    "policyDigest",
+    "bindings",
+    "state",
+    "operationProgress",
+    "transitions",
+    "packageAuthorization"
+  ],
+  "title": "RunReceipt",
+  "type": "object"
+}

@@ -39,6 +39,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commonkit_contracts::receipt_v2_schema()?,
         ),
         (
+            "receipt-v3.schema.json",
+            commonkit_contracts::receipt_v3_schema()?,
+        ),
+        (
             "diagnostics.schema.json",
             commonkit_contracts::diagnostics_schema()?,
         ),

@@ -19,9 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use commonkit_contracts::{
     CONTRACT_VERSION, ContractError, FORWARD_CONTRACT_VERSION, FORWARD_SCHEMA_VERSION, Operation,
-    OperationPhase, OperationProgress, Plan, PlanBindings, ReceiptState, ReceiptTransition,
-    RecoveryCapability, RunReceipt, SCHEMA_VERSION, SchemaVersion, Sha256Digest, StableId,
-    canonical_json, digest_domain_json,
+    OperationPhase, OperationProgress, PACKAGE_RECEIPT_CONTRACT_VERSION,
+    PACKAGE_RECEIPT_SCHEMA_VERSION, PackageExitClassification, PackageReceiptAuthorization, Plan,
+    PlanBindings, ReceiptState, ReceiptTransition, RecoveryCapability, RunReceipt, SCHEMA_VERSION,
+    SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,7 @@ impl ReceiptJournal {
             bindings,
             SchemaVersion(SCHEMA_VERSION),
             CONTRACT_VERSION.into(),
+            None,
         )
     }
 
@@ -67,6 +69,27 @@ impl ReceiptJournal {
             plan.bindings.clone(),
             plan.schema_version,
             plan.contract_version.clone(),
+            None,
+        )
+    }
+
+    pub fn for_package_plan(
+        run_id: StableId,
+        plan: &Plan,
+        authorization: PackageReceiptAuthorization,
+    ) -> Result<Self, ReceiptError> {
+        validate_package_receipt_authorization(plan, &authorization)?;
+        Self::new_versioned(
+            run_id,
+            plan.id.clone(),
+            plan.target_id.clone(),
+            plan.desired_digest.clone(),
+            plan.observed_digest.clone(),
+            plan.policy_digest.clone(),
+            plan.bindings.clone(),
+            SchemaVersion(PACKAGE_RECEIPT_SCHEMA_VERSION),
+            PACKAGE_RECEIPT_CONTRACT_VERSION.into(),
+            Some(authorization),
         )
     }
 
@@ -81,10 +104,13 @@ impl ReceiptJournal {
         bindings: PlanBindings,
         schema_version: SchemaVersion,
         contract_version: String,
+        package_authorization: Option<PackageReceiptAuthorization>,
     ) -> Result<Self, ReceiptError> {
         validate_receipt_version(schema_version, &contract_version)?;
         let progress = Vec::new();
-        let progress_digest = progress_digest(schema_version, &progress)?;
+        validate_package_authorization_shape(schema_version, package_authorization.as_ref())?;
+        let progress_digest =
+            progress_digest(schema_version, &progress, package_authorization.as_ref())?;
         let first = make_transition_for_schema(
             schema_version,
             0,
@@ -104,6 +130,7 @@ impl ReceiptJournal {
                 observed_digest,
                 policy_digest,
                 bindings,
+                package_authorization,
                 state: ReceiptState::Prepared,
                 operation_progress: progress,
                 transitions: vec![first],
@@ -128,6 +155,7 @@ impl ReceiptJournal {
         let progress_digest = progress_digest(
             self.receipt.schema_version,
             &self.receipt.operation_progress,
+            self.receipt.package_authorization.as_ref(),
         )?;
         let transition = make_transition_for_schema(
             self.receipt.schema_version,
@@ -190,6 +218,32 @@ impl ReceiptJournal {
         self.append_progress_transition()
     }
 
+    pub fn record_package_exit(
+        &mut self,
+        operation_id: &Sha256Digest,
+        exit_classification: PackageExitClassification,
+        final_digest: Option<Sha256Digest>,
+    ) -> Result<(), ReceiptError> {
+        let authorization = self
+            .receipt
+            .package_authorization
+            .as_mut()
+            .ok_or(ReceiptError::InvalidPackageAuthorization)?;
+        let evidence = authorization
+            .evidence
+            .iter_mut()
+            .find(|evidence| &evidence.operation_id == operation_id)
+            .ok_or(ReceiptError::InvalidPackageAuthorization)?;
+        if matches!(exit_classification, PackageExitClassification::Succeeded)
+            != final_digest.is_some()
+        {
+            return Err(ReceiptError::InvalidPackageAuthorization);
+        }
+        evidence.exit_classification = exit_classification;
+        evidence.final_digest = final_digest;
+        self.append_progress_transition()
+    }
+
     fn append_progress_transition(&mut self) -> Result<(), ReceiptError> {
         let previous = self
             .receipt
@@ -199,6 +253,7 @@ impl ReceiptJournal {
         let progress_digest = progress_digest(
             self.receipt.schema_version,
             &self.receipt.operation_progress,
+            self.receipt.package_authorization.as_ref(),
         )?;
         let transition = make_transition_for_schema(
             self.receipt.schema_version,
@@ -224,6 +279,10 @@ impl ReceiptJournal {
 
     pub fn verify_chain(&self) -> Result<(), ReceiptError> {
         validate_receipt_version(self.receipt.schema_version, &self.receipt.contract_version)?;
+        validate_package_authorization_shape(
+            self.receipt.schema_version,
+            self.receipt.package_authorization.as_ref(),
+        )?;
         if self
             .receipt
             .transitions
@@ -265,6 +324,7 @@ impl ReceiptJournal {
         let progress_digest = progress_digest(
             self.receipt.schema_version,
             &self.receipt.operation_progress,
+            self.receipt.package_authorization.as_ref(),
         )?;
         if self
             .receipt
@@ -1185,10 +1245,10 @@ fn make_transition_for_schema(
     progress_digest: Sha256Digest,
 ) -> Result<ReceiptTransition, ContractError> {
     let entry_digest = digest_domain_json(
-        if schema_version.0 == FORWARD_SCHEMA_VERSION {
-            "commonkit.receipt-transition.v2"
-        } else {
-            "commonkit.receipt-transition.v1"
+        match schema_version.0 {
+            PACKAGE_RECEIPT_SCHEMA_VERSION => "commonkit.receipt-transition.v3",
+            FORWARD_SCHEMA_VERSION => "commonkit.receipt-transition.v2",
+            _ => "commonkit.receipt-transition.v1",
         },
         &TransitionSemantic {
             sequence,
@@ -1209,7 +1269,14 @@ fn make_transition_for_schema(
 fn progress_digest(
     schema_version: SchemaVersion,
     progress: &[OperationProgress],
+    package_authorization: Option<&PackageReceiptAuthorization>,
 ) -> Result<Sha256Digest, ContractError> {
+    if schema_version.0 == PACKAGE_RECEIPT_SCHEMA_VERSION {
+        return digest_domain_json(
+            "commonkit.operation-progress.v3",
+            &(progress, package_authorization),
+        );
+    }
     digest_domain_json(
         if schema_version.0 == FORWARD_SCHEMA_VERSION {
             "commonkit.operation-progress.v2"
@@ -1227,6 +1294,8 @@ fn validate_receipt_version(
     if (schema_version.0 == SCHEMA_VERSION && contract_version == CONTRACT_VERSION)
         || (schema_version.0 == FORWARD_SCHEMA_VERSION
             && contract_version == FORWARD_CONTRACT_VERSION)
+        || (schema_version.0 == PACKAGE_RECEIPT_SCHEMA_VERSION
+            && contract_version == PACKAGE_RECEIPT_CONTRACT_VERSION)
     {
         Ok(())
     } else {
@@ -1235,7 +1304,7 @@ fn validate_receipt_version(
 }
 
 fn receipt_state_supported(schema_version: SchemaVersion, state: ReceiptState) -> bool {
-    schema_version.0 == FORWARD_SCHEMA_VERSION
+    schema_version.0 >= FORWARD_SCHEMA_VERSION
         || !matches!(
             state,
             ReceiptState::ApplyingForward
@@ -1247,11 +1316,70 @@ fn receipt_state_supported(schema_version: SchemaVersion, state: ReceiptState) -
 }
 
 fn operation_phase_supported(schema_version: SchemaVersion, phase: OperationPhase) -> bool {
-    schema_version.0 == FORWARD_SCHEMA_VERSION
+    schema_version.0 >= FORWARD_SCHEMA_VERSION
         || !matches!(
             phase,
             OperationPhase::ForwardRecovered | OperationPhase::ForwardRecoveryFailed
         )
+}
+
+fn validate_package_authorization_shape(
+    schema_version: SchemaVersion,
+    authorization: Option<&PackageReceiptAuthorization>,
+) -> Result<(), ReceiptError> {
+    if schema_version.0 != PACKAGE_RECEIPT_SCHEMA_VERSION {
+        return if authorization.is_none() {
+            Ok(())
+        } else {
+            Err(ReceiptError::InvalidPackageAuthorization)
+        };
+    }
+    let authorization = authorization.ok_or(ReceiptError::InvalidPackageAuthorization)?;
+    if authorization.evidence.is_empty() {
+        return Err(ReceiptError::InvalidPackageAuthorization);
+    }
+    let mut operation_ids = std::collections::BTreeSet::new();
+    for evidence in &authorization.evidence {
+        if !operation_ids.insert(&evidence.operation_id) {
+            return Err(ReceiptError::InvalidPackageAuthorization);
+        }
+        match (&evidence.exit_classification, &evidence.final_digest) {
+            (PackageExitClassification::Succeeded, Some(_))
+            | (PackageExitClassification::NotRun, None)
+            | (PackageExitClassification::Failed { .. }, None) => {}
+            _ => return Err(ReceiptError::InvalidPackageAuthorization),
+        }
+    }
+    Ok(())
+}
+
+fn validate_package_receipt_authorization(
+    plan: &Plan,
+    authorization: &PackageReceiptAuthorization,
+) -> Result<(), ReceiptError> {
+    validate_package_authorization_shape(
+        SchemaVersion(PACKAGE_RECEIPT_SCHEMA_VERSION),
+        Some(authorization),
+    )?;
+    let package_operations = plan
+        .operations
+        .iter()
+        .filter(|operation| {
+            operation.adapter_id.as_str() == "packages"
+                || operation.resource.resource_type.as_str() == "package"
+        })
+        .collect::<Vec<_>>();
+    if package_operations.len() != authorization.evidence.len()
+        || package_operations.iter().any(|operation| {
+            !authorization
+                .evidence
+                .iter()
+                .any(|evidence| evidence.operation_id == operation.id)
+        })
+    {
+        return Err(ReceiptError::InvalidPackageAuthorization);
+    }
+    Ok(())
 }
 
 fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool {
@@ -1366,6 +1494,8 @@ pub enum ReceiptError {
     InvalidHashChain,
     #[error("operation progress transition is invalid")]
     InvalidOperationProgress,
+    #[error("package receipt authorization or evidence is invalid")]
+    InvalidPackageAuthorization,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
