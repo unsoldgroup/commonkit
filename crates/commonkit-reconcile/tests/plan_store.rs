@@ -237,3 +237,49 @@ fn latest_matching_rejects_a_symlink_plan_entry() {
     ));
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn latest_matching_rejects_an_unexpected_non_json_plan_artifact() {
+    let root = temporary_directory("plan-store-unexpected-entry");
+    let store = PlanStore::open(&root).expect("store");
+    let plan = plan_for("local-target", '3', 'c');
+    store.persist(&plan).expect("persist");
+    let path = root.join(format!(
+        "{}.json",
+        plan.id.as_str().trim_start_matches("sha256:")
+    ));
+    fs::rename(path, root.join("plan.bak")).expect("rename plan artifact");
+
+    assert!(matches!(
+        store.load_latest_for_target(&StableId::parse("local-target").expect("target")),
+        Err(PlanStoreError::InvalidPlan)
+    ));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn latest_matching_allows_only_a_strict_inflight_plan_temp_entry() {
+    let root = temporary_directory("plan-store-allowed-temp");
+    let store = PlanStore::open(&root).expect("store");
+    let plan = plan_for("local-target", '3', 'c');
+    store.persist(&plan).expect("persist");
+    fs::write(
+        root.join(format!(
+            ".plan-123-{}-0.tmp",
+            plan.id.as_str().trim_start_matches("sha256:")
+        )),
+        b"inflight",
+    )
+    .expect("write inflight temp");
+    fs::write(root.join(".plan-store.metadata"), b"metadata").expect("write metadata");
+
+    assert_eq!(
+        store
+            .load_latest_for_target(&StableId::parse("local-target").expect("target"))
+            .expect("load latest")
+            .expect("matching plan")
+            .id,
+        plan.id
+    );
+    fs::remove_dir_all(root).expect("cleanup");
+}

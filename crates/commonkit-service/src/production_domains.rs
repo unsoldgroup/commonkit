@@ -3401,39 +3401,40 @@ impl SyncDomain for ProductionSyncDomain {
                 .map_err(|_| DomainFailure::InvalidRequest)?,
             // Legacy drift callers omit the id. Resolve that request to the
             // newest immutable plan; this remains entirely offline.
-            None => match self
-                .plan_store
-                .load_latest_for_target_with_bindings(
-                    &self.config.target_id,
-                    &self.config.target_identity_digest,
-                    &self.config.composed_loadout_digest,
-                    &self.config.policy_digest,
-                )
-                .map_err(|_| DomainFailure::InvalidRequest)?
-            {
-                Some(plan) => plan,
-                None => {
-                    let has_target_plan = self
-                        .plan_store
-                        .load_latest_for_target(&self.config.target_id)
-                        .map_err(|_| DomainFailure::InvalidRequest)?
-                        .is_some();
-                    // Legacy inventory checks may run before a plan has been
-                    // persisted. Preserve their offline file-only path, but
-                    // never materialize providers or resolve packages here.
-                    if !has_target_plan
-                        && self.config.provider_pipeline.is_none()
-                        && self.config.package_resolution.is_none()
-                    {
-                        return Ok(serde_json::json!({
-                            "verified": true,
-                            "offline": true,
-                            "targetId": self.config.target_id,
-                        }));
-                    }
+            None => {
+                let selection = self
+                    .plan_store
+                    .scan_latest_for_target_with_bindings(
+                        &self.config.target_id,
+                        &self.config.target_identity_digest,
+                        &self.config.composed_loadout_digest,
+                        &self.config.policy_digest,
+                    )
+                    .map_err(|_| DomainFailure::InvalidRequest)?;
+                if selection.has_invalid_candidate {
                     return Err(DomainFailure::InvalidRequest);
                 }
-            },
+                match selection.latest {
+                    Some(plan) => plan,
+                    None => {
+                        // Legacy inventory checks may run before a plan has
+                        // been persisted. Preserve their offline file-only
+                        // path, but never materialize providers or resolve
+                        // packages here.
+                        if !selection.has_target_candidate
+                            && self.config.provider_pipeline.is_none()
+                            && self.config.package_resolution.is_none()
+                        {
+                            return Ok(serde_json::json!({
+                                "verified": true,
+                                "offline": true,
+                                "targetId": self.config.target_id,
+                            }));
+                        }
+                        return Err(DomainFailure::InvalidRequest);
+                    }
+                }
+            }
         };
         if plan.target_id != self.config.target_id
             || reference
@@ -6601,6 +6602,22 @@ mod production_verify_binding_tests {
         domain.plan_store.persist(&plan).expect("persist plan");
         std::fs::rename(plan_path(root, &plan), root.join("plans/wrong-plan.json"))
             .expect("rename plan");
+
+        assert_eq!(
+            domain.verify(serde_json::json!({})),
+            Err(DomainFailure::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn legacy_verify_rejects_a_non_json_plan_artifact() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let root = temporary.path();
+        let domain = domain(root, "local-target", 't', 'c', 'p');
+        let plan = plan("local-target", 't', 'c', 'p');
+        domain.plan_store.persist(&plan).expect("persist plan");
+        std::fs::rename(plan_path(root, &plan), root.join("plans/plan.bak"))
+            .expect("rename plan artifact");
 
         assert_eq!(
             domain.verify(serde_json::json!({})),

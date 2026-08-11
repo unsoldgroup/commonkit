@@ -364,6 +364,16 @@ pub struct PlanStore {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanScanResult {
+    /// Newest valid plan matching the requested target and bindings.
+    pub latest: Option<Plan>,
+    /// Whether the scan saw any valid plan for the requested target, including stale bindings.
+    pub has_target_candidate: bool,
+    /// Whether any known directory entry was malformed or had an invalid plan identity.
+    pub has_invalid_candidate: bool,
+}
+
 impl PlanStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, PlanStoreError> {
         fs::create_dir_all(root.as_ref())?;
@@ -435,14 +445,14 @@ impl PlanStore {
     /// drift checks which intentionally do not carry a plan id in their
     /// legacy request shape.
     pub fn load_latest(&self) -> Result<Option<Plan>, PlanStoreError> {
-        self.load_latest_matching(None, None)
+        self.checked_scan(self.load_latest_matching(None, None)?)
     }
 
     pub fn load_latest_for_target(
         &self,
         target_id: &StableId,
     ) -> Result<Option<Plan>, PlanStoreError> {
-        self.load_latest_matching(Some(target_id), None)
+        self.checked_scan(self.load_latest_matching(Some(target_id), None)?)
     }
 
     pub fn load_latest_for_target_with_bindings(
@@ -452,6 +462,25 @@ impl PlanStore {
         composed_loadout_digest: &Sha256Digest,
         policy_digest: &Sha256Digest,
     ) -> Result<Option<Plan>, PlanStoreError> {
+        self.checked_scan(self.load_latest_matching(
+            Some(target_id),
+            Some((
+                target_identity_digest,
+                composed_loadout_digest,
+                policy_digest,
+            )),
+        )?)
+    }
+
+    /// Scans the plan directory once, returning both the latest matching plan
+    /// and evidence needed to distinguish an empty store from stale entries.
+    pub fn scan_latest_for_target_with_bindings(
+        &self,
+        target_id: &StableId,
+        target_identity_digest: &Sha256Digest,
+        composed_loadout_digest: &Sha256Digest,
+        policy_digest: &Sha256Digest,
+    ) -> Result<PlanScanResult, PlanStoreError> {
         self.load_latest_matching(
             Some(target_id),
             Some((
@@ -462,30 +491,56 @@ impl PlanStore {
         )
     }
 
+    fn checked_scan(&self, scan: PlanScanResult) -> Result<Option<Plan>, PlanStoreError> {
+        if scan.has_invalid_candidate {
+            return Err(PlanStoreError::InvalidPlan);
+        }
+        Ok(scan.latest)
+    }
+
     fn load_latest_matching(
         &self,
         target_id: Option<&StableId>,
         bindings: Option<(&Sha256Digest, &Sha256Digest, &Sha256Digest)>,
-    ) -> Result<Option<Plan>, PlanStoreError> {
+    ) -> Result<PlanScanResult, PlanStoreError> {
         let mut latest: Option<(std::time::SystemTime, Sha256Digest, Plan)> = None;
+        let mut has_target_candidate = false;
+        let mut has_invalid_candidate = false;
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             let path = entry.path();
+            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+                has_invalid_candidate = true;
+                continue;
+            };
+            if is_allowed_plan_store_entry(name) {
+                continue;
+            }
             if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                has_invalid_candidate = true;
                 continue;
             }
             let (bytes, modified) = read_plan_file(&path)?;
-            let plan: Plan = serde_json::from_slice(&bytes)?;
+            let plan: Plan = match serde_json::from_slice(&bytes) {
+                Ok(plan) => plan,
+                Err(_) => {
+                    has_invalid_candidate = true;
+                    continue;
+                }
+            };
             if validate_plan(&plan).is_err() {
-                return Err(PlanStoreError::InvalidPlan);
+                has_invalid_candidate = true;
+                continue;
             }
             let expected_name = format!("{}.json", plan.id.as_str().trim_start_matches("sha256:"));
-            if path.file_name().and_then(|value| value.to_str()) != Some(&expected_name) {
-                return Err(PlanStoreError::InvalidPlan);
+            if name != expected_name {
+                has_invalid_candidate = true;
+                continue;
             }
             if target_id.is_some_and(|target| target != &plan.target_id) {
                 continue;
             }
+            has_target_candidate = true;
             if bindings.is_some_and(|(target, loadout, policy)| {
                 plan.bindings.target_identity_digest != *target
                     || plan.bindings.composed_loadout_digest != *loadout
@@ -499,7 +554,11 @@ impl PlanStore {
                 latest = Some((modified, plan.id.clone(), plan));
             }
         }
-        Ok(latest.map(|(_, _, plan)| plan))
+        Ok(PlanScanResult {
+            latest: latest.map(|(_, _, plan)| plan),
+            has_target_candidate,
+            has_invalid_candidate,
+        })
     }
 
     fn path(&self, id: &Sha256Digest) -> PathBuf {
@@ -508,6 +567,35 @@ impl PlanStore {
             id.as_str().trim_start_matches("sha256:")
         ))
     }
+}
+
+fn is_allowed_plan_store_entry(name: &str) -> bool {
+    if name == ".plan-store.metadata" {
+        return true;
+    }
+    let Some(value) = name
+        .strip_prefix(".plan-")
+        .and_then(|value| value.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let mut parts = value.split('-');
+    let Some(pid) = parts.next() else {
+        return false;
+    };
+    let Some(digest) = parts.next() else {
+        return false;
+    };
+    let Some(nonce) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
+        && digest.len() == 64
+        && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !nonce.is_empty()
+        && nonce.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn read_plan_bytes(path: &Path) -> Result<Vec<u8>, PlanStoreError> {
@@ -520,6 +608,10 @@ fn read_plan_file(path: &Path) -> Result<(Vec<u8>, std::time::SystemTime), PlanS
     let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
+    let current = fs::symlink_metadata(path)?;
+    if current.file_type().is_symlink() || !current.is_file() || !same_file(&metadata, &current) {
+        return Err(PlanStoreError::InvalidPlan);
+    }
     Ok((bytes, modified))
 }
 
@@ -560,6 +652,18 @@ fn no_follow_open_error(error: &std::io::Error) -> bool {
     {
         let _ = error;
         false
+    }
+}
+
+fn same_file(opened: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        opened.dev() == current.dev() && opened.ino() == current.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        opened.len() == current.len() && opened.modified().ok() == current.modified().ok()
     }
 }
 
