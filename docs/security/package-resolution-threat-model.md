@@ -29,12 +29,13 @@ Planning, apply preparation, verification, and restart recovery load only the pe
 The production APT resolver is limited to Debian and Ubuntu targets with an
 exact binary name, version, architecture, suite, component set, and
 CommonKit-owned source-registry entry. It probes the distro, codename,
-architecture, `apt` and `dpkg` versions and executable digests, effective APT
+architecture, `apt` and `dpkg` versions and no-follow `apt-get`, `apt-cache`,
+and `dpkg` executable digests, effective APT
 configuration, and the configured `Signed-By` key before repository access. A
 mismatch fails before `apt-get update`.
 
 APT receives a CommonKit-owned minimal configuration root, private lists,
-archive cache and empty closure-selection status, one generated source, a scrubbed
+archive and binary caches, and empty closure-selection status, one generated source, a scrubbed
 environment, and fixed arguments. When running as root, CommonKit requires the
 `_apt` identity and gives it group-read/traverse access only to the generated
 configuration, source, and key plus ownership of the two APT partial-download
@@ -67,7 +68,8 @@ signer scope, and key digest, so widening or re-keying invalidates existing
 resolution authority. The resolver requires one authenticated `InRelease`,
 binds its digest, rejects removal/downgrade/replacement relationships or
 unresolved dependency alternatives from real APT output, and accepts only
-exact SHA-256 `.deb` records. CommonKit preflights the complete locator set
+exact SHA-256 `.deb` records whose complete repository-relative `Filename`
+matches the archive locator. CommonKit preflights the complete locator set
 before the first request, then downloads every archive through the per-hop
 scoped fetch seam and verifies its digest and size before persistence.
 

@@ -275,7 +275,7 @@ fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
     assert!(rendered.contains("Acquire::By-Hash=force"));
     assert!(rendered.contains("Acquire::https::AllowRedirect=false"));
     assert!(rendered.contains("--simulate --no-remove"));
-    assert!(rendered.contains("--print-uris --download-only --no-remove"));
+    assert!(rendered.contains("--quiet=2 --print-uris --download-only --no-remove"));
     assert!(!rendered.contains("--allow-unauthenticated"));
     assert!(commands.iter().all(|command| {
         command.environment.get("APT_CONFIG").map(String::as_str) == Some("<private>/apt.conf")

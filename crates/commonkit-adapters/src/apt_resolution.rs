@@ -144,14 +144,10 @@ impl ProcessAptResolutionCommandRunner {
             AptResolutionCommandError::InvalidOutput("/etc/os-release is not UTF-8".into())
         })?;
         validate_host_target(target, &os_release)?;
-        let apt_digest = content_digest(
-            &fs::read("/usr/bin/apt-get")
-                .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?,
-        )?;
-        let dpkg_digest = content_digest(
-            &fs::read("/usr/bin/dpkg")
-                .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?,
-        )?;
+        let apt_digest = digest_no_follow_regular_file(std::path::Path::new("/usr/bin/apt-get"))?;
+        let apt_cache_digest =
+            digest_no_follow_regular_file(std::path::Path::new("/usr/bin/apt-cache"))?;
+        let dpkg_digest = digest_no_follow_regular_file(std::path::Path::new("/usr/bin/dpkg"))?;
         let signing_key = read_trusted_signing_key(&repository.signed_by)?;
         let key_digest = content_digest(&signing_key)?;
         let dpkg_config_digest = digest_dpkg_configuration(
@@ -234,6 +230,7 @@ impl ProcessAptResolutionCommandRunner {
             architecture,
             &os_release,
             &apt_digest,
+            &apt_cache_digest,
             &dpkg_digest,
             &key_digest,
             &dpkg_config_digest,
@@ -241,6 +238,15 @@ impl ProcessAptResolutionCommandRunner {
         if content_digest(&read_trusted_signing_key(&repository.signed_by)?)? != key_digest {
             return Err(AptResolutionCommandError::Failed(
                 "APT signing key changed during authority probe".into(),
+            ));
+        }
+        if digest_no_follow_regular_file(std::path::Path::new("/usr/bin/apt-get"))? != apt_digest
+            || digest_no_follow_regular_file(std::path::Path::new("/usr/bin/apt-cache"))?
+                != apt_cache_digest
+            || digest_no_follow_regular_file(std::path::Path::new("/usr/bin/dpkg"))? != dpkg_digest
+        {
+            return Err(AptResolutionCommandError::Failed(
+                "APT executable changed during authority probe".into(),
             ));
         }
         Ok(binding)
@@ -770,6 +776,7 @@ fn apt_command_plan(
         apt(vec![
             "-o".into(),
             format!("Dir::State::status={workspace}/status"),
+            "--quiet=2".into(),
             "--print-uris".into(),
             "--download-only".into(),
             "--no-remove".into(),
@@ -791,6 +798,10 @@ fn apt_options(workspace: &str) -> Vec<String> {
         format!("Dir::State::lists={workspace}/lists"),
         "-o".into(),
         format!("Dir::Cache::archives={workspace}/archives"),
+        "-o".into(),
+        format!("Dir::Cache::pkgcache={workspace}/pkgcache.bin"),
+        "-o".into(),
+        format!("Dir::Cache::srcpkgcache={workspace}/srcpkgcache.bin"),
         "-o".into(),
         "APT::Get::List-Cleanup=0".into(),
         "-o".into(),
@@ -1268,14 +1279,12 @@ fn resolve_apt_on_linux(
     })?;
     validate_host_target(&request.target, &os_release)?;
 
-    let apt_bytes = fs::read("/usr/bin/apt-get")
-        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
-    let dpkg_bytes = fs::read("/usr/bin/dpkg")
-        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
     let key_bytes = read_trusted_signing_key(&request.repository.signed_by)?;
     let live_status_bytes = read_trusted_dpkg_status()?;
-    let apt_digest = content_digest(&apt_bytes)?;
-    let dpkg_digest = content_digest(&dpkg_bytes)?;
+    let apt_digest = digest_no_follow_regular_file(std::path::Path::new("/usr/bin/apt-get"))?;
+    let apt_cache_digest =
+        digest_no_follow_regular_file(std::path::Path::new("/usr/bin/apt-cache"))?;
+    let dpkg_digest = digest_no_follow_regular_file(std::path::Path::new("/usr/bin/dpkg"))?;
     let key_digest = content_digest(&key_bytes)?;
     let dpkg_config_digest = digest_dpkg_configuration(
         std::path::Path::new("/etc/dpkg/dpkg.cfg"),
@@ -1340,6 +1349,7 @@ fn resolve_apt_on_linux(
         architecture,
         &os_release,
         &apt_digest,
+        &apt_cache_digest,
         &dpkg_digest,
         &key_digest,
         &dpkg_config_digest,
@@ -1371,10 +1381,15 @@ fn resolve_apt_on_linux(
         metadata_digest,
         signature_digest: key_digest,
     }];
-    let archives = resolve_archives_from_package_metadata(&outputs[8], &outputs[9], |package| {
-        let command = apt_package_metadata_command(package, workspace_text)?;
-        run_fixed_command(&command, workspace_text)
-    })?;
+    let archives = resolve_archives_from_package_metadata(
+        &request.canonical_repository,
+        &outputs[8],
+        &outputs[9],
+        |package| {
+            let command = apt_package_metadata_command(package, workspace_text)?;
+            run_fixed_command(&command, workspace_text)
+        },
+    )?;
     validate_simulated_archive_closure(&outputs[8], &archives)?;
     let mut risks = parse_solver_risks(&outputs[8], &outputs[7], &outputs[5]);
     let closure_names = archives
@@ -1424,14 +1439,10 @@ fn resolve_apt_on_linux(
     ));
     let before = PackageObservationV1 { installed_versions };
 
-    if content_digest(
-        &fs::read("/usr/bin/apt-get")
-            .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?,
-    )? != apt_digest
-        || content_digest(
-            &fs::read("/usr/bin/dpkg")
-                .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?,
-        )? != dpkg_digest
+    if digest_no_follow_regular_file(std::path::Path::new("/usr/bin/apt-get"))? != apt_digest
+        || digest_no_follow_regular_file(std::path::Path::new("/usr/bin/apt-cache"))?
+            != apt_cache_digest
+        || digest_no_follow_regular_file(std::path::Path::new("/usr/bin/dpkg"))? != dpkg_digest
         || content_digest(&read_trusted_signing_key(&request.repository.signed_by)?)?
             != signed_metadata[0].signature_digest
         || digest_dpkg_configuration(
@@ -1557,10 +1568,13 @@ fn valid_apt_repository(value: &str) -> bool {
     };
     url.scheme() == "https"
         && !url.cannot_be_a_base()
+        && url.host_str().is_some()
         && url.username().is_empty()
         && url.password().is_none()
         && url.query().is_none()
         && url.fragment().is_none()
+        && !value.contains('%')
+        && url.as_str().trim_end_matches('/') == value.trim_end_matches('/')
 }
 
 fn run_fixed_command(
@@ -1643,6 +1657,7 @@ fn manager_binding_from_evidence(
     architecture: &str,
     os_release: &str,
     apt_digest: &Sha256Digest,
+    apt_cache_digest: &Sha256Digest,
     dpkg_digest: &Sha256Digest,
     key_digest: &Sha256Digest,
     dpkg_config_digest: &Sha256Digest,
@@ -1651,7 +1666,7 @@ fn manager_binding_from_evidence(
     let dpkg_version = parse_tool_version(dpkg_version_output, "version")?;
     let executable_digest = digest_domain_json(
         "commonkit.apt-executable-binding.v1",
-        &(apt_digest, dpkg_digest),
+        &(apt_digest, apt_cache_digest, dpkg_digest),
     )
     .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))?;
     let config_digest = digest_domain_json(
@@ -1989,6 +2004,34 @@ fn content_digest(bytes: &[u8]) -> Result<Sha256Digest, AptResolutionCommandErro
         .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))
 }
 
+fn digest_no_follow_regular_file(
+    path: &std::path::Path,
+) -> Result<Sha256Digest, AptResolutionCommandError> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(AptResolutionCommandError::Unavailable(format!(
+            "required executable is not a no-follow regular file: {}",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    content_digest(&bytes)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AptPrintUriRecord {
     immutable_locator: String,
@@ -2017,7 +2060,9 @@ fn parse_print_uri_records(
         .filter(|line| !line.is_empty())
     {
         if !line.starts_with('\'') {
-            continue;
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT print-uris output contains an unknown nonempty line".into(),
+            ));
         }
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.len() != 4 {
@@ -2165,7 +2210,7 @@ fn parse_package_metadata_record(
     }
     let filename = fields["Filename"];
     if filename.starts_with('/')
-        || filename.contains(['\\', '?', '#'])
+        || filename.contains(['\\', '?', '#', '%'])
         || filename
             .split('/')
             .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
@@ -2194,6 +2239,7 @@ fn parse_package_metadata_record(
 }
 
 fn resolve_archives_from_package_metadata(
+    canonical_repository: &str,
     simulation: &str,
     print_uris: &str,
     mut load_metadata: impl FnMut(&AptResolvedPackageV1) -> Result<String, AptResolutionCommandError>,
@@ -2222,7 +2268,14 @@ fn resolve_archives_from_package_metadata(
                 "APT signed package metadata has no matching archive URI".into(),
             )
         })?;
-        if metadata.size != print_record.size
+        let expected_locator = format!(
+            "{}/{}",
+            canonical_repository.trim_end_matches('/'),
+            metadata.filename
+        );
+        if !valid_apt_repository(canonical_repository)
+            || print_record.immutable_locator != expected_locator
+            || metadata.size != print_record.size
             || print_record
                 .reported_sha256
                 .as_ref()
@@ -2495,6 +2548,7 @@ mod tests {
         print_uris: &str,
     ) -> Result<Vec<AptResolvedArchiveV1>, AptResolutionCommandError> {
         resolve_archives_from_package_metadata(
+            "https://archive.ubuntu.com/ubuntu",
             include_str!("../tests/fixtures/apt/simulate-safe.txt"),
             print_uris,
             |package| match package.name.as_str() {
@@ -2557,9 +2611,12 @@ mod tests {
 
         for metadata in cases {
             assert!(
-                resolve_archives_from_package_metadata(simulation, md5_print_uri, |_| {
-                    Ok(metadata.clone())
-                })
+                resolve_archives_from_package_metadata(
+                    "https://archive.ubuntu.com/ubuntu",
+                    simulation,
+                    md5_print_uri,
+                    |_| Ok(metadata.clone()),
+                )
                 .is_err()
             );
         }
@@ -2573,11 +2630,68 @@ mod tests {
                 "SHA256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             );
         assert!(
-            resolve_archives_from_package_metadata(simulation, &sha256_mismatch, |_| {
-                Ok(base.into())
-            })
+            resolve_archives_from_package_metadata(
+                "https://archive.ubuntu.com/ubuntu",
+                simulation,
+                &sha256_mismatch,
+                |_| Ok(base.into()),
+            )
             .is_err()
         );
+    }
+
+    #[test]
+    fn archive_uri_must_match_the_full_signed_filename_under_the_canonical_repository() {
+        let simulation = "Inst curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])\n";
+        let metadata = include_str!("../tests/fixtures/apt/package-show-curl.txt");
+        let filename = "curl_8.5.0-2ubuntu10.6_amd64.deb";
+        let cases = [
+            format!(
+                "'https://archive.ubuntu.com/ubuntu/pool/universe/c/curl/{filename}' {filename} 14 MD5Sum:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            ),
+            format!(
+                "'https://mirror.invalid/ubuntu/pool/main/c/curl/{filename}' {filename} 14 MD5Sum:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            ),
+            format!(
+                "'http://archive.ubuntu.com/ubuntu/pool/main/c/curl/{filename}' {filename} 14 MD5Sum:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            ),
+            format!(
+                "'https://archive.ubuntu.com/ubuntu/pool/main/c/curl/../curl/{filename}' {filename} 14 MD5Sum:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            ),
+            format!(
+                "'https://archive.ubuntu.com/ubuntu/pool/main/c/%63url/{filename}' {filename} 14 MD5Sum:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            ),
+        ];
+
+        for print_uri in cases {
+            assert!(
+                resolve_archives_from_package_metadata(
+                    "https://archive.ubuntu.com/ubuntu",
+                    simulation,
+                    &print_uri,
+                    |_| Ok(metadata.into()),
+                )
+                .is_err(),
+                "accepted untrusted archive URI: {print_uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn print_uri_output_rejects_every_unknown_nonempty_line() {
+        let valid = include_str!("../tests/fixtures/apt/print-uris-weak.txt");
+        for hostile in [
+            format!("unexpected APT output\n{valid}"),
+            valid.replacen('\'', "", 1),
+            format!(
+                "{valid}https://mirror.invalid/curl.deb curl.deb 14 MD5Sum:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            ),
+        ] {
+            assert!(
+                parse_print_uri_records(&hostile).is_err(),
+                "accepted unknown print-URI output: {hostile}"
+            );
+        }
     }
 
     #[test]
@@ -2601,7 +2715,34 @@ mod tests {
         );
         assert!(rendered.contains("Dir::State::lists=<private>/lists"));
         assert!(rendered.contains("Dir::State::status=<private>/status"));
+        assert!(rendered.contains("Dir::Cache::pkgcache=<private>/pkgcache.bin"));
+        assert!(rendered.contains("Dir::Cache::srcpkgcache=<private>/srcpkgcache.bin"));
         assert!(rendered.ends_with("show curl:amd64=8.5.0-2ubuntu10.6"));
+    }
+
+    #[test]
+    fn manager_binding_includes_the_apt_cache_executable() {
+        let digest = |character: char| {
+            Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
+        };
+        let binding = |apt_cache_digest: &Sha256Digest| {
+            manager_binding_from_evidence(
+                "apt 2.7.14 (amd64)\n",
+                "Debian 'dpkg' package management program version 1.22.6 (amd64).\n",
+                "Acquire::Languages \"none\";\n",
+                "deb [arch=amd64 signed-by=<private>/archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main\n",
+                "amd64",
+                "ID=ubuntu\nVERSION_ID=24.04\nVERSION_CODENAME=noble\n",
+                &digest('a'),
+                apt_cache_digest,
+                &digest('b'),
+                &digest('c'),
+                &digest('d'),
+            )
+            .unwrap()
+        };
+
+        assert_ne!(binding(&digest('e')), binding(&digest('f')));
     }
 
     #[test]
@@ -2976,5 +3117,24 @@ mod tests {
                 Err(AptResolutionCommandError::Unavailable(_))
             ));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apt_executable_digest_does_not_follow_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let executable = root.path().join("apt-cache");
+        let linked = root.path().join("linked-apt-cache");
+        fs::write(&executable, b"trusted apt-cache bytes").unwrap();
+        std::os::unix::fs::symlink(&executable, &linked).unwrap();
+
+        assert_eq!(
+            digest_no_follow_regular_file(&executable).unwrap(),
+            content_digest(b"trusted apt-cache bytes").unwrap()
+        );
+        assert!(matches!(
+            digest_no_follow_regular_file(&linked),
+            Err(AptResolutionCommandError::Unavailable(_))
+        ));
     }
 }
