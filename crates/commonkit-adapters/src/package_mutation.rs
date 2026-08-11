@@ -32,6 +32,10 @@ pub trait PackageMutationBackend: Send {
         self.manager() == manager
     }
 
+    fn supports_target(&self, _resolution: &PackageResolutionV1) -> bool {
+        true
+    }
+
     fn observe(
         &mut self,
         resolution: &PackageResolutionV1,
@@ -484,6 +488,9 @@ fn ensure_supported(
     {
         return Err(failure("package_apt_identity_invalid"));
     }
+    if !backend.supports_target(resolution) {
+        return Err(failure("package_target_unsupported"));
+    }
     let approved = matches!(
         (&resolution.manager.manager, &resolution.recipe),
         (
@@ -602,11 +609,29 @@ pub struct ProcessOfflinePackageBackend {
 pub struct SshOfflinePackageBackend<T> {
     root_id: StableId,
     transport: T,
+    target_platform: Option<(String, String)>,
 }
 
 impl<T> SshOfflinePackageBackend<T> {
     pub fn new(root_id: StableId, transport: T) -> Self {
-        Self { root_id, transport }
+        Self {
+            root_id,
+            transport,
+            target_platform: None,
+        }
+    }
+
+    pub fn with_target_platform(
+        root_id: StableId,
+        transport: T,
+        operating_system: impl Into<String>,
+        architecture: impl Into<String>,
+    ) -> Self {
+        Self {
+            root_id,
+            transport,
+            target_platform: Some((operating_system.into(), architecture.into())),
+        }
     }
 
     fn request(
@@ -653,6 +678,12 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
 
     fn supports_manager(&self, manager: PackageManager) -> bool {
         matches!(manager, PackageManager::Apt | PackageManager::Nvm)
+    }
+
+    fn supports_target(&self, resolution: &PackageResolutionV1) -> bool {
+        self.target_platform.as_ref().is_some_and(|(os, arch)| {
+            package_target_matches_platform(&resolution.target, resolution.manager.manager, os, arch)
+        })
     }
 
     fn observe(
@@ -791,6 +822,15 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         matches!(manager, PackageManager::Apt | PackageManager::Nvm)
     }
 
+    fn supports_target(&self, resolution: &PackageResolutionV1) -> bool {
+        package_target_matches_platform(
+            &resolution.target,
+            resolution.manager.manager,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    }
+
     fn observe(
         &mut self,
         resolution: &PackageResolutionV1,
@@ -905,6 +945,35 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         } else {
             self.prepare_offline(resolution, artifacts)
         }
+    }
+}
+
+fn package_target_matches_platform(
+    target: &crate::PackageTargetV1,
+    manager: PackageManager,
+    operating_system: &str,
+    architecture: &str,
+) -> bool {
+    let os_matches = match manager {
+        PackageManager::Apt => operating_system.eq_ignore_ascii_case("linux"),
+        PackageManager::Nvm => {
+            operating_system.eq_ignore_ascii_case("linux")
+                || operating_system.eq_ignore_ascii_case("macos")
+                || operating_system.eq_ignore_ascii_case("darwin")
+        }
+        _ => false,
+    };
+    os_matches
+        && target.os.eq_ignore_ascii_case(operating_system)
+        && canonical_arch(&target.arch) == canonical_arch(architecture)
+}
+
+fn canonical_arch(architecture: &str) -> std::borrow::Cow<'_, str> {
+    match architecture.to_ascii_lowercase().as_str() {
+        "x86_64" | "amd64" => "x86_64".into(),
+        "aarch64" | "arm64" => "aarch64".into(),
+        "armv7" | "armv7l" => "arm".into(),
+        other => other.to_owned().into(),
     }
 }
 

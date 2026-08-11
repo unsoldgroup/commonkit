@@ -28,6 +28,7 @@ fn digest(seed: char) -> Sha256Digest {
 #[derive(Clone)]
 struct FakeMutationBackend {
     manager: PackageManager,
+    target_supported: bool,
     observed: PackageObservationV1,
     calls: Arc<Mutex<Vec<&'static str>>>,
 }
@@ -35,6 +36,10 @@ struct FakeMutationBackend {
 impl PackageMutationBackend for FakeMutationBackend {
     fn manager(&self) -> PackageManager {
         self.manager
+    }
+
+    fn supports_target(&self, _resolution: &PackageResolutionV1) -> bool {
+        self.target_supported
     }
 
     fn observe(
@@ -176,6 +181,7 @@ fn approved_apt_resolution_delegates_only_offline_mutation_calls() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
+        target_supported: true,
         observed: resolution.before.clone(),
         calls: calls.clone(),
     };
@@ -206,6 +212,7 @@ fn unsupported_manager_fails_before_backend_mutation() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
+        target_supported: true,
         observed: resolution.before.clone(),
         calls: calls.clone(),
     };
@@ -239,6 +246,7 @@ fn apt_recovery_rejects_ambiguous_all_and_native_identity_before_backend_mutatio
     let calls = Arc::new(Mutex::new(Vec::new()));
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
+        target_supported: true,
         observed: resolution.before.clone(),
         calls: calls.clone(),
     };
@@ -460,4 +468,30 @@ fn apt_recovery_resolves_all_and_native_architectures_in_the_closure() {
         adapter.observe_recovery(&operation(resolution_ref.digest)),
         Ok(RecoveryObservation::After)
     );
+}
+
+#[test]
+fn unsupported_target_platform_fails_before_backend_mutation() {
+    let (resolution, authority) = apt_resolution();
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: false,
+        observed: resolution.before.clone(),
+        calls: calls.clone(),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+    let error = adapter
+        .preflight(&operation(resolution_ref.digest))
+        .unwrap_err();
+    assert_eq!(error.code, "package_target_unsupported");
+    assert!(calls.lock().unwrap().is_empty());
 }
