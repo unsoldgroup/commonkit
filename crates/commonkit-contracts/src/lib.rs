@@ -16,6 +16,8 @@ pub const CONTRACT_VERSION: &str = "1.0";
 pub const SCHEMA_VERSION: u32 = 1;
 pub const FORWARD_CONTRACT_VERSION: &str = "2.0";
 pub const FORWARD_SCHEMA_VERSION: u32 = 2;
+pub const PACKAGE_RECEIPT_CONTRACT_VERSION: &str = "3.0";
+pub const PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 3;
 
 pub fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, ContractError> {
     serde_jcs::to_vec(value).map_err(|_| ContractError::Canonicalization)
@@ -1439,6 +1441,46 @@ pub struct ReceiptTransition {
     pub entry_digest: Sha256Digest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageNoPreimageReason {
+    AdditiveForwardOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PackageExitClassification {
+    NotRun,
+    Succeeded,
+    Failed { code: StableId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageReceiptEvidence {
+    pub operation_id: Sha256Digest,
+    pub resolution_digest: Sha256Digest,
+    pub target_authority_digest: Sha256Digest,
+    pub manager: PackageManager,
+    pub manager_authority_digest: Sha256Digest,
+    pub source_id: StableId,
+    pub source_authority_digest: Sha256Digest,
+    pub before_installed_versions: BTreeSet<String>,
+    pub no_preimage_reason: PackageNoPreimageReason,
+    pub exit_classification: PackageExitClassification,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_digest: Option<Sha256Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageReceiptAuthorization {
+    pub consent_digest: Sha256Digest,
+    pub confirmation_id: StableId,
+    pub operation_set_digest: Sha256Digest,
+    pub evidence: Vec<PackageReceiptEvidence>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunReceipt {
@@ -1452,6 +1494,8 @@ pub struct RunReceipt {
     pub observed_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
     pub bindings: PlanBindings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_authorization: Option<PackageReceiptAuthorization>,
     pub state: ReceiptState,
     pub operation_progress: Vec<OperationProgress>,
     pub transitions: Vec<ReceiptTransition>,
@@ -1908,6 +1952,8 @@ pub fn receipt_schema() -> Result<Value, ContractError> {
             "canceled",
         ],
     )?;
+    remove_schema_property(&mut schema, "packageAuthorization")?;
+    remove_package_receipt_definitions(&mut schema)?;
     Ok(schema)
 }
 
@@ -1921,6 +1967,36 @@ pub fn receipt_v2_schema() -> Result<Value, ContractError> {
         FORWARD_SCHEMA_VERSION,
         FORWARD_CONTRACT_VERSION,
     )?;
+    remove_schema_property(&mut schema, "packageAuthorization")?;
+    remove_package_receipt_definitions(&mut schema)?;
+    Ok(schema)
+}
+
+pub fn receipt_v3_schema() -> Result<Value, ContractError> {
+    let mut schema = schema_with_id(
+        schema_for!(RunReceipt),
+        "https://schemas.commonkit.dev/v3/receipt.schema.json",
+    )?;
+    constrain_wire_version(
+        &mut schema,
+        PACKAGE_RECEIPT_SCHEMA_VERSION,
+        PACKAGE_RECEIPT_CONTRACT_VERSION,
+    )?;
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?
+        .insert(
+            "packageAuthorization".into(),
+            serde_json::json!({"$ref": "#/$defs/PackageReceiptAuthorization"}),
+        );
+    let required = schema
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    if !required.iter().any(|value| value == "packageAuthorization") {
+        required.push(Value::String("packageAuthorization".into()));
+    }
     Ok(schema)
 }
 
@@ -1999,6 +2075,35 @@ fn retain_schema_enum(
         .and_then(Value::as_array_mut)
         .ok_or(ContractError::SchemaGeneration)?;
     values.retain(|value| value.as_str().is_some_and(|value| allowed.contains(&value)));
+    Ok(())
+}
+
+fn remove_schema_property(schema: &mut Value, property: &str) -> Result<(), ContractError> {
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?
+        .remove(property);
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|value| value.as_str() != Some(property));
+    }
+    Ok(())
+}
+
+fn remove_package_receipt_definitions(schema: &mut Value) -> Result<(), ContractError> {
+    let definitions = schema
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    for definition in [
+        "PackageExitClassification",
+        "PackageManager",
+        "PackageNoPreimageReason",
+        "PackageReceiptAuthorization",
+        "PackageReceiptEvidence",
+    ] {
+        definitions.remove(definition);
+    }
     Ok(())
 }
 

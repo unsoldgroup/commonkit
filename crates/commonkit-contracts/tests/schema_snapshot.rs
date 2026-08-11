@@ -28,6 +28,10 @@ fn checked_in_layer_schema_matches_the_rust_contract() {
         commonkit_contracts::receipt_v2_schema(),
     );
     assert_schema(
+        "receipt-v3.schema.json",
+        commonkit_contracts::receipt_v3_schema(),
+    );
+    assert_schema(
         "diagnostics.schema.json",
         commonkit_contracts::diagnostics_schema(),
     );
