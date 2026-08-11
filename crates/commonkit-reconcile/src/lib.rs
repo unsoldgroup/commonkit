@@ -782,7 +782,8 @@ fn open_plan_file(
     }
     #[cfg(windows)]
     {
-        open_plan_file_windows(directory, name, root_path)
+        let _ = root_path;
+        open_plan_file_windows(directory, name)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -801,43 +802,73 @@ fn open_plan_file(
 fn open_plan_file_windows(
     directory: &Dir,
     name: &Path,
-    root_path: &Path,
 ) -> Result<(cap_std::fs::File, cap_std::fs::Metadata), PlanStoreError> {
     use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
     use std::os::windows::io::FromRawHandle;
-    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_SYNCHRONOUS_IO_NONALERT,
+        NtCreateFile,
     };
+    use windows_sys::Win32::Foundation::{GENERIC_READ, HANDLE, UNICODE_STRING};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    let path = root_path.join(name);
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    wide.push(0);
-    // SAFETY: `wide` is NUL-terminated and remains alive for the call. The
-    // returned handle is owned and converted immediately when valid.
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
+    let mut components = name.components();
+    let Some(std::path::Component::Normal(leaf)) = components.next() else {
+        return Err(PlanStoreError::UnsafeEntry);
+    };
+    if components.next().is_some() {
+        return Err(PlanStoreError::UnsafeEntry);
+    }
+    let wide: Vec<u16> = leaf.encode_wide().collect();
+    if wide.is_empty() || wide.len() > (u16::MAX as usize / 2) {
+        return Err(PlanStoreError::UnsafeEntry);
+    }
+    let mut unicode = UNICODE_STRING {
+        Length: (wide.len() * 2) as u16,
+        MaximumLength: (wide.len() * 2) as u16,
+        Buffer: wide.as_ptr() as *mut u16,
+    };
+    let root = directory.try_clone()?.into_std_file();
+    let mut attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: root.as_raw_handle() as HANDLE,
+        ObjectName: &mut unicode,
+        Attributes: 0,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let mut handle: HANDLE = std::ptr::null_mut();
+    // SAFETY: all pointed-to structures remain alive for the synchronous call;
+    // RootDirectory is a retained directory handle and the leaf is one component.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
             GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &mut attributes,
+            &mut status_block,
             std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_ATTRIBUTE_NORMAL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
             0,
         )
     };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(std::io::Error::last_os_error().into());
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status).into());
     }
-    // SAFETY: `handle` is a valid owned handle from CreateFileW.
+    // SAFETY: NtCreateFile returned success and initialized an owned HANDLE.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let file = cap_std::fs::File::from_std(file);
     let metadata = file.metadata()?;
     if !metadata.is_file() || cap_metadata_is_reparse_point(&metadata) {
         return Err(PlanStoreError::UnsafeEntry);
     }
-    let _ = directory;
     Ok((file, metadata))
 }
 
@@ -2422,5 +2453,21 @@ mod plan_file_windows_tests {
         assert!(same_directory(&handle, &handle).expect("identity"));
         handle.sync_all().expect("directory flush contract");
         fs::remove_dir(path).expect("cleanup");
+    }
+
+    #[test]
+    fn windows_leaf_open_uses_the_retained_directory_handle_contract() {
+        let path = std::env::temp_dir().join(format!(
+            "commonkit-plan-leaf-{}-{}",
+            std::process::id(),
+            PLAN_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).expect("temporary root");
+        fs::write(path.join("plan.json"), b"plan").expect("plan");
+        let (directory, _handle) = open_plan_root(&path).expect("open root");
+        let (file, _) =
+            open_plan_file_windows(&directory, Path::new("plan.json")).expect("open relative leaf");
+        assert_eq!(file.metadata().expect("metadata").len(), 4);
+        fs::remove_dir_all(path).expect("cleanup");
     }
 }
