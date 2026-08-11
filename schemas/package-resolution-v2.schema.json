@@ -1,0 +1,569 @@
+{
+  "$defs": {
+    "ArtifactEvidence": {
+      "additionalProperties": false,
+      "properties": {
+        "authority": {
+          "type": "string"
+        },
+        "metadataDigest": {
+          "type": "string"
+        },
+        "signatureDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "authority",
+        "metadataDigest",
+        "signatureDigest"
+      ],
+      "type": "object"
+    },
+    "ContentReference": {
+      "additionalProperties": false,
+      "properties": {
+        "bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "digest": {
+          "type": "string"
+        },
+        "sensitivity": {
+          "$ref": "#/$defs/ContentSensitivity"
+        }
+      },
+      "required": [
+        "digest",
+        "bytes",
+        "sensitivity"
+      ],
+      "type": "object"
+    },
+    "ContentSensitivity": {
+      "enum": [
+        "portable",
+        "local_sensitive"
+      ],
+      "type": "string"
+    },
+    "ManagerBindingV1": {
+      "additionalProperties": false,
+      "properties": {
+        "configDigest": {
+          "type": "string"
+        },
+        "executableDigest": {
+          "type": "string"
+        },
+        "manager": {
+          "$ref": "#/$defs/PackageManager"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "manager",
+        "version",
+        "executableDigest",
+        "configDigest"
+      ],
+      "type": "object"
+    },
+    "NodeOfflineInstallRecipeV1": {
+      "additionalProperties": false,
+      "properties": {
+        "archiveFileName": {
+          "type": "string"
+        },
+        "cacheRelativePath": {
+          "type": "string"
+        },
+        "installLatestNpm": {
+          "type": "boolean"
+        },
+        "migratePackages": {
+          "type": "boolean"
+        },
+        "noSourceFallback": {
+          "type": "boolean"
+        },
+        "nodeVersion": {
+          "type": "string"
+        },
+        "nvmScriptDigest": {
+          "type": "string"
+        },
+        "nvmVersion": {
+          "type": "string"
+        },
+        "offline": {
+          "type": "boolean"
+        },
+        "perVersionLock": {
+          "type": "boolean"
+        },
+        "shellExecutableDigest": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "nodeVersion",
+        "archiveFileName",
+        "cacheRelativePath",
+        "nvmVersion",
+        "nvmScriptDigest",
+        "shellExecutableDigest",
+        "offline",
+        "noSourceFallback",
+        "perVersionLock",
+        "installLatestNpm",
+        "migratePackages"
+      ],
+      "type": "object"
+    },
+    "OfflineInstallRecipeV1": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_roles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "homebrew_bottle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "artifact_roles"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_roles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "apt_archives",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "artifact_roles"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_roles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "install": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NodeOfflineInstallRecipeV1"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": {
+              "const": "node_archive",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "artifact_roles",
+            "install"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "artifact_roles": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "rust_toolchain",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "artifact_roles"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PackageArtifactV1": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "$ref": "#/$defs/ContentReference"
+        },
+        "materializationKey": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sourceMetadataDigest": {
+          "type": "string"
+        },
+        "upstreamChecksum": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "role",
+        "content",
+        "upstreamChecksum",
+        "size",
+        "materializationKey",
+        "sourceMetadataDigest"
+      ],
+      "type": "object"
+    },
+    "PackageDeclaration": {
+      "additionalProperties": false,
+      "description": "An exact package declaration resolved only by the trusted controller.\n\n`id` is the stable merge and report identity, `version` is an exact pin,\n`manager` selects the fixed read-only query backend, and `source` is matched\nagainst `securityPolicy.allowlists.package_sources`.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "manager": {
+          "$ref": "#/$defs/PackageManager"
+        },
+        "selector": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PackageSelector"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "manager",
+        "source"
+      ],
+      "type": "object"
+    },
+    "PackageManager": {
+      "description": "A package/toolchain backend supported by read-only package observation.",
+      "enum": [
+        "homebrew",
+        "apt",
+        "fnm",
+        "nvm",
+        "rustup"
+      ],
+      "type": "string"
+    },
+    "PackageObservationV1": {
+      "additionalProperties": false,
+      "properties": {
+        "installedVersions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "installedVersions"
+      ],
+      "type": "object"
+    },
+    "PackageSelector": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "homebrew_formula",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "architecture": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "apt_binary",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "type": {
+              "const": "node_runtime",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "components": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "profile": {
+              "$ref": "#/$defs/RustToolchainProfile"
+            },
+            "targets": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "type": {
+              "const": "rust_toolchain",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "profile"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PackageTargetV1": {
+      "additionalProperties": false,
+      "properties": {
+        "arch": {
+          "type": "string"
+        },
+        "codename": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "distroId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "distroVersion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "libc": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "managerPrefix": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "os": {
+          "type": "string"
+        },
+        "osVersion": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "os",
+        "osVersion",
+        "arch"
+      ],
+      "type": "object"
+    },
+    "ResolvedPackage": {
+      "additionalProperties": false,
+      "properties": {
+        "declaration": {
+          "$ref": "#/$defs/PackageDeclaration"
+        },
+        "source": {
+          "$ref": "#/$defs/SourceBindingV1"
+        }
+      },
+      "required": [
+        "declaration"
+      ],
+      "type": "object"
+    },
+    "RustToolchainProfile": {
+      "enum": [
+        "minimal"
+      ],
+      "type": "string"
+    },
+    "SourceBindingV1": {
+      "additionalProperties": false,
+      "properties": {
+        "canonicalRepository": {
+          "type": "string"
+        },
+        "registryDefinitionDigest": {
+          "type": "string"
+        },
+        "repositoryRevision": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signedMetadata": {
+          "items": {
+            "$ref": "#/$defs/ArtifactEvidence"
+          },
+          "type": "array"
+        },
+        "sourceId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sourceId",
+        "registryDefinitionDigest",
+        "canonicalRepository",
+        "signedMetadata"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://schemas.commonkit.dev/v2/package-resolution.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "items": {
+        "$ref": "#/$defs/PackageArtifactV1"
+      },
+      "type": "array"
+    },
+    "before": {
+      "$ref": "#/$defs/PackageObservationV1"
+    },
+    "closure": {
+      "items": {
+        "$ref": "#/$defs/ResolvedPackage"
+      },
+      "type": "array"
+    },
+    "declaration": {
+      "$ref": "#/$defs/PackageDeclaration"
+    },
+    "manager": {
+      "$ref": "#/$defs/ManagerBindingV1"
+    },
+    "recipe": {
+      "$ref": "#/$defs/OfflineInstallRecipeV1"
+    },
+    "schemaVersion": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "source": {
+      "$ref": "#/$defs/SourceBindingV1"
+    },
+    "target": {
+      "$ref": "#/$defs/PackageTargetV1"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "declaration",
+    "target",
+    "manager",
+    "source",
+    "before",
+    "closure",
+    "artifacts",
+    "recipe"
+  ],
+  "title": "PackageResolutionV2",
+  "type": "object"
+}

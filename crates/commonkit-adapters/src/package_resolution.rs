@@ -15,6 +15,19 @@ use crate::{
     PackageDesiredIntent, ProviderContractError, ResolvedMaterializedState, ResourceIntent,
 };
 
+pub const COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS: &[&str] = &[
+    "5be8a3f6c8a5c01d106c0ad820b1a390b168d356",
+    "dd792f5973c6de52c432cbdac77abfa00ddbf2b7",
+    "cc68f5a3106ff448322e48ed27f5e38d5b0a215f",
+    "8fcca13fef1d0c2e91008e09770f7a9a5ae15600",
+    "890c08db8579162fee0df9db8beab4dfcf555ef4",
+    "c82fa3ae1cbedc6be46b9360c43cec45c17ab93c",
+    "108f52b48db57bb0cc439b2997b01419bd92f80a",
+    "a363a499291cbbc940dd62e41f10027af002f8b0",
+    "71dcfd284a79c3b38668286bc97ec7a07ede3fc1",
+    "86c8d74642e67846f8e120284daa80d1e737bc9f",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageTargetV1 {
@@ -97,10 +110,36 @@ pub struct PackageArtifactV1 {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum OfflineInstallRecipeV1 {
-    HomebrewBottle { artifact_roles: BTreeSet<StableId> },
-    AptArchives { artifact_roles: BTreeSet<StableId> },
-    NodeArchive { artifact_roles: BTreeSet<StableId> },
-    RustToolchain { artifact_roles: BTreeSet<StableId> },
+    HomebrewBottle {
+        artifact_roles: BTreeSet<StableId>,
+    },
+    AptArchives {
+        artifact_roles: BTreeSet<StableId>,
+    },
+    NodeArchive {
+        artifact_roles: BTreeSet<StableId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        install: Option<NodeOfflineInstallRecipeV1>,
+    },
+    RustToolchain {
+        artifact_roles: BTreeSet<StableId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeOfflineInstallRecipeV1 {
+    pub node_version: String,
+    pub archive_file_name: String,
+    pub cache_relative_path: String,
+    pub nvm_version: String,
+    pub nvm_script_digest: Sha256Digest,
+    pub shell_executable_digest: Sha256Digest,
+    pub offline: bool,
+    pub no_source_fallback: bool,
+    pub per_version_lock: bool,
+    pub install_latest_npm: bool,
+    pub migrate_packages: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -185,9 +224,40 @@ pub fn package_resolution_schema() -> Result<serde_json::Value, serde_json::Erro
     if let Some(required) = schema["$defs"]["ResolvedPackage"]["required"].as_array_mut() {
         required.retain(|field| field != "source");
     }
+    if let Some(node_recipe) = schema["$defs"]["OfflineInstallRecipeV1"]["oneOf"]
+        .as_array_mut()
+        .and_then(|variants| variants.get_mut(2))
+    {
+        node_recipe["properties"]
+            .as_object_mut()
+            .map(|properties| properties.remove("install"));
+    }
+    schema["$defs"]
+        .as_object_mut()
+        .map(|definitions| definitions.remove("NodeOfflineInstallRecipeV1"));
     schema["$id"] = serde_json::Value::String(
         "https://schemas.commonkit.dev/v1/package-resolution.schema.json".into(),
     );
+    Ok(schema)
+}
+
+pub fn package_resolution_v2_schema() -> Result<serde_json::Value, serde_json::Error> {
+    let mut schema = serde_json::to_value(schema_for!(PackageResolutionV1))?;
+    if let Some(required) = schema["$defs"]["ResolvedPackage"]["required"].as_array_mut() {
+        required.retain(|field| field != "source");
+    }
+    if let Some(node_recipe) = schema["$defs"]["OfflineInstallRecipeV1"]["oneOf"]
+        .as_array_mut()
+        .and_then(|variants| variants.get_mut(2))
+    {
+        if let Some(required) = node_recipe["required"].as_array_mut() {
+            required.push(serde_json::Value::String("install".into()));
+        }
+    }
+    schema["$id"] = serde_json::Value::String(
+        "https://schemas.commonkit.dev/v2/package-resolution.schema.json".into(),
+    );
+    schema["title"] = serde_json::Value::String("PackageResolutionV2".into());
     Ok(schema)
 }
 
@@ -200,6 +270,13 @@ pub struct PackageFetchRequestV1 {
     pub size: u64,
     pub materialization_key: StableId,
     pub source_metadata_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PackageDiscoveryFetchRequestV1 {
+    pub role: StableId,
+    pub immutable_locator: String,
+    pub maximum_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,9 +306,16 @@ pub struct PackageResolutionRequestV1<'a> {
     pub canonical_repository: &'a str,
     pub registry_definition_digest: &'a Sha256Digest,
     pub apt_source_authority: Option<&'a AptSourceAuthorityV1>,
+    pub node_source_authority: Option<&'a NodeSourceAuthorityV1>,
 }
 
 pub trait PackageFetch {
+    /// Validates a complete immutable locator set before the first response is
+    /// requested. The coordinator's scoped wrapper enforces source roots.
+    fn preflight_locators(&mut self, _locators: &[String]) -> Result<(), PackageResolutionError> {
+        Ok(())
+    }
+
     /// Fetches exactly one HTTP response. Implementations must disable
     /// automatic redirect following and return every redirect as a hop.
     fn fetch_hop(
@@ -239,10 +323,43 @@ pub trait PackageFetch {
         request: &PackageFetchRequestV1,
         locator: &str,
     ) -> Result<PackageFetchHopV1, PackageResolutionError>;
+
+    /// Fetches authenticated metadata whose digest is learned only after its
+    /// signature has been verified. This remains a per-hop capability.
+    fn fetch_discovery_hop(
+        &mut self,
+        request: &PackageDiscoveryFetchRequestV1,
+        locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError> {
+        let placeholder = PackageFetchRequestV1 {
+            role: request.role.clone(),
+            immutable_locator: request.immutable_locator.clone(),
+            upstream_checksum: Sha256Digest::parse(format!("sha256:{}", "0".repeat(64)))?,
+            size: 0,
+            materialization_key: request.role.clone(),
+            source_metadata_digest: Sha256Digest::parse(format!("sha256:{}", "0".repeat(64)))?,
+        };
+        self.fetch_hop(&placeholder, locator)
+    }
+}
+
+pub struct PackageFetchedResolutionV1 {
+    pub probe: PackageResolutionProbeV1,
+    pub draft: PackageResolutionDraftV1,
+    pub fetched: Vec<(PackageFetchRequestV1, Vec<u8>)>,
 }
 
 pub trait PackageResolutionBackend {
     fn manager(&self) -> PackageManager;
+
+    /// Pure/local capability validation performed for the entire desired
+    /// state before any resolver receives network authority.
+    fn preflight_resolution(
+        &mut self,
+        _request: &PackageResolutionRequestV1<'_>,
+    ) -> Result<(), PackageResolutionError> {
+        Ok(())
+    }
 
     fn probe(
         &mut self,
@@ -254,6 +371,16 @@ pub trait PackageResolutionBackend {
         request: &PackageResolutionRequestV1<'_>,
         source: &SourceBindingV1,
     ) -> Result<PackageResolutionDraftV1, PackageResolutionError>;
+
+    /// Optional staged resolution for registries such as Node where signed
+    /// metadata must be fetched before archive checksums are known.
+    fn resolve_and_fetch(
+        &mut self,
+        _request: &PackageResolutionRequestV1<'_>,
+        _fetch: &mut dyn PackageFetch,
+    ) -> Result<Option<PackageFetchedResolutionV1>, PackageResolutionError> {
+        Ok(None)
+    }
 
     fn fetch_artifacts(
         &mut self,
@@ -295,6 +422,8 @@ struct PackageSourceDefinitionV1<'a> {
     approved_artifact_roots: &'a BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     apt_source_authority: Option<&'a AptSourceAuthorityV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_source_authority: Option<&'a NodeSourceAuthorityV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,6 +435,12 @@ pub struct AptSourceAuthorityV1 {
     pub signing_key_digest: Sha256Digest,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NodeSourceAuthorityV1 {
+    pub release_key_fingerprints: BTreeSet<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageSourceDefinition {
     source_id: StableId,
@@ -313,6 +448,7 @@ struct PackageSourceDefinition {
     canonical_repository: String,
     approved_artifact_roots: BTreeSet<String>,
     apt_source_authority: Option<AptSourceAuthorityV1>,
+    node_source_authority: Option<NodeSourceAuthorityV1>,
     digest: Sha256Digest,
 }
 
@@ -346,7 +482,9 @@ fn package_source_definition_digest(
     source: &PackageSourceDefinition,
 ) -> Result<Sha256Digest, PackageResolutionError> {
     Ok(digest_domain_json(
-        if source.apt_source_authority.is_some() {
+        if source.node_source_authority.is_some() {
+            "commonkit.package-source-registry-definition.v3"
+        } else if source.apt_source_authority.is_some() {
             "commonkit.package-source-registry-definition.v2"
         } else {
             "commonkit.package-source-registry-definition.v1"
@@ -357,6 +495,7 @@ fn package_source_definition_digest(
             canonical_repository: &source.canonical_repository,
             approved_artifact_roots: &source.approved_artifact_roots,
             apt_source_authority: source.apt_source_authority.as_ref(),
+            node_source_authority: source.node_source_authority.as_ref(),
         },
     )?)
 }
@@ -371,9 +510,15 @@ fn package_source_registry_digest<'a>(
             canonical_repository: &source.canonical_repository,
             approved_artifact_roots: &source.approved_artifact_roots,
             apt_source_authority: source.apt_source_authority.as_ref(),
+            node_source_authority: source.node_source_authority.as_ref(),
         })
         .collect::<Vec<_>>();
     let domain = if entries
+        .iter()
+        .any(|entry| entry.node_source_authority.is_some())
+    {
+        "commonkit.package-source-registry.v3"
+    } else if entries
         .iter()
         .any(|entry| entry.apt_source_authority.is_some())
     {
@@ -516,6 +661,7 @@ impl PackageSourceRegistry {
                     canonical_repository: &source.canonical_repository,
                     approved_artifact_roots: &source.approved_artifact_roots,
                     apt_source_authority: source.apt_source_authority.as_ref(),
+                    node_source_authority: None,
                 },
             )?;
             if registry
@@ -527,6 +673,7 @@ impl PackageSourceRegistry {
                         canonical_repository: source.canonical_repository,
                         approved_artifact_roots: source.approved_artifact_roots,
                         apt_source_authority: source.apt_source_authority,
+                        node_source_authority: None,
                         digest,
                     },
                 )
@@ -543,9 +690,15 @@ impl PackageSourceRegistry {
                 canonical_repository: &source.canonical_repository,
                 approved_artifact_roots: &source.approved_artifact_roots,
                 apt_source_authority: source.apt_source_authority.as_ref(),
+                node_source_authority: source.node_source_authority.as_ref(),
             })
             .collect::<Vec<_>>();
         let domain = if entries
+            .iter()
+            .any(|entry| entry.node_source_authority.is_some())
+        {
+            "commonkit.package-source-registry.v3"
+        } else if entries
             .iter()
             .any(|entry| entry.apt_source_authority.is_some())
         {
@@ -594,6 +747,43 @@ impl PackageSourceRegistry {
         Ok(self)
     }
 
+    pub fn with_node_source_authority(
+        mut self,
+        source_id: &StableId,
+        authority: NodeSourceAuthorityV1,
+    ) -> Result<Self, PackageResolutionError> {
+        if !valid_node_release_fingerprints(&authority.release_key_fingerprints) {
+            return Err(PackageResolutionError::MutableSourceMetadata);
+        }
+        let source = self.sources.get_mut(source_id).ok_or_else(|| {
+            PackageResolutionError::UnknownSource {
+                source_id: source_id.clone(),
+            }
+        })?;
+        if source.manager != PackageManager::Nvm {
+            return Err(PackageResolutionError::SourceManagerMismatch);
+        }
+        source.node_source_authority = Some(authority);
+        source.digest = package_source_definition_digest(source)?;
+        self.digest = package_source_registry_digest(self.sources.values())?;
+        Ok(self)
+    }
+
+    pub fn with_commonkit_node_release_authority(
+        self,
+        source_id: &StableId,
+    ) -> Result<Self, PackageResolutionError> {
+        self.with_node_source_authority(
+            source_id,
+            NodeSourceAuthorityV1 {
+                release_key_fingerprints: COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS
+                    .iter()
+                    .map(|fingerprint| (*fingerprint).into())
+                    .collect(),
+            },
+        )
+    }
+
     pub fn digest(&self) -> &Sha256Digest {
         &self.digest
     }
@@ -627,6 +817,7 @@ struct PreparedPackageResolution {
     source: SourceBindingV1,
     before: PackageObservationV1,
     draft: PackageResolutionDraftV1,
+    fetched: Option<Vec<(PackageFetchRequestV1, Vec<u8>)>>,
 }
 
 impl<'a> PackageResolutionCoordinator<'a> {
@@ -671,8 +862,26 @@ impl<'a> PackageResolutionCoordinator<'a> {
             canonical_repository: &definition.canonical_repository,
             registry_definition_digest: &definition.digest,
             apt_source_authority: definition.apt_source_authority.as_ref(),
+            node_source_authority: definition.node_source_authority.as_ref(),
         };
-        let mut probe = self.backend.probe(&request)?;
+        self.backend.preflight_resolution(&request)?;
+        let mut scoped_fetch = RecordingPackageFetch {
+            inner: self.fetch,
+            fetched: Vec::new(),
+            approved_artifact_roots: &definition.approved_artifact_roots,
+        };
+        let fetched_resolution = self
+            .backend
+            .resolve_and_fetch(&request, &mut scoped_fetch)?;
+        let (mut probe, mut draft, fetched) = if let Some(fetched) = fetched_resolution {
+            (fetched.probe, fetched.draft, Some(fetched.fetched))
+        } else {
+            let probe = self.backend.probe(&request)?;
+            let source = source_binding(&definition, &probe);
+            validate_source(&source)?;
+            let draft = self.backend.resolve(&request, &source)?;
+            (probe, draft, None)
+        };
         probe.signed_metadata.sort();
         if probe
             .signed_metadata
@@ -681,15 +890,8 @@ impl<'a> PackageResolutionCoordinator<'a> {
         {
             return Err(PackageResolutionError::DuplicateSourceMetadata);
         }
-        let source = SourceBindingV1 {
-            source_id: definition.source_id.clone(),
-            registry_definition_digest: definition.digest.clone(),
-            canonical_repository: definition.canonical_repository.clone(),
-            repository_revision: probe.repository_revision,
-            signed_metadata: probe.signed_metadata,
-        };
+        let source = source_binding(&definition, &probe);
         validate_source(&source)?;
-        let mut draft = self.backend.resolve(&request, &source)?;
         canonicalize_draft(&mut draft)?;
         self.validate_closure(&draft.closure, declaration, &source)?;
         validate_recipe_roles(
@@ -702,6 +904,7 @@ impl<'a> PackageResolutionCoordinator<'a> {
             source,
             before: probe.before,
             draft,
+            fetched,
         })
     }
 
@@ -717,6 +920,7 @@ impl<'a> PackageResolutionCoordinator<'a> {
             source,
             before,
             draft,
+            fetched,
         } = prepared;
         let PackageDesiredIntent::Package { declaration } = &desired;
         let request = PackageResolutionRequestV1 {
@@ -727,26 +931,40 @@ impl<'a> PackageResolutionCoordinator<'a> {
             canonical_repository: &definition.canonical_repository,
             registry_definition_digest: &definition.digest,
             apt_source_authority: definition.apt_source_authority.as_ref(),
+            node_source_authority: definition.node_source_authority.as_ref(),
         };
         let source_metadata_digest = source.metadata_digest()?;
         for artifact in &draft.artifacts {
             validate_fetch_request(artifact, &definition.approved_artifact_roots)?;
         }
-        let mut recording_fetch = RecordingPackageFetch {
-            inner: self.fetch,
-            fetched: Vec::new(),
-            approved_artifact_roots: &definition.approved_artifact_roots,
+        let fetched = if let Some(fetched) = fetched {
+            fetched
+        } else {
+            let mut recording_fetch = RecordingPackageFetch {
+                inner: self.fetch,
+                fetched: Vec::new(),
+                approved_artifact_roots: &definition.approved_artifact_roots,
+            };
+            self.backend.fetch_artifacts(
+                &request,
+                &source,
+                &draft.artifacts,
+                &mut recording_fetch,
+            )?;
+            recording_fetch.fetched
         };
-        self.backend
-            .fetch_artifacts(&request, &source, &draft.artifacts, &mut recording_fetch)?;
         let artifacts = validate_and_persist_artifacts(
             &draft.artifacts,
-            recording_fetch.fetched,
+            fetched,
             &source_metadata_digest,
             store,
         )?;
         let resolution = PackageResolutionV1 {
-            schema_version: SchemaVersion(1),
+            schema_version: SchemaVersion(if self.manager.manager == PackageManager::Nvm {
+                2
+            } else {
+                1
+            }),
             declaration: declaration.clone(),
             target: target.clone(),
             manager: self.manager.clone(),
@@ -778,7 +996,18 @@ impl<'a> PackageResolutionCoordinator<'a> {
         state.verify()?;
         for resource in &state.resources {
             if let ResourceIntent::Package(desired) = &resource.intent {
-                self.preflight_desired(desired, target)?;
+                let definition = self.preflight_desired(desired, target)?;
+                let request = PackageResolutionRequestV1 {
+                    desired,
+                    target,
+                    manager: &self.manager,
+                    source_id: &definition.source_id,
+                    canonical_repository: &definition.canonical_repository,
+                    registry_definition_digest: &definition.digest,
+                    apt_source_authority: definition.apt_source_authority.as_ref(),
+                    node_source_authority: definition.node_source_authority.as_ref(),
+                };
+                self.backend.preflight_resolution(&request)?;
             }
         }
         let mut prepared = Vec::new();
@@ -903,6 +1132,19 @@ impl SourceBindingV1 {
     }
 }
 
+fn source_binding(
+    definition: &PackageSourceDefinition,
+    probe: &PackageResolutionProbeV1,
+) -> SourceBindingV1 {
+    SourceBindingV1 {
+        source_id: definition.source_id.clone(),
+        registry_definition_digest: definition.digest.clone(),
+        canonical_repository: definition.canonical_repository.clone(),
+        repository_revision: probe.repository_revision.clone(),
+        signed_metadata: probe.signed_metadata.clone(),
+    }
+}
+
 impl ResolvedPackageIntent {
     pub fn load_persisted(
         &self,
@@ -913,8 +1155,10 @@ impl ResolvedPackageIntent {
             serde_json::from_slice::<CompatiblePackageResolutionV1>(&bytes)
                 .map(CompatiblePackageResolutionV1::inherit_missing_parent_sources)
         })?;
-        if resolution.schema_version != SchemaVersion(1)
-            || resolution.declaration != self.declaration
+        if !matches!(
+            resolution.schema_version,
+            SchemaVersion(1) | SchemaVersion(2)
+        ) || resolution.declaration != self.declaration
         {
             return Err(PackageResolutionError::ResolutionBindingMismatch);
         }
@@ -975,6 +1219,13 @@ fn validate_persisted_resolution(
     resolution: &PackageResolutionV1,
 ) -> Result<(), PackageResolutionError> {
     resolution.declaration.validate_for_resolution()?;
+    if (resolution.declaration.manager == PackageManager::Nvm
+        && resolution.schema_version != SchemaVersion(2))
+        || (resolution.declaration.manager != PackageManager::Nvm
+            && resolution.schema_version != SchemaVersion(1))
+    {
+        return Err(PackageResolutionError::ResolutionBindingMismatch);
+    }
     validate_target(&resolution.target)?;
     validate_manager(&resolution.manager)?;
     validate_source(&resolution.source)?;
@@ -1027,7 +1278,49 @@ fn validate_persisted_resolution(
             .artifacts
             .iter()
             .map(|artifact| artifact.role.clone()),
-    )
+    )?;
+    let expected_node_recipe = if resolution.manager.manager == PackageManager::Nvm {
+        let version = resolution
+            .declaration
+            .version
+            .strip_prefix('v')
+            .unwrap_or(&resolution.declaration.version);
+        let platform = crate::node_resolution::node_platform(&resolution.target)?;
+        let archive = format!("node-v{version}-{platform}.tar.xz");
+        Some((
+            version,
+            archive.clone(),
+            format!(".cache/bin/node-v{version}-{platform}/{archive}"),
+        ))
+    } else {
+        None
+    };
+    match (&resolution.manager.manager, &resolution.recipe) {
+        (
+            PackageManager::Nvm,
+            OfflineInstallRecipeV1::NodeArchive {
+                install: Some(install),
+                ..
+            },
+        ) if expected_node_recipe.as_ref().is_some_and(
+            |(version, archive_file_name, cache_relative_path)| {
+                install.node_version == *version
+                    && install.archive_file_name == *archive_file_name
+                    && install.cache_relative_path == *cache_relative_path
+            },
+        ) && install.nvm_version == resolution.manager.version
+            && install.nvm_script_digest == resolution.manager.executable_digest
+            && install.offline
+            && install.no_source_fallback
+            && install.per_version_lock
+            && !install.install_latest_npm
+            && !install.migrate_packages =>
+        {
+            Ok(())
+        }
+        (PackageManager::Nvm, _) => Err(PackageResolutionError::InvalidNodeRequest),
+        (_, _) => Ok(()),
+    }
 }
 
 struct RecordingPackageFetch<'a> {
@@ -1037,6 +1330,13 @@ struct RecordingPackageFetch<'a> {
 }
 
 impl PackageFetch for RecordingPackageFetch<'_> {
+    fn preflight_locators(&mut self, locators: &[String]) -> Result<(), PackageResolutionError> {
+        for locator in locators {
+            validate_fetch_locator(locator, self.approved_artifact_roots)?;
+        }
+        self.inner.preflight_locators(locators)
+    }
+
     fn fetch_hop(
         &mut self,
         request: &PackageFetchRequestV1,
@@ -1066,6 +1366,51 @@ impl PackageFetch for RecordingPackageFetch<'_> {
         }
         Err(PackageResolutionError::TooManyRedirects)
     }
+
+    fn fetch_discovery_hop(
+        &mut self,
+        request: &PackageDiscoveryFetchRequestV1,
+        locator: &str,
+    ) -> Result<PackageFetchHopV1, PackageResolutionError> {
+        if locator != request.immutable_locator {
+            return Err(PackageResolutionError::ResolutionBindingMismatch);
+        }
+        validate_fetch_locator(locator, self.approved_artifact_roots)?;
+        let mut current = locator.to_owned();
+        let mut visited = BTreeSet::new();
+        for _ in 0..=10 {
+            if !visited.insert(current.clone()) {
+                return Err(PackageResolutionError::RedirectLoop);
+            }
+            let result = self.inner.fetch_discovery_hop(request, &current)?;
+            match result {
+                PackageFetchHopV1::Complete(result) => {
+                    if u64::try_from(result.bytes.len())
+                        .ok()
+                        .is_none_or(|size| size > request.maximum_bytes)
+                    {
+                        return Err(PackageResolutionError::CorruptArtifact);
+                    }
+                    return Ok(PackageFetchHopV1::Complete(result));
+                }
+                PackageFetchHopV1::Redirect { location } => {
+                    validate_fetch_locator(&location, self.approved_artifact_roots)?;
+                    current = location;
+                }
+            }
+        }
+        Err(PackageResolutionError::TooManyRedirects)
+    }
+}
+
+fn valid_node_release_fingerprints(fingerprints: &BTreeSet<String>) -> bool {
+    !fingerprints.is_empty()
+        && fingerprints.iter().all(|fingerprint| {
+            fingerprint.len() == 40
+                && fingerprint.chars().all(|character| {
+                    character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                })
+        })
 }
 
 fn validate_target(target: &PackageTargetV1) -> Result<(), PackageResolutionError> {
@@ -1252,7 +1597,7 @@ fn validate_recipe_roles(
     let expected = match recipe {
         OfflineInstallRecipeV1::HomebrewBottle { artifact_roles }
         | OfflineInstallRecipeV1::AptArchives { artifact_roles }
-        | OfflineInstallRecipeV1::NodeArchive { artifact_roles }
+        | OfflineInstallRecipeV1::NodeArchive { artifact_roles, .. }
         | OfflineInstallRecipeV1::RustToolchain { artifact_roles } => artifact_roles,
     };
     let actual = roles.into_iter().collect::<BTreeSet<_>>();
@@ -1330,6 +1675,18 @@ pub enum PackageResolutionError {
     IncompleteAptClosure,
     #[error("APT resolver backend failed: {reason}")]
     AptBackend { reason: String },
+    #[error("Node/nvm resolution request is unsupported or incomplete")]
+    InvalidNodeRequest,
+    #[error("Node/nvm target or manager authority does not match the controller binding")]
+    NodeAuthorityMismatch,
+    #[error("Node release metadata signature is not authorized")]
+    UnauthenticatedNodeMetadata,
+    #[error("Node release metadata omitted the exact target archive")]
+    IncompleteNodeRelease,
+    #[error("Node/nvm target platform has no controlled binary mapping")]
+    UnsupportedNodeTarget,
+    #[error("Node/nvm resolver backend failed: {reason}")]
+    NodeBackend { reason: String },
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
     #[error(transparent)]

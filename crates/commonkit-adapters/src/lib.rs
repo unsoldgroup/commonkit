@@ -12,6 +12,7 @@ mod git_sync;
 mod github_onboarding;
 mod mcp_clients;
 mod native;
+mod node_resolution;
 mod package_resolution;
 mod packages;
 mod pipeline;
@@ -68,14 +69,23 @@ pub use github_onboarding::{
 };
 pub use mcp_clients::{McpClientMaterializationError, materialize_mcp_client_state};
 pub use native::NativeProvider;
+pub use node_resolution::{
+    NodeReleaseSignatureError, NodeReleaseSignatureVerifier, NodeResolutionBackend,
+    NodeRuntimeHost, NodeRuntimeHostError, NodeRuntimeHostSnapshotV1, NodeSignatureCommandSpecV1,
+    ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, VerifiedNodeReleaseSignatureV1,
+    validate_nvm_environment,
+};
 pub use package_resolution::{
-    AptSourceAuthorityV1, ArtifactEvidence, ControlledPackageSourceV1, ManagerBindingV1,
-    OfflineInstallRecipeV1, OfflinePackageBackend, PackageArtifactV1, PackageFetch,
-    PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1, PackageObservationV1,
+    AptSourceAuthorityV1, ArtifactEvidence, COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS,
+    ControlledPackageSourceV1, ManagerBindingV1, NodeOfflineInstallRecipeV1, NodeSourceAuthorityV1,
+    OfflineInstallRecipeV1, OfflinePackageBackend, PackageArtifactV1,
+    PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1, PackageFetchRequestV1,
+    PackageFetchResultV1, PackageFetchedResolutionV1, PackageObservationV1,
     PackageResolutionAuthority, PackageResolutionBackend, PackageResolutionCoordinator,
     PackageResolutionDraftV1, PackageResolutionError, PackageResolutionProbeV1,
     PackageResolutionRequestV1, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
     ResolvedPackage, ResolvedPackageIntent, SourceBindingV1, package_resolution_schema,
+    package_resolution_v2_schema,
 };
 pub use packages::{
     PackageBackendEvidence, PackageCommandError, PackageCommandOutput, PackageCommandRunner,
