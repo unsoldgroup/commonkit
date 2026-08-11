@@ -25,8 +25,8 @@ use commonkit_adapters::{
     ProcessNodeRuntimeHost, ProcessOfflinePackageBackend, ProcessPlatformSecretCommandRunner,
     ProcessRemoteRunner, ProviderCapability, ProviderContext, ProviderInputs, ProviderPipeline,
     ProviderPlanRequest, ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter,
-    RemoteProviderStager, ResolvedMaterializedState, ResourceProvenance, SecretValue, SshFileAdapter,
-    SshOfflinePackageBackend, SshTargetCapabilities, build_provider_plan,
+    RemoteProviderStager, ResolvedMaterializedState, ResourceProvenance, SecretValue,
+    SshFileAdapter, SshOfflinePackageBackend, SshTargetCapabilities, build_provider_plan,
     build_resolved_provider_plan_with_router, materialize_mcp_client_state, validate_ownership,
 };
 use commonkit_config::{
