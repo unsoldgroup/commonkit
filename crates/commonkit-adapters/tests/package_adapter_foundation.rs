@@ -3,8 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
     ArtifactStore, ContentSensitivity, ManagerBindingV1, OfflineInstallRecipeV1, PackageAdapter,
-    PackageMutationBackend, PackageMutationError, PackageObservationV1, PackageResolutionAuthority,
-    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ResolvedPackage, SourceBindingV1,
+    PackageMutationBackend, PackageMutationBackendRegistry, PackageMutationError,
+    PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1, PackageSourceRegistry,
+    PackageTargetV1, ResolvedPackage, SourceBindingV1,
 };
 use commonkit_contracts::{
     Operation, OperationKind, PackageDeclaration, PackageManager, PackageSelector,
@@ -337,4 +338,49 @@ fn apt_recovery_resolves_all_and_native_architectures_in_the_closure() {
         adapter.observe_recovery(&operation(resolution_ref.digest)),
         Ok(RecoveryObservation::After)
     );
+}
+
+fn fake_backend(manager: PackageManager) -> Box<dyn PackageMutationBackend> {
+    Box::new(FakeMutationBackend {
+        manager,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+/// The registry's duplicate-claim check previously probed only Apt and Nvm,
+/// so two backends claiming any other manager registered silently and
+/// dispatch went to whichever was inserted first. Every manager must be
+/// covered for the closed-dispatch guarantee to hold.
+#[test]
+fn registry_rejects_two_backends_claiming_the_same_manager() {
+    for manager in [
+        PackageManager::Homebrew,
+        PackageManager::Apt,
+        PackageManager::Fnm,
+        PackageManager::Nvm,
+        PackageManager::Rustup,
+    ] {
+        assert_eq!(
+            PackageMutationBackendRegistry::new([fake_backend(manager), fake_backend(manager)])
+                .err(),
+            Some(PackageMutationError::Backend),
+            "duplicate {manager:?} backends were accepted"
+        );
+    }
+}
+
+#[test]
+fn registry_accepts_distinct_managers_and_reports_only_those() {
+    let registry = PackageMutationBackendRegistry::new([
+        fake_backend(PackageManager::Homebrew),
+        fake_backend(PackageManager::Rustup),
+    ])
+    .expect("distinct managers register");
+
+    assert!(registry.supports_manager(PackageManager::Homebrew));
+    assert!(registry.supports_manager(PackageManager::Rustup));
+    assert!(!registry.supports_manager(PackageManager::Fnm));
 }

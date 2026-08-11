@@ -2083,7 +2083,10 @@ impl LocalExecutionError {
                 commonkit_adapters::PackageMutationError::UnsupportedRecipe => {
                     "package_operation_unsupported"
                 }
-                commonkit_adapters::PackageMutationError::Backend => "package_apply_failed",
+                // Phase-agnostic: this surfaces from observe, prepare, apply
+                // and verify alike, so it must not borrow one of the
+                // phase-specific codes assigned at the adapter call sites.
+                commonkit_adapters::PackageMutationError::Backend => "package_backend_failed",
             },
         })
     }

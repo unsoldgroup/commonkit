@@ -189,11 +189,9 @@ impl TargetHelper {
                 let mut backend = ProcessOfflinePackageBackend::new(root_path);
                 match phase {
                     PackageMutationPhase::Observe => {
-                        let observed = crate::PackageMutationBackend::observe(
-                            &mut backend,
-                            &resolution,
-                        )
-                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
+                        let observed =
+                            crate::PackageMutationBackend::observe(&mut backend, &resolution)
+                                .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
                         Ok(SshFilesystemResponse::PackageObserved {
                             installed_versions: observed.installed_versions,
                         })

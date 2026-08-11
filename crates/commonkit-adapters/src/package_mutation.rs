@@ -14,9 +14,9 @@ use commonkit_reconcile::{Adapter, AdapterFailure, RecoveryObservation};
 use thiserror::Error;
 
 use crate::{
-    apt_resolution::apt_package_identity, ArtifactStore, NodeOfflineInstallRecipeV1,
-    OfflineInstallRecipeV1, PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1,
-    PackageResourcePlanner, ProviderPlanError, ResolvedPackageIntent, ResourceProvenance,
+    ArtifactStore, NodeOfflineInstallRecipeV1, OfflineInstallRecipeV1, PackageObservationV1,
+    PackageResolutionAuthority, PackageResolutionV1, PackageResourcePlanner, ProviderPlanError,
+    ResolvedPackageIntent, ResourceProvenance, apt_resolution::apt_package_identity,
 };
 
 /// The only target-side capability exposed to package mutation.
@@ -55,6 +55,30 @@ pub trait PackageMutationBackend: Send {
     ) -> Result<(), PackageMutationError>;
 }
 
+/// Every `PackageManager`, for the registry's duplicate-claim check.
+///
+/// `assert_package_managers_covered` below matches exhaustively, so adding a
+/// variant to `PackageManager` fails to compile here rather than silently
+/// escaping duplicate detection.
+const ALL_PACKAGE_MANAGERS: [PackageManager; 5] = [
+    PackageManager::Homebrew,
+    PackageManager::Apt,
+    PackageManager::Fnm,
+    PackageManager::Nvm,
+    PackageManager::Rustup,
+];
+
+#[allow(dead_code)]
+fn assert_package_managers_covered(manager: PackageManager) {
+    match manager {
+        PackageManager::Homebrew
+        | PackageManager::Apt
+        | PackageManager::Fnm
+        | PackageManager::Nvm
+        | PackageManager::Rustup => {}
+    }
+}
+
 /// Closed dispatch for production package mutation. The adapter has one
 /// stable route, while this registry permits only explicitly registered
 /// manager backends to handle a persisted resolution.
@@ -69,11 +93,9 @@ impl PackageMutationBackendRegistry {
         let mut registered: Vec<Box<dyn PackageMutationBackend>> = Vec::new();
         for backend in backends {
             if registered.iter().any(|existing| {
-                [PackageManager::Apt, PackageManager::Nvm]
-                    .iter()
-                    .any(|manager| {
-                        existing.supports_manager(*manager) && backend.supports_manager(*manager)
-                    })
+                ALL_PACKAGE_MANAGERS.iter().any(|manager| {
+                    existing.supports_manager(*manager) && backend.supports_manager(*manager)
+                })
             }) {
                 return Err(PackageMutationError::Backend);
             }
@@ -844,10 +866,7 @@ fn package_version_key(
 ) -> Option<String> {
     match resolution.manager.manager {
         PackageManager::Apt => {
-            let Some(PackageSelector::AptBinary {
-                name,
-                architecture,
-            }) =
+            let Some(PackageSelector::AptBinary { name, architecture }) =
                 package.declaration.selector.as_ref()
             else {
                 return None;
