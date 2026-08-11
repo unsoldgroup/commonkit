@@ -70,6 +70,32 @@ pub struct LocalTargetFilesystem {
     access: RootAccess,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TargetDirectoryIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl TargetDirectoryIdentity {
+    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            Self {}
+        }
+    }
+}
+
 impl LocalTargetFilesystem {
     pub fn open(root: &Path, access: RootAccess) -> Result<Self, TargetFilesystemError> {
         if !root.is_absolute() || root.parent().is_none() {
@@ -88,19 +114,15 @@ impl LocalTargetFilesystem {
     pub(crate) fn open_nofollow(
         root: &Path,
         access: RootAccess,
+        expected_identity: TargetDirectoryIdentity,
     ) -> Result<Self, TargetFilesystemError> {
         if !root.is_absolute() || root.parent().is_none() {
             return Err(TargetFilesystemError::InvalidRoot);
         }
         let directory = open_absolute_directory_nofollow(root)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let expected = std::fs::metadata(root)?;
-            let opened = directory.try_clone()?.into_std_file().metadata()?;
-            if expected.dev() != opened.dev() || expected.ino() != opened.ino() {
-                return Err(TargetFilesystemError::InvalidRoot);
-            }
+        let opened = directory.try_clone()?.into_std_file().metadata()?;
+        if TargetDirectoryIdentity::from_metadata(&opened) != expected_identity {
+            return Err(TargetFilesystemError::InvalidRoot);
         }
         Ok(Self {
             root: directory,
@@ -1005,6 +1027,30 @@ fn set_target_directory_mode(directory: &Dir, mode: Option<u32>) -> Result<(), s
 #[cfg(not(unix))]
 fn set_target_directory_mode(_directory: &Dir, _mode: Option<u32>) -> Result<(), std::io::Error> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nofollow_open_rejects_an_ordinary_directory_swap_after_validation() {
+        let base = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("commonkit-target-identity-{}", std::process::id()));
+        let root = base.join("root");
+        let replacement = base.join("replacement");
+        std::fs::create_dir_all(&root).unwrap();
+        let identity =
+            TargetDirectoryIdentity::from_metadata(&std::fs::symlink_metadata(&root).unwrap());
+
+        std::fs::rename(&root, &replacement).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let result = LocalTargetFilesystem::open_nofollow(&root, RootAccess::ReadWrite, identity);
+        assert!(matches!(result, Err(TargetFilesystemError::InvalidRoot)));
+
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
 
 #[cfg(not(windows))]

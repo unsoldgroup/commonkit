@@ -20,6 +20,7 @@ use crate::{
     ARTIFACT_CHUNK_SIZE, ContentReference, MAX_ARTIFACT_TRANSFER_BYTES,
     artifact_chunk_response_digest,
 };
+use crate::target::TargetDirectoryIdentity;
 use crate::{
     AptResolutionBackend, AptSourceAuthorityV1, ArtifactStore, ContentSensitivity,
     LocalTargetFilesystem, NodeResolutionBackend, NodeRuntimeHost, PackageDiscoveryFetchRequestV1,
@@ -43,6 +44,13 @@ pub struct TargetHelper {
     staging: std::sync::Mutex<Dir>,
     package_resolution: Option<TargetPackageResolutionConfig>,
     protected_paths: Vec<PathBuf>,
+}
+
+struct ValidatedRoot {
+    id: StableId,
+    path: PathBuf,
+    identity: TargetDirectoryIdentity,
+    access: RootAccess,
 }
 
 impl TargetHelper {
@@ -69,15 +77,14 @@ impl TargetHelper {
         package_resolution: Option<TargetPackageResolutionConfig>,
         protected_paths: Vec<PathBuf>,
     ) -> Result<Self, TargetFilesystemError> {
-        Self::validate_configuration(&roots, state_root, &protected_paths)?;
+        let validated_roots =
+            Self::validate_configuration_internal(&roots, state_root, &protected_paths)?;
         let mut mapped = BTreeMap::new();
-        for root in roots {
-            let raw_path = PathBuf::from(&root.path);
-            let path = validate_secure_path(&raw_path, true, false)
-                .map_err(|_| TargetFilesystemError::InvalidRoot)?;
-            let filesystem = LocalTargetFilesystem::open_nofollow(&path, root.access)?;
+        for root in validated_roots {
+            let filesystem =
+                LocalTargetFilesystem::open_nofollow(&root.path, root.access, root.identity)?;
             if mapped
-                .insert(root.id, (filesystem, path, root.access))
+                .insert(root.id, (filesystem, root.path, root.access))
                 .is_some()
             {
                 return Err(TargetFilesystemError::InvalidSshConfig("duplicate root id"));
@@ -117,6 +124,14 @@ impl TargetHelper {
         state_root: &Path,
         protected_paths: &[PathBuf],
     ) -> Result<(), TargetFilesystemError> {
+        Self::validate_configuration_internal(roots, state_root, protected_paths).map(|_| ())
+    }
+
+    fn validate_configuration_internal(
+        roots: &[TargetRoot],
+        state_root: &Path,
+        protected_paths: &[PathBuf],
+    ) -> Result<Vec<ValidatedRoot>, TargetFilesystemError> {
         let state_identity = validate_secure_path(state_root, true, true)?;
         if std::fs::symlink_metadata(state_root).is_ok() && !owned_by_effective_user(state_root) {
             return Err(TargetFilesystemError::InvalidSshConfig(
@@ -134,35 +149,48 @@ impl TargetHelper {
         let mut root_identities = Vec::with_capacity(roots.len());
         for root in roots {
             let path = PathBuf::from(&root.path);
-            let identity = validate_secure_path(&path, true, false)
+            let validated = validate_secure_path_with_identity(&path, true, false)
                 .map_err(|_| TargetFilesystemError::InvalidRoot)?;
+            let identity = validated
+                .directory_identity
+                .ok_or(TargetFilesystemError::InvalidRoot)?;
             if root.access == RootAccess::ReadWrite && !owned_by_effective_user(&path) {
                 return Err(TargetFilesystemError::InvalidRoot);
             }
             if ids.insert(root.id.clone(), ()).is_some() {
                 return Err(TargetFilesystemError::InvalidSshConfig("duplicate root id"));
             }
-            root_identities.push((path, identity, root.access));
+            root_identities.push((path, validated.path, identity, root.access));
         }
-        for (path, identity, access) in root_identities {
-            if access == RootAccess::ReadWrite
+        for (path, canonical_path, _, access) in &root_identities {
+            if *access == RootAccess::ReadWrite
                 && (protected_paths
                     .iter()
-                    .any(|protected| path.starts_with(protected) || protected.starts_with(&path))
+                    .any(|protected| path.starts_with(protected) || protected.starts_with(path))
                     || protected_identities.iter().any(|protected| {
-                        identity.starts_with(protected) || protected.starts_with(&identity)
+                        canonical_path.starts_with(protected)
+                            || protected.starts_with(canonical_path)
                     })
                     || path.starts_with(state_root)
-                    || state_root.starts_with(&path)
-                    || identity.starts_with(&state_identity)
-                    || state_identity.starts_with(&identity))
+                    || state_root.starts_with(path)
+                    || canonical_path.starts_with(&state_identity)
+                    || state_identity.starts_with(canonical_path))
             {
                 return Err(TargetFilesystemError::InvalidSshConfig(
                     "writable root overlaps helper control path",
                 ));
             }
         }
-        Ok(())
+        Ok(root_identities
+            .into_iter()
+            .zip(roots.iter())
+            .map(|((_, path, identity, access), root)| ValidatedRoot {
+                id: root.id.clone(),
+                path,
+                identity,
+                access,
+            })
+            .collect())
     }
 
     pub fn validate_path(
@@ -1000,11 +1028,24 @@ impl TargetHelper {
     }
 }
 
+struct SecurePathValidation {
+    path: PathBuf,
+    directory_identity: Option<TargetDirectoryIdentity>,
+}
+
 fn validate_secure_path(
     path: &Path,
     expected_directory: bool,
     allow_missing_leaf: bool,
 ) -> Result<PathBuf, TargetFilesystemError> {
+    Ok(validate_secure_path_with_identity(path, expected_directory, allow_missing_leaf)?.path)
+}
+
+fn validate_secure_path_with_identity(
+    path: &Path,
+    expected_directory: bool,
+    allow_missing_leaf: bool,
+) -> Result<SecurePathValidation, TargetFilesystemError> {
     if !path.is_absolute() {
         return Err(TargetFilesystemError::InvalidSshConfig(
             "target helper paths must be absolute",
@@ -1013,12 +1054,17 @@ fn validate_secure_path(
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
             if metadata.file_type().is_symlink() {
-                let Some(identity) = allowed_platform_alias(path, expected_directory)? else {
+                let Some((identity, directory_identity)) =
+                    allowed_platform_alias(path, expected_directory)?
+                else {
                     return Err(TargetFilesystemError::InvalidSshConfig(
                         "target helper path has an unsafe type",
                     ));
                 };
-                return Ok(identity);
+                return Ok(SecurePathValidation {
+                    path: identity,
+                    directory_identity: Some(directory_identity),
+                });
             }
             if (expected_directory && !metadata.is_dir())
                 || (!expected_directory && !metadata.is_file() && !metadata.is_dir())
@@ -1029,8 +1075,14 @@ fn validate_secure_path(
             }
             validate_secure_metadata(&metadata, false)?;
             validate_secure_ancestors(path.parent())?;
-            std::fs::canonicalize(path)
-                .map_err(|_| TargetFilesystemError::InvalidSshConfig("cannot canonicalize path"))
+            Ok(SecurePathValidation {
+                path: std::fs::canonicalize(path).map_err(|_| {
+                    TargetFilesystemError::InvalidSshConfig("cannot canonicalize path")
+                })?,
+                directory_identity: metadata
+                    .is_dir()
+                    .then(|| TargetDirectoryIdentity::from_metadata(&metadata)),
+            })
         }
         Err(error) if allow_missing_leaf && error.kind() == std::io::ErrorKind::NotFound => {
             let parent = path
@@ -1039,7 +1091,10 @@ fn validate_secure_path(
                     "target helper path has no parent",
                 ))?;
             validate_secure_ancestors(Some(parent))?;
-            canonicalize_missing(path)
+            Ok(SecurePathValidation {
+                path: canonicalize_missing(path)?,
+                directory_identity: None,
+            })
         }
         Err(error) => Err(TargetFilesystemError::Io(error)),
     }
@@ -1080,7 +1135,7 @@ fn validate_secure_ancestors(start: Option<&Path>) -> Result<(), TargetFilesyste
 fn allowed_platform_alias(
     path: &Path,
     expected_directory: bool,
-) -> Result<Option<PathBuf>, TargetFilesystemError> {
+) -> Result<Option<(PathBuf, TargetDirectoryIdentity)>, TargetFilesystemError> {
     if !expected_directory {
         return Ok(None);
     }
@@ -1100,7 +1155,10 @@ fn allowed_platform_alias(
     }
     validate_secure_metadata(&metadata, true)?;
     validate_secure_ancestors(identity.parent())?;
-    Ok(Some(identity))
+    Ok(Some((
+        identity,
+        TargetDirectoryIdentity::from_metadata(&metadata),
+    )))
 }
 
 fn validate_secure_metadata(
