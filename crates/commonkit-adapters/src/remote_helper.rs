@@ -860,6 +860,7 @@ impl TargetHelper {
                 // the descriptor/lock guarantees used by this protocol.
                 Err(TargetFilesystemError::PackageResolutionUnavailable)
             }
+            #[cfg(unix)]
             SshFilesystemRequest::StageArtifactChunk {
                 run_id,
                 transfer_id,
@@ -881,6 +882,7 @@ impl TargetHelper {
                 total_chunks,
                 content,
             ),
+            #[cfg(unix)]
             SshFilesystemRequest::ReadArtifactChunk {
                 request_id,
                 transfer_id,
@@ -1048,7 +1050,7 @@ fn cleanup_staging(staging: &Dir) -> Result<(), std::io::Error> {
         if !name.ends_with(".part") {
             continue;
         }
-        let metadata = entry.metadata()?;
+        let metadata = staging.symlink_metadata(&*name)?;
         if !metadata.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1085,10 +1087,18 @@ fn cleanup_staging(staging: &Dir) -> Result<(), std::io::Error> {
             continue;
         }
         let part = format!("{}.part", name.trim_end_matches(".meta"));
-        if staging.metadata(&part).is_ok() {
-            continue;
+        match staging.symlink_metadata(&part) {
+            Ok(metadata) if metadata.is_file() => continue,
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsafe staging entry",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
-        let metadata = entry.metadata()?;
+        let metadata = staging.symlink_metadata(&*name)?;
         if !metadata.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1134,10 +1144,12 @@ fn staging_usage(staging: &Dir) -> Result<(usize, u64), std::io::Error> {
     let mut bytes: u64 = 0;
     for entry in staging.read_dir(".")? {
         let entry = entry?;
-        if !entry.file_name().to_string_lossy().ends_with(".part") {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".part") {
             continue;
         }
-        let metadata = entry.metadata()?;
+        let metadata = staging.symlink_metadata(&*name)?;
         if !metadata.is_file() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

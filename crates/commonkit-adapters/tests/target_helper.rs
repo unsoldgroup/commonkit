@@ -427,6 +427,96 @@ fn sequence_zero_restarts_after_orphaned_part_or_metadata() {
     fs::remove_dir_all(state).unwrap();
 }
 
+#[cfg(not(unix))]
+#[test]
+fn helper_rejects_chunk_protocol_on_non_unix_before_dispatch() {
+    let home = temp("chunk-platform-home");
+    let target = temp("chunk-platform-target");
+    let state = temp("chunk-platform-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state, "roots": [{"id":"home","path":target,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let request = SshFilesystemRequest::StageArtifactChunk {
+        run_id: StableId::parse("platform-run").unwrap(),
+        transfer_id: StableId::parse("platform-transfer").unwrap(),
+        digest: Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(b""))).unwrap(),
+        byte_count: 0,
+        chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+        sequence: 0,
+        offset: 0,
+        total_chunks: 1,
+        content: vec![],
+    };
+    assert!(!invoke(&home, &request).status.success());
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn helper_rejects_staging_symlinks_during_cleanup() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp("chunk-symlink-home");
+    let target = temp("chunk-symlink-target");
+    let outside = temp("chunk-symlink-outside");
+    let state = temp("chunk-symlink-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state, "roots": [{"id":"home","path":target,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let content = vec![b's'; commonkit_adapters::ARTIFACT_CHUNK_SIZE as usize + 1];
+    let digest = Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&content))).unwrap();
+    let transfer = StableId::parse("transfer-symlink").unwrap();
+    let request = SshFilesystemRequest::StageArtifactChunk {
+        run_id: transfer.clone(),
+        transfer_id: transfer.clone(),
+        digest: digest.clone(),
+        byte_count: content.len() as u64,
+        chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+        sequence: 0,
+        offset: 0,
+        total_chunks: 2,
+        content: content[..commonkit_adapters::ARTIFACT_CHUNK_SIZE as usize].to_vec(),
+    };
+    assert!(invoke(&home, &request).status.success());
+    let staging = state.join("artifact-staging");
+    let stem = format!(
+        "{}-{}",
+        transfer,
+        digest.as_str().trim_start_matches("sha256:")
+    );
+    fs::remove_file(staging.join(format!("{stem}.part"))).unwrap();
+    symlink(&outside, staging.join(format!("{stem}.part"))).unwrap();
+    let probe = invoke(
+        &home,
+        &SshFilesystemRequest::ReadFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: NormalizedManagedPath::parse("cleanup-probe").unwrap(),
+        },
+    );
+    assert!(!probe.status.success());
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
 #[test]
 fn helper_rejects_any_command_surface_other_than_stdio_protocol() {
     let output = Command::new(env!("CARGO_BIN_EXE_commonkit-target-helper"))
