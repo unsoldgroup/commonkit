@@ -415,21 +415,25 @@ impl ProductionSshPlanExecutor {
 
     fn adapter(&self) -> Result<Vec<Box<dyn Adapter>>, DomainFailure> {
         let transport = self.factory.open(&self.target)?;
-        Ok(vec![Box::new(
-            SshFileAdapter::open_with_capabilities(
-                self.target.root_id.clone(),
-                &self.adapter_state,
-                transport,
-                self.target.capabilities,
-            )
-            .map_err(|_| DomainFailure::OperationFailed)?,
-        )])
+        Ok(vec![
+            Box::new(
+                SshFileAdapter::open_with_capabilities(
+                    self.target.root_id.clone(),
+                    &self.adapter_state,
+                    transport,
+                    self.target.capabilities,
+                )
+                .map_err(|_| DomainFailure::OperationFailed)?,
+            ),
+            Box::new(super::UnavailablePackageAdapter),
+        ])
     }
 
     fn execute_inner(
         &self,
         plan: &Plan,
         confirmation: &StableId,
+        package_consent: Option<&commonkit_contracts::PackageConsent>,
     ) -> Result<ReconcileOutcome, DomainFailure> {
         let durable = self
             .plan_store
@@ -470,13 +474,27 @@ impl ProductionSshPlanExecutor {
             Ok(_) => Reconciler::with_store(&self.receipts)
                 .recover_run(run_id, &durable, &mut adapters)
                 .map_err(|_| DomainFailure::OperationFailed),
-            Err(ReceiptError::NotFound(_)) => Reconciler::with_store(&self.receipts)
-                .execute(&durable, run_id, &mut adapters)
-                .map_err(|_| DomainFailure::OperationFailed),
+            Err(ReceiptError::NotFound(_)) => {
+                let reconciler = Reconciler::with_store(&self.receipts);
+                match package_consent {
+                    Some(consent) => reconciler
+                        .execute_with_package_consent(&durable, run_id, consent, &mut adapters)
+                        .map_err(|_| DomainFailure::OperationFailed),
+                    None => reconciler
+                        .execute(&durable, run_id, &mut adapters)
+                        .map_err(|_| DomainFailure::OperationFailed),
+                }
+            }
             Err(ReceiptError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                Reconciler::with_store(&self.receipts)
-                    .execute(&durable, run_id, &mut adapters)
-                    .map_err(|_| DomainFailure::OperationFailed)
+                let reconciler = Reconciler::with_store(&self.receipts);
+                match package_consent {
+                    Some(consent) => reconciler
+                        .execute_with_package_consent(&durable, run_id, consent, &mut adapters)
+                        .map_err(|_| DomainFailure::OperationFailed),
+                    None => reconciler
+                        .execute(&durable, run_id, &mut adapters)
+                        .map_err(|_| DomainFailure::OperationFailed),
+                }
             }
             Err(_) => Err(DomainFailure::OperationFailed),
         }
@@ -485,11 +503,75 @@ impl ProductionSshPlanExecutor {
 
 impl PlanExecutor for ProductionSshPlanExecutor {
     fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult {
+        if plan.operations.iter().any(|operation| {
+            operation.adapter_id.as_str() == "packages"
+                || operation.resource.resource_type.as_str() == "package"
+        }) {
+            return ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(StableId::parse("package_consent_required").expect("static ID")),
+            };
+        }
         let result = self
             .lock
             .lock()
             .map_err(|_| DomainFailure::OperationFailed)
-            .and_then(|_| self.execute_inner(plan, confirmation_id));
+            .and_then(|_| self.execute_inner(plan, confirmation_id, None));
+        match result {
+            Ok(ReconcileOutcome::Succeeded | ReconcileOutcome::ForwardRecovered) => {
+                ExecutionResult {
+                    status: ApplyStatus::Succeeded,
+                    failure_code: None,
+                }
+            }
+            Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
+                status: ApplyStatus::RolledBack,
+                failure_code: None,
+            },
+            Ok(
+                ReconcileOutcome::RollbackFailed
+                | ReconcileOutcome::ForwardRecoveryRequired
+                | ReconcileOutcome::ForwardRecoveryFailed,
+            )
+            | Err(_) => ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(StableId::parse("remote_execution_failed").expect("static ID")),
+            },
+        }
+    }
+
+    fn execute_with_package_consent(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        consent: &commonkit_contracts::PackageConsent,
+    ) -> ExecutionResult {
+        if plan.operations.iter().any(|operation| {
+            operation.adapter_id.as_str() == "packages"
+                || operation.resource.resource_type.as_str() == "package"
+        }) {
+            if Reconciler::validate_package_consent(plan, consent).is_err() {
+                return ExecutionResult {
+                    status: ApplyStatus::Failed,
+                    failure_code: Some(
+                        StableId::parse("package_consent_mismatch").expect("static ID"),
+                    ),
+                };
+            }
+            // The closed registry currently has no concrete offline package
+            // mutator. Fail before opening the SSH transport.
+            return ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(
+                    StableId::parse("package_adapter_unavailable").expect("static ID"),
+                ),
+            };
+        }
+        let result = self
+            .lock
+            .lock()
+            .map_err(|_| DomainFailure::OperationFailed)
+            .and_then(|_| self.execute_inner(plan, confirmation_id, Some(consent)));
         match result {
             Ok(ReconcileOutcome::Succeeded | ReconcileOutcome::ForwardRecovered) => {
                 ExecutionResult {

@@ -602,12 +602,27 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
-        preflight_adapters(plan, adapters)?;
         if plan.operations.iter().any(is_package_operation) {
             return Err(ReconcileError::PackageConsentRequired);
         }
+        preflight_adapters(plan, adapters)?;
         let journal = ReceiptJournal::for_plan(run_id, plan)?;
         self.execute_preflighted(plan, adapters, journal)
+    }
+
+    /// Validates the reviewed package operation set without opening an adapter,
+    /// touching a target, or creating a receipt. The package adapter repeats
+    /// this binding against its persisted resolution before execution.
+    pub fn validate_package_consent(
+        plan: &Plan,
+        consent: &PackageConsent,
+    ) -> Result<(), ReconcileError> {
+        validate_plan(plan)?;
+        let bindings = package_bindings_from_plan(plan)?;
+        consent
+            .validate(plan, &bindings)
+            .map_err(|_| ReconcileError::PackageConsentMismatch)?;
+        Ok(())
     }
 
     pub fn execute_with_package_consent(
@@ -618,6 +633,13 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
+        // This first pass is deliberately adapter-free. A malformed or stale
+        // consent must not cause target observation, transport setup, or a
+        // receipt checkpoint before it is rejected.
+        let expected_bindings = package_bindings_from_plan(plan)?;
+        consent
+            .validate(plan, &expected_bindings)
+            .map_err(|_| ReconcileError::PackageConsentMismatch)?;
         preflight_adapters(plan, adapters)?;
         let mut bindings = Vec::new();
         let mut evidence = Vec::new();
@@ -639,9 +661,12 @@ impl<'a> Reconciler<'a> {
             bindings.push(binding);
             evidence.push(operation_evidence);
         }
+        if bindings != expected_bindings {
+            return Err(ReconcileError::PackageConsentBindingChanged);
+        }
         consent
             .validate(plan, &bindings)
-            .map_err(ReceiptError::from)?;
+            .map_err(|_| ReconcileError::PackageConsentMismatch)?;
         let authorization = PackageReceiptAuthorization {
             consent_digest: consent.digest().map_err(ReceiptError::from)?,
             confirmation_id: consent.confirmation_id.clone(),
@@ -1177,6 +1202,27 @@ fn is_package_operation(operation: &Operation) -> bool {
         || operation.resource.resource_type.as_str() == "package"
 }
 
+fn package_bindings_from_plan(
+    plan: &Plan,
+) -> Result<Vec<PackageOperationConsentBinding>, ReconcileError> {
+    let package_operations = plan
+        .operations
+        .iter()
+        .filter(|operation| is_package_operation(operation))
+        .map(|operation| PackageOperationConsentBinding {
+            operation_id: operation.id.clone(),
+            resolution_digest: operation.payload_digest.clone(),
+        })
+        .collect::<Vec<_>>();
+    if package_operations.is_empty() {
+        return Err(ReconcileError::PackageConsentRequired);
+    }
+    if plan.bindings.package_resolution_authority_digest.is_none() {
+        return Err(ReconcileError::PackageResolutionAuthorityMissing);
+    }
+    Ok(package_operations)
+}
+
 fn validate_plan(plan: &Plan) -> Result<(), ReconcileError> {
     let rebuilt = build_plan(PlanDraft {
         target_id: plan.target_id.clone(),
@@ -1202,8 +1248,14 @@ pub enum ReconcileError {
     PlanMismatch,
     #[error("package operations require explicit package consent")]
     PackageConsentRequired,
+    #[error("package consent does not match the reviewed operation set")]
+    PackageConsentMismatch,
+    #[error("package plan is missing package-resolution authority")]
+    PackageResolutionAuthorityMissing,
     #[error("package authorization evidence is unavailable from adapter {adapter_id}")]
     PackageAuthorizationUnavailable { adapter_id: StableId },
+    #[error("package adapter changed the consent binding before execution")]
+    PackageConsentBindingChanged,
     #[error("adapter preflight failed: {0:?}")]
     AdapterPreflightFailed(AdapterFailure),
     #[error("adapter is not registered: {0}")]

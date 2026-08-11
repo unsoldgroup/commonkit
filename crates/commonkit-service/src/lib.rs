@@ -24,9 +24,10 @@ use commonkit_adapters::{
     PackageObserver, ProcessPackageCommandRunner, ProviderCapability,
 };
 use commonkit_contracts::{
-    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, PackageDeclaration,
-    Plan, PlanBindings, Principal, ReceiptState, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion,
-    SecurityPolicy, Sha256Digest, StableId, assert_no_embedded_secrets, digest_domain_json,
+    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Operation,
+    PackageConsent, PackageDeclaration, Plan, PlanBindings, Principal, ReceiptState,
+    RecoveryCapability, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, SecurityPolicy,
+    Sha256Digest, StableId, assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, ReceiptAudience, build_plan, resolve_principal};
 use commonkit_reconcile::{
@@ -1480,6 +1481,15 @@ pub struct ExecutionResult {
 pub trait PlanExecutor: Send + Sync + 'static {
     fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult;
 
+    fn execute_with_package_consent(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        _consent: &PackageConsent,
+    ) -> ExecutionResult {
+        self.execute(plan, confirmation_id)
+    }
+
     fn execute_bound(
         &self,
         plan: &Plan,
@@ -1577,6 +1587,29 @@ impl PlanExecutor for TargetIdentityPlanExecutor {
         self.fallback
             .execute_bound(plan, confirmation_id, idempotency_key)
     }
+
+    fn execute_with_package_consent(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        consent: &PackageConsent,
+    ) -> ExecutionResult {
+        let filesystem = plan
+            .operations
+            .iter()
+            .all(|operation| matches!(operation.adapter_id.as_str(), "files" | "ssh-files"));
+        if filesystem && !plan.operations.is_empty() {
+            return self.targets.get(&plan.target_id).map_or(
+                ExecutionResult {
+                    status: ApplyStatus::Failed,
+                    failure_code: Some(stable_code("target_executor_unavailable")),
+                },
+                |executor| executor.execute_with_package_consent(plan, confirmation_id, consent),
+            );
+        }
+        self.fallback
+            .execute_with_package_consent(plan, confirmation_id, consent)
+    }
 }
 
 impl TargetDispatchPlanExecutor {
@@ -1645,6 +1678,39 @@ impl PlanExecutor for TargetDispatchPlanExecutor {
         self.local
             .execute_bound(plan, confirmation_id, idempotency_key)
     }
+
+    fn execute_with_package_consent(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        consent: &PackageConsent,
+    ) -> ExecutionResult {
+        let has_ssh = plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() == "ssh-files");
+        let has_local = plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() != "ssh-files");
+        if has_ssh && has_local {
+            return ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(stable_code("mixed_target_plan")),
+            };
+        }
+        if has_ssh {
+            return self.ssh.as_ref().map_or(
+                ExecutionResult {
+                    status: ApplyStatus::Failed,
+                    failure_code: Some(stable_code("ssh_executor_unavailable")),
+                },
+                |executor| executor.execute_with_package_consent(plan, confirmation_id, consent),
+            );
+        }
+        self.local
+            .execute_with_package_consent(plan, confirmation_id, consent)
+    }
 }
 
 /// Executes approved local plans through CommonKit's durable reconciliation
@@ -1697,10 +1763,10 @@ impl LocalPlanExecutor {
     }
 
     fn adapters(&self) -> Result<Vec<Box<dyn Adapter>>, LocalExecutionError> {
-        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(FileAdapter::open(
-            &self.target_root,
-            &self.adapter_state,
-        )?)];
+        let mut adapters: Vec<Box<dyn Adapter>> = vec![
+            Box::new(FileAdapter::open(&self.target_root, &self.adapter_state)?),
+            Box::new(UnavailablePackageAdapter),
+        ];
         if let Some(relay) = &self.relay {
             adapters.push(Box::new(
                 RelayAdapter::open(stable_code("relay"), &relay.live, &relay.state)?
@@ -1753,6 +1819,7 @@ impl LocalPlanExecutor {
         plan: &Plan,
         confirmation_id: &StableId,
         idempotency_key: Option<&str>,
+        package_consent: Option<&PackageConsent>,
     ) -> Result<ReconcileOutcome, LocalExecutionError> {
         let durable = self.plan_store.load(&plan.id)?;
         if durable != *plan {
@@ -1787,7 +1854,13 @@ impl LocalPlanExecutor {
             Err(error) => return Err(error.into()),
         }
         let mut adapters = self.adapters()?;
-        Ok(Reconciler::with_store(&self.receipt_store).execute(&durable, run_id, &mut adapters)?)
+        let reconciler = Reconciler::with_store(&self.receipt_store);
+        Ok(match package_consent {
+            Some(consent) => {
+                reconciler.execute_with_package_consent(&durable, run_id, consent, &mut adapters)?
+            }
+            None => reconciler.execute(&durable, run_id, &mut adapters)?,
+        })
     }
 }
 
@@ -1797,7 +1870,7 @@ impl PlanExecutor for LocalPlanExecutor {
             .execution_lock
             .lock()
             .map_err(|_| LocalExecutionError::Lock)
-            .and_then(|_guard| self.execute_durable(plan, confirmation_id, None));
+            .and_then(|_guard| self.execute_durable(plan, confirmation_id, None, None));
         execution_result(result)
     }
 
@@ -1811,8 +1884,92 @@ impl PlanExecutor for LocalPlanExecutor {
             .execution_lock
             .lock()
             .map_err(|_| LocalExecutionError::Lock)
-            .and_then(|_guard| self.execute_durable(plan, confirmation_id, Some(idempotency_key)));
+            .and_then(|_guard| {
+                self.execute_durable(plan, confirmation_id, Some(idempotency_key), None)
+            });
         execution_result(result)
+    }
+
+    fn execute_with_package_consent(
+        &self,
+        plan: &Plan,
+        confirmation_id: &StableId,
+        consent: &PackageConsent,
+    ) -> ExecutionResult {
+        let result = self
+            .execution_lock
+            .lock()
+            .map_err(|_| LocalExecutionError::Lock)
+            .and_then(|_guard| self.execute_durable(plan, confirmation_id, None, Some(consent)));
+        execution_result(result)
+    }
+}
+
+/// Package mutation is intentionally unavailable until a concrete offline
+/// backend is registered. Keeping the route in the service's closed registry
+/// means a package plan cannot fall through to a filesystem or generic
+/// executor when that backend is absent.
+struct UnavailablePackageAdapter;
+
+impl Adapter for UnavailablePackageAdapter {
+    fn id(&self) -> &StableId {
+        static ID: std::sync::OnceLock<StableId> = std::sync::OnceLock::new();
+        ID.get_or_init(|| StableId::parse("packages").expect("static adapter ID"))
+    }
+
+    fn supports_operation(&self, operation: &Operation) -> bool {
+        operation.adapter_id.as_str() == "packages"
+            && operation.resource.resource_type.as_str() == "package"
+            && operation.kind == commonkit_contracts::OperationKind::Create
+            && operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
+    }
+
+    fn supports_offline_recovery(&self, operation: &Operation) -> bool {
+        self.supports_operation(operation)
+    }
+
+    fn preflight(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        Err(commonkit_reconcile::AdapterFailure::new(
+            "package_adapter_unavailable",
+            "no concrete offline package adapter is registered",
+        ))
+    }
+
+    fn prepare(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        Err(commonkit_reconcile::AdapterFailure::new(
+            "package_adapter_unavailable",
+            "no concrete offline package adapter is registered",
+        ))
+    }
+    fn apply(&mut self, _operation: &Operation) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        Err(commonkit_reconcile::AdapterFailure::new(
+            "package_adapter_unavailable",
+            "no concrete offline package adapter is registered",
+        ))
+    }
+    fn verify(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        Err(commonkit_reconcile::AdapterFailure::new(
+            "package_adapter_unavailable",
+            "no concrete offline package adapter is registered",
+        ))
+    }
+    fn rollback(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        Err(commonkit_reconcile::AdapterFailure::new(
+            "package_adapter_unavailable",
+            "no concrete offline package adapter is registered",
+        ))
     }
 }
 
@@ -2008,7 +2165,25 @@ impl LocalExecutionError {
             Self::Lock => "executor_unavailable",
             Self::PlanStore(_) => "plan_invalid",
             Self::Receipt(_) => "receipt_invalid",
-            Self::Reconcile(_) => "reconcile_failed",
+            Self::Reconcile(error) => match error {
+                commonkit_reconcile::ReconcileError::AdapterPreflightFailed(failure) => {
+                    return StableId::parse(failure.code.clone())
+                        .unwrap_or_else(|_| stable_code("adapter_failure"));
+                }
+                commonkit_reconcile::ReconcileError::PackageConsentRequired => {
+                    "package_consent_required"
+                }
+                commonkit_reconcile::ReconcileError::PackageConsentMismatch => {
+                    "package_consent_mismatch"
+                }
+                commonkit_reconcile::ReconcileError::PackageResolutionAuthorityMissing => {
+                    "package_resolution_authority_missing"
+                }
+                commonkit_reconcile::ReconcileError::PackageConsentBindingChanged => {
+                    "package_consent_binding_changed"
+                }
+                _ => "reconcile_failed",
+            },
             Self::Adapter(_) => "adapter_unavailable",
             Self::Relay(_) => "relay_unavailable",
             Self::Contract(_) => "contract_invalid",
@@ -2534,7 +2709,22 @@ impl ControlPlane {
         idempotency_key: &str,
     ) -> Result<(ApplyOperation, bool), ControlError> {
         let (operation, created, job) =
-            self.reserve_apply(plan_id, confirmation_id, idempotency_key)?;
+            self.reserve_apply(plan_id, confirmation_id, idempotency_key, None)?;
+        if let Some(job) = job {
+            return Ok((self.execute_job(job), created));
+        }
+        Ok((operation, created))
+    }
+
+    pub fn apply_with_package_consent(
+        &self,
+        plan_id: &Sha256Digest,
+        confirmation_id: &StableId,
+        idempotency_key: &str,
+        consent: PackageConsent,
+    ) -> Result<(ApplyOperation, bool), ControlError> {
+        let (operation, created, job) =
+            self.reserve_apply(plan_id, confirmation_id, idempotency_key, Some(consent))?;
         if let Some(job) = job {
             return Ok((self.execute_job(job), created));
         }
@@ -2546,6 +2736,7 @@ impl ControlPlane {
         plan_id: &Sha256Digest,
         confirmation_id: &StableId,
         idempotency_key: &str,
+        package_consent: Option<PackageConsent>,
     ) -> Result<(ApplyOperation, bool, Option<ExecutionJob>), ControlError> {
         if idempotency_key.is_empty()
             || idempotency_key.len() > 128
@@ -2556,6 +2747,24 @@ impl ControlPlane {
             return Err(ControlError::InvalidIdempotencyKey);
         }
         let plan = self.plan(plan_id).ok_or(ControlError::PlanNotFound)?;
+        let has_package_operations = plan.operations.iter().any(|operation| {
+            operation.adapter_id.as_str() == "packages"
+                || operation.resource.resource_type.as_str() == "package"
+        });
+        let package_consent = if has_package_operations {
+            let consent = package_consent.ok_or(ControlError::PackageConsentRequired)?;
+            if consent.confirmation_id != *confirmation_id {
+                return Err(ControlError::PackageConsentMismatch);
+            }
+            Reconciler::validate_package_consent(&plan, &consent)
+                .map_err(|_| ControlError::PackageConsentMismatch)?;
+            Some(consent)
+        } else {
+            if package_consent.is_some() {
+                return Err(ControlError::PackageConsentUnexpected);
+            }
+            None
+        };
         self.validate_plan_execution_authority(&plan)?;
         self.validate_relay_execution_authority(&plan, confirmation_id, idempotency_key)?;
         let operation_id = digest_domain_json(
@@ -2609,6 +2818,7 @@ impl ControlPlane {
                 plan,
                 confirmation_id: confirmation_id.clone(),
                 idempotency_key: idempotency_key.to_owned(),
+                package_consent,
             }),
         ))
     }
@@ -2710,8 +2920,12 @@ impl ControlPlane {
             .expect("control runtime lock")
             .executor
             .clone();
-        let execution =
-            executor.execute_bound(&job.plan, &job.confirmation_id, &job.idempotency_key);
+        let execution = match &job.package_consent {
+            Some(consent) => {
+                executor.execute_with_package_consent(&job.plan, &job.confirmation_id, consent)
+            }
+            None => executor.execute_bound(&job.plan, &job.confirmation_id, &job.idempotency_key),
+        };
         let completed = ApplyOperation {
             id: job.operation_id.clone(),
             run_id: durable_run_id(&job.plan.id, &job.confirmation_id)
@@ -2734,6 +2948,7 @@ struct ExecutionJob {
     plan: Plan,
     confirmation_id: StableId,
     idempotency_key: String,
+    package_consent: Option<PackageConsent>,
 }
 
 fn validate_control_plan(plan: &Plan) -> Result<(), ControlError> {
@@ -2766,6 +2981,12 @@ pub enum ControlError {
     InvalidIdempotencyKey,
     #[error("idempotency key is already bound to another plan")]
     IdempotencyConflict,
+    #[error("package operations require explicit package consent")]
+    PackageConsentRequired,
+    #[error("package consent does not match the confirmed plan and operation set")]
+    PackageConsentMismatch,
+    #[error("package consent is only valid for package operations")]
+    PackageConsentUnexpected,
     #[error("relay authority changed after plan review")]
     RelayAuthorityChanged,
     #[error("provider plan authority changed after plan review")]
@@ -2789,6 +3010,8 @@ pub enum ControlError {
 struct ApplyRequest {
     confirmed: bool,
     confirmation_id: StableId,
+    #[serde(default)]
+    package_consent: Option<PackageConsent>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2913,10 +3136,15 @@ async fn target_apply_plan(
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .ok_or_else(|| ApiError::bad_request("idempotency_key_required"))?;
-    let (operation, created) = state
-        .control
-        .apply(&plan, &request.confirmation_id, key)
-        .map_err(ApiError::from)?;
+    let (operation, created) = match request.package_consent {
+        Some(consent) => {
+            state
+                .control
+                .apply_with_package_consent(&plan, &request.confirmation_id, key, consent)
+        }
+        None => state.control.apply(&plan, &request.confirmation_id, key),
+    }
+    .map_err(ApiError::from)?;
     Ok((
         if created {
             StatusCode::ACCEPTED
@@ -3026,7 +3254,7 @@ async fn apply_plan(
         .ok_or_else(|| ApiError::bad_request("idempotency_key_required"))?;
     let (operation, created, job) = state
         .control
-        .reserve_apply(&id, &request.confirmation_id, key)
+        .reserve_apply(&id, &request.confirmation_id, key, request.package_consent)
         .map_err(ApiError::from)?;
     if created {
         state.events.publish(
@@ -3141,6 +3369,11 @@ impl From<ControlError> for ApiError {
             }
             ControlError::RelayAuthorityChanged => Self::conflict("relay_authority_changed"),
             ControlError::PlanAuthorityChanged => Self::conflict("stale_plan"),
+            ControlError::PackageConsentRequired => Self::conflict("package_consent_required"),
+            ControlError::PackageConsentMismatch => Self::conflict("package_consent_mismatch"),
+            ControlError::PackageConsentUnexpected => {
+                Self::bad_request("package_consent_unexpected")
+            }
             ControlError::InvalidIdempotencyKey => Self::bad_request("invalid_idempotency_key"),
             ControlError::InvalidPlan | ControlError::Contract(_) => {
                 Self::bad_request("invalid_plan")

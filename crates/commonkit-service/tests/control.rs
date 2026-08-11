@@ -13,16 +13,19 @@ use commonkit_adapters::{
     ExactProviderVersion, MaterializedState, ProviderCapability, ProviderCapabilityResource,
     ProviderInputs, ResourceProvenance,
 };
-use commonkit_contracts::{OperationKind, PlanBindings, ResourceRef, Risk, Sha256Digest, StableId};
+use commonkit_contracts::{
+    OperationKind, PackageConsent, PackageOperationConsentBinding, PlanBindings,
+    RecoveryCapability, ResourceRef, Risk, Sha256Digest, StableId, package_operation_set_digest,
+};
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_reconcile::PlanStore;
 use commonkit_relay::{
     RelayAdapter, RelayConfig, RelayMutationInputs, RelayPlanRequest, plan_relay_operation,
 };
 use commonkit_service::{
-    ApplyStatus, ControlPlane, ControlToken, DomainFailure, EventHub, ExecutionResult,
-    PlanExecutionAuthority, PlanExecutor, RelayProviderAuthority, ServiceStatus, SyncDomain,
-    resolved_mcp_from_materialized, router_with_control,
+    ApplyStatus, ControlError, ControlPlane, ControlToken, DomainFailure, EventHub,
+    ExecutionResult, PlanExecutionAuthority, PlanExecutor, RelayProviderAuthority, ServiceStatus,
+    SyncDomain, resolved_mcp_from_materialized, router_with_control,
 };
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -81,8 +84,130 @@ fn plan() -> commonkit_contracts::Plan {
     .expect("plan")
 }
 
+fn package_plan() -> commonkit_contracts::Plan {
+    let operation = finalize_operation(OperationDraft {
+        adapter_id: StableId::parse("packages").expect("adapter"),
+        kind: OperationKind::Create,
+        resource: ResourceRef {
+            resource_type: StableId::parse("package").expect("type"),
+            resource_id: StableId::parse("ripgrep").expect("resource"),
+            managed_path: None,
+        },
+        risk: Risk::Medium,
+        requires_confirmation: true,
+        recovery_capability: RecoveryCapability::ConvergeForwardOnly,
+        depends_on: vec![],
+        before_digest: None,
+        after_digest: Some(digest('d')),
+        payload_digest: digest('e'),
+        provenance: None,
+        summary: "install ripgrep".into(),
+    })
+    .expect("operation");
+    build_plan(PlanDraft {
+        target_id: StableId::parse("laptop").expect("target"),
+        desired_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: digest('c'),
+        bindings: PlanBindings {
+            package_resolution_authority_digest: Some(digest('8')),
+            ..bindings()
+        },
+        operations: vec![operation],
+    })
+    .expect("plan")
+}
+
 struct SuccessfulExecutor {
     calls: AtomicUsize,
+}
+
+struct ConsentAwareExecutor {
+    consent_calls: AtomicUsize,
+}
+
+impl PlanExecutor for ConsentAwareExecutor {
+    fn execute(
+        &self,
+        _plan: &commonkit_contracts::Plan,
+        _confirmation_id: &StableId,
+    ) -> ExecutionResult {
+        panic!("package apply must carry consent")
+    }
+
+    fn execute_with_package_consent(
+        &self,
+        _plan: &commonkit_contracts::Plan,
+        _confirmation_id: &StableId,
+        _consent: &PackageConsent,
+    ) -> ExecutionResult {
+        self.consent_calls.fetch_add(1, Ordering::SeqCst);
+        ExecutionResult {
+            status: ApplyStatus::Succeeded,
+            failure_code: None,
+        }
+    }
+}
+
+#[test]
+fn package_apply_requires_consent_before_reserving_idempotency() {
+    let executor = Arc::new(SuccessfulExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let control = ControlPlane::new(executor.clone());
+    let plan = control.register_plan(package_plan()).unwrap();
+
+    let error = control
+        .apply(
+            &plan.id,
+            &StableId::parse("package-confirmation").unwrap(),
+            "package-apply",
+        )
+        .unwrap_err();
+
+    assert!(matches!(error, ControlError::PackageConsentRequired));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+
+    let mismatch = PackageConsent {
+        confirmation_id: StableId::parse("package-confirmation").unwrap(),
+        operation_set_digest: digest('f'),
+    };
+    let error = control
+        .apply_with_package_consent(
+            &plan.id,
+            &StableId::parse("package-confirmation").unwrap(),
+            "package-apply-mismatch",
+            mismatch,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ControlError::PackageConsentMismatch));
+    assert_eq!(executor.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn package_apply_carries_consent_to_the_executor() {
+    let executor = Arc::new(ConsentAwareExecutor {
+        consent_calls: AtomicUsize::new(0),
+    });
+    let control = ControlPlane::new(executor.clone());
+    let plan = control.register_plan(package_plan()).unwrap();
+    let binding = PackageOperationConsentBinding {
+        operation_id: plan.operations[0].id.clone(),
+        resolution_digest: plan.operations[0].payload_digest.clone(),
+    };
+    let confirmation_id = StableId::parse("package-confirmation").unwrap();
+    let consent = PackageConsent {
+        confirmation_id: confirmation_id.clone(),
+        operation_set_digest: package_operation_set_digest(&plan, &[binding]).unwrap(),
+    };
+
+    let (operation, created) = control
+        .apply_with_package_consent(&plan.id, &confirmation_id, "package-apply", consent)
+        .unwrap();
+
+    assert!(created);
+    assert_eq!(operation.status, ApplyStatus::Succeeded);
+    assert_eq!(executor.consent_calls.load(Ordering::SeqCst), 1);
 }
 
 impl PlanExecutor for SuccessfulExecutor {
