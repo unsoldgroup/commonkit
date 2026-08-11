@@ -1,4 +1,6 @@
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -14,6 +16,7 @@ use crate::{
 
 pub const MAX_SSH_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SSH_RESPONSE_BYTES: usize = 576 * 1024 * 1024;
+const MAX_SSH_STDERR_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSshConfig {
@@ -107,34 +110,46 @@ pub fn run_process_bounded(
     stdin: &[u8],
     output_limit: usize,
 ) -> Result<ProcessOutput, std::io::Error> {
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let mut child_stdin = child.stdin.take().expect("piped stdin");
     let (sender, receiver) = mpsc::channel();
-    let streams: [(u8, Box<dyn Read + Send>); 2] =
-        [(0u8, Box::new(stdout)), (1u8, Box::new(stderr))];
-    for (kind, stream) in streams {
+    let streams: [(u8, usize, Box<dyn Read + Send>); 2] = [
+        (0u8, output_limit, Box::new(stdout)),
+        (1u8, MAX_SSH_STDERR_BYTES, Box::new(stderr)),
+    ];
+    for (kind, limit, stream) in streams {
         let sender = sender.clone();
         std::thread::spawn(move || {
             let mut bytes = Vec::new();
             let result = stream
-                .take((output_limit + 1) as u64)
+                .take(limit.saturating_add(1) as u64)
                 .read_to_end(&mut bytes)
                 .map(|_| bytes);
-            let _ = sender.send((kind, result));
+            let _ = sender.send((kind, limit, result));
         });
     }
     let sender_for_stdin = sender.clone();
     let stdin = stdin.to_vec();
     std::thread::spawn(move || {
         let result = child_stdin.write_all(&stdin).map(|_| ());
-        let _ = sender_for_stdin.send((2, result.map(|_| Vec::new())));
+        let _ = sender_for_stdin.send((2, 0, result.map(|_| Vec::new())));
     });
     drop(sender);
 
@@ -144,20 +159,20 @@ pub fn run_process_bounded(
     let mut overflow = false;
     let mut input_error = None;
     while stdout.is_none() || stderr.is_none() || !stdin_done {
-        let (kind, result) = match receiver.recv_timeout(Duration::from_millis(20)) {
+        let (kind, limit, result) = match receiver.recv_timeout(Duration::from_millis(20)) {
             Ok(value) => value,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if overflow {
-                    let _ = child.kill();
+                    terminate_process_group(&mut child);
                 }
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         match result {
-            Ok(bytes) if (kind == 0 || kind == 1) && bytes.len() > output_limit => {
+            Ok(bytes) if (kind == 0 || kind == 1) && bytes.len() > limit => {
                 overflow = true;
-                let _ = child.kill();
+                terminate_process_group(&mut child);
             }
             Ok(bytes) if kind == 0 => stdout = Some(bytes),
             Ok(bytes) if kind == 1 => stderr = Some(bytes),
@@ -167,12 +182,12 @@ pub fn run_process_bounded(
                     std::io::ErrorKind::BrokenPipe,
                     "remote process closed stdin",
                 ));
-                let _ = child.kill();
+                terminate_process_group(&mut child);
             }
         }
     }
     if overflow {
-        let _ = child.kill();
+        terminate_process_group(&mut child);
     }
     let status = child.wait()?.code().unwrap_or(-1);
     if overflow {
@@ -189,6 +204,19 @@ pub fn run_process_bounded(
         stdout: stdout.unwrap_or_default(),
         stderr: stderr.unwrap_or_default(),
     })
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let process_group = -(child.id() as i32);
+        // The child is placed in a private process group before spawn. Killing
+        // the group also closes pipes inherited by descendants.
+        unsafe {
+            let _ = libc::kill(process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
 }
 
 pub struct OpenSshTransport<R> {

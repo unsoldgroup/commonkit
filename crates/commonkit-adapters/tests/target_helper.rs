@@ -336,6 +336,97 @@ fn chunk_transfer_rejects_gaps_and_tampering_but_accepts_safe_retry() {
     fs::remove_dir_all(state).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn sequence_zero_restarts_after_orphaned_part_or_metadata() {
+    let home = temp("chunk-restart-home");
+    let target = temp("chunk-restart-target");
+    let state = temp("chunk-restart-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state, "roots": [{"id":"home","path":target,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bytes = vec![b'r'; 1_048_577];
+    let first_chunk = vec![b'r'; 1_048_576];
+    let digest = Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&bytes))).unwrap();
+    let transfer = StableId::parse("transfer-restart").unwrap();
+    let first = SshFilesystemRequest::StageArtifactChunk {
+        run_id: transfer.clone(),
+        transfer_id: transfer.clone(),
+        digest: digest.clone(),
+        byte_count: bytes.len() as u64,
+        chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+        sequence: 0,
+        offset: 0,
+        total_chunks: 2,
+        content: first_chunk,
+    };
+    assert!(invoke(&home, &first).status.success());
+    let staging = state.join("artifact-staging");
+    let stem = format!(
+        "{}-{}",
+        transfer,
+        digest.as_str().trim_start_matches("sha256:")
+    );
+    let part_path = staging.join(format!("{stem}.part"));
+    let meta_path = staging.join(format!("{stem}.meta"));
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 60 * 60);
+    fs::File::open(&part_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(old))
+        .unwrap();
+    // The part looks stale, but the authoritative metadata was refreshed by
+    // the accepted chunk. Restart cleanup must retain the active transfer.
+    fs::File::open(&meta_path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::now()))
+        .unwrap();
+    let retained = invoke(
+        &home,
+        &SshFilesystemRequest::ReadFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: NormalizedManagedPath::parse("cleanup-probe").unwrap(),
+        },
+    );
+    assert!(retained.status.success());
+    // Simulate a crash after the part write and before metadata creation.
+    fs::remove_file(&meta_path).unwrap();
+    assert!(invoke(&home, &first).status.success());
+    // Simulate the opposite crash window: metadata exists but the part was
+    // not durable. A fresh sequence-0 request must safely recreate both.
+    fs::remove_file(&part_path).unwrap();
+    assert!(invoke(&home, &first).status.success());
+    let final_chunk = SshFilesystemRequest::StageArtifactChunk {
+        run_id: transfer.clone(),
+        transfer_id: transfer.clone(),
+        digest: digest.clone(),
+        byte_count: bytes.len() as u64,
+        chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+        sequence: 1,
+        offset: commonkit_adapters::ARTIFACT_CHUNK_SIZE as u64,
+        total_chunks: 2,
+        content: vec![b'r'],
+    };
+    assert!(invoke(&home, &final_chunk).status.success());
+    let verified = invoke(
+        &home,
+        &SshFilesystemRequest::VerifyArtifact {
+            run_id: transfer,
+            digest,
+        },
+    );
+    assert!(verified.status.success());
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
 #[test]
 fn helper_rejects_any_command_surface_other_than_stdio_protocol() {
     let output = Command::new(env!("CARGO_BIN_EXE_commonkit-target-helper"))

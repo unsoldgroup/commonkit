@@ -447,7 +447,12 @@ impl TargetHelper {
         let _lock =
             acquire_staging_lock(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         let (part, meta) = Self::transfer_paths(&transfer_id, &digest);
-        let part_exists = staging.metadata(&part).is_ok();
+        let mut part_exists = match staging.symlink_metadata(&part) {
+            Ok(metadata) if metadata.is_file() => true,
+            Ok(_) => return Err(TargetFilesystemError::RemoteArtifact),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(TargetFilesystemError::RemoteArtifact),
+        };
         let reference = ContentReference {
             digest: digest.clone(),
             bytes: byte_count,
@@ -481,10 +486,37 @@ impl TargetHelper {
                 response_digest,
             });
         }
+        let identity = format!("{digest}|{byte_count}|{chunk_size}|{total_chunks}");
+        let metadata_matches = if part_exists {
+            let mut meta_options = staging_open_options();
+            meta_options.read(true);
+            match staging.open_with(&meta, &meta_options) {
+                Ok(meta_file) => {
+                    let mut metadata_bytes = Vec::new();
+                    meta_file.take(4097).read_to_end(&mut metadata_bytes)?;
+                    metadata_bytes.starts_with(format!("{identity}|").as_bytes())
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => return Err(TargetFilesystemError::RemoteArtifact),
+            }
+        } else {
+            false
+        };
+        // A sequence-0 retry is the only operation allowed to recover an
+        // interrupted initialization. Reset both halves under the transfer
+        // lock so a stale/orphaned pair cannot consume the aggregate cap or
+        // be mixed with a new transfer identity.
+        if sequence == 0 && offset == 0 && (!part_exists || !metadata_matches) {
+            if part_exists {
+                staging.remove_file(&part)?;
+            }
+            let _ = staging.remove_file(&meta);
+            part_exists = false;
+        }
         let (part_count, staged_bytes) =
             staging_usage(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         let current_len = staging
-            .metadata(&part)
+            .symlink_metadata(&part)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         if !part_exists && part_count >= STAGING_MAX_PARTS {
@@ -497,7 +529,6 @@ impl TargetHelper {
         {
             return Err(TargetFilesystemError::RemoteArtifact);
         }
-        let identity = format!("{digest}|{byte_count}|{chunk_size}|{total_chunks}");
         if sequence == 0 && offset == 0 && !part_exists {
             let mut options = OpenOptions::new();
             options.write(true).create_new(true);
@@ -523,12 +554,7 @@ impl TargetHelper {
             if !part_exists {
                 return Err(TargetFilesystemError::RemoteArtifact);
             }
-            let mut meta_options = staging_open_options();
-            meta_options.read(true);
-            let meta_file = staging.open_with(&meta, &meta_options)?;
-            let mut metadata_bytes = Vec::new();
-            meta_file.take(4097).read_to_end(&mut metadata_bytes)?;
-            if !metadata_bytes.starts_with(format!("{identity}|").as_bytes()) {
+            if !metadata_matches {
                 return Err(TargetFilesystemError::RemoteArtifact);
             }
             let mut part_options = staging_open_options();
@@ -826,6 +852,14 @@ impl TargetHelper {
                 }
                 Ok(SshFilesystemResponse::ArtifactStaged { digest })
             }
+            #[cfg(not(unix))]
+            SshFilesystemRequest::StageArtifactChunk { .. }
+            | SshFilesystemRequest::ReadArtifactChunk { .. } => {
+                // Apt/NVM package resolution and mutation are Unix-only. Do
+                // not create or touch the staging store on platforms without
+                // the descriptor/lock guarantees used by this protocol.
+                Err(TargetFilesystemError::PackageResolutionUnavailable)
+            }
             SshFilesystemRequest::StageArtifactChunk {
                 run_id,
                 transfer_id,
@@ -1021,15 +1055,27 @@ fn cleanup_staging(staging: &Dir) -> Result<(), std::io::Error> {
                 "unsafe staging entry",
             ));
         }
-        let stale = metadata
-            .modified()
-            .ok()
+        let meta_name = format!("{}.meta", name.trim_end_matches(".part"));
+        let liveness = match staging.symlink_metadata(&meta_name) {
+            Ok(metadata) if metadata.is_file() => Some(metadata),
+            Ok(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsafe staging entry",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let stale = liveness
+            .as_ref()
+            .or(Some(&metadata))
+            .and_then(|metadata| metadata.modified().ok())
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age.as_secs() > STAGING_STALE_AFTER_SECS);
         if stale {
             entry.remove_file()?;
-            let meta = format!("{}.meta", name.trim_end_matches(".part"));
-            let _ = staging.remove_file(meta);
+            let _ = staging.remove_file(meta_name);
         }
     }
     for entry in entries {
