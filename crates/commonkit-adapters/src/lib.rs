@@ -77,15 +77,15 @@ pub use node_resolution::{
 };
 pub use package_resolution::{
     AptSourceAuthorityV1, ArtifactEvidence, COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS,
-    ControlledPackageSourceV1, ManagerBindingV1, NodeOfflineInstallRecipeV1, NodeSourceAuthorityV1,
-    OfflineInstallRecipeV1, OfflinePackageBackend, PackageArtifactV1,
-    PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1, PackageFetchRequestV1,
-    PackageFetchResultV1, PackageFetchedResolutionV1, PackageObservationV1,
-    PackageResolutionAuthority, PackageResolutionBackend, PackageResolutionCoordinator,
-    PackageResolutionDraftV1, PackageResolutionError, PackageResolutionProbeV1,
-    PackageResolutionRequestV1, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
-    ResolvedPackage, ResolvedPackageIntent, SourceBindingV1, package_resolution_schema,
-    package_resolution_v2_schema,
+    COMMONKIT_NVM_SCRIPT_RELEASES, ControlledPackageSourceV1, ManagerBindingV1,
+    NodeOfflineInstallRecipeV1, NodeSourceAuthorityV1, OfflineInstallRecipeV1,
+    OfflinePackageBackend, PackageArtifactV1, PackageDiscoveryFetchRequestV1, PackageFetch,
+    PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1, PackageFetchedResolutionV1,
+    PackageObservationV1, PackageResolutionAuthority, PackageResolutionBackend,
+    PackageResolutionCoordinator, PackageResolutionDraftV1, PackageResolutionError,
+    PackageResolutionProbeV1, PackageResolutionRequestV1, PackageResolutionV1,
+    PackageSourceRegistry, PackageTargetV1, ResolvedPackage, ResolvedPackageIntent,
+    SourceBindingV1, package_resolution_schema, package_resolution_v2_schema,
 };
 pub use packages::{
     PackageBackendEvidence, PackageCommandError, PackageCommandOutput, PackageCommandRunner,

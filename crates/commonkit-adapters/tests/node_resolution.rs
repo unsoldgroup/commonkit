@@ -2,12 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 
 use commonkit_adapters::{
-    ArtifactStore, ContentSensitivity, ControlledPackageSourceV1, ManagerBindingV1,
-    NodeReleaseSignatureError, NodeReleaseSignatureVerifier, NodeResolutionBackend,
-    NodeRuntimeHost, NodeRuntimeHostError, NodeRuntimeHostSnapshotV1, NodeSourceAuthorityV1,
-    OfflineInstallRecipeV1, PackageFetch, PackageFetchHopV1, PackageFetchRequestV1,
-    PackageFetchResultV1, PackageObservationV1, PackageResolutionCoordinator,
-    PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
+    ArtifactStore, COMMONKIT_NVM_SCRIPT_RELEASES, ContentSensitivity, ControlledPackageSourceV1,
+    ManagerBindingV1, NodeReleaseSignatureError, NodeReleaseSignatureVerifier,
+    NodeResolutionBackend, NodeRuntimeHost, NodeRuntimeHostError, NodeRuntimeHostSnapshotV1,
+    NodeSourceAuthorityV1, OfflineInstallRecipeV1, PackageFetch, PackageFetchHopV1,
+    PackageFetchRequestV1, PackageFetchResultV1, PackageObservationV1,
+    PackageResolutionCoordinator, PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
     ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, ResolvedPackageIntent,
     package_resolution_v2_schema, validate_nvm_environment, validate_nvm_environment_os,
 };
@@ -64,6 +64,10 @@ fn source_authority() -> NodeSourceAuthorityV1 {
         release_key_fingerprints: BTreeSet::from([
             "5be8a3f6c8a5c01d106c0ad820b1a390b168d356".into()
         ]),
+        nvm_script_releases: COMMONKIT_NVM_SCRIPT_RELEASES
+            .iter()
+            .map(|(version, digest)| ((*version).into(), Sha256Digest::parse(*digest).unwrap()))
+            .collect(),
     }
 }
 
@@ -75,7 +79,7 @@ fn registry() -> PackageSourceRegistry {
 }
 
 fn host_snapshot() -> NodeRuntimeHostSnapshotV1 {
-    let nvm_script_digest = content_digest(b"nvm 0.40.6 fixture");
+    let nvm_script_digest = Sha256Digest::parse(COMMONKIT_NVM_SCRIPT_RELEASES[0].1).unwrap();
     let shell_executable_digest = content_digest(b"bash fixture");
     let release_keyring_digest = content_digest(b"release keyring fixture");
     let config_digest = digest_domain_json(
@@ -340,6 +344,7 @@ fn node_source_key_drift_invalidates_persisted_authority() {
                 release_key_fingerprints: BTreeSet::from([
                     "dd792f5973c6de52c432cbdac77abfa00ddbf2b7".into(),
                 ]),
+                nvm_script_releases: source_authority().nvm_script_releases,
             },
         )
         .unwrap();
@@ -354,6 +359,7 @@ fn node_source_key_drift_invalidates_persisted_authority() {
 fn production_node_source_authority_rejects_unapproved_signers() {
     let arbitrary = NodeSourceAuthorityV1 {
         release_key_fingerprints: BTreeSet::from(["00".repeat(20)]),
+        nvm_script_releases: source_authority().nvm_script_releases,
     };
     assert!(matches!(
         PackageSourceRegistry::builtin()
@@ -367,6 +373,16 @@ fn production_node_source_authority_rejects_unapproved_signers() {
             .with_node_source_authority(&id("nodejs-nvm"), source_authority())
             .is_ok()
     );
+
+    let mut unknown_release = source_authority();
+    unknown_release.nvm_script_releases =
+        BTreeMap::from([("0.99.0".into(), content_digest(b"unapproved nvm script"))]);
+    assert!(matches!(
+        PackageSourceRegistry::builtin()
+            .unwrap()
+            .with_node_source_authority(&id("nodejs-nvm"), unknown_release),
+        Err(PackageResolutionError::MutableSourceMetadata)
+    ));
 }
 
 #[test]
@@ -744,7 +760,7 @@ fn process_host_fixture() -> (tempfile::TempDir, ProcessNodeRuntimeHost, Package
     std::fs::create_dir_all(&nvm_dir).unwrap();
     std::fs::write(
         nvm_dir.join("nvm.sh"),
-        include_bytes!("fixtures/node/nvm-version-dispatch-0.40.6.sh"),
+        include_bytes!("fixtures/node/nvm-v0.40.6.sh"),
     )
     .unwrap();
     let shell = root.path().join("bash");
@@ -770,6 +786,10 @@ fn process_nvm_probe_requires_nvm_and_rejects_default_packages_or_prefix() {
     let (_root, mut host, target) = process_host_fixture();
     let snapshot = host.probe(&target).unwrap();
     assert_eq!(snapshot.manager.version, "0.40.6");
+    assert_eq!(
+        snapshot.nvm_script_digest.as_str(),
+        COMMONKIT_NVM_SCRIPT_RELEASES[0].1,
+    );
 
     let (root, mut host, target) = process_host_fixture();
     std::fs::write(root.path().join(".nvm/default-packages"), b"typescript\n").unwrap();
@@ -785,8 +805,47 @@ fn process_nvm_probe_requires_nvm_and_rejects_default_packages_or_prefix() {
 }
 
 #[test]
+fn node_backend_rejects_an_unknown_nvm_release_before_fetch() {
+    let mut snapshot = host_snapshot();
+    let unknown_digest = content_digest(b"unknown nvm release");
+    snapshot.manager.version = "0.99.0".into();
+    snapshot.manager.executable_digest = unknown_digest.clone();
+    snapshot.nvm_script_digest = unknown_digest;
+    let manager = snapshot.manager.clone();
+    let mut host = FixtureHost {
+        snapshot: Ok(snapshot),
+        calls: 0,
+    };
+    let mut verifier = FixtureVerifier {
+        fingerprint: String::new(),
+        signed_payload: Vec::new(),
+        calls: 0,
+    };
+    let mut backend = NodeResolutionBackend::new(&mut host, &mut verifier);
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::new(),
+        contacted: Vec::new(),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+
+    assert!(matches!(
+        PackageResolutionCoordinator::new(
+            &policy(),
+            &registry(),
+            manager,
+            &mut backend,
+            &mut fetch,
+        )
+        .resolve(&desired(), &target(), &store),
+        Err(PackageResolutionError::NodeAuthorityMismatch)
+    ));
+    assert!(fetch.contacted.is_empty());
+}
+
+#[test]
 fn process_nvm_probe_rejects_ambiguous_or_executable_version_dispatches() {
-    let valid = include_str!("fixtures/node/nvm-version-dispatch-0.40.6.sh");
+    let valid = include_str!("fixtures/node/nvm-v0.40.6.sh");
     let cases = [
         format!("NVM_VERSION='9.9.9'\n{valid}"),
         format!("nvm_echo '9.9.9'\n{valid}"),
@@ -808,6 +867,28 @@ fn process_nvm_probe_rejects_ambiguous_or_executable_version_dispatches() {
             host.probe(&target),
             Err(NodeRuntimeHostError::UnsafeConfiguration(_))
         ));
+    }
+}
+
+#[test]
+fn process_nvm_probe_rejects_scripts_outside_the_commonkit_release_authority() {
+    let valid = include_str!("fixtures/node/nvm-v0.40.6.sh");
+    let cases = [
+        format!("{valid}\n# altered after release\n"),
+        format!("cat <<'SPOOF'\n{valid}SPOOF\n"),
+        valid.replace("0.40.6", "0.99.0"),
+    ];
+
+    for script in cases {
+        let (root, mut host, target) = process_host_fixture();
+        std::fs::write(root.path().join(".nvm/nvm.sh"), script).unwrap();
+
+        assert_eq!(
+            host.probe(&target),
+            Err(NodeRuntimeHostError::UnsafeConfiguration(
+                "nvm.sh does not match a CommonKit-approved release".into(),
+            )),
+        );
     }
 }
 

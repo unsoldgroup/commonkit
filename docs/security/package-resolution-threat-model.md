@@ -81,12 +81,16 @@ the `nodejs-nvm` source, nvm 0.40.6 or newer, and Node's version-specific
 glibc Linux binary targets. Windows, musl, aliases, ranges, moving release
 paths, custom mirrors, and source-build fallback fail closed.
 
-Before network access, CommonKit opens `nvm.sh`, the configured shell, and the
-Node release keyring without following the leaf and binds their digests with
-the target tuple and nvm directory. It rejects `default-packages`, a user
-`.npmrc` prefix, prefix or mirror environment overrides, package migration,
-and latest-npm behavior. nvm remains a sourced shell function; CommonKit never
-treats it as a standalone executable.
+Before network access, CommonKit opens `nvm.sh` without following the leaf and
+requires its SHA-256 digest in the CommonKit-owned nvm release map. It then
+statically confirms that the embedded version matches the mapped release. The
+manager and source-registry authority bind that exact release and digest.
+CommonKit also opens the configured shell and Node release keyring without
+following the leaf and binds their digests with the target tuple and nvm
+directory. It rejects `default-packages`, a user `.npmrc` prefix, prefix or
+mirror environment overrides, package migration, and latest-npm behavior. nvm
+remains a sourced shell function; CommonKit never treats it as a standalone
+executable.
 
 The resolver preflights the checksum, armored-signature, and exact archive
 locators together. It fetches each response through the scoped per-hop seam,

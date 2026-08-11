@@ -252,7 +252,7 @@ fn generated_nvm_negative_control_rejects_default_packages_with_exact_reason() {
 
     assert_generated_unsafe_nvm_control(
         root.path(),
-        include_bytes!("fixtures/node/nvm-version-dispatch-0.40.6.sh"),
+        include_bytes!("fixtures/node/nvm-v0.40.6.sh"),
         &shell,
         &keyring,
         &target,

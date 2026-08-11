@@ -12,11 +12,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ArtifactEvidence, ManagerBindingV1, NodeOfflineInstallRecipeV1, OfflineInstallRecipeV1,
-    PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1, PackageFetchRequestV1,
-    PackageFetchedResolutionV1, PackageObservationV1, PackageResolutionBackend,
-    PackageResolutionDraftV1, PackageResolutionError, PackageResolutionProbeV1,
-    PackageResolutionRequestV1, PackageTargetV1, ResolvedPackage, SourceBindingV1,
+    ArtifactEvidence, COMMONKIT_NVM_SCRIPT_RELEASES, ManagerBindingV1, NodeOfflineInstallRecipeV1,
+    OfflineInstallRecipeV1, PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1,
+    PackageFetchRequestV1, PackageFetchedResolutionV1, PackageObservationV1,
+    PackageResolutionBackend, PackageResolutionDraftV1, PackageResolutionError,
+    PackageResolutionProbeV1, PackageResolutionRequestV1, PackageTargetV1, ResolvedPackage,
+    SourceBindingV1,
 };
 
 const MAX_RELEASE_METADATA_BYTES: u64 = 1024 * 1024;
@@ -417,11 +418,15 @@ fn validate_host_snapshot(
     request: &PackageResolutionRequestV1<'_>,
     host: &NodeRuntimeHostSnapshotV1,
 ) -> Result<(), PackageResolutionError> {
+    let approved_nvm_script = request
+        .node_source_authority
+        .and_then(|authority| authority.nvm_script_releases.get(&host.manager.version));
     if &host.target != request.target
         || &host.manager != request.manager
         || host.manager.manager != PackageManager::Nvm
         || !nvm_at_least_0_40_6(&host.manager.version)
         || host.manager.executable_digest != host.nvm_script_digest
+        || approved_nvm_script != Some(&host.nvm_script_digest)
         || content_digest(&host.release_keyring)? != host.release_keyring_digest
     {
         return Err(PackageResolutionError::NodeAuthorityMismatch);
@@ -487,7 +492,23 @@ impl NodeRuntimeHost for ProcessNodeRuntimeHost {
             ));
         }
         let nvm_script = read_regular_no_follow(&self.nvm_dir.join("nvm.sh"))?;
+        let nvm_script_digest = host_content_digest(&nvm_script)?;
+        let approved_version = COMMONKIT_NVM_SCRIPT_RELEASES
+            .iter()
+            .find_map(|(version, digest)| {
+                (nvm_script_digest.as_str() == *digest).then_some(*version)
+            })
+            .ok_or_else(|| {
+                NodeRuntimeHostError::UnsafeConfiguration(
+                    "nvm.sh does not match a CommonKit-approved release".into(),
+                )
+            })?;
         let nvm_version = parse_nvm_version(&nvm_script)?;
+        if nvm_version != approved_version {
+            return Err(NodeRuntimeHostError::UnsafeConfiguration(
+                "nvm.sh version does not match its approved release digest".into(),
+            ));
+        }
         if !nvm_at_least_0_40_6(&nvm_version) {
             return Err(NodeRuntimeHostError::UnsafeConfiguration(
                 "nvm 0.40.6 or newer is required".into(),
@@ -530,7 +551,6 @@ impl NodeRuntimeHost for ProcessNodeRuntimeHost {
         validate_nvm_environment_os(&std::env::vars_os().collect())?;
         let shell = read_executable_no_follow(&self.shell_executable)?;
         let keyring = read_regular_no_follow(&self.release_keyring)?;
-        let nvm_script_digest = host_content_digest(&nvm_script)?;
         let shell_executable_digest = host_content_digest(&shell)?;
         let release_keyring_digest = host_content_digest(&keyring)?;
         let config_digest = digest_domain_json(
@@ -759,9 +779,6 @@ fn parse_nvm_version(bytes: &[u8]) -> Result<String, NodeRuntimeHostError> {
     let mut dispatch = None;
     let mut static_version_literals = Vec::new();
     for (index, line) in lines.iter().enumerate() {
-        if line.contains("NVM_VERSION=") {
-            return Err(malformed());
-        }
         if let Some(version) = static_nvm_echo_version(line) {
             if semantic_nvm_version(version).is_some() {
                 static_version_literals.push((index, version));

@@ -28,6 +28,11 @@ pub const COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS: &[&str] = &[
     "86c8d74642e67846f8e120284daa80d1e737bc9f",
 ];
 
+pub const COMMONKIT_NVM_SCRIPT_RELEASES: &[(&str, &str)] = &[(
+    "0.40.6",
+    "sha256:baad94563757afa5147950e3dfa272f06b6307e1a7d92c553f8438959b5165fe",
+)];
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageTargetV1 {
@@ -464,6 +469,7 @@ pub struct AptSourceAuthorityV1 {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NodeSourceAuthorityV1 {
     pub release_key_fingerprints: BTreeSet<String>,
+    pub nvm_script_releases: BTreeMap<String, Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,7 +514,7 @@ fn package_source_definition_digest(
 ) -> Result<Sha256Digest, PackageResolutionError> {
     Ok(digest_domain_json(
         if source.node_source_authority.is_some() {
-            "commonkit.package-source-registry-definition.v3"
+            "commonkit.package-source-registry-definition.v4"
         } else if source.apt_source_authority.is_some() {
             "commonkit.package-source-registry-definition.v2"
         } else {
@@ -542,7 +548,7 @@ fn package_source_registry_digest<'a>(
         .iter()
         .any(|entry| entry.node_source_authority.is_some())
     {
-        "commonkit.package-source-registry.v3"
+        "commonkit.package-source-registry.v4"
     } else if entries
         .iter()
         .any(|entry| entry.apt_source_authority.is_some())
@@ -777,7 +783,9 @@ impl PackageSourceRegistry {
         source_id: &StableId,
         authority: NodeSourceAuthorityV1,
     ) -> Result<Self, PackageResolutionError> {
-        if !valid_node_release_fingerprints(&authority.release_key_fingerprints) {
+        if !valid_node_release_fingerprints(&authority.release_key_fingerprints)
+            || !valid_nvm_script_releases(&authority.nvm_script_releases)
+        {
             return Err(PackageResolutionError::MutableSourceMetadata);
         }
         let source = self.sources.get_mut(source_id).ok_or_else(|| {
@@ -805,6 +813,7 @@ impl PackageSourceRegistry {
                     .iter()
                     .map(|fingerprint| (*fingerprint).into())
                     .collect(),
+                nvm_script_releases: commonkit_nvm_script_releases()?,
             },
         )
     }
@@ -1469,6 +1478,25 @@ fn valid_node_release_fingerprints(fingerprints: &BTreeSet<String>) -> bool {
                 })
                 && approved.contains(fingerprint.as_str())
         })
+}
+
+fn valid_nvm_script_releases(releases: &BTreeMap<String, Sha256Digest>) -> bool {
+    !releases.is_empty()
+        && releases.iter().all(|(version, digest)| {
+            COMMONKIT_NVM_SCRIPT_RELEASES
+                .iter()
+                .any(|(approved_version, approved_digest)| {
+                    version == approved_version && digest.as_str() == *approved_digest
+                })
+        })
+}
+
+fn commonkit_nvm_script_releases() -> Result<BTreeMap<String, Sha256Digest>, PackageResolutionError>
+{
+    COMMONKIT_NVM_SCRIPT_RELEASES
+        .iter()
+        .map(|(version, digest)| Ok(((*version).into(), Sha256Digest::parse(*digest)?)))
+        .collect()
 }
 
 fn validate_target(target: &PackageTargetV1) -> Result<(), PackageResolutionError> {
