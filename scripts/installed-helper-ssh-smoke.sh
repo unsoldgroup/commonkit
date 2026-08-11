@@ -47,13 +47,18 @@ sudo -u "$user" test -r "$runtime_root" -a -x "$runtime_root"
 sudo -u "$user" test -r "$home/.ssh/authorized_keys"
 sudo -u "$user" test -x "$home/commonkit-target-helper"
 sudo -u "$user" test -w "$target" -a -w "$state"
-cleanup() {
+cleanup_runtime() {
   if [[ -f "$scratch/sshd/pid" ]]; then
-    kill "$(cat "$scratch/sshd/pid")" 2>/dev/null || true
+    sudo kill "$(cat "$scratch/sshd/pid")" 2>/dev/null || true
   fi
+  sudo userdel "$user" 2>/dev/null || true
   rm -f "$home/.config/commonkit/.target-helper."*.tmp "$scratch/sshd/pid"
+  case "$runtime_root" in
+    /tmp/commonkit-ssh-smoke.*) sudo rm -rf -- "$runtime_root" ;;
+    *) printf 'refusing to remove unexpected runtime root: %s\n' "$runtime_root" >&2 ;;
+  esac
 }
-trap cleanup EXIT INT TERM
+trap cleanup_runtime EXIT INT TERM
 if [[ "${COMMONKIT_PACKAGE_SUPPORT:-0}" == "1" && "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" != "1" ]]; then
   echo 'package support requires an explicit successful native probe' >&2
   exit 1
@@ -103,15 +108,11 @@ StrictModes yes
 LogLevel VERBOSE
 CFG
 sshd_log="$scratch/sshd/sshd.log"
-cleanup() {
+cleanup_sshd() {
   if [[ -f "$scratch/sshd/pid" ]]; then sudo kill "$(cat "$scratch/sshd/pid")" 2>/dev/null || true; fi
-  sudo userdel "$user" 2>/dev/null || true
-  case "$runtime_root" in
-    /tmp/commonkit-ssh-smoke.*) sudo rm -rf -- "$runtime_root" ;;
-    *) printf 'refusing to remove unexpected runtime root: %s\n' "$runtime_root" >&2 ;;
-  esac
+  rm -f "$home/.config/commonkit/.target-helper."*.tmp "$scratch/sshd/pid"
 }
-trap cleanup EXIT
+trap 'cleanup_sshd; cleanup_runtime' EXIT
 sudo install -d -m 0755 /run/sshd
 sudo /usr/sbin/sshd -t -f "$scratch/sshd/config"
 sudo /usr/sbin/sshd -E "$sshd_log" -f "$scratch/sshd/config"

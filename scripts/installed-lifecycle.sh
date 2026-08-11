@@ -178,7 +178,10 @@ start_daemon() {
   cat "$scratch/service/commonkitd.log" >&2
   return 1
 }
-trap stop_daemon EXIT
+cleanup_probe_temps() {
+  rm -f "$HOME/.config/commonkit/.target-helper."*.tmp
+}
+trap 'stop_daemon; cleanup_probe_temps' EXIT
 start_daemon
 "$commonkit" daemon status | node -e 'let b="";process.stdin.on("data",c=>b+=c);process.stdin.on("end",()=>{const s=JSON.parse(b);if(!s.installed||!s.running)process.exit(1)})'
 "$commonkit" daemon restart >/dev/null
@@ -459,7 +462,6 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
 }));
 JS
 chmod 0600 "$HOME/.config/commonkit/target-helper.json"
-trap 'rm -f "$HOME/.config/commonkit/.target-helper."*.tmp' EXIT
 if [[ "${COMMONKIT_PACKAGE_SUPPORT:-0}" == "1" && "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" != "1" ]]; then
   echo 'package support requires an explicit successful native probe' >&2
   exit 1

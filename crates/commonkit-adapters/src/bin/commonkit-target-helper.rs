@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -13,6 +13,7 @@ use commonkit_adapters::{
 use commonkit_contracts::{SecurityPolicy, Sha256Digest, StableId};
 use commonkit_core::TargetRoot;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 
 const MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -73,10 +74,12 @@ fn run() -> Result<(), ()> {
         return Err(());
     }
     let config: HelperConfig = serde_json::from_slice(&config_bytes).map_err(|_| ())?;
-    let helper = TargetHelper::open_with_package_resolution(
+    let protected = protected_paths(&config_path, &config);
+    let helper = TargetHelper::open_with_package_resolution_and_protected_paths(
         config.roots,
         &config.state_root,
         config.package_resolution,
+        protected,
     )
     .map_err(|_| ())?;
     let mut input = Vec::new();
@@ -131,21 +134,47 @@ fn target_probe() -> Result<commonkit_adapters::PackageTargetV1, ()> {
 
 fn detect_libc() -> Result<String, ()> {
     let ldd = Path::new("/usr/bin/ldd");
-    let metadata = fs::symlink_metadata(ldd).map_err(|_| ())?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    validate_existing_path(ldd, true, false)?;
+    let before = read_bounded_nofollow(ldd)?;
+    let before_digest = Sha256::digest(&before);
+    let mut child = std::process::Command::new(ldd)
+        .arg("--version")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|_| ())?;
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or(())?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut stdout)
+        .map_err(|_| ())?;
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .ok_or(())?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut stderr)
+        .map_err(|_| ())?;
+    if stdout.len() > 64 * 1024
+        || stderr.len() > 64 * 1024
+        || !child.wait().map_err(|_| ())?.success()
+    {
         return Err(());
     }
-    let output = std::process::Command::new(ldd)
-        .arg("--version")
-        .output()
-        .map_err(|_| ())?;
-    if !output.status.success() {
+    let after = read_bounded_nofollow(ldd)?;
+    if Sha256::digest(&after) != before_digest {
         return Err(());
     }
     let text = format!(
         "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stdout),
+        String::from_utf8_lossy(&stderr)
     )
     .to_ascii_lowercase();
     if text.contains("glibc") || text.contains("gnu libc") {
@@ -155,6 +184,26 @@ fn detect_libc() -> Result<String, ()> {
     } else {
         Err(())
     }
+}
+
+fn read_bounded_nofollow(path: &Path) -> Result<Vec<u8>, ()> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path).map_err(|_| ())?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(());
+    }
+    Ok(bytes)
 }
 
 fn canonical_apt_source(source: &StableId) -> Result<&'static str, ()> {
@@ -173,6 +222,27 @@ fn package_policy(source: &StableId) -> SecurityPolicy {
         )]),
         ..SecurityPolicy::default()
     }
+}
+
+fn protected_paths(config_path: &Path, config: &HelperConfig) -> Vec<PathBuf> {
+    let mut paths = vec![config_path.to_path_buf(), config.state_root.clone()];
+    if let Ok(executable) = std::env::current_exe() {
+        paths.push(executable);
+    }
+    if let Some(package) = &config.package_resolution {
+        if let Some(apt) = &package.apt {
+            paths.push(apt.signed_by.clone());
+        }
+        if let Some(node) = &package.node {
+            paths.extend([
+                node.nvm_dir.clone(),
+                node.shell_executable.clone(),
+                node.release_keyring.clone(),
+                node.gpgv_executable.clone(),
+            ]);
+        }
+    }
+    paths
 }
 
 fn owner_allowed(uid: u32) -> bool {
@@ -363,9 +433,12 @@ fn provision(args: &[String]) -> Result<(), ()> {
         target_identity_digest,
     });
     validate_roots(&config)?;
-    let candidate = config.package_resolution.clone();
-    TargetHelper::open_with_package_resolution(config.roots.clone(), &config.state_root, candidate)
-        .map_err(|_| ())?;
+    TargetHelper::validate_configuration(
+        &config.roots,
+        &config.state_root,
+        &protected_paths(&config_path, &config),
+    )
+    .map_err(|_| ())?;
     write_config_atomic(&config_path, &config)
 }
 
@@ -451,10 +524,10 @@ fn write_config_atomic(path: &Path, config: &HelperConfig) -> Result<(), ()> {
     }
     let verified: HelperConfig =
         serde_json::from_slice(&fs::read(path).map_err(|_| ())?).map_err(|_| ())?;
-    TargetHelper::open_with_package_resolution(
-        verified.roots,
+    TargetHelper::validate_configuration(
+        &verified.roots,
         &verified.state_root,
-        verified.package_resolution,
+        &protected_paths(path, &verified),
     )
     .map_err(|_| ())?;
     Ok(())

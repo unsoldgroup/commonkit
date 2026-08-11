@@ -4,7 +4,8 @@ use std::process::{Command, Stdio};
 
 use commonkit_adapters::{
     FileMode, NormalizedManagedPath, PackageDesiredIntent, SafeSymlinkTarget, SshFilesystemRequest,
-    SshFilesystemResponse, SymlinkTargetKind, TargetResource, package_resolution_request_digest,
+    SshFilesystemResponse, SymlinkTargetKind, TargetHelper, TargetResource,
+    package_resolution_request_digest,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, digest_domain_json,
@@ -608,4 +609,24 @@ fn installed_probe_rejects_a_symlinked_config_path() {
     assert!(!output.status.success());
     let _ = fs::remove_dir_all(home);
     let _ = fs::remove_file(outside);
+}
+
+#[test]
+fn helper_rejects_a_writable_root_overlapping_control_state() {
+    let root = temp("protected-root");
+    fs::create_dir_all(&root).unwrap();
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let result = TargetHelper::validate_configuration(
+        &[commonkit_core::TargetRoot {
+            id: StableId::parse("home").unwrap(),
+            path: root.to_string_lossy().into_owned(),
+            access: commonkit_core::RootAccess::ReadWrite,
+        }],
+        &state,
+        std::slice::from_ref(&state),
+    );
+    assert!(result.is_err());
+    assert!(!state.join("artifacts").exists());
+    let _ = fs::remove_dir_all(root);
 }

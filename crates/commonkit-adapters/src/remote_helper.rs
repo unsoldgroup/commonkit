@@ -32,6 +32,7 @@ pub struct TargetHelper {
     receipts: PathBuf,
     staging: std::sync::Mutex<Dir>,
     package_resolution: Option<TargetPackageResolutionConfig>,
+    protected_paths: Vec<PathBuf>,
 }
 
 impl TargetHelper {
@@ -44,6 +45,21 @@ impl TargetHelper {
         state_root: &Path,
         package_resolution: Option<TargetPackageResolutionConfig>,
     ) -> Result<Self, TargetFilesystemError> {
+        Self::open_with_package_resolution_and_protected_paths(
+            roots,
+            state_root,
+            package_resolution,
+            Vec::new(),
+        )
+    }
+
+    pub fn open_with_package_resolution_and_protected_paths(
+        roots: Vec<TargetRoot>,
+        state_root: &Path,
+        package_resolution: Option<TargetPackageResolutionConfig>,
+        protected_paths: Vec<PathBuf>,
+    ) -> Result<Self, TargetFilesystemError> {
+        Self::validate_configuration(&roots, state_root, &protected_paths)?;
         let mut mapped = BTreeMap::new();
         for root in roots {
             let path = PathBuf::from(&root.path);
@@ -73,7 +89,44 @@ impl TargetHelper {
             receipts,
             staging: std::sync::Mutex::new(staging),
             package_resolution,
+            protected_paths,
         })
+    }
+
+    pub fn validate_configuration(
+        roots: &[TargetRoot],
+        state_root: &Path,
+        protected_paths: &[PathBuf],
+    ) -> Result<(), TargetFilesystemError> {
+        if !state_root.is_absolute() || protected_paths.iter().any(|path| !path.is_absolute()) {
+            return Err(TargetFilesystemError::InvalidSshConfig(
+                "target helper paths must be absolute",
+            ));
+        }
+        let mut ids = BTreeMap::new();
+        for root in roots {
+            let path = PathBuf::from(&root.path);
+            if !path.is_absolute() {
+                return Err(TargetFilesystemError::InvalidRoot);
+            }
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(TargetFilesystemError::InvalidRoot);
+            }
+            if ids.insert(root.id.clone(), ()).is_some() {
+                return Err(TargetFilesystemError::InvalidSshConfig("duplicate root id"));
+            }
+            if root.access == RootAccess::ReadWrite
+                && protected_paths
+                    .iter()
+                    .any(|protected| path.starts_with(protected) || protected.starts_with(&path))
+            {
+                return Err(TargetFilesystemError::InvalidSshConfig(
+                    "writable root overlaps helper control path",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn root(&self, id: &StableId) -> Result<LocalTargetFilesystem, TargetFilesystemError> {
@@ -82,6 +135,28 @@ impl TargetHelper {
             .get(id)
             .ok_or_else(|| TargetFilesystemError::UnknownRoot(id.clone()))?;
         LocalTargetFilesystem::open(path, *access)
+    }
+
+    fn ensure_unprotected(
+        &self,
+        root_id: &StableId,
+        path: &crate::NormalizedManagedPath,
+    ) -> Result<(), TargetFilesystemError> {
+        let (root, _) = self
+            .roots
+            .get(root_id)
+            .ok_or_else(|| TargetFilesystemError::UnknownRoot(root_id.clone()))?;
+        let absolute = root.join(path.as_str());
+        if self
+            .protected_paths
+            .iter()
+            .any(|protected| absolute.starts_with(protected) || protected.starts_with(&absolute))
+        {
+            return Err(TargetFilesystemError::InvalidSshConfig(
+                "managed path overlaps helper control path",
+            ));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -575,6 +650,17 @@ impl TargetHelper {
         &self,
         request: SshFilesystemRequest,
     ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+        match &request {
+            SshFilesystemRequest::ReadFile { root_id, path }
+            | SshFilesystemRequest::InspectResource { root_id, path }
+            | SshFilesystemRequest::WriteFile { root_id, path, .. }
+            | SshFilesystemRequest::WriteDirectory { root_id, path, .. }
+            | SshFilesystemRequest::WriteSymlink { root_id, path, .. }
+            | SshFilesystemRequest::Remove { root_id, path } => {
+                self.ensure_unprotected(root_id, path)?;
+            }
+            _ => {}
+        }
         match request {
             SshFilesystemRequest::ReadFile { root_id, path } => {
                 Ok(match self.root(&root_id)?.read_file(&path)? {
