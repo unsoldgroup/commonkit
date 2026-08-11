@@ -27,6 +27,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             commonkit_contracts::plan_v2_schema()?,
         ),
         (
+            "package-consent.schema.json",
+            commonkit_contracts::package_consent_schema()?,
+        ),
+        (
             "receipt.schema.json",
             commonkit_contracts::receipt_schema()?,
         ),

@@ -1280,6 +1280,110 @@ pub struct Plan {
     pub operations: Vec<Operation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageOperationConsentBinding {
+    pub operation_id: Sha256Digest,
+    pub resolution_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageConsent {
+    pub confirmation_id: StableId,
+    pub operation_set_digest: Sha256Digest,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageOperationSetSemantic<'a> {
+    plan_id: &'a Sha256Digest,
+    target_id: &'a StableId,
+    operations: Vec<PackageOperationSemantic<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageOperationSemantic<'a> {
+    operation_id: &'a Sha256Digest,
+    after_digest: &'a Sha256Digest,
+    resolution_digest: &'a Sha256Digest,
+}
+
+pub fn package_operation_set_digest(
+    plan: &Plan,
+    bindings: &[PackageOperationConsentBinding],
+) -> Result<Sha256Digest, ContractError> {
+    let mut resolutions = BTreeMap::new();
+    for binding in bindings {
+        if resolutions
+            .insert(&binding.operation_id, &binding.resolution_digest)
+            .is_some()
+        {
+            return Err(ContractError::InvalidPackageConsent);
+        }
+    }
+
+    let mut operations = Vec::new();
+    for operation in &plan.operations {
+        let package_routed = operation.adapter_id.as_str() == "packages"
+            || operation.resource.resource_type.as_str() == "package";
+        if !package_routed {
+            continue;
+        }
+        if operation.adapter_id.as_str() != "packages"
+            || operation.resource.resource_type.as_str() != "package"
+            || operation.kind != OperationKind::Create
+            || !operation.requires_confirmation
+            || operation.recovery_capability != RecoveryCapability::ConvergeForwardOnly
+            || operation.before_digest.is_some()
+        {
+            return Err(ContractError::InvalidPackageConsent);
+        }
+        let after_digest = operation
+            .after_digest
+            .as_ref()
+            .ok_or(ContractError::InvalidPackageConsent)?;
+        let resolution_digest = resolutions
+            .remove(&operation.id)
+            .ok_or(ContractError::InvalidPackageConsent)?;
+        operations.push(PackageOperationSemantic {
+            operation_id: &operation.id,
+            after_digest,
+            resolution_digest,
+        });
+    }
+    if operations.is_empty() || !resolutions.is_empty() {
+        return Err(ContractError::InvalidPackageConsent);
+    }
+    operations.sort_by(|left, right| left.operation_id.cmp(right.operation_id));
+    digest_domain_json(
+        "commonkit.package-operation-set.v1",
+        &PackageOperationSetSemantic {
+            plan_id: &plan.id,
+            target_id: &plan.target_id,
+            operations,
+        },
+    )
+}
+
+impl PackageConsent {
+    pub fn validate(
+        &self,
+        plan: &Plan,
+        bindings: &[PackageOperationConsentBinding],
+    ) -> Result<(), ContractError> {
+        if package_operation_set_digest(plan, bindings)? != self.operation_set_digest {
+            return Err(ContractError::InvalidPackageConsent);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, ContractError> {
+        digest_domain_json("commonkit.package-consent.v1", self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptState {
@@ -1762,6 +1866,13 @@ pub fn plan_v2_schema() -> Result<Value, ContractError> {
     Ok(schema)
 }
 
+pub fn package_consent_schema() -> Result<Value, ContractError> {
+    schema_with_id(
+        schema_for!(PackageConsent),
+        "https://schemas.commonkit.dev/v1/package-consent.schema.json",
+    )
+}
+
 pub fn receipt_schema() -> Result<Value, ContractError> {
     let mut schema = schema_with_id(
         schema_for!(RunReceipt),
@@ -1943,6 +2054,8 @@ pub enum ContractError {
     InvalidStyleguideDescriptor,
     #[error("package versions must be non-empty exact pins without whitespace or range syntax")]
     InvalidPackageDeclaration,
+    #[error("package consent does not bind the exact additive forward-only package operation set")]
+    InvalidPackageConsent,
     #[error("optimization limits must be positive")]
     InvalidOptimizationLimits,
     #[error("unsupported SkillOpt provider version or compatibility contract")]
