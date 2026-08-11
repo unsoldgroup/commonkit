@@ -587,6 +587,45 @@ impl PackageResolutionAuthority {
         &self.digest
     }
 
+    pub fn target(&self) -> &PackageTargetV1 {
+        &self.target
+    }
+
+    pub fn manager(&self) -> &ManagerBindingV1 {
+        &self.manager
+    }
+
+    pub fn load_by_resolution_digest(
+        &self,
+        resolution_digest: &Sha256Digest,
+        store: &ArtifactStore,
+    ) -> Result<(ResolvedPackageIntent, PackageResolutionV1), PackageResolutionError> {
+        let bytes = store.load_by_digest(resolution_digest)?;
+        let resolution = serde_json::from_slice::<PackageResolutionV1>(&bytes).or_else(|_| {
+            serde_json::from_slice::<CompatiblePackageResolutionV1>(&bytes)
+                .map(CompatiblePackageResolutionV1::inherit_missing_parent_sources)
+        })?;
+        let resolution_reference = ContentReference {
+            digest: resolution_digest.clone(),
+            bytes: bytes
+                .len()
+                .try_into()
+                .map_err(|_| PackageResolutionError::CorruptArtifact)?,
+            sensitivity: ContentSensitivity::Portable,
+        };
+        let intent = ResolvedPackageIntent {
+            declaration: resolution.declaration.clone(),
+            resolution: resolution_reference,
+            artifacts: resolution
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.content.clone())
+                .collect(),
+        };
+        let validated = self.validate(&intent, store)?;
+        Ok((intent, validated))
+    }
+
     pub fn validate(
         &self,
         intent: &ResolvedPackageIntent,
