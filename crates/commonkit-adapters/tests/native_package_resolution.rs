@@ -192,6 +192,12 @@ fn read_only_apt_plan_rejects_late_duplicate_or_unrecognized_apt_overrides() {
         .iter_mut()
         .find(|argument| argument.as_str() == "Dir::State::lists=<private>/lists")
         .unwrap() = "Dir::State::lists=/var/lib/apt/lists".into();
+    let mut host_package_cache = apt_install_command(&["--simulate"]);
+    *host_package_cache
+        .args
+        .iter_mut()
+        .find(|argument| argument.as_str() == "Dir::Cache::pkgcache=<private>/pkgcache.bin")
+        .unwrap() = "Dir::Cache::pkgcache=/var/cache/apt/pkgcache.bin".into();
     let mut missing_security_option = apt_install_command(&["--simulate"]);
     let assignment = missing_security_option
         .args
@@ -208,6 +214,7 @@ fn read_only_apt_plan_rejects_late_duplicate_or_unrecognized_apt_overrides() {
         duplicate_security_option,
         hook_override,
         replaced_private_directory,
+        host_package_cache,
         missing_security_option,
     ] {
         assert!(validate_read_only_apt_commands(&[unsafe_command]).is_err());
@@ -264,6 +271,10 @@ fn apt_install_command(safety_flags: &[&str]) -> AptCommandSpecV1 {
         "-o".into(),
         "Dir::Cache::archives=<private>/archives".into(),
         "-o".into(),
+        "Dir::Cache::pkgcache=<private>/pkgcache.bin".into(),
+        "-o".into(),
+        "Dir::Cache::srcpkgcache=<private>/srcpkgcache.bin".into(),
+        "-o".into(),
         "APT::Get::List-Cleanup=0".into(),
         "-o".into(),
         "Acquire::AllowInsecureRepositories=false".into(),
@@ -292,6 +303,9 @@ fn apt_install_command(safety_flags: &[&str]) -> AptCommandSpecV1 {
         "-o".into(),
         "Dir::State::status=<private>/status".into(),
     ];
+    if safety_flags == ["--print-uris", "--download-only"] {
+        args.push("--quiet=2".into());
+    }
     args.extend(safety_flags.iter().map(|flag| (*flag).to_owned()));
     args.extend(["--no-remove".into(), "--no-install-recommends".into()]);
     if safety_flags == ["--print-uris", "--download-only"] {
@@ -643,6 +657,7 @@ fn validate_apt_get_command(command: &AptCommandSpecV1) -> Result<(), &'static s
             require_canonical_apt_options(&options, true)
         }
         [
+            quiet,
             print_uris,
             download_only,
             no_remove,
@@ -651,6 +666,7 @@ fn validate_apt_get_command(command: &AptCommandSpecV1) -> Result<(), &'static s
             install,
             package,
         ] if !command.network
+            && quiet == "--quiet=2"
             && print_uris == "--print-uris"
             && download_only == "--download-only"
             && no_remove == "--no-remove"
@@ -717,6 +733,8 @@ fn require_canonical_apt_options(
         ("Dir::Etc::sourceparts", "-"),
         ("Dir::State::lists", "<private>/lists"),
         ("Dir::Cache::archives", "<private>/archives"),
+        ("Dir::Cache::pkgcache", "<private>/pkgcache.bin"),
+        ("Dir::Cache::srcpkgcache", "<private>/srcpkgcache.bin"),
         ("APT::Get::List-Cleanup", "0"),
         ("Acquire::AllowInsecureRepositories", "false"),
         ("Acquire::AllowWeakRepositories", "false"),
