@@ -16,8 +16,7 @@ use commonkit_adapters::{
     ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
     ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
     RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, SshTargetCapabilities,
-    SshTargetFilesystem, TargetFilesystem, build_provider_plan, materialize_mcp_client_state,
-    validate_ownership,
+    build_provider_plan, materialize_mcp_client_state, validate_ownership,
 };
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
