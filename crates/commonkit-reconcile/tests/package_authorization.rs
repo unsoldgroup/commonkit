@@ -3,12 +3,15 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_contracts::{
-    Operation, OperationKind, PackageConsent, PackageExitClassification, PackageManager,
-    PackageNoPreimageReason, PackageOperationConsentBinding, PackageReceiptEvidence, PlanBindings,
+    Operation, OperationKind, OperationPhase, PackageConsent, PackageExitClassification,
+    PackageManager, PackageNoPreimageReason, PackageOperationConsentBinding,
+    PackageReceiptAuthorization, PackageReceiptEvidence, PlanBindings, ReceiptState,
     RecoveryCapability, ResourceRef, Risk, Sha256Digest, StableId, package_operation_set_digest,
 };
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
-use commonkit_reconcile::{Adapter, AdapterFailure, ReceiptStore, ReconcileError, Reconciler};
+use commonkit_reconcile::{
+    Adapter, AdapterFailure, ReceiptStore, ReconcileError, ReconcileOutcome, Reconciler,
+};
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
@@ -63,6 +66,7 @@ fn package_plan() -> commonkit_contracts::Plan {
 struct PackageAdapterStub {
     id: StableId,
     mutation_count: usize,
+    forbid_observation: bool,
 }
 
 impl Adapter for PackageAdapterStub {
@@ -76,6 +80,17 @@ impl Adapter for PackageAdapterStub {
 
     fn supports_offline_recovery(&self, _operation: &Operation) -> bool {
         true
+    }
+
+    fn observe_recovery(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<commonkit_reconcile::RecoveryObservation, AdapterFailure> {
+        assert!(
+            !self.forbid_observation,
+            "recovery must use durable evidence only"
+        );
+        Ok(commonkit_reconcile::RecoveryObservation::After)
     }
 
     fn package_authorization_binding(
@@ -126,6 +141,149 @@ impl Adapter for PackageAdapterStub {
     }
 }
 
+fn package_authorization(operation: &Operation) -> PackageReceiptAuthorization {
+    PackageReceiptAuthorization {
+        consent_digest: digest('1'),
+        confirmation_id: StableId::parse("confirm-packages").unwrap(),
+        operation_set_digest: digest('2'),
+        evidence: vec![PackageReceiptEvidence {
+            operation_id: operation.id.clone(),
+            resolution_digest: operation.payload_digest.clone(),
+            target_authority_digest: digest('3'),
+            manager: PackageManager::Apt,
+            manager_authority_digest: digest('4'),
+            source_id: StableId::parse("ubuntu-main").unwrap(),
+            source_authority_digest: digest('5'),
+            before_installed_versions: BTreeSet::new(),
+            no_preimage_reason: PackageNoPreimageReason::AdditiveForwardOnly,
+            exit_classification: PackageExitClassification::NotRun,
+            final_digest: None,
+        }],
+    }
+}
+
+#[test]
+fn interrupted_package_recovery_accepts_v2_plan_bound_to_v3_receipt() {
+    let root = temporary_directory("package-recovery-v2-v3");
+    let store = ReceiptStore::open(&root).unwrap();
+    let plan = package_plan();
+    let run_id = StableId::parse("package-interrupted").unwrap();
+    let operation = &plan.operations[0];
+    let mut authorization = package_authorization(operation);
+    authorization.operation_set_digest = package_operation_set_digest(
+        &plan,
+        &[PackageOperationConsentBinding {
+            operation_id: operation.id.clone(),
+            resolution_digest: operation.payload_digest.clone(),
+        }],
+    )
+    .unwrap();
+    let mut journal =
+        commonkit_reconcile::ReceiptJournal::for_package_plan(run_id.clone(), &plan, authorization)
+            .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::Applying).unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::ApplyStarted, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
+        id: StableId::parse("packages").unwrap(),
+        mutation_count: 0,
+        forbid_observation: false,
+    })];
+    let outcome = Reconciler::with_store(&store)
+        .recover_run(run_id.clone(), &plan, &mut adapters)
+        .unwrap();
+
+    assert_eq!(outcome, ReconcileOutcome::ForwardRecovered);
+    assert_eq!(
+        store.load(run_id).unwrap().receipt().state,
+        ReceiptState::ForwardRecovered
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn package_recovery_repairs_forward_evidence_gap_without_target_or_provider_work() {
+    let root = temporary_directory("package-recovery-evidence-gap");
+    let store = ReceiptStore::open(&root).unwrap();
+    let plan = package_plan();
+    let run_id = StableId::parse("package-evidence-gap").unwrap();
+    let operation = &plan.operations[0];
+    let mut authorization = package_authorization(operation);
+    authorization.operation_set_digest = package_operation_set_digest(
+        &plan,
+        &[PackageOperationConsentBinding {
+            operation_id: operation.id.clone(),
+            resolution_digest: operation.payload_digest.clone(),
+        }],
+    )
+    .unwrap();
+    let mut journal =
+        commonkit_reconcile::ReceiptJournal::for_package_plan(run_id.clone(), &plan, authorization)
+            .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::Applying).unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::Verifying).unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::ApplyingForward).unwrap();
+    store.persist(&journal).unwrap();
+    for phase in [
+        OperationPhase::ApplyStarted,
+        OperationPhase::Applied,
+        OperationPhase::Verified,
+    ] {
+        journal
+            .record_operation(operation.id.clone(), phase, None)
+            .unwrap();
+        store.persist(&journal).unwrap();
+    }
+    journal
+        .transition(ReceiptState::ForwardRecoveryRequired)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::ForwardRecovered, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
+        id: StableId::parse("packages").unwrap(),
+        mutation_count: 0,
+        forbid_observation: true,
+    })];
+    let outcome = Reconciler::with_store(&store)
+        .recover_run(run_id.clone(), &plan, &mut adapters)
+        .unwrap();
+
+    assert_eq!(outcome, ReconcileOutcome::ForwardRecovered);
+    let receipt = store.load(run_id).unwrap();
+    let evidence = &receipt
+        .receipt()
+        .package_authorization
+        .as_ref()
+        .unwrap()
+        .evidence[0];
+    assert_eq!(
+        evidence.exit_classification,
+        PackageExitClassification::Succeeded
+    );
+    assert_eq!(evidence.final_digest, Some(digest('f')));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
     let root = temporary_directory("package-authorization");
@@ -142,6 +300,7 @@ fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
     let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
+        forbid_observation: false,
     })];
     let before = std::fs::read_dir(&root).unwrap().count();
 
