@@ -10,9 +10,9 @@ use commonkit_reconcile::{Adapter, AdapterFailure, RecoveryObservation};
 use thiserror::Error;
 
 use crate::{
-    ArtifactStore, NodeOfflineInstallRecipeV1, OfflineInstallRecipeV1, PackageObservationV1,
-    PackageResolutionAuthority, PackageResolutionV1, PackageResourcePlanner, ProviderPlanError,
-    ResolvedPackageIntent, ResourceProvenance,
+    apt_resolution::apt_package_identity, ArtifactStore, NodeOfflineInstallRecipeV1,
+    OfflineInstallRecipeV1, PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1,
+    PackageResourcePlanner, ProviderPlanError, ResolvedPackageIntent, ResourceProvenance,
 };
 
 /// The only target-side capability exposed to package mutation.
@@ -352,16 +352,19 @@ fn package_version_key(
 ) -> Option<String> {
     match resolution.manager.manager {
         PackageManager::Apt => {
-            let Some(PackageSelector::AptBinary { architecture, .. }) =
+            let Some(PackageSelector::AptBinary {
+                name,
+                architecture,
+            }) =
                 package.declaration.selector.as_ref()
             else {
                 return None;
             };
-            Some(format!(
-                "{}:{}={}",
-                package.declaration.id.as_str(),
-                architecture.as_deref().unwrap_or("native"),
-                package.declaration.version
+            let architecture = architecture.as_deref().unwrap_or(&resolution.target.arch);
+            Some(apt_package_identity(
+                name,
+                architecture,
+                &package.declaration.version,
             ))
         }
         PackageManager::Nvm => Some(
