@@ -2210,7 +2210,12 @@ fn parse_configured_packages(
     simulation: &str,
 ) -> Result<BTreeSet<(String, String, String)>, AptResolutionCommandError> {
     let mut configured = BTreeSet::new();
-    for line in simulation.lines().map(str::trim) {
+    for line in simulation.lines() {
+        if line.split_whitespace().next() == Some("Conf") && line != line.trim() {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT configure action contains leading or trailing whitespace".into(),
+            ));
+        }
         let rest = match line.strip_prefix("Conf ") {
             Some(rest) => rest,
             None if line.split_whitespace().next() == Some("Conf") => {
@@ -2223,42 +2228,51 @@ fn parse_configured_packages(
         let (name_with_arch, after_name) = rest.split_once(' ').ok_or_else(|| {
             AptResolutionCommandError::InvalidOutput("malformed APT configure action".into())
         })?;
-        let version = after_name
+        let body = after_name
             .strip_prefix('(')
-            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.strip_suffix(')'))
             .ok_or_else(|| {
                 AptResolutionCommandError::InvalidOutput(
-                    "malformed APT configure action version".into(),
+                    "APT configure action must have balanced parentheses".into(),
                 )
             })?;
-        let listed_architecture = after_name
-            .rsplit_once('[')
-            .and_then(|(_, value)| value.strip_suffix("])"))
-            .or_else(|| {
-                after_name
-                    .rsplit_once('[')
-                    .and_then(|(_, value)| value.strip_suffix(']'))
-            });
+        let fields = body.split_whitespace().collect::<Vec<_>>();
+        let [version, source, architecture_field] = fields.as_slice() else {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT configure action must contain exact version, source, and architecture fields"
+                    .into(),
+            ));
+        };
+        let listed_architecture = architecture_field
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .ok_or_else(|| {
+                AptResolutionCommandError::InvalidOutput(
+                    "APT configure action architecture must be bracketed".into(),
+                )
+            })?;
         let (name, qualified_architecture) = name_with_arch
             .split_once(':')
             .map_or((name_with_arch, None), |(name, arch)| (name, Some(arch)));
-        let architecture = listed_architecture
-            .or(qualified_architecture)
-            .ok_or_else(|| {
-                AptResolutionCommandError::InvalidOutput(
-                    "APT configure action did not bind a package architecture".into(),
-                )
-            })?;
-        if qualified_architecture.is_some_and(|qualified| qualified != architecture)
+        if qualified_architecture.is_some_and(|qualified| qualified != listed_architecture)
             || !safe_apt_token(name)
-            || !safe_apt_token(architecture)
+            || !safe_apt_token(listed_architecture)
             || !safe_apt_version(version)
+            || source.is_empty()
+            || !source.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | '+' | '-' | '_' | ':' | '/' | '~')
+            })
         {
             return Err(AptResolutionCommandError::InvalidOutput(
                 "malformed APT configure action identity".into(),
             ));
         }
-        if !configured.insert((name.to_owned(), architecture.to_owned(), version.to_owned())) {
+        if !configured.insert((
+            name.to_owned(),
+            listed_architecture.to_owned(),
+            (*version).to_owned(),
+        )) {
             return Err(AptResolutionCommandError::InvalidOutput(
                 "APT simulation returned a duplicate configure action".into(),
             ));
@@ -2482,6 +2496,37 @@ mod tests {
             assert!(
                 validate_live_safety_simulation(unsafe_output, &closure).is_err(),
                 "{unsafe_output}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_safety_simulation_rejects_malformed_conf_grammar() {
+        let closure = vec![AptResolvedPackageV1 {
+            name: "curl".into(),
+            version: "8.5.0-2ubuntu10.6".into(),
+            architecture: "amd64".into(),
+        }];
+
+        for malformed in [
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64]\n",
+            "Conf curl 8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])\n",
+            "Conf curl:amd64 (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble\n",
+            "Conf curl (8.5.0-2ubuntu10.6 [amd64])\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble extra [amd64])\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64] extra)\n",
+            "Conf curl:amd64 (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64]) trailing\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble amd64)\n",
+            "Conf curl ((8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64]))\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [[amd64]])\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64]])\n",
+            " Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64]) \n",
+        ] {
+            assert!(
+                validate_live_safety_simulation(malformed, &closure).is_err(),
+                "{malformed}"
             );
         }
     }
