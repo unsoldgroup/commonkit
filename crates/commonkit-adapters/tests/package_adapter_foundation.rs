@@ -218,6 +218,129 @@ fn unsupported_manager_fails_before_backend_mutation() {
 }
 
 #[test]
+fn apt_recovery_rejects_ambiguous_all_and_native_identity_before_backend_mutation() {
+    let (mut resolution, authority) = apt_resolution();
+    let mut ambiguous = resolution.closure[0].clone();
+    ambiguous.declaration.id = StableId::parse("zz-dep-0123456789abcdef012345678").unwrap();
+    ambiguous.declaration.selector = Some(PackageSelector::AptBinary {
+        name: "ripgrep".into(),
+        architecture: Some("all".into()),
+    });
+    resolution.closure.push(ambiguous);
+
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        observed: resolution.before.clone(),
+        calls: calls.clone(),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    let error = adapter
+        .preflight(&operation(resolution_ref.digest))
+        .expect_err("ambiguous APT identities must fail closed");
+    assert_eq!(error.code, "package_apt_identity_invalid");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn apt_recovery_rejects_foreign_architecture_before_backend_mutation() {
+    let (mut resolution, authority) = apt_resolution();
+    let mut foreign = resolution.closure[0].clone();
+    foreign.declaration.id = StableId::parse("zz-dep-0123456789abcdef012345678").unwrap();
+    foreign.declaration.selector = Some(PackageSelector::AptBinary {
+        name: "ripgrep".into(),
+        architecture: Some("arm64".into()),
+    });
+    resolution.closure.push(foreign);
+
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        observed: resolution.before.clone(),
+        calls: calls.clone(),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    let error = adapter
+        .preflight(&operation(resolution_ref.digest))
+        .expect_err("foreign APT architectures must fail closed");
+    assert_eq!(error.code, "package_apt_identity_invalid");
+    assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn apt_recovery_does_not_treat_wrong_real_identity_as_after() {
+    let (resolution, authority) = apt_resolution();
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from(["logical-root:amd64=14.1.1-1ubuntu1".into()]),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Other)
+    );
+}
+
+#[test]
+fn apt_recovery_does_not_treat_ambiguous_observed_architectures_as_after() {
+    let (resolution, authority) = apt_resolution();
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from([
+                "ripgrep:all=14.1.1-1ubuntu1".into(),
+                "ripgrep:amd64=14.1.1-1ubuntu1".into(),
+            ]),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Other)
+    );
+}
+
+#[test]
 fn apt_recovery_matches_real_names_for_logical_root_and_hashed_dependencies() {
     let (mut resolution, authority) = apt_resolution();
     let source = resolution.source.clone();

@@ -1,5 +1,7 @@
 //! Offline, forward-only mutation of controller-resolved package plans.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use commonkit_contracts::{
     Operation, OperationKind, PackageExitClassification, PackageManager,
     PackageOperationConsentBinding, PackageReceiptEvidence, PackageSelector, RecoveryCapability,
@@ -10,9 +12,9 @@ use commonkit_reconcile::{Adapter, AdapterFailure, RecoveryObservation};
 use thiserror::Error;
 
 use crate::{
-    apt_resolution::apt_package_identity, ArtifactStore, NodeOfflineInstallRecipeV1,
-    OfflineInstallRecipeV1, PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1,
-    PackageResourcePlanner, ProviderPlanError, ResolvedPackageIntent, ResourceProvenance,
+    ArtifactStore, NodeOfflineInstallRecipeV1, OfflineInstallRecipeV1, PackageObservationV1,
+    PackageResolutionAuthority, PackageResolutionV1, PackageResourcePlanner, ProviderPlanError,
+    ResolvedPackageIntent, ResourceProvenance, apt_resolution::apt_package_identity,
 };
 
 /// The only target-side capability exposed to package mutation.
@@ -120,6 +122,11 @@ impl PackageAdapter {
     }
 
     fn after_resolution(resolution: &PackageResolutionV1, observed: &PackageObservationV1) -> bool {
+        if resolution.manager.manager == PackageManager::Apt
+            && apt_observation_has_ambiguous_identity(observed, &resolution.target.arch)
+        {
+            return false;
+        }
         resolution.closure.iter().all(|package| {
             package_version_key(package, resolution)
                 .is_some_and(|key| observed.installed_versions.contains(&key))
@@ -319,6 +326,11 @@ fn ensure_supported(
     if resolution.manager.manager != backend_manager {
         return Err(failure("package_manager_mismatch"));
     }
+    if resolution.manager.manager == PackageManager::Apt
+        && !valid_apt_resolution_identity(resolution)
+    {
+        return Err(failure("package_apt_identity_invalid"));
+    }
     let approved = matches!(
         (&resolution.manager.manager, &resolution.recipe),
         (
@@ -346,16 +358,72 @@ fn ensure_supported(
     }
 }
 
+fn valid_apt_resolution_identity(resolution: &PackageResolutionV1) -> bool {
+    let mut identities = BTreeSet::new();
+    let mut name_versions = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for package in &resolution.closure {
+        let Some(PackageSelector::AptBinary { name, architecture }) =
+            package.declaration.selector.as_ref()
+        else {
+            return false;
+        };
+        let architecture = architecture.as_deref().unwrap_or(&resolution.target.arch);
+        if architecture == "native"
+            || (architecture != "all" && architecture != resolution.target.arch)
+            || name.is_empty()
+            || architecture.is_empty()
+        {
+            return false;
+        }
+        if !identities.insert((
+            name.to_owned(),
+            architecture.to_owned(),
+            package.declaration.version.clone(),
+        )) {
+            return false;
+        }
+        name_versions
+            .entry((name.to_owned(), package.declaration.version.clone()))
+            .or_default()
+            .insert(architecture.to_owned());
+    }
+    !name_versions.values().any(|architectures| {
+        architectures.contains("all") && architectures.contains(&resolution.target.arch)
+    })
+}
+
+fn apt_observation_has_ambiguous_identity(
+    observed: &PackageObservationV1,
+    target_architecture: &str,
+) -> bool {
+    let mut name_versions = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for identity in &observed.installed_versions {
+        let Some((name_architecture, version)) = identity.split_once('=') else {
+            continue;
+        };
+        let Some((name, architecture)) = name_architecture.rsplit_once(':') else {
+            continue;
+        };
+        if name.is_empty() || architecture.is_empty() {
+            return true;
+        }
+        name_versions
+            .entry((name.to_owned(), version.to_owned()))
+            .or_default()
+            .insert(architecture.to_owned());
+    }
+    name_versions.values().any(|architectures| {
+        architectures.contains("all") && architectures.contains(target_architecture)
+    })
+}
+
 fn package_version_key(
     package: &crate::ResolvedPackage,
     resolution: &PackageResolutionV1,
 ) -> Option<String> {
     match resolution.manager.manager {
         PackageManager::Apt => {
-            let Some(PackageSelector::AptBinary {
-                name,
-                architecture,
-            }) =
+            let Some(PackageSelector::AptBinary { name, architecture }) =
                 package.declaration.selector.as_ref()
             else {
                 return None;
