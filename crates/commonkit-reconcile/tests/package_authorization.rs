@@ -381,6 +381,103 @@ fn package_recovery_repairs_forward_recovered_failed_evidence_gap_without_target
 }
 
 #[test]
+fn package_recovery_repairs_failed_evidence_after_forward_failure_checkpoint() {
+    let root = temporary_directory("package-recovery-failed-checkpoint");
+    let store = ReceiptStore::open(&root).unwrap();
+    let plan = package_plan();
+    let run_id = StableId::parse("package-failed-checkpoint").unwrap();
+    let operation = &plan.operations[0];
+    let mut authorization = package_authorization(operation);
+    authorization.operation_set_digest = package_operation_set_digest(
+        &plan,
+        &[PackageOperationConsentBinding {
+            operation_id: operation.id.clone(),
+            resolution_digest: operation.payload_digest.clone(),
+        }],
+    )
+    .unwrap();
+    let mut journal =
+        commonkit_reconcile::ReceiptJournal::for_package_plan(run_id.clone(), &plan, authorization)
+            .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::Applying).unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::Verifying).unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::ApplyingForward).unwrap();
+    store.persist(&journal).unwrap();
+    for phase in [
+        OperationPhase::ApplyStarted,
+        OperationPhase::Applied,
+        OperationPhase::Verified,
+        OperationPhase::ForwardRecoveryFailed,
+    ] {
+        journal
+            .record_operation(
+                operation.id.clone(),
+                phase,
+                (phase == OperationPhase::ForwardRecoveryFailed)
+                    .then(|| StableId::parse("legacy_recovery_failure").unwrap()),
+            )
+            .unwrap();
+        store.persist(&journal).unwrap();
+    }
+    journal
+        .transition(ReceiptState::ForwardRecoveryRequired)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::ConvergingForward).unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .transition(ReceiptState::ForwardRecoveryFailed)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_package_exit(
+            &operation.id,
+            PackageExitClassification::Failed {
+                code: StableId::parse("legacy_recovery_failure").unwrap(),
+            },
+            None,
+        )
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::ForwardRecovered, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
+        id: StableId::parse("packages").unwrap(),
+        mutation_count: 0,
+        forbid_observation: true,
+        verify_failure: false,
+    })];
+    let outcome = Reconciler::with_store(&store)
+        .recover_run(run_id.clone(), &plan, &mut adapters)
+        .unwrap();
+
+    assert_eq!(outcome, ReconcileOutcome::ForwardRecovered);
+    let receipt = store.load(run_id).unwrap();
+    let evidence = &receipt
+        .receipt()
+        .package_authorization
+        .as_ref()
+        .unwrap()
+        .evidence[0];
+    assert_eq!(
+        evidence.exit_classification,
+        PackageExitClassification::Succeeded
+    );
+    assert_eq!(evidence.final_digest, Some(digest('f')));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
     let root = temporary_directory("package-authorization");
     let store = ReceiptStore::open(&root).unwrap();
