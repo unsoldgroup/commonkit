@@ -262,7 +262,7 @@ fn validate_operation_binding(
                 StableId::parse("package").expect("static resource type"),
                 None,
                 Some(desired_digest.clone()),
-                desired_digest,
+                intent.resolution.digest.clone(),
             )
         }
     };
@@ -640,6 +640,8 @@ pub enum ProviderPlanError {
     MissingResourcePlanner(ResourceType),
     #[error("package desired intent must be resolved by the trusted controller before planning")]
     PackageResolutionRequired,
+    #[error("resolved package artifacts could not be staged without changing their digest")]
+    PackageResolutionStaging,
     #[error("resolved package planning requires current controller package authority")]
     MissingPackageResolutionAuthority,
     #[error("more than one resource planner is installed for {0:?}")]

@@ -104,6 +104,13 @@ impl Adapter for PackageAdapterStub {
         )))
     }
 
+    fn package_final_digest(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<Option<Sha256Digest>, AdapterFailure> {
+        Ok(Some(digest('f')))
+    }
+
     fn prepare(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
         Ok(())
     }
@@ -146,14 +153,16 @@ fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
         ),
         Err(ReconcileError::PackageConsentRequired)
     ));
-    assert!(Reconciler::with_store(&store)
-        .execute_with_package_consent(
-            &plan,
-            StableId::parse("wrong-consent").unwrap(),
-            &wrong,
-            &mut adapters,
-        )
-        .is_err());
+    assert!(
+        Reconciler::with_store(&store)
+            .execute_with_package_consent(
+                &plan,
+                StableId::parse("wrong-consent").unwrap(),
+                &wrong,
+                &mut adapters,
+            )
+            .is_err()
+    );
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), before);
 
     let consent = PackageConsent {
@@ -168,10 +177,13 @@ fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
             &mut adapters,
         )
         .unwrap();
-    assert!(store
+    let receipt = store
         .load(StableId::parse("valid-consent").unwrap())
-        .unwrap()
-        .receipt()
-        .package_authorization
-        .is_some());
+        .unwrap();
+    let authorization = receipt.receipt().package_authorization.as_ref().unwrap();
+    assert_eq!(
+        authorization.evidence[0].exit_classification,
+        PackageExitClassification::Succeeded
+    );
+    assert_eq!(authorization.evidence[0].final_digest, Some(digest('f')));
 }

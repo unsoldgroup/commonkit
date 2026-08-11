@@ -14,6 +14,7 @@ mod github_onboarding;
 mod mcp_clients;
 mod native;
 mod node_resolution;
+mod package_mutation;
 mod package_resolution;
 mod packages;
 mod pipeline;
@@ -83,6 +84,7 @@ pub use node_resolution::{
     ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, VerifiedNodeReleaseSignatureV1,
     validate_nvm_environment, validate_nvm_environment_os,
 };
+pub use package_mutation::{PackageAdapter, PackageMutationBackend, PackageMutationError};
 pub use package_resolution::{
     AptSourceAuthorityV1, ArtifactEvidence, COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS,
     COMMONKIT_NVM_SCRIPT_RELEASES, ControlledPackageSourceV1, ManagerBindingV1,
