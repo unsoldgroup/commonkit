@@ -332,6 +332,7 @@ fn ssh_package_backend_stages_chunked_artifacts_before_reference_only_mutation()
         transport,
         "linux",
         "amd64",
+        digest('c'),
     );
 
     backend.prepare_offline(&resolution, &artifacts).unwrap();

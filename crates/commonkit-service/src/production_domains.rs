@@ -435,6 +435,8 @@ pub trait ProductionSshTransportFactory: Send + Sync + 'static {
 
 #[derive(Clone)]
 pub struct ProductionSshTarget {
+    target_id: StableId,
+    target_identity_digest: Sha256Digest,
     root_id: StableId,
     host: String,
     user: String,
@@ -506,6 +508,7 @@ impl ProductionSshPlanExecutor {
             package_transport,
             self.target.operating_system.clone(),
             self.target.architecture.clone(),
+            self.target.target_identity_digest.clone(),
         );
         Ok(vec![
             Box::new(
@@ -535,6 +538,11 @@ impl ProductionSshPlanExecutor {
             .load(&plan.id)
             .map_err(|_| DomainFailure::OperationFailed)?;
         if durable != *plan {
+            return Err(DomainFailure::StalePlan);
+        }
+        if plan.target_id != self.target.target_id
+            || plan.bindings.target_identity_digest != self.target.target_identity_digest
+        {
             return Err(DomainFailure::StalePlan);
         }
         self.validate_package_privilege(plan)?;
@@ -770,8 +778,14 @@ impl ProductionDomainRegistry {
                             plan_store.clone(),
                             receipt_root.as_ref(),
                             config.adapter_state.clone(),
-                            production_ssh_target(transport, capabilities, platform)
-                                .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                            production_ssh_target(
+                                transport,
+                                capabilities,
+                                platform,
+                                config.target_id.clone(),
+                                config.target_identity_digest.clone(),
+                            )
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?,
                             factory.clone(),
                         )
                         .map_err(|_| ProductionDomainError::UnsafeConfig)?,
@@ -982,6 +996,8 @@ impl ProductionDomainRegistry {
                     Some((
                         sync.adapter_state.clone(),
                         ProductionSshTarget {
+                            target_id: sync.target_id.clone(),
+                            target_identity_digest: sync.target_identity_digest.clone(),
                             root_id: root_id.clone(),
                             host: host.clone(),
                             user: user.clone(),
@@ -2427,7 +2443,13 @@ impl ProductionSyncDomain {
             .ok_or(DomainFailure::OperationFailed)?;
         let capabilities = self.config.ssh_target_capabilities()?;
         let platform = self.config.provider_platform()?;
-        let ssh_target = production_ssh_target(transport, capabilities, platform)?;
+        let ssh_target = production_ssh_target(
+            transport,
+            capabilities,
+            platform,
+            self.config.target_id.clone(),
+            self.config.target_identity_digest.clone(),
+        )?;
         let mut remote = self.ssh_factory.open(&ssh_target)?;
         // SSH resolution authority is attested by the target helper. Do not
         // read APT keyring or NVM paths from the controller while planning a
@@ -2804,7 +2826,13 @@ impl ProductionSyncDomain {
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
                 let capabilities = self.config.ssh_target_capabilities()?;
                 let platform = self.config.provider_platform()?;
-                let target = production_ssh_target(transport, capabilities, platform.clone())?;
+                let target = production_ssh_target(
+                    transport,
+                    capabilities,
+                    platform.clone(),
+                    self.config.target_id.clone(),
+                    self.config.target_identity_digest.clone(),
+                )?;
                 let mut ssh = self.ssh_factory.open(&target)?;
                 for state in &states {
                     let suffix = &state.digest.as_str()[7..39];
@@ -2836,6 +2864,7 @@ impl ProductionSyncDomain {
                             package_transport,
                             platform.operating_system.clone(),
                             platform.architecture.clone(),
+                            self.config.target_identity_digest.clone(),
                         );
                         let package_artifacts =
                             ArtifactStore::open(self.config.adapter_state.join("packages"))
@@ -2937,6 +2966,8 @@ fn production_ssh_target(
     config: &SyncTargetTransport,
     capabilities: SshTargetCapabilities,
     platform: SyncTargetPlatform,
+    target_id: StableId,
+    target_identity_digest: Sha256Digest,
 ) -> Result<ProductionSshTarget, DomainFailure> {
     let SyncTargetTransport::Ssh {
         root_id,
@@ -2951,6 +2982,8 @@ fn production_ssh_target(
         return Err(DomainFailure::OperationFailed);
     };
     Ok(ProductionSshTarget {
+        target_id,
+        target_identity_digest,
         root_id: root_id.clone(),
         host: host.clone(),
         user: user.clone(),
@@ -3743,6 +3776,8 @@ impl SyncDomain for ProductionSyncDomain {
                         transport,
                         capabilities,
                         platform,
+                        self.config.target_id.clone(),
+                        self.config.target_identity_digest.clone(),
                     )?)?,
                     capabilities,
                 )
@@ -3752,12 +3787,15 @@ impl SyncDomain for ProductionSyncDomain {
                         transport,
                         capabilities,
                         self.config.provider_platform()?,
+                        self.config.target_id.clone(),
+                        self.config.target_identity_digest.clone(),
                     )?)?;
                     let package_backend = SshOfflinePackageBackend::with_target_platform(
                         root_id.clone(),
                         package_transport,
                         self.config.provider_platform()?.operating_system,
                         self.config.provider_platform()?.architecture,
+                        self.config.target_identity_digest.clone(),
                     );
                     let package_artifacts =
                         ArtifactStore::open_existing(self.config.adapter_state.join("packages"))
@@ -3836,6 +3874,8 @@ impl SyncDomain for ProductionSyncDomain {
                             transport,
                             capabilities,
                             platform,
+                            self.config.target_id.clone(),
+                            self.config.target_identity_digest.clone(),
                         )?)?,
                         capabilities,
                     )

@@ -825,11 +825,15 @@ impl TargetHelper {
                 phase,
                 resolution,
                 artifacts,
+                target_identity_digest,
             } => {
                 let config = self
                     .package_resolution
                     .as_ref()
                     .ok_or(TargetFilesystemError::PackageResolutionRejected)?;
+                if target_identity_digest.as_ref() != Some(&config.target_identity_digest) {
+                    return Err(TargetFilesystemError::PackageResolutionRejected);
+                }
                 let registry = target_package_source_registry(config)?;
                 let authority = crate::PackageResolutionAuthority::new(
                     &config.target,

@@ -202,6 +202,14 @@ fn package_plan(
     resolution_digest: Sha256Digest,
     authority_digest: Sha256Digest,
 ) -> commonkit_contracts::Plan {
+    package_plan_with_identity(resolution_digest, authority_digest, digest("target"))
+}
+
+fn package_plan_with_identity(
+    resolution_digest: Sha256Digest,
+    authority_digest: Sha256Digest,
+    target_identity_digest: Sha256Digest,
+) -> commonkit_contracts::Plan {
     let operation = finalize_operation(OperationDraft {
         adapter_id: StableId::parse("packages").unwrap(),
         kind: OperationKind::Create,
@@ -227,7 +235,7 @@ fn package_plan(
         observed_digest: digest("package-observed"),
         policy_digest: digest("package-policy"),
         bindings: PlanBindings {
-            target_identity_digest: digest("target"),
+            target_identity_digest,
             composed_loadout_digest: digest("loadout"),
             provider_inputs_digest: digest("provider-inputs"),
             ownership_map_digest: digest("ownership"),
@@ -492,6 +500,44 @@ fn non_root_ssh_apt_rejects_before_receipt_or_transport() {
             .next()
             .is_none()
     );
+}
+
+#[test]
+fn ssh_executor_rejects_rotated_target_identity_before_transport() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote = Memory::default();
+    let (_, plans, _, executor) = setup(temporary.path(), remote.clone());
+    let (resolution, authority) = apt_resolution();
+    let package_artifacts = ArtifactStore::open(temporary.path().join("adapter/packages")).unwrap();
+    let resolution_ref = package_artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let plan = package_plan_with_identity(
+        resolution_ref.digest,
+        authority.digest().clone(),
+        digest("rotated-target"),
+    );
+    plans.persist(&plan).unwrap();
+    let confirmation_id = StableId::parse("package-confirmation").unwrap();
+    let consent = PackageConsent {
+        confirmation_id: confirmation_id.clone(),
+        operation_set_digest: package_operation_set_digest(
+            &plan,
+            &[PackageOperationConsentBinding {
+                operation_id: plan.operations[0].id.clone(),
+                resolution_digest: plan.operations[0].payload_digest.clone(),
+            }],
+        )
+        .unwrap(),
+    };
+
+    let result = executor.execute_with_package_consent(&plan, &confirmation_id, &consent);
+
+    assert_eq!(result.status, ApplyStatus::Failed);
+    assert_eq!(remote.0.lock().unwrap().opens, 0);
 }
 
 async fn apply_and_wait(

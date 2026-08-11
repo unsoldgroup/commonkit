@@ -680,6 +680,7 @@ pub struct SshOfflinePackageBackend<T> {
     root_id: StableId,
     transport: T,
     target_platform: Option<(String, String)>,
+    target_identity_digest: Option<Sha256Digest>,
 }
 
 impl<T> SshOfflinePackageBackend<T> {
@@ -688,6 +689,7 @@ impl<T> SshOfflinePackageBackend<T> {
             root_id,
             transport,
             target_platform: None,
+            target_identity_digest: None,
         }
     }
 
@@ -696,11 +698,13 @@ impl<T> SshOfflinePackageBackend<T> {
         transport: T,
         operating_system: impl Into<String>,
         architecture: impl Into<String>,
+        target_identity_digest: Sha256Digest,
     ) -> Self {
         Self {
             root_id,
             transport,
             target_platform: Some((operating_system.into(), architecture.into())),
+            target_identity_digest: Some(target_identity_digest),
         }
     }
 
@@ -723,6 +727,7 @@ impl<T> SshOfflinePackageBackend<T> {
                 phase,
                 resolution: resolution.clone(),
                 artifacts: transferred,
+                target_identity_digest: self.target_identity_digest.clone(),
             })
             .map_err(|_| PackageMutationError::Backend)
     }

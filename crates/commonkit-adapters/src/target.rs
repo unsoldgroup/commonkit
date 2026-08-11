@@ -388,6 +388,10 @@ pub enum SshFilesystemRequest {
         phase: PackageMutationPhase,
         resolution: crate::PackageResolutionV1,
         artifacts: Vec<PackageMutationArtifact>,
+        /// Identity of the configured target, carried by the controller-side
+        /// backend and checked against the helper's persisted authority.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target_identity_digest: Option<commonkit_contracts::Sha256Digest>,
     },
     /// Requests target-local package resolution. The target must probe its own
     /// manager and return the complete resolution plus exact artifact bytes;
