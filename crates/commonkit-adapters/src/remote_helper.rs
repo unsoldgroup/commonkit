@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::Dir;
+#[cfg(unix)]
+use cap_std::fs::OpenOptions;
 use commonkit_contracts::{PackageManager, StableId};
 use commonkit_core::{RootAccess, TargetRoot};
 use futures_util::StreamExt;
@@ -12,17 +15,21 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
+#[cfg(unix)]
 use crate::{
-    ARTIFACT_CHUNK_SIZE, AptResolutionBackend, AptSourceAuthorityV1, ArtifactStore,
-    ContentReference, ContentSensitivity, LocalTargetFilesystem, MAX_ARTIFACT_TRANSFER_BYTES,
-    NodeResolutionBackend, NodeRuntimeHost, PackageDiscoveryFetchRequestV1, PackageFetch,
-    PackageFetchHopV1, PackageFetchRequestV1, PackageMutationArtifact, PackageMutationBackend,
-    PackageMutationPhase, PackageResolutionBackend, PackageResolutionCoordinator,
-    PackageResolutionError, PackageSourceRegistry, ProcessAptResolutionCommandRunner,
-    ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, ProcessOfflinePackageBackend,
-    SshFilesystemRequest, SshFilesystemResponse, TargetFilesystem, TargetFilesystemError,
-    TargetPackageResolutionConfig, artifact_chunk_response_digest,
-    package_resolution_request_digest, package_resolution_response_digest,
+    ARTIFACT_CHUNK_SIZE, ContentReference, MAX_ARTIFACT_TRANSFER_BYTES,
+    artifact_chunk_response_digest,
+};
+use crate::{
+    AptResolutionBackend, AptSourceAuthorityV1, ArtifactStore, ContentSensitivity,
+    LocalTargetFilesystem, NodeResolutionBackend, NodeRuntimeHost, PackageDiscoveryFetchRequestV1,
+    PackageFetch, PackageFetchHopV1, PackageFetchRequestV1, PackageMutationArtifact,
+    PackageMutationBackend, PackageMutationPhase, PackageResolutionBackend,
+    PackageResolutionCoordinator, PackageResolutionError, PackageSourceRegistry,
+    ProcessAptResolutionCommandRunner, ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost,
+    ProcessOfflinePackageBackend, SshFilesystemRequest, SshFilesystemResponse, TargetFilesystem,
+    TargetFilesystemError, TargetPackageResolutionConfig, package_resolution_request_digest,
+    package_resolution_response_digest,
 };
 
 const MAX_RESOLUTION_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -32,6 +39,7 @@ pub struct TargetHelper {
     roots: BTreeMap<StableId, (PathBuf, RootAccess)>,
     artifacts: ArtifactStore,
     receipts: PathBuf,
+    #[cfg(unix)]
     staging: std::sync::Mutex<Dir>,
     package_resolution: Option<TargetPackageResolutionConfig>,
     protected_paths: Vec<PathBuf>,
@@ -91,6 +99,7 @@ impl TargetHelper {
             roots: mapped,
             artifacts,
             receipts,
+            #[cfg(unix)]
             staging: std::sync::Mutex::new(staging),
             package_resolution,
             protected_paths,
@@ -362,6 +371,7 @@ impl TargetHelper {
         })
     }
 
+    #[cfg(unix)]
     fn transfer_paths(
         transfer_id: &StableId,
         digest: &commonkit_contracts::Sha256Digest,
@@ -377,6 +387,7 @@ impl TargetHelper {
         )
     }
 
+    #[cfg(unix)]
     fn validate_chunk(
         byte_count: u64,
         chunk_size: u32,
@@ -399,6 +410,7 @@ impl TargetHelper {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn validate_chunk_shape(
         byte_count: u64,
         chunk_size: u32,
@@ -420,6 +432,7 @@ impl TargetHelper {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(unix)]
     fn stage_artifact_chunk(
         &self,
         run_id: StableId,
@@ -618,6 +631,7 @@ impl TargetHelper {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[cfg(unix)]
     fn read_artifact_chunk(
         &self,
         request_id: StableId,
@@ -969,14 +983,21 @@ fn package_resolution_rejected(
     }
 }
 
+#[cfg(unix)]
 const STAGING_MAX_PARTS: usize = 128;
+#[cfg(unix)]
 const STAGING_MAX_BYTES: u64 = MAX_ARTIFACT_TRANSFER_BYTES;
 const STAGING_STALE_AFTER_SECS: u64 = 24 * 60 * 60;
 
+#[cfg(unix)]
 struct StagingLock {
     file: cap_std::fs::File,
 }
 
+#[cfg(not(unix))]
+struct StagingLock;
+
+#[cfg(unix)]
 fn acquire_staging_lock(staging: &Dir) -> Result<StagingLock, std::io::Error> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
@@ -1014,6 +1035,12 @@ fn acquire_staging_lock(staging: &Dir) -> Result<StagingLock, std::io::Error> {
     Ok(StagingLock { file })
 }
 
+#[cfg(not(unix))]
+fn acquire_staging_lock(_staging: &Dir) -> Result<StagingLock, std::io::Error> {
+    Ok(StagingLock)
+}
+
+#[cfg(unix)]
 impl Drop for StagingLock {
     fn drop(&mut self) {
         #[cfg(unix)]
@@ -1023,17 +1050,12 @@ impl Drop for StagingLock {
     }
 }
 
+#[cfg(unix)]
 fn staging_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
-    #[cfg(unix)]
     {
         use cap_std::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(0x0200_0000 | 0x0020_0000);
     }
     options
 }
