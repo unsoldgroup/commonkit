@@ -14,7 +14,9 @@ use commonkit_core::{Sha256Digest, StableId};
 use sha2::{Digest, Sha256};
 
 fn temp(name: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!("commonkit-helper-{name}-{}", std::process::id()))
+    std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .join(format!("commonkit-helper-{name}-{}", std::process::id()))
 }
 
 fn invoke(home: &std::path::Path, request: &SshFilesystemRequest) -> std::process::Output {
@@ -810,4 +812,85 @@ fn helper_rejects_a_writable_root_overlapping_control_state() {
     assert!(result.is_err());
     assert!(!state.join("artifacts").exists());
     let _ = fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn helper_rejects_a_symlinked_root_ancestor_before_writefile() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp("alias-home");
+    let state = temp("alias-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let alias = home.join("managed");
+    symlink(home.join(".config"), &alias).unwrap();
+    fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state,
+            "roots": [{"id":"home","path":alias.join("commonkit"),"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = invoke(
+        &home,
+        &SshFilesystemRequest::WriteFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: NormalizedManagedPath::parse("escaped.txt").unwrap(),
+            content: b"must not write".to_vec(),
+        },
+    );
+    assert!(!output.status.success());
+    assert!(!home.join(".config/commonkit/escaped.txt").exists());
+
+    let _ = fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(state);
+}
+
+#[cfg(unix)]
+#[test]
+fn helper_rejects_group_world_writable_runtime_root_and_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for (name, unsafe_root, unsafe_state) in [("root", true, false), ("state", false, true)] {
+        let home = temp(&format!("unsafe-{name}-home"));
+        let root = temp(&format!("unsafe-{name}-root"));
+        let state = temp(&format!("unsafe-{name}-state"));
+        fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        if unsafe_root {
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        if unsafe_state {
+            fs::set_permissions(&state, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        fs::write(
+            home.join(".config/commonkit/target-helper.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "stateRoot": state,
+                "roots": [{"id":"home","path":root,"access":"read_write"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let output = invoke(
+            &home,
+            &SshFilesystemRequest::WriteFile {
+                root_id: StableId::parse("home").unwrap(),
+                path: NormalizedManagedPath::parse("blocked.txt").unwrap(),
+                content: b"must not write".to_vec(),
+            },
+        );
+        assert!(!output.status.success(), "unsafe {name} was accepted");
+        assert!(!root.join("blocked.txt").exists());
+
+        let _ = fs::remove_dir_all(home);
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(state);
+    }
 }

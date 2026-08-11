@@ -111,28 +111,45 @@ impl TargetHelper {
         state_root: &Path,
         protected_paths: &[PathBuf],
     ) -> Result<(), TargetFilesystemError> {
-        if !state_root.is_absolute() || protected_paths.iter().any(|path| !path.is_absolute()) {
+        let state_identity = validate_secure_path(state_root, true, true)?;
+        if std::fs::symlink_metadata(state_root).is_ok() && !owned_by_effective_user(state_root) {
             return Err(TargetFilesystemError::InvalidSshConfig(
-                "target helper paths must be absolute",
+                "state root has an unexpected owner",
             ));
         }
+        let protected_identities = protected_paths
+            .iter()
+            .map(|path| {
+                let allow_missing = path == state_root;
+                validate_secure_path(path, false, allow_missing)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut ids = BTreeMap::new();
+        let mut root_identities = Vec::with_capacity(roots.len());
         for root in roots {
             let path = PathBuf::from(&root.path);
-            if !path.is_absolute() {
-                return Err(TargetFilesystemError::InvalidRoot);
-            }
-            let metadata = std::fs::symlink_metadata(&path)?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            let identity = validate_secure_path(&path, true, false)
+                .map_err(|_| TargetFilesystemError::InvalidRoot)?;
+            if root.access == RootAccess::ReadWrite && !owned_by_effective_user(&path) {
                 return Err(TargetFilesystemError::InvalidRoot);
             }
             if ids.insert(root.id.clone(), ()).is_some() {
                 return Err(TargetFilesystemError::InvalidSshConfig("duplicate root id"));
             }
-            if root.access == RootAccess::ReadWrite
-                && protected_paths
+            root_identities.push((path, identity, root.access));
+        }
+        for (path, identity, access) in root_identities {
+            if access == RootAccess::ReadWrite
+                && (protected_paths
                     .iter()
                     .any(|protected| path.starts_with(protected) || protected.starts_with(&path))
+                    || protected_identities.iter().any(|protected| {
+                        identity.starts_with(protected) || protected.starts_with(&identity)
+                    })
+                    || path.starts_with(state_root)
+                    || state_root.starts_with(&path)
+                    || identity.starts_with(&state_identity)
+                    || state_identity.starts_with(&identity))
             {
                 return Err(TargetFilesystemError::InvalidSshConfig(
                     "writable root overlaps helper control path",
@@ -966,6 +983,130 @@ impl TargetHelper {
                 Ok(SshFilesystemResponse::RecoveryReady { receipt_digest })
             }
         }
+    }
+}
+
+fn validate_secure_path(
+    path: &Path,
+    expected_directory: bool,
+    allow_missing_leaf: bool,
+) -> Result<PathBuf, TargetFilesystemError> {
+    if !path.is_absolute() {
+        return Err(TargetFilesystemError::InvalidSshConfig(
+            "target helper paths must be absolute",
+        ));
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink()
+                || (expected_directory && !metadata.is_dir())
+                || (!expected_directory && !metadata.is_file() && !metadata.is_dir())
+            {
+                return Err(TargetFilesystemError::InvalidSshConfig(
+                    "target helper path has an unsafe type",
+                ));
+            }
+            validate_secure_metadata(&metadata, false)?;
+            validate_secure_ancestors(path.parent())?;
+            std::fs::canonicalize(path)
+                .map_err(|_| TargetFilesystemError::InvalidSshConfig("cannot canonicalize path"))
+        }
+        Err(error) if allow_missing_leaf && error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .ok_or(TargetFilesystemError::InvalidSshConfig(
+                    "target helper path has no parent",
+                ))?;
+            validate_secure_ancestors(Some(parent))?;
+            canonicalize_missing(path)
+        }
+        Err(error) => Err(TargetFilesystemError::Io(error)),
+    }
+}
+
+fn validate_secure_ancestors(start: Option<&Path>) -> Result<(), TargetFilesystemError> {
+    let mut current = start.ok_or(TargetFilesystemError::InvalidSshConfig(
+        "target helper path has no parent",
+    ))?;
+    loop {
+        let metadata = std::fs::symlink_metadata(current)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(TargetFilesystemError::InvalidSshConfig(
+                "target helper path ancestor is unsafe",
+            ));
+        }
+        validate_secure_metadata(&metadata, true)?;
+        let Some(parent) = current.parent() else {
+            return Ok(());
+        };
+        if parent == current {
+            return Ok(());
+        }
+        current = parent;
+    }
+}
+
+fn validate_secure_metadata(
+    metadata: &std::fs::Metadata,
+    allow_sticky_ancestor: bool,
+) -> Result<(), TargetFilesystemError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        let sticky_root = allow_sticky_ancestor && mode & 0o1000 != 0 && metadata.uid() == 0;
+        if (!sticky_root && mode & 0o022 != 0) || !owner_allowed(metadata.uid()) {
+            return Err(TargetFilesystemError::InvalidSshConfig(
+                "target helper path has unsafe ownership or mode",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn canonicalize_missing(path: &Path) -> Result<PathBuf, TargetFilesystemError> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        return std::fs::canonicalize(path)
+            .map_err(|_| TargetFilesystemError::InvalidSshConfig("cannot canonicalize path"));
+    }
+    let parent = path
+        .parent()
+        .ok_or(TargetFilesystemError::InvalidSshConfig(
+            "target helper path has no parent",
+        ))?;
+    let name = path
+        .file_name()
+        .ok_or(TargetFilesystemError::InvalidSshConfig(
+            "target helper path has no name",
+        ))?;
+    Ok(canonicalize_missing(parent)?.join(name))
+}
+
+fn owner_allowed(uid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let effective = unsafe { libc::geteuid() };
+        uid == effective || uid == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        true
+    }
+}
+
+fn owned_by_effective_user(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.uid() == unsafe { libc::geteuid() })
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
     }
 }
 
