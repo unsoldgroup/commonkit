@@ -7,7 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 use cap_std::fs::Dir;
 use commonkit_contracts::{
     Operation, OperationKind, PackageExitClassification, PackageManager,
@@ -633,7 +633,7 @@ fn runtime_authority(
 pub struct ProcessOfflinePackageBackend {
     logical_root: PathBuf,
     process_root: PathBuf,
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     _root_dir: Option<Dir>,
 }
 
@@ -899,12 +899,12 @@ impl ProcessOfflinePackageBackend {
         Self {
             logical_root: target_root.clone(),
             process_root: target_root,
-            #[cfg(target_os = "linux")]
+            #[cfg(unix)]
             _root_dir: None,
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     pub fn new_with_bound_root(
         _target_root: impl Into<PathBuf>,
         root_handle: std::fs::File,
@@ -916,7 +916,11 @@ impl ProcessOfflinePackageBackend {
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
             return Err(PackageMutationError::Backend);
         }
-        let process_root = PathBuf::from(format!("/proc/self/fd/{fd}"));
+        #[cfg(target_os = "linux")]
+        let fd_path = "/proc/self/fd";
+        #[cfg(not(target_os = "linux"))]
+        let fd_path = "/dev/fd";
+        let process_root = PathBuf::from(format!("{fd_path}/{fd}"));
         if !fs::metadata(&process_root)
             .map(|metadata| metadata.is_dir())
             .unwrap_or(false)
@@ -930,7 +934,7 @@ impl ProcessOfflinePackageBackend {
         })
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(unix))]
     pub fn new_with_bound_root(
         _target_root: impl Into<PathBuf>,
         _root_handle: std::fs::File,
@@ -966,18 +970,19 @@ impl ProcessOfflinePackageBackend {
         resolution: &PackageResolutionV1,
     ) -> Result<PackageObservationV1, PackageMutationError> {
         self.ensure_nvm_target(resolution)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let bound_nvm = self.bound_nvm_dir()?;
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let nvm_dir = bound_nvm
             .as_ref()
             .map(|bound| bound.path.clone())
             .unwrap_or_else(|| self.process_root.join(".nvm"));
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(unix))]
         let nvm_dir = self.process_root.join(".nvm");
         let script = self.validate_nvm_script(resolution)?;
         let script_copy = script.materialize()?;
-        let output = Command::new("/bin/bash")
+        let mut command = Command::new("/bin/bash");
+        command
             .arg("-c")
             .arg("set -eu; . \"$1\"; nvm ls --no-colors")
             .arg("commonkit")
@@ -987,7 +992,9 @@ impl ProcessOfflinePackageBackend {
             .env("NVM_DIR", &nvm_dir)
             .env("PATH", CLOSED_NVM_PATH)
             .env("NVM_NO_SOURCE_FALLBACK", "1")
-            .env("NVM_OFFLINE", "1")
+            .env("NVM_OFFLINE", "1");
+        let _bound_root = self.configure_nvm_command(&mut command)?;
+        let output = command
             .output()
             .map_err(|_| PackageMutationError::Backend)?;
         if !output.status.success() {
@@ -1006,7 +1013,7 @@ impl ProcessOfflinePackageBackend {
         &self,
         resolution: &PackageResolutionV1,
     ) -> Result<ValidatedNvmScript, PackageMutationError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if let Some(root) = &self._root_dir {
             let nvm = crate::target::open_target_dir_nofollow(root, Path::new(".nvm"))
                 .map_err(|_| PackageMutationError::Backend)?;
@@ -1163,16 +1170,17 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                 let script_copy = script.materialize()?;
                 let archive = self.artifact_bytes(resolution, artifacts, "node-archive")?;
                 self.write_nvm_cache(&install.cache_relative_path, &archive)?;
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 let bound_nvm = self.bound_nvm_dir()?;
-                #[cfg(target_os = "linux")]
+                #[cfg(unix)]
                 let nvm_dir = bound_nvm
                     .as_ref()
                     .map(|bound| bound.path.clone())
                     .unwrap_or_else(|| self.process_root.join(".nvm"));
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(unix))]
                 let nvm_dir = self.process_root.join(".nvm");
-                let status = Command::new("/bin/bash")
+                let mut command = Command::new("/bin/bash");
+                command
                     .arg("-c")
                     .arg("set -eu; export NVM_NO_SOURCE_FALLBACK=1 NVM_OFFLINE=1; . \"$1\"; nvm install --offline \"$2\"")
                     .arg("commonkit")
@@ -1183,7 +1191,9 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                     .env("NVM_DIR", nvm_dir)
                     .env("PATH", CLOSED_NVM_PATH)
                     .env("NVM_NO_SOURCE_FALLBACK", "1")
-                    .env("NVM_OFFLINE", "1")
+                    .env("NVM_OFFLINE", "1");
+                let _bound_root = self.configure_nvm_command(&mut command)?;
+                let status = command
                     .status()
                     .map_err(|_| PackageMutationError::Backend)?;
                 status
@@ -1210,7 +1220,35 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
 }
 
 impl ProcessOfflinePackageBackend {
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
+    fn configure_nvm_command(
+        &self,
+        command: &mut Command,
+    ) -> Result<Option<std::fs::File>, PackageMutationError> {
+        let Some(root) = &self._root_dir else {
+            return Ok(None);
+        };
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+        let handle = root
+            .try_clone()
+            .map_err(|_| PackageMutationError::Backend)?
+            .into_std_file();
+        let fd = handle.as_raw_fd();
+        command.env("HOME", ".").env("NVM_DIR", "./.nvm");
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(fd) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        Ok(Some(handle))
+    }
+
+    #[cfg(unix)]
     fn bound_nvm_dir(&self) -> Result<Option<BoundNvmDir>, PackageMutationError> {
         let Some(root) = &self._root_dir else {
             return Ok(None);
@@ -1226,8 +1264,12 @@ impl ProcessOfflinePackageBackend {
         if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
             return Err(PackageMutationError::Backend);
         }
+        #[cfg(target_os = "linux")]
+        let fd_path = "/proc/self/fd";
+        #[cfg(not(target_os = "linux"))]
+        let fd_path = "/dev/fd";
         Ok(Some(BoundNvmDir {
-            path: PathBuf::from(format!("/proc/self/fd/{fd}")),
+            path: PathBuf::from(format!("{fd_path}/{fd}")),
             _handle: handle,
         }))
     }
@@ -1237,7 +1279,7 @@ impl ProcessOfflinePackageBackend {
         relative_path: &str,
         bytes: &[u8],
     ) -> Result<(), PackageMutationError> {
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         if let Some(root) = &self._root_dir {
             let nvm = crate::target::open_target_dir_nofollow(root, Path::new(".nvm"))
                 .map_err(|_| PackageMutationError::Backend)?;
@@ -1268,13 +1310,13 @@ impl ProcessOfflinePackageBackend {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 struct BoundNvmDir {
     path: PathBuf,
     _handle: std::fs::File,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn open_or_create_bound_dir(root: &Dir, relative: &Path) -> Result<Dir, PackageMutationError> {
     let mut current = root
         .try_clone()
@@ -1286,13 +1328,13 @@ fn open_or_create_bound_dir(root: &Dir, relative: &Path) -> Result<Dir, PackageM
             }
             return Err(PackageMutationError::Backend);
         };
-        match crate::target::open_target_dir_nofollow(&current, name) {
+        match crate::target::open_target_dir_nofollow(&current, Path::new(name)) {
             Ok(next) => current = next,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 current
                     .create_dir(name)
                     .map_err(|_| PackageMutationError::Backend)?;
-                current = crate::target::open_target_dir_nofollow(&current, name)
+                current = crate::target::open_target_dir_nofollow(&current, Path::new(name))
                     .map_err(|_| PackageMutationError::Backend)?;
             }
             Err(_) => return Err(PackageMutationError::Backend),
@@ -1301,7 +1343,7 @@ fn open_or_create_bound_dir(root: &Dir, relative: &Path) -> Result<Dir, PackageM
     Ok(current)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn read_bound_regular_no_follow(
     parent: &Dir,
     name: &Path,
@@ -1312,7 +1354,7 @@ fn read_bound_regular_no_follow(
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(PackageMutationError::Backend);
     }
-    let file = crate::target::open_target_file_nofollow(parent, name)
+    let mut file = crate::target::open_target_file_nofollow(parent, name)
         .map_err(|_| PackageMutationError::Backend)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
@@ -1482,7 +1524,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     #[test]
     fn bound_nvm_cache_write_survives_root_path_swap() {
         use super::ProcessOfflinePackageBackend;

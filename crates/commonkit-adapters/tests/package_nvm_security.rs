@@ -142,7 +142,7 @@ fn nvm_observe_rejects_manager_prefix_that_does_not_match_backend_target() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn bound_nvm_mutation_survives_a_post_start_root_swap() {
     use std::fs::OpenOptions;
@@ -178,7 +178,7 @@ fn bound_nvm_mutation_survives_a_post_start_root_swap() {
     assert!(!root.path().join("observed-on-bound-root").exists());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 #[test]
 fn bound_nvm_rejects_a_symlinked_nvm_ancestor() {
     use std::fs::OpenOptions;
