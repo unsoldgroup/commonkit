@@ -13,15 +13,16 @@ use std::time::Duration;
 #[cfg(unix)]
 use commonkit_adapters::{
     AptCommandSpecV1, AptRepositoryConfigurationV1, AptResolutionBackend,
-    AptResolutionSystemRequestV1, ArtifactStore, ControlledPackageSourceV1, NodeResolutionBackend,
-    NodeRuntimeHost, NodeRuntimeHostError, PackageDesiredIntent, PackageDiscoveryFetchRequestV1,
-    PackageFetch, PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1,
-    PackageResolutionCoordinator, PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
+    AptResolutionSystemRequestV1, AptSourceAuthorityV1, ArtifactStore, ControlledPackageSourceV1,
+    ManagerBindingV1, NodeResolutionBackend, NodeRuntimeHost, NodeRuntimeHostError,
+    PackageDesiredIntent, PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1,
+    PackageFetchRequestV1, PackageFetchResultV1, PackageResolutionCoordinator,
+    PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
     ProcessAptResolutionCommandRunner, ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost,
 };
 #[cfg(unix)]
 use commonkit_contracts::{
-    PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, StableId,
+    PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, Sha256Digest, StableId,
 };
 #[cfg(unix)]
 use futures_util::StreamExt;
@@ -56,6 +57,71 @@ fn read_only_apt_plan_accepts_only_safe_install_modes_in_private_state() {
 
 #[cfg(unix)]
 #[test]
+fn production_apt_command_plan_matches_only_closed_read_only_shapes() {
+    let source_id = stable_id("ubuntu-main");
+    let authority = AptSourceAuthorityV1 {
+        suite: "noble".into(),
+        components: BTreeSet::from(["main".into()]),
+        signing_authority: stable_id("ubuntu-archive-keyring"),
+        signing_key_digest: fixture_digest('d'),
+    };
+    let registry = PackageSourceRegistry::builtin()
+        .unwrap()
+        .with_apt_source_authority(&source_id, authority.clone())
+        .unwrap();
+    let request = AptResolutionSystemRequestV1 {
+        declaration: PackageDeclaration {
+            id: stable_id("curl"),
+            version: "8.5.0-2ubuntu10.6".into(),
+            manager: PackageManager::Apt,
+            source: source_id.clone(),
+            selector: Some(PackageSelector::AptBinary {
+                name: "curl".into(),
+                architecture: Some("amd64".into()),
+            }),
+        },
+        target: PackageTargetV1 {
+            os: "linux".into(),
+            os_version: "24.04".into(),
+            distro_id: Some("ubuntu".into()),
+            distro_version: Some("24.04".into()),
+            codename: Some("noble".into()),
+            arch: "amd64".into(),
+            libc: Some("glibc".into()),
+            manager_prefix: None,
+        },
+        manager: ManagerBindingV1 {
+            manager: PackageManager::Apt,
+            version: "apt:2.7.14;dpkg:1.22.6".into(),
+            executable_digest: fixture_digest('a'),
+            config_digest: fixture_digest('b'),
+        },
+        source_id: source_id.clone(),
+        canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+        registry_definition_digest: registry.source_definition_digest(&source_id).unwrap(),
+        source_authority: authority,
+        repository: AptRepositoryConfigurationV1 {
+            source_id,
+            suite: "noble".into(),
+            components: BTreeSet::from(["main".into()]),
+            signed_by: PathBuf::from("/usr/share/keyrings/ubuntu-archive-keyring.gpg"),
+            signing_authority: stable_id("ubuntu-archive-keyring"),
+        },
+    };
+
+    let commands = ProcessAptResolutionCommandRunner::command_snapshot(&request).unwrap();
+
+    for (index, command) in commands.into_iter().enumerate() {
+        assert_eq!(
+            validate_read_only_apt_commands(&[command]),
+            Ok(()),
+            "production APT command {index}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn read_only_apt_plan_rejects_real_or_ambiguously_safe_install_commands() {
     let real_install = apt_install_command(&[]);
     let conflicting_modes = apt_install_command(&["--simulate", "--print-uris", "--download-only"]);
@@ -86,6 +152,63 @@ fn read_only_apt_plan_rejects_real_or_ambiguously_safe_install_commands() {
     ] {
         assert!(validate_read_only_apt_commands(&[unsafe_command]).is_err());
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_apt_plan_rejects_late_duplicate_or_unrecognized_apt_overrides() {
+    let mut host_state_override = apt_install_command(&["--simulate"]);
+    host_state_override.args.extend([
+        "-o".into(),
+        "Dir::State::status=/var/lib/dpkg/status".into(),
+    ]);
+    let mut disables_simulation = apt_install_command(&["--simulate"]);
+    insert_apt_option_before_action(&mut disables_simulation, "APT::Get::Simulate=false");
+    let mut duplicate_security_option = apt_install_command(&["--simulate"]);
+    insert_apt_option_before_action(
+        &mut duplicate_security_option,
+        "APT::Get::AllowUnauthenticated=false",
+    );
+    let mut hook_override = apt_install_command(&["--simulate"]);
+    insert_apt_option_before_action(&mut hook_override, "DPkg::Pre-Invoke=/tmp/escape");
+    let mut replaced_private_directory = apt_install_command(&["--simulate"]);
+    *replaced_private_directory
+        .args
+        .iter_mut()
+        .find(|argument| argument.as_str() == "Dir::State::lists=<private>/lists")
+        .unwrap() = "Dir::State::lists=/var/lib/apt/lists".into();
+    let mut missing_security_option = apt_install_command(&["--simulate"]);
+    let assignment = missing_security_option
+        .args
+        .iter()
+        .position(|argument| argument == "Acquire::Check-Valid-Until=true")
+        .unwrap();
+    missing_security_option
+        .args
+        .drain(assignment - 1..=assignment);
+
+    for unsafe_command in [
+        host_state_override,
+        disables_simulation,
+        duplicate_security_option,
+        hook_override,
+        replaced_private_directory,
+        missing_security_option,
+    ] {
+        assert!(validate_read_only_apt_commands(&[unsafe_command]).is_err());
+    }
+}
+
+#[cfg(unix)]
+fn insert_apt_option_before_action(command: &mut AptCommandSpecV1, assignment: &str) {
+    let action = command
+        .args
+        .iter()
+        .position(|argument| argument == "--simulate")
+        .expect("fixture has a simulation action");
+    command
+        .args
+        .splice(action..action, ["-o".into(), assignment.into()]);
 }
 
 #[cfg(unix)]
@@ -126,10 +249,40 @@ fn apt_install_command(safety_flags: &[&str]) -> AptCommandSpecV1 {
         "-o".into(),
         "Dir::Cache::archives=<private>/archives".into(),
         "-o".into(),
+        "APT::Get::List-Cleanup=0".into(),
+        "-o".into(),
+        "Acquire::AllowInsecureRepositories=false".into(),
+        "-o".into(),
+        "Acquire::AllowWeakRepositories=false".into(),
+        "-o".into(),
+        "Acquire::AllowDowngradeToInsecureRepositories=false".into(),
+        "-o".into(),
+        "APT::Get::AllowUnauthenticated=false".into(),
+        "-o".into(),
+        "Acquire::Check-Valid-Until=true".into(),
+        "-o".into(),
+        "Acquire::Check-Date=true".into(),
+        "-o".into(),
+        "Acquire::By-Hash=force".into(),
+        "-o".into(),
+        "Acquire::http::AllowRedirect=false".into(),
+        "-o".into(),
+        "Acquire::https::AllowRedirect=false".into(),
+        "-o".into(),
+        "Acquire::http::Proxy=DIRECT".into(),
+        "-o".into(),
+        "Acquire::https::Proxy=DIRECT".into(),
+        "-o".into(),
+        "Acquire::Languages=none".into(),
+        "-o".into(),
         "Dir::State::status=<private>/status".into(),
     ];
     args.extend(safety_flags.iter().map(|flag| (*flag).to_owned()));
-    args.extend(["--no-remove".into(), "install".into(), "curl=1".into()]);
+    args.extend(["--no-remove".into(), "--no-install-recommends".into()]);
+    if safety_flags == ["--print-uris", "--download-only"] {
+        args.push("--reinstall".into());
+    }
+    args.extend(["install".into(), "curl=1".into()]);
     AptCommandSpecV1 {
         executable: "/usr/bin/apt-get".into(),
         args,
@@ -408,127 +561,158 @@ fn assert_read_only_apt_plan(
 #[cfg(unix)]
 fn validate_read_only_apt_commands(commands: &[AptCommandSpecV1]) -> Result<(), &'static str> {
     for command in commands {
-        if command.args.iter().any(|argument| {
-            matches!(
-                argument.as_str(),
-                "remove"
-                    | "purge"
-                    | "upgrade"
-                    | "dist-upgrade"
-                    | "full-upgrade"
-                    | "autoremove"
-                    | "--install"
-                    | "--unpack"
-                    | "--configure"
-            )
-        }) {
-            return Err("target mutation verb is not allowed");
-        }
-
-        let is_apt_get = command.executable == "/usr/bin/apt-get";
-        let is_apt_cache = command.executable == "/usr/bin/apt-cache";
-        let is_version_probe = is_apt_get && command.args.as_slice() == ["--version"];
-        if (is_apt_get && !is_version_probe) || is_apt_cache {
-            let required_private_options = [
-                "Dir::Etc::sourcelist=<private>/sources.list",
-                "Dir::Etc::sourceparts=-",
-                "Dir::State::lists=<private>/lists",
-                "Dir::Cache::archives=<private>/archives",
-            ];
-            if command.environment
-                != BTreeMap::from([("APT_CONFIG".into(), "<private>/apt.conf".into())])
-                || required_private_options
-                    .iter()
-                    .any(|required| !command.args.iter().any(|argument| argument == required))
-            {
-                return Err("APT command is not bound to private state");
-            }
+        if command.environment
+            != BTreeMap::from([("APT_CONFIG".into(), "<private>/apt.conf".into())])
+        {
+            return Err("command is not bound to the private APT configuration");
         }
 
         match command.executable.as_str() {
-            "/usr/bin/apt-get" if is_version_probe => {}
-            "/usr/bin/apt-get" => match apt_command_action(&command.args) {
-                Some("update" | "install") => {}
-                _ => return Err("apt-get action is not read-only"),
-            },
-            "/usr/bin/apt-cache" => {
-                if apt_command_action(&command.args) != Some("depends") {
-                    return Err("apt-cache action is not approved");
-                }
-            }
-            "/usr/bin/dpkg" => {
-                if !matches!(command.args.as_slice(), [argument] if matches!(argument.as_str(), "--version" | "--print-architecture"))
-                {
-                    return Err("dpkg action is not read-only");
-                }
-            }
-            "/usr/bin/apt-config" => {
-                if command.args.as_slice() != ["dump"] {
-                    return Err("apt-config action is not read-only");
-                }
-            }
-            "/usr/bin/dpkg-query" => {
-                if command.args.first().map(String::as_str) != Some("-W") {
-                    return Err("dpkg-query action is not read-only");
-                }
-            }
-            "/usr/bin/apt-mark" => {
-                if command.args.as_slice() != ["showhold"] {
-                    return Err("apt-mark action is not read-only");
-                }
-            }
-            _ => return Err("command executable is not approved for APT evidence"),
-        }
-
-        let install_count = command
-            .args
-            .iter()
-            .filter(|argument| argument.as_str() == "install")
-            .count();
-        if install_count == 0 {
-            continue;
-        }
-        if !is_apt_get || install_count != 1 {
-            return Err("install is only allowed as one apt-get action");
-        }
-
-        let flag_count = |flag: &str| {
-            command
-                .args
-                .iter()
-                .filter(|argument| argument.as_str() == flag)
-                .count()
-        };
-        let simulation = flag_count("--simulate") == 1
-            && flag_count("--print-uris") == 0
-            && flag_count("--download-only") == 0;
-        let download_plan = flag_count("--simulate") == 0
-            && flag_count("--print-uris") == 1
-            && flag_count("--download-only") == 1;
-        let private_status = command
-            .args
-            .iter()
-            .any(|argument| argument == "Dir::State::status=<private>/status");
-        if !(simulation || download_plan) || !private_status {
-            return Err("install lacks one exact read-only mode in private state");
+            "/usr/bin/apt-get" => validate_apt_get_command(command)?,
+            "/usr/bin/apt-cache" => validate_apt_cache_command(command)?,
+            "/usr/bin/dpkg"
+                if !command.network
+                    && matches!(command.args.as_slice(), [argument] if matches!(argument.as_str(), "--version" | "--print-architecture")) =>
+                {}
+            "/usr/bin/apt-config" if !command.network && command.args.as_slice() == ["dump"] => {}
+            "/usr/bin/dpkg-query"
+                if !command.network
+                    && command.args.as_slice()
+                        == [
+                            "-W",
+                            "-f=${binary:Package}\\t${db:Status-Abbrev}\\t${Version}\\t${Architecture}\\n",
+                        ] => {}
+            "/usr/bin/apt-mark" if !command.network && command.args.as_slice() == ["showhold"] => {}
+            _ => return Err("command does not match a closed read-only APT evidence shape"),
         }
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn apt_command_action(args: &[String]) -> Option<&str> {
-    let mut index = 0;
-    while index < args.len() {
-        if args[index] == "-o" {
-            index += 2;
-        } else if args[index].starts_with('-') {
-            index += 1;
-        } else {
-            return Some(args[index].as_str());
-        }
+fn validate_apt_get_command(command: &AptCommandSpecV1) -> Result<(), &'static str> {
+    if !command.network && command.args.as_slice() == ["--version"] {
+        return Ok(());
     }
-    None
+    let (options, action) = parse_apt_options(&command.args)?;
+    match action {
+        [update] if command.network && update == "update" => {
+            require_canonical_apt_options(&options, false)
+        }
+        [simulate, no_remove, no_recommends, install, package]
+            if !command.network
+                && simulate == "--simulate"
+                && no_remove == "--no-remove"
+                && no_recommends == "--no-install-recommends"
+                && install == "install"
+                && is_exact_package(package) =>
+        {
+            require_canonical_apt_options(&options, true)
+        }
+        [
+            print_uris,
+            download_only,
+            no_remove,
+            no_recommends,
+            reinstall,
+            install,
+            package,
+        ] if !command.network
+            && print_uris == "--print-uris"
+            && download_only == "--download-only"
+            && no_remove == "--no-remove"
+            && no_recommends == "--no-install-recommends"
+            && reinstall == "--reinstall"
+            && install == "install"
+            && is_exact_package(package) =>
+        {
+            require_canonical_apt_options(&options, true)
+        }
+        _ => Err("apt-get command does not match a closed read-only shape"),
+    }
+}
+
+#[cfg(unix)]
+fn validate_apt_cache_command(command: &AptCommandSpecV1) -> Result<(), &'static str> {
+    let (options, action) = parse_apt_options(&command.args)?;
+    match action {
+        [depends, recurse, package]
+            if !command.network
+                && depends == "depends"
+                && recurse == "--recurse"
+                && is_exact_package(package) =>
+        {
+            require_canonical_apt_options(&options, true)
+        }
+        _ => Err("apt-cache command does not match the closed dependency-inspection shape"),
+    }
+}
+
+#[cfg(unix)]
+fn parse_apt_options(args: &[String]) -> Result<(BTreeMap<&str, &str>, &[String]), &'static str> {
+    let mut index = 0;
+    let mut options = BTreeMap::new();
+    while index < args.len() && args[index] == "-o" {
+        let assignment = args
+            .get(index + 1)
+            .ok_or("APT -o is missing its key=value assignment")?;
+        let (key, value) = assignment
+            .split_once('=')
+            .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+            .ok_or("APT -o assignment is malformed")?;
+        if options.insert(key, value).is_some() {
+            return Err("APT option is duplicated");
+        }
+        index += 2;
+    }
+    if args[index..].iter().any(|argument| argument == "-o") {
+        return Err("APT option appears after the command action");
+    }
+    Ok((options, &args[index..]))
+}
+
+#[cfg(unix)]
+fn require_canonical_apt_options(
+    actual: &BTreeMap<&str, &str>,
+    include_status: bool,
+) -> Result<(), &'static str> {
+    let mut expected = BTreeMap::from([
+        ("Dir::Etc::sourcelist", "<private>/sources.list"),
+        ("Dir::Etc::sourceparts", "-"),
+        ("Dir::State::lists", "<private>/lists"),
+        ("Dir::Cache::archives", "<private>/archives"),
+        ("APT::Get::List-Cleanup", "0"),
+        ("Acquire::AllowInsecureRepositories", "false"),
+        ("Acquire::AllowWeakRepositories", "false"),
+        ("Acquire::AllowDowngradeToInsecureRepositories", "false"),
+        ("APT::Get::AllowUnauthenticated", "false"),
+        ("Acquire::Check-Valid-Until", "true"),
+        ("Acquire::Check-Date", "true"),
+        ("Acquire::By-Hash", "force"),
+        ("Acquire::http::AllowRedirect", "false"),
+        ("Acquire::https::AllowRedirect", "false"),
+        ("Acquire::http::Proxy", "DIRECT"),
+        ("Acquire::https::Proxy", "DIRECT"),
+        ("Acquire::Languages", "none"),
+    ]);
+    if include_status {
+        expected.insert("Dir::State::status", "<private>/status");
+    }
+    if actual == &expected {
+        Ok(())
+    } else {
+        Err("APT options differ from the closed private security profile")
+    }
+}
+
+#[cfg(unix)]
+fn is_exact_package(argument: &str) -> bool {
+    argument.split_once('=').is_some_and(|(package, version)| {
+        !package.is_empty()
+            && !version.is_empty()
+            && !package.starts_with('-')
+            && !argument.chars().any(char::is_whitespace)
+    })
 }
 
 #[cfg(unix)]
@@ -761,6 +945,12 @@ fn required_id(name: &'static str) -> StableId {
 #[cfg(unix)]
 fn stable_id(value: &str) -> StableId {
     StableId::parse(value).expect("static harness ID is valid")
+}
+
+#[cfg(unix)]
+fn fixture_digest(byte: char) -> Sha256Digest {
+    Sha256Digest::parse(format!("sha256:{}", byte.to_string().repeat(64)))
+        .expect("static fixture digest is valid")
 }
 
 #[cfg(unix)]
