@@ -34,16 +34,27 @@ configuration, and the configured `Signed-By` key before repository access. A
 mismatch fails before `apt-get update`.
 
 APT receives a CommonKit-owned minimal configuration root, private lists,
-archive cache and empty solver status, one generated source, a scrubbed
-environment, and fixed arguments. Host configuration fragments, hooks,
+archive cache and empty closure-selection status, one generated source, a scrubbed
+environment, and fixed arguments. When running as root, CommonKit requires the
+`_apt` identity and gives it group-read/traverse access only to the generated
+configuration, source, and key plus ownership of the two APT partial-download
+directories. APT is pinned to that sandbox identity; an unsandboxed-root fallback
+diagnostic fails resolution. Host configuration fragments, hooks,
 automatic proxy discovery and helper or solver overrides are absent and the
 effective configuration is checked before repository access. Insecure, weak,
 or downgraded-to-insecure repositories, unauthenticated packages, proxies, and
 automatic redirects are disabled. Resolution invokes only metadata update,
 dependency inspection, simulation, and `--print-uris --download-only`; it
 never invokes an install. Simulation and archive enumeration share the same
-private solver state and must return the same exact closure. Live dpkg state
-is observed separately for hold and downgrade classification.
+empty private solver state and must return the same exact closure. Separately,
+CommonKit opens the root-owned dpkg status without following the leaf, copies it
+into the private workspace, and requires a zero-exit, complete `dpkg-query`
+inventory to match it. A second non-networked simulation pins every archived
+package and version against that live-state snapshot. It must select no package
+outside the archive set and produce no removal, downgrade, replacement, or
+unresolved outcome. The canonical installed inventory, status digest, and
+normalized safety result are bound into the before observation. The original
+status digest is rechecked after resolution.
 
 The resolver opens the configured signing key once without following the
 leaf, requires a root-owned regular file with no group/world write bits,
