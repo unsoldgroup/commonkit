@@ -11,8 +11,8 @@ use commonkit_adapters::{
 use commonkit_cli::about_me_setup::{SetupAnswers, SetupRequest, setup_profile};
 use commonkit_config::{LayerSet, compose_layers, v1_merge_rules};
 use commonkit_contracts::{
-    LayerDocument, LayerKind, SchemaVersion, SecurityPolicy, Sha256Digest, StableId,
-    assert_no_embedded_secrets,
+    LayerDocument, LayerKind, PackageConsent, SchemaVersion, SecurityPolicy, Sha256Digest,
+    StableId, assert_no_embedded_secrets,
 };
 use commonkit_core::enforce_policy_floor;
 use commonkit_personal_context::{
@@ -89,6 +89,9 @@ enum Command {
         plan_id: String,
         #[arg(long)]
         confirmed: bool,
+        /// JSON PackageConsent produced during package plan review.
+        #[arg(long = "package-consent")]
+        package_consent: Option<PathBuf>,
     },
     /// Verify managed state and provider integrity.
     Verify,
@@ -353,6 +356,8 @@ enum TargetCommand {
         plan_id: String,
         #[arg(long)]
         confirmed: bool,
+        #[arg(long = "package-consent")]
+        package_consent: Option<PathBuf>,
     },
     Verify {
         targets: Vec<String>,
@@ -901,10 +906,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     target,
                     plan_id,
                     confirmed: true,
+                    package_consent,
                 } => print_daemon(daemon_control(
                     "POST",
                     &format!("/control/v1/targets/{target}/plans/{plan_id}/apply"),
-                    Some(json!({"confirmed":true,"confirmationId":format!("cli-apply-{target}")})),
+                    Some(target_apply_request(target.as_str(), package_consent)?),
                     Some(nonce("target-apply")),
                 )?)?,
             }
@@ -964,10 +970,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::Apply {
             plan_id,
             confirmed: true,
+            package_consent,
         } => print_daemon(daemon_control(
             "POST",
             &format!("/control/v1/plans/{plan_id}/apply"),
-            Some(json!({"confirmed":true,"confirmationId":"cli-apply"})),
+            Some(apply_request(package_consent)?),
             Some(nonce("apply")),
         )?)?,
         Command::Rollback {
@@ -1972,6 +1979,50 @@ fn run_skills(command: SkillsCommand) -> Result<(), Box<dyn Error>> {
 fn read_json_file<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T, Box<dyn Error>> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
+
+fn apply_request(package_consent: Option<PathBuf>) -> Result<Value, Box<dyn Error>> {
+    let consent = package_consent
+        .as_ref()
+        .map(read_json_file::<PackageConsent>)
+        .transpose()?;
+    let confirmation_id = consent
+        .as_ref()
+        .map(|consent| consent.confirmation_id.clone())
+        .unwrap_or_else(|| StableId::parse("cli-apply").expect("static ID"));
+    Ok(match consent {
+        Some(consent) => json!({
+            "confirmed": true,
+            "confirmationId": confirmation_id,
+            "packageConsent": consent,
+        }),
+        None => json!({"confirmed":true,"confirmationId":confirmation_id}),
+    })
+}
+
+fn target_apply_request(
+    target: &str,
+    package_consent: Option<PathBuf>,
+) -> Result<Value, Box<dyn Error>> {
+    let consent = package_consent
+        .as_ref()
+        .map(read_json_file::<PackageConsent>)
+        .transpose()?;
+    let confirmation_id = consent
+        .as_ref()
+        .map(|consent| consent.confirmation_id.clone())
+        .unwrap_or_else(|| {
+            StableId::parse(format!("cli-apply-{target}")).expect("target ID was parsed by CLI")
+        });
+    Ok(match consent {
+        Some(consent) => json!({
+            "confirmed": true,
+            "confirmationId": confirmation_id,
+            "packageConsent": consent,
+        }),
+        None => json!({"confirmed":true,"confirmationId":confirmation_id}),
+    })
+}
+
 fn now_unix_ms() -> Result<u64, Box<dyn Error>> {
     Ok(std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
