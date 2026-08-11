@@ -511,6 +511,13 @@ pub trait Adapter {
     {
         Ok(None)
     }
+    /// Returns sanitized final package-state evidence for the v3 receipt.
+    fn package_final_digest(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<Option<Sha256Digest>, AdapterFailure> {
+        Ok(None)
+    }
     fn observe_recovery(
         &mut self,
         _operation: &Operation,
@@ -614,7 +621,11 @@ impl<'a> Reconciler<'a> {
         preflight_adapters(plan, adapters)?;
         let mut bindings = Vec::new();
         let mut evidence = Vec::new();
-        for operation in plan.operations.iter().filter(|operation| is_package_operation(operation)) {
+        for operation in plan
+            .operations
+            .iter()
+            .filter(|operation| is_package_operation(operation))
+        {
             let adapter = adapters
                 .iter()
                 .find(|adapter| adapter.id() == &operation.adapter_id)
@@ -664,6 +675,8 @@ impl<'a> Reconciler<'a> {
                         Some(stable_failure_code(&failure)),
                     )?;
                     self.persist(&journal)?;
+                    record_package_failure(&mut journal, operation, &failure)?;
+                    self.persist(&journal)?;
                     journal.transition(ReceiptState::Canceled)?;
                     self.persist(&journal)?;
                     return Ok(ReconcileOutcome::Canceled);
@@ -702,6 +715,8 @@ impl<'a> Reconciler<'a> {
                         Some(stable_failure_code(&failure)),
                     )?;
                     self.persist(&journal)?;
+                    record_package_failure(&mut journal, operation, &failure)?;
+                    self.persist(&journal)?;
                     applied.push((*operation).clone());
                     return self.recover(&mut journal, &applied, adapters);
                 }
@@ -726,6 +741,8 @@ impl<'a> Reconciler<'a> {
                         Some(stable_failure_code(&failure)),
                     )?;
                     self.persist(&journal)?;
+                    record_package_failure(&mut journal, operation, &failure)?;
+                    self.persist(&journal)?;
                     return self.recover(&mut journal, &applied, adapters);
                 }
             }
@@ -749,6 +766,8 @@ impl<'a> Reconciler<'a> {
                     Some(stable_failure_code(&failure)),
                 )?;
                 self.persist(&journal)?;
+                record_package_failure(&mut journal, operation, &failure)?;
+                self.persist(&journal)?;
                 return self.require_forward_recovery(&mut journal);
             }
             journal.record_operation(operation.id.clone(), OperationPhase::Applied, None)?;
@@ -761,9 +780,13 @@ impl<'a> Reconciler<'a> {
                     Some(stable_failure_code(&failure)),
                 )?;
                 self.persist(&journal)?;
+                record_package_failure(&mut journal, operation, &failure)?;
+                self.persist(&journal)?;
                 return self.require_forward_recovery(&mut journal);
             }
             journal.record_operation(operation.id.clone(), OperationPhase::Verified, None)?;
+            self.persist(&journal)?;
+            record_package_success(&mut journal, operation, adapters)?;
             self.persist(&journal)?;
         }
 
@@ -983,17 +1006,23 @@ impl<'a> Reconciler<'a> {
                 Err(code) => Err(code),
             };
             match result {
-                Ok(()) => journal.record_operation(
-                    operation.id.clone(),
-                    OperationPhase::ForwardRecovered,
-                    None,
-                )?,
+                Ok(()) => {
+                    journal.record_operation(
+                        operation.id.clone(),
+                        OperationPhase::ForwardRecovered,
+                        None,
+                    )?;
+                    self.persist(journal)?;
+                    record_package_success(journal, operation, adapters)?;
+                }
                 Err(code) => {
                     journal.record_operation(
                         operation.id.clone(),
                         OperationPhase::ForwardRecoveryFailed,
-                        Some(code),
+                        Some(code.clone()),
                     )?;
+                    self.persist(journal)?;
+                    record_package_failure_code(journal, operation, code)?;
                     self.persist(journal)?;
                     journal.transition(ReceiptState::ForwardRecoveryFailed)?;
                     self.persist(journal)?;
@@ -1051,6 +1080,50 @@ impl<'a> Reconciler<'a> {
     }
 }
 
+fn record_package_failure(
+    journal: &mut ReceiptJournal,
+    operation: &Operation,
+    failure: &AdapterFailure,
+) -> Result<(), ReceiptError> {
+    record_package_failure_code(journal, operation, stable_failure_code(failure))
+}
+
+fn record_package_failure_code(
+    journal: &mut ReceiptJournal,
+    operation: &Operation,
+    code: StableId,
+) -> Result<(), ReceiptError> {
+    if is_package_operation(operation) && journal.receipt().package_authorization.is_some() {
+        journal.record_package_exit(
+            &operation.id,
+            PackageExitClassification::Failed { code },
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn record_package_success(
+    journal: &mut ReceiptJournal,
+    operation: &Operation,
+    adapters: &mut [Box<dyn Adapter>],
+) -> Result<(), ReconcileError> {
+    if !is_package_operation(operation) || journal.receipt().package_authorization.is_none() {
+        return Ok(());
+    }
+    let digest = adapter_for(adapters, &operation.adapter_id)?
+        .package_final_digest(operation)
+        .map_err(ReconcileError::AdapterPreflightFailed)?;
+    if let Some(digest) = digest {
+        journal.record_package_exit(
+            &operation.id,
+            PackageExitClassification::Succeeded,
+            Some(digest),
+        )?;
+    }
+    Ok(())
+}
+
 fn stable_failure_code(failure: &AdapterFailure) -> StableId {
     StableId::parse(failure.code.clone())
         .unwrap_or_else(|_| StableId::parse("adapter_failure").expect("static stable ID"))
@@ -1068,7 +1141,10 @@ fn adapter_for<'a>(
     Err(ReconcileError::AdapterNotFound(id.clone()))
 }
 
-fn preflight_adapters(plan: &Plan, adapters: &mut [Box<dyn Adapter>]) -> Result<(), ReconcileError> {
+fn preflight_adapters(
+    plan: &Plan,
+    adapters: &mut [Box<dyn Adapter>],
+) -> Result<(), ReconcileError> {
     let crosses_forward_barrier = plan
         .operations
         .iter()
