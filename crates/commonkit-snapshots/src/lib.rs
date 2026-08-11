@@ -158,6 +158,7 @@ pub trait DatabaseLifecycle {
 pub enum RestoreFailpoint {
     None,
     AfterSwap,
+    KillAfterSwap,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2134,6 +2135,14 @@ impl<'a, C: AuthenticatedCipher> DurableRestore<'a, C> {
         receipt.state = RestoreState::Swapped;
         self.write_receipt(&run, &receipt)?;
         if failpoint == RestoreFailpoint::AfterSwap {
+            return Err(SnapshotError::Interrupted);
+        }
+        if failpoint == RestoreFailpoint::KillAfterSwap {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(std::process::id() as libc::pid_t, libc::SIGKILL);
+            }
+            #[cfg(not(unix))]
             return Err(SnapshotError::Interrupted);
         }
         if verify_database(database_path, &plan.expected_content_digest, manifest).is_err() {

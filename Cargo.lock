@@ -783,6 +783,7 @@ name = "commonkit-snapshots"
 version = "0.1.0"
 dependencies = [
  "chacha20poly1305",
+ "libc",
  "rand 0.9.5",
  "rusqlite",
  "serde",

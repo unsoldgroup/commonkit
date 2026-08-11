@@ -30,7 +30,9 @@ fn main() {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = env::args_os().skip(1);
-    let action = arguments.next().ok_or("expected interrupt or recover")?;
+    let action = arguments
+        .next()
+        .ok_or("expected interrupt, sigkill, or recover")?;
     let root = arguments.next().ok_or("expected fixture root")?;
     if arguments.next().is_some() {
         return Err("unexpected extra argument".into());
@@ -45,7 +47,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let transaction_root = root.join("transactions");
 
     match action.to_str() {
-        Some("interrupt") => {
+        Some(action @ ("interrupt" | "sigkill")) => {
             fs::write(&database_path, b"pre-interruption database")?;
             let mut objects = DurableObjectStore::open(root.join("objects"))?;
             let database = DatabaseId::new("context-mode")?;
@@ -64,14 +66,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 database,
                 expected_content_digest: manifest.content_digest.clone(),
             };
+            let failpoint = if action == "sigkill" {
+                RestoreFailpoint::KillAfterSwap
+            } else {
+                RestoreFailpoint::AfterSwap
+            };
             let result = DurableRestore::open(transaction_root, &cipher)?.execute(
                 plan,
                 &manifest,
                 &objects,
                 &database_path,
                 &mut NoopLifecycle,
-                RestoreFailpoint::AfterSwap,
+                failpoint,
             );
+            if action == "sigkill" {
+                return Err("SIGKILL failpoint returned unexpectedly".into());
+            }
             if !matches!(result, Err(SnapshotError::Interrupted)) {
                 return Err("restore did not stop at the requested interruption".into());
             }
@@ -92,7 +102,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("fresh-process recovery did not restore the preimage".into());
             }
         }
-        _ => return Err("expected interrupt or recover".into()),
+        _ => return Err("expected interrupt, sigkill, or recover".into()),
     }
     Ok(())
 }
