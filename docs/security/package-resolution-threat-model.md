@@ -33,17 +33,29 @@ architecture, `apt` and `dpkg` versions and executable digests, effective APT
 configuration, and the configured `Signed-By` key before repository access. A
 mismatch fails before `apt-get update`.
 
-APT receives private lists and archive-cache directories, a single generated
-source file, a scrubbed environment, and fixed arguments. Insecure, weak, or
-downgraded-to-insecure repositories, unauthenticated packages, proxies, and
+APT receives a CommonKit-owned minimal configuration root, private lists,
+archive cache and empty solver status, one generated source, a scrubbed
+environment, and fixed arguments. Host configuration fragments, hooks,
+automatic proxy discovery and helper or solver overrides are absent and the
+effective configuration is checked before repository access. Insecure, weak,
+or downgraded-to-insecure repositories, unauthenticated packages, proxies, and
 automatic redirects are disabled. Resolution invokes only metadata update,
-simulation, and `--print-uris --download-only`; it never invokes an install.
-The resolver requires one authenticated `InRelease`, binds its digest and the
-no-follow key-file digest, rejects held/removal/downgrade/replacement or
-unresolved-alternative outcomes, and accepts only exact SHA-256 `.deb`
-records. CommonKit preflights the complete locator set before the first
-request, then downloads every archive through the per-hop scoped fetch seam
-and verifies its digest and size before persistence.
+dependency inspection, simulation, and `--print-uris --download-only`; it
+never invokes an install. Simulation and archive enumeration share the same
+private solver state and must return the same exact closure. Live dpkg state
+is observed separately for hold and downgrade classification.
+
+The resolver opens the configured signing key once without following the
+leaf, requires a root-owned regular file with no group/world write bits,
+copies those bytes into the private workspace, and points `Signed-By` only at
+that immutable copy. The source registry binds the suite, component set,
+signer scope, and key digest, so widening or re-keying invalidates existing
+resolution authority. The resolver requires one authenticated `InRelease`,
+binds its digest, rejects removal/downgrade/replacement relationships or
+unresolved dependency alternatives from real APT output, and accepts only
+exact SHA-256 `.deb` records. CommonKit preflights the complete locator set
+before the first request, then downloads every archive through the per-hop
+scoped fetch seam and verifies its digest and size before persistence.
 
 ## Deferred work
 

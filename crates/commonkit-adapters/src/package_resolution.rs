@@ -228,6 +228,7 @@ pub struct PackageResolutionRequestV1<'a> {
     pub source_id: &'a StableId,
     pub canonical_repository: &'a str,
     pub registry_definition_digest: &'a Sha256Digest,
+    pub apt_source_authority: Option<&'a AptSourceAuthorityV1>,
 }
 
 pub trait PackageFetch {
@@ -292,6 +293,17 @@ struct PackageSourceDefinitionV1<'a> {
     manager: PackageManager,
     canonical_repository: &'a str,
     approved_artifact_roots: &'a BTreeSet<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apt_source_authority: Option<&'a AptSourceAuthorityV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AptSourceAuthorityV1 {
+    pub suite: String,
+    pub components: BTreeSet<String>,
+    pub signing_authority: StableId,
+    pub signing_key_digest: Sha256Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,6 +312,7 @@ struct PackageSourceDefinition {
     manager: PackageManager,
     canonical_repository: String,
     approved_artifact_roots: BTreeSet<String>,
+    apt_source_authority: Option<AptSourceAuthorityV1>,
     digest: Sha256Digest,
 }
 
@@ -310,6 +323,8 @@ pub struct ControlledPackageSourceV1 {
     pub manager: PackageManager,
     pub canonical_repository: String,
     pub approved_artifact_roots: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apt_source_authority: Option<AptSourceAuthorityV1>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -325,6 +340,48 @@ pub struct PackageResolutionAuthority {
     registry: PackageSourceRegistry,
     package_sources: BTreeSet<String>,
     digest: Sha256Digest,
+}
+
+fn package_source_definition_digest(
+    source: &PackageSourceDefinition,
+) -> Result<Sha256Digest, PackageResolutionError> {
+    Ok(digest_domain_json(
+        if source.apt_source_authority.is_some() {
+            "commonkit.package-source-registry-definition.v2"
+        } else {
+            "commonkit.package-source-registry-definition.v1"
+        },
+        &PackageSourceDefinitionV1 {
+            source_id: &source.source_id,
+            manager: source.manager,
+            canonical_repository: &source.canonical_repository,
+            approved_artifact_roots: &source.approved_artifact_roots,
+            apt_source_authority: source.apt_source_authority.as_ref(),
+        },
+    )?)
+}
+
+fn package_source_registry_digest<'a>(
+    sources: impl Iterator<Item = &'a PackageSourceDefinition>,
+) -> Result<Sha256Digest, PackageResolutionError> {
+    let entries = sources
+        .map(|source| PackageSourceDefinitionV1 {
+            source_id: &source.source_id,
+            manager: source.manager,
+            canonical_repository: &source.canonical_repository,
+            approved_artifact_roots: &source.approved_artifact_roots,
+            apt_source_authority: source.apt_source_authority.as_ref(),
+        })
+        .collect::<Vec<_>>();
+    let domain = if entries
+        .iter()
+        .any(|entry| entry.apt_source_authority.is_some())
+    {
+        "commonkit.package-source-registry.v2"
+    } else {
+        "commonkit.package-source-registry.v1"
+    };
+    Ok(digest_domain_json(domain, &entries)?)
 }
 
 impl PackageResolutionAuthority {
@@ -436,13 +493,29 @@ impl PackageSourceRegistry {
             {
                 return Err(PackageResolutionError::MutableSourceMetadata);
             }
+            if source
+                .apt_source_authority
+                .as_ref()
+                .is_some_and(|authority| {
+                    source.manager != PackageManager::Apt
+                        || authority.suite.is_empty()
+                        || authority.components.is_empty()
+                })
+            {
+                return Err(PackageResolutionError::MutableSourceMetadata);
+            }
             let digest = digest_domain_json(
-                "commonkit.package-source-registry-definition.v1",
+                if source.apt_source_authority.is_some() {
+                    "commonkit.package-source-registry-definition.v2"
+                } else {
+                    "commonkit.package-source-registry-definition.v1"
+                },
                 &PackageSourceDefinitionV1 {
                     source_id: &source.source_id,
                     manager: source.manager,
                     canonical_repository: &source.canonical_repository,
                     approved_artifact_roots: &source.approved_artifact_roots,
+                    apt_source_authority: source.apt_source_authority.as_ref(),
                 },
             )?;
             if registry
@@ -453,6 +526,7 @@ impl PackageSourceRegistry {
                         manager: source.manager,
                         canonical_repository: source.canonical_repository,
                         approved_artifact_roots: source.approved_artifact_roots,
+                        apt_source_authority: source.apt_source_authority,
                         digest,
                     },
                 )
@@ -468,9 +542,18 @@ impl PackageSourceRegistry {
                 manager: source.manager,
                 canonical_repository: &source.canonical_repository,
                 approved_artifact_roots: &source.approved_artifact_roots,
+                apt_source_authority: source.apt_source_authority.as_ref(),
             })
             .collect::<Vec<_>>();
-        let digest = digest_domain_json("commonkit.package-source-registry.v1", &entries)?;
+        let domain = if entries
+            .iter()
+            .any(|entry| entry.apt_source_authority.is_some())
+        {
+            "commonkit.package-source-registry.v2"
+        } else {
+            "commonkit.package-source-registry.v1"
+        };
+        let digest = digest_domain_json(domain, &entries)?;
         Ok(Self {
             sources: registry,
             digest,
@@ -489,6 +572,28 @@ impl PackageSourceRegistry {
             })
     }
 
+    pub fn with_apt_source_authority(
+        mut self,
+        source_id: &StableId,
+        authority: AptSourceAuthorityV1,
+    ) -> Result<Self, PackageResolutionError> {
+        if authority.suite.is_empty() || authority.components.is_empty() {
+            return Err(PackageResolutionError::MutableSourceMetadata);
+        }
+        let source = self.sources.get_mut(source_id).ok_or_else(|| {
+            PackageResolutionError::UnknownSource {
+                source_id: source_id.clone(),
+            }
+        })?;
+        if source.manager != PackageManager::Apt {
+            return Err(PackageResolutionError::SourceManagerMismatch);
+        }
+        source.apt_source_authority = Some(authority);
+        source.digest = package_source_definition_digest(source)?;
+        self.digest = package_source_registry_digest(self.sources.values())?;
+        Ok(self)
+    }
+
     pub fn digest(&self) -> &Sha256Digest {
         &self.digest
     }
@@ -504,6 +609,7 @@ fn controlled_source(
         manager,
         canonical_repository: canonical_repository.into(),
         approved_artifact_roots: BTreeSet::new(),
+        apt_source_authority: None,
     })
 }
 
@@ -564,6 +670,7 @@ impl<'a> PackageResolutionCoordinator<'a> {
             source_id: &definition.source_id,
             canonical_repository: &definition.canonical_repository,
             registry_definition_digest: &definition.digest,
+            apt_source_authority: definition.apt_source_authority.as_ref(),
         };
         let mut probe = self.backend.probe(&request)?;
         probe.signed_metadata.sort();
@@ -619,6 +726,7 @@ impl<'a> PackageResolutionCoordinator<'a> {
             source_id: &definition.source_id,
             canonical_repository: &definition.canonical_repository,
             registry_definition_digest: &definition.digest,
+            apt_source_authority: definition.apt_source_authority.as_ref(),
         };
         let source_metadata_digest = source.metadata_digest()?;
         for artifact in &draft.artifacts {

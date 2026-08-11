@@ -475,6 +475,7 @@ fn target_manager_and_source_mismatch_fail_before_backend_or_fetch() {
             manager: PackageManager::Apt,
             canonical_repository: "https://archive.example.invalid/apt".into(),
             approved_artifact_roots: BTreeSet::new(),
+            apt_source_authority: None,
         }])
         .unwrap();
     let mut backend = PanicBackend;
@@ -796,6 +797,7 @@ fn persisted_resolution_rejects_target_manager_source_and_artifact_list_drift() 
             manager: PackageManager::Homebrew,
             canonical_repository: "https://example.invalid/homebrew-core".into(),
             approved_artifact_roots: BTreeSet::new(),
+            apt_source_authority: None,
         }])
         .unwrap();
     assert!(matches!(
@@ -825,6 +827,14 @@ fn persisted_resolution_rejects_target_manager_source_and_artifact_list_drift() 
         substituted_intent.load_and_validate(&target(), &manager_binding(), &registry, &store),
         Err(PackageResolutionError::SourceBindingMismatch)
     ));
+}
+
+#[test]
+fn builtin_source_registry_preserves_the_filesystem_and_generic_v1_digest() {
+    assert_eq!(
+        PackageSourceRegistry::builtin().unwrap().digest().as_str(),
+        "sha256:188316c18c44cefdc652d4828a1904ce35621cd19ee7c4e99f8985df5b6dd2fc"
+    );
 }
 
 #[test]
