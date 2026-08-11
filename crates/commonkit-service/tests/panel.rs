@@ -89,8 +89,14 @@ async fn status_exposes_immutable_runtime_identity() {
     let body = get_status(ServiceStatus::default()).await;
 
     assert_eq!(body["panelContractVersion"], "commonkit.panel/v1");
-    assert!(body["buildRevision"].as_str().is_some_and(|value| !value.is_empty()));
-    assert!(body["daemonBinarySha256"]
-        .as_str()
-        .is_some_and(|value| value.starts_with("sha256:") && value.len() == 71));
+    assert!(
+        body["buildRevision"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert!(
+        body["daemonBinarySha256"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sha256:") && value.len() == 71)
+    );
 }

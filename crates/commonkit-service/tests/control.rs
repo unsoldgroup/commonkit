@@ -25,7 +25,7 @@ use commonkit_relay::{
 use commonkit_service::{
     ApplyStatus, ControlError, ControlPlane, ControlToken, DomainFailure, EventHub,
     ExecutionResult, PlanExecutionAuthority, PlanExecutor, RelayProviderAuthority, ServiceStatus,
-    SyncDomain, resolved_mcp_from_materialized, router_with_control,
+    SyncDomain, TargetIdentityPlanExecutor, resolved_mcp_from_materialized, router_with_control,
 };
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -208,6 +208,42 @@ fn package_apply_carries_consent_to_the_executor() {
     assert!(created);
     assert_eq!(operation.status, ApplyStatus::Succeeded);
     assert_eq!(executor.consent_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn package_plan_routes_to_its_target_executor_instead_of_the_local_fallback() {
+    let local = Arc::new(ConsentAwareExecutor {
+        consent_calls: AtomicUsize::new(0),
+    });
+    let target = Arc::new(ConsentAwareExecutor {
+        consent_calls: AtomicUsize::new(0),
+    });
+    let executor = TargetIdentityPlanExecutor::new(
+        local.clone(),
+        BTreeMap::from([(
+            StableId::parse("laptop").unwrap(),
+            target.clone() as Arc<dyn PlanExecutor>,
+        )]),
+    );
+    let plan = package_plan();
+    let confirmation_id = StableId::parse("package-confirmation").unwrap();
+    let consent = PackageConsent {
+        confirmation_id: confirmation_id.clone(),
+        operation_set_digest: package_operation_set_digest(
+            &plan,
+            &[PackageOperationConsentBinding {
+                operation_id: plan.operations[0].id.clone(),
+                resolution_digest: plan.operations[0].payload_digest.clone(),
+            }],
+        )
+        .unwrap(),
+    };
+
+    let result = executor.execute_with_package_consent(&plan, &confirmation_id, &consent);
+
+    assert_eq!(result.status, ApplyStatus::Succeeded);
+    assert_eq!(target.consent_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(local.consent_calls.load(Ordering::SeqCst), 0);
 }
 
 impl PlanExecutor for SuccessfulExecutor {

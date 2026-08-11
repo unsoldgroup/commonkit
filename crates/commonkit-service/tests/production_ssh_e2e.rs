@@ -1,11 +1,17 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, header};
 use commonkit_adapters::*;
-use commonkit_contracts::{Sha256Digest, StableId, digest_domain_json};
+use commonkit_contracts::{
+    OperationKind, PackageConsent, PackageDeclaration, PackageManager,
+    PackageOperationConsentBinding, PackageSelector, PlanBindings, RecoveryCapability, ResourceRef,
+    Risk, SchemaVersion, SecurityPolicy, Sha256Digest, StableId, digest_domain_json,
+    package_operation_set_digest,
+};
+use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_reconcile::PlanStore;
 use commonkit_service::*;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use tower::ServiceExt;
@@ -14,6 +20,9 @@ use tower::ServiceExt;
 struct Remote {
     files: BTreeMap<String, Vec<u8>>,
     staged: BTreeMap<Sha256Digest, Vec<u8>>,
+    opens: usize,
+    installed_packages: BTreeSet<String>,
+    package_phases: Vec<PackageMutationPhase>,
 }
 #[derive(Clone, Default)]
 struct Memory(Arc<Mutex<Remote>>);
@@ -31,9 +40,9 @@ impl SshFilesystemTransport for Memory {
                 .map(|content| SshFilesystemResponse::Resource {
                     resource: TargetResource::File { content },
                 })
-                 .unwrap_or(SshFilesystemResponse::Resource {
-                     resource: TargetResource::Absent,
-                 })),
+                .unwrap_or(SshFilesystemResponse::Resource {
+                    resource: TargetResource::Absent,
+                })),
             SshFilesystemRequest::ReadFile { path, .. } => Ok(remote
                 .files
                 .get(path.as_str())
@@ -59,6 +68,35 @@ impl SshFilesystemTransport for Memory {
             {
                 Ok(SshFilesystemResponse::ArtifactVerified { digest })
             }
+            SshFilesystemRequest::PackageMutation {
+                phase, resolution, ..
+            } => {
+                remote.package_phases.push(phase);
+                match phase {
+                    PackageMutationPhase::Observe => Ok(SshFilesystemResponse::PackageObserved {
+                        installed_versions: remote.installed_packages.clone(),
+                    }),
+                    PackageMutationPhase::Apply => {
+                        for package in &resolution.closure {
+                            let Some(PackageSelector::AptBinary { name, architecture }) =
+                                package.declaration.selector.as_ref()
+                            else {
+                                return Err(TargetFilesystemError::InvalidRemoteResponse);
+                            };
+                            let architecture =
+                                architecture.as_deref().unwrap_or(&resolution.target.arch);
+                            remote.installed_packages.insert(format!(
+                                "{name}:{architecture}={}",
+                                package.declaration.version
+                            ));
+                        }
+                        Ok(SshFilesystemResponse::Applied)
+                    }
+                    PackageMutationPhase::Prepare | PackageMutationPhase::Verify => {
+                        Ok(SshFilesystemResponse::Applied)
+                    }
+                }
+            }
             _ => Err(TargetFilesystemError::InvalidRemoteResponse),
         }
     }
@@ -69,6 +107,7 @@ impl ProductionSshTransportFactory for Factory {
         &self,
         _: &ProductionSshTarget,
     ) -> Result<Box<dyn SshFilesystemTransport + Send>, DomainFailure> {
+        self.0.0.lock().unwrap().opens += 1;
         Ok(Box::new(self.0.clone()))
     }
 }
@@ -86,6 +125,118 @@ fn digest(value: &str) -> Sha256Digest {
 }
 fn write_json(path: &std::path::Path, value: &impl serde::Serialize) {
     std::fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+}
+
+fn apt_resolution() -> (PackageResolutionV1, PackageResolutionAuthority) {
+    let source_id = StableId::parse("ubuntu-main").unwrap();
+    let target = PackageTargetV1 {
+        os: "linux".into(),
+        os_version: "24.04".into(),
+        distro_id: Some("ubuntu".into()),
+        distro_version: Some("24.04".into()),
+        codename: Some("noble".into()),
+        arch: "amd64".into(),
+        libc: Some("glibc".into()),
+        manager_prefix: None,
+    };
+    let manager = ManagerBindingV1 {
+        manager: PackageManager::Apt,
+        version: "2.7.14".into(),
+        executable_digest: digest("apt-executable"),
+        config_digest: digest("apt-config"),
+    };
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let policy = SecurityPolicy {
+        allowlists: [(
+            StableId::parse("package_sources").unwrap(),
+            BTreeSet::from(["ubuntu-main".into()]),
+        )]
+        .into_iter()
+        .collect(),
+        ..SecurityPolicy::default()
+    };
+    let authority = PackageResolutionAuthority::new(&target, &manager, &registry, &policy).unwrap();
+    let declaration = PackageDeclaration {
+        id: StableId::parse("ripgrep").unwrap(),
+        version: "14.1.1-1ubuntu1".into(),
+        manager: PackageManager::Apt,
+        source: source_id.clone(),
+        selector: Some(PackageSelector::AptBinary {
+            name: "ripgrep".into(),
+            architecture: Some("amd64".into()),
+        }),
+    };
+    let source = SourceBindingV1 {
+        source_id,
+        registry_definition_digest: registry
+            .source_definition_digest(&StableId::parse("ubuntu-main").unwrap())
+            .unwrap(),
+        canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+        repository_revision: Some("0".repeat(64)),
+        signed_metadata: Vec::new(),
+    };
+    (
+        PackageResolutionV1 {
+            schema_version: SchemaVersion(1),
+            declaration: declaration.clone(),
+            target,
+            manager,
+            source: source.clone(),
+            before: PackageObservationV1 {
+                installed_versions: BTreeSet::new(),
+            },
+            closure: vec![ResolvedPackage {
+                declaration,
+                source,
+            }],
+            artifacts: Vec::new(),
+            recipe: OfflineInstallRecipeV1::AptArchives {
+                artifact_roles: BTreeSet::new(),
+            },
+        },
+        authority,
+    )
+}
+
+fn package_plan(
+    resolution_digest: Sha256Digest,
+    authority_digest: Sha256Digest,
+) -> commonkit_contracts::Plan {
+    let operation = finalize_operation(OperationDraft {
+        adapter_id: StableId::parse("packages").unwrap(),
+        kind: OperationKind::Create,
+        resource: ResourceRef {
+            resource_type: StableId::parse("package").unwrap(),
+            resource_id: StableId::parse("ripgrep").unwrap(),
+            managed_path: None,
+        },
+        risk: Risk::Medium,
+        requires_confirmation: true,
+        recovery_capability: RecoveryCapability::ConvergeForwardOnly,
+        depends_on: Vec::new(),
+        before_digest: None,
+        after_digest: Some(digest("package-after")),
+        payload_digest: resolution_digest,
+        provenance: None,
+        summary: "install ripgrep".into(),
+    })
+    .unwrap();
+    build_plan(PlanDraft {
+        target_id: StableId::parse("remote-linux").unwrap(),
+        desired_digest: digest("package-desired"),
+        observed_digest: digest("package-observed"),
+        policy_digest: digest("package-policy"),
+        bindings: PlanBindings {
+            target_identity_digest: digest("target"),
+            composed_loadout_digest: digest("loadout"),
+            provider_inputs_digest: digest("provider-inputs"),
+            ownership_map_digest: digest("ownership"),
+            artifact_set_digest: digest("artifacts"),
+            package_resolution_authority_digest: Some(authority_digest),
+        },
+        operations: vec![operation],
+    })
+    .unwrap()
 }
 
 async fn call(
@@ -133,6 +284,7 @@ fn setup(
     ProductionDomainRegistry,
     Arc<PlanStore>,
     Arc<dyn PlanExecutor>,
+    Arc<dyn PlanExecutor>,
 ) {
     setup_with_capabilities(root, remote, false)
 }
@@ -144,6 +296,7 @@ fn setup_with_capabilities(
 ) -> (
     ProductionDomainRegistry,
     Arc<PlanStore>,
+    Arc<dyn PlanExecutor>,
     Arc<dyn PlanExecutor>,
 ) {
     let artifacts = ArtifactStore::open(root.join("artifacts")).unwrap();
@@ -224,22 +377,67 @@ fn setup_with_capabilities(
         .unwrap();
     let dispatch: Arc<dyn PlanExecutor> = Arc::new(TargetDispatchPlanExecutor::new(
         Arc::new(Fallback),
-        Some(ssh),
+        Some(ssh.clone()),
     ));
-    (registry, plans, dispatch)
+    (registry, plans, dispatch, ssh)
 }
 
 #[test]
 fn ssh_target_with_provider_mcp_requires_a_target_resident_daemon() {
     let temporary = tempfile::tempdir().unwrap();
     let remote = Memory::default();
-    let (registry, _, _) = setup_with_capabilities(temporary.path(), remote, true);
+    let (registry, _, _, _) = setup_with_capabilities(temporary.path(), remote, true);
     assert_eq!(
         registry.sync.as_ref().unwrap().plan(serde_json::json!({
             "confirmed": true,
             "confirmationId": "relay-plan"
         })),
         Err(DomainFailure::RelayRequiresTargetResidentDaemon)
+    );
+}
+
+#[test]
+fn approved_package_plan_opens_the_typed_ssh_adapter_instead_of_the_unavailable_fallback() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote = Memory::default();
+    let (_, plans, _, executor) = setup(temporary.path(), remote.clone());
+    let (resolution, authority) = apt_resolution();
+    let package_artifacts = ArtifactStore::open(temporary.path().join("adapter/packages")).unwrap();
+    let resolution_ref = package_artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let plan = package_plan(resolution_ref.digest, authority.digest().clone());
+    plans.persist(&plan).unwrap();
+    let confirmation_id = StableId::parse("package-confirmation").unwrap();
+    let consent = PackageConsent {
+        confirmation_id: confirmation_id.clone(),
+        operation_set_digest: package_operation_set_digest(
+            &plan,
+            &[PackageOperationConsentBinding {
+                operation_id: plan.operations[0].id.clone(),
+                resolution_digest: plan.operations[0].payload_digest.clone(),
+            }],
+        )
+        .unwrap(),
+    };
+
+    let result = executor.execute_with_package_consent(&plan, &confirmation_id, &consent);
+
+    assert_eq!(result.status, ApplyStatus::Succeeded);
+    assert_eq!(result.failure_code, None);
+    let remote = remote.0.lock().unwrap();
+    assert!(remote.opens >= 2);
+    assert_eq!(
+        remote.package_phases,
+        vec![
+            PackageMutationPhase::Prepare,
+            PackageMutationPhase::Apply,
+            PackageMutationPhase::Verify,
+            PackageMutationPhase::Observe,
+        ]
     );
 }
 
@@ -284,7 +482,7 @@ async fn apply_and_wait(
 async fn authenticated_sync_plan_dispatches_ssh_apply_rejects_stale_and_survives_restart() {
     let temporary = tempfile::tempdir().unwrap();
     let remote = Memory::default();
-    let (registry, plans, executor) = setup(temporary.path(), remote.clone());
+    let (registry, plans, executor, _) = setup(temporary.path(), remote.clone());
     let token = ControlToken::generate();
     let control = ControlPlane::with_plan_store(executor, plans.clone());
     control.set_headless_domains(registry.into_headless());
@@ -346,7 +544,7 @@ async fn authenticated_sync_plan_dispatches_ssh_apply_rejects_stale_and_survives
         true
     );
 
-    let (registry, _, executor) = setup(temporary.path(), remote.clone());
+    let (registry, _, executor, _) = setup(temporary.path(), remote.clone());
     let restarted = ControlPlane::with_plan_store(executor, plans);
     restarted.set_headless_domains(registry.into_headless());
     let restarted_app = router_with_control(

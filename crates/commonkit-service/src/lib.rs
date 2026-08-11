@@ -25,10 +25,10 @@ use commonkit_adapters::{
     ProcessOfflinePackageBackend, ProcessPackageCommandRunner, ProviderCapability,
 };
 use commonkit_contracts::{
-    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Operation,
-    PackageConsent, PackageDeclaration, Plan, PlanBindings, Principal, ReceiptState,
-    RecoveryCapability, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, SecurityPolicy,
-    Sha256Digest, StableId, assert_no_embedded_secrets, digest_domain_json,
+    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, PackageConsent,
+    PackageDeclaration, Plan, PlanBindings, Principal, ReceiptState, RuntimeDiagnostic,
+    SCHEMA_VERSION, SchemaVersion, SecurityPolicy, Sha256Digest, StableId,
+    assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, ReceiptAudience, build_plan, resolve_principal};
 use commonkit_reconcile::{
@@ -160,8 +160,7 @@ fn current_binary_sha256() -> String {
         .and_then(|path| std::fs::read(path).ok())
         .map(|bytes| format!("sha256:{:x}", Sha256::digest(bytes)))
         .unwrap_or_else(|| {
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                .into()
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000".into()
         })
 }
 
@@ -1522,10 +1521,12 @@ impl TargetIdentityPlanExecutor {
 
 impl PlanExecutor for TargetIdentityPlanExecutor {
     fn execute(&self, plan: &Plan, confirmation_id: &StableId) -> ExecutionResult {
-        let filesystem = plan
-            .operations
-            .iter()
-            .all(|operation| matches!(operation.adapter_id.as_str(), "files" | "ssh-files"));
+        let target_bound = plan.operations.iter().all(|operation| {
+            matches!(
+                operation.adapter_id.as_str(),
+                "files" | "ssh-files" | "packages"
+            )
+        });
         let mixed_filesystem = plan
             .operations
             .iter()
@@ -1540,7 +1541,7 @@ impl PlanExecutor for TargetIdentityPlanExecutor {
                 failure_code: Some(stable_code("mixed_target_plan")),
             };
         }
-        if filesystem && !plan.operations.is_empty() {
+        if target_bound && !plan.operations.is_empty() {
             return self.targets.get(&plan.target_id).map_or(
                 ExecutionResult {
                     status: ApplyStatus::Failed,
@@ -1558,10 +1559,12 @@ impl PlanExecutor for TargetIdentityPlanExecutor {
         confirmation_id: &StableId,
         idempotency_key: &str,
     ) -> ExecutionResult {
-        let filesystem = plan
-            .operations
-            .iter()
-            .all(|operation| matches!(operation.adapter_id.as_str(), "files" | "ssh-files"));
+        let target_bound = plan.operations.iter().all(|operation| {
+            matches!(
+                operation.adapter_id.as_str(),
+                "files" | "ssh-files" | "packages"
+            )
+        });
         let mixed_filesystem = plan
             .operations
             .iter()
@@ -1576,7 +1579,7 @@ impl PlanExecutor for TargetIdentityPlanExecutor {
                 failure_code: Some(stable_code("mixed_target_plan")),
             };
         }
-        if filesystem && !plan.operations.is_empty() {
+        if target_bound && !plan.operations.is_empty() {
             return self.targets.get(&plan.target_id).map_or(
                 ExecutionResult {
                     status: ApplyStatus::Failed,
@@ -1595,11 +1598,13 @@ impl PlanExecutor for TargetIdentityPlanExecutor {
         confirmation_id: &StableId,
         consent: &PackageConsent,
     ) -> ExecutionResult {
-        let filesystem = plan
-            .operations
-            .iter()
-            .all(|operation| matches!(operation.adapter_id.as_str(), "files" | "ssh-files"));
-        if filesystem && !plan.operations.is_empty() {
+        let target_bound = plan.operations.iter().all(|operation| {
+            matches!(
+                operation.adapter_id.as_str(),
+                "files" | "ssh-files" | "packages"
+            )
+        });
+        if target_bound && !plan.operations.is_empty() {
             return self.targets.get(&plan.target_id).map_or(
                 ExecutionResult {
                     status: ApplyStatus::Failed,
@@ -2136,60 +2141,6 @@ impl LocalExecutionError {
             Self::Relay(_) => "relay_unavailable",
             Self::Contract(_) => "contract_invalid",
         })
-    }
-}
-
-/// Closed fallback for targets whose concrete package transport is not
-/// registered. It never delegates package operations to another adapter.
-struct UnavailablePackageAdapter;
-
-impl Adapter for UnavailablePackageAdapter {
-    fn id(&self) -> &StableId {
-        static ID: std::sync::OnceLock<StableId> = std::sync::OnceLock::new();
-        ID.get_or_init(|| StableId::parse("packages").expect("static adapter ID"))
-    }
-
-    fn supports_operation(&self, operation: &Operation) -> bool {
-        operation.adapter_id.as_str() == "packages"
-            && operation.resource.resource_type.as_str() == "package"
-            && operation.kind == commonkit_contracts::OperationKind::Create
-            && operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
-    }
-
-    fn supports_offline_recovery(&self, operation: &Operation) -> bool {
-        self.supports_operation(operation)
-    }
-
-    fn preflight(
-        &mut self,
-        _operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        Err(commonkit_reconcile::AdapterFailure::new(
-            "package_adapter_unavailable",
-            "no concrete offline package adapter is registered",
-        ))
-    }
-
-    fn prepare(
-        &mut self,
-        operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        self.preflight(operation)
-    }
-
-    fn apply(&mut self, operation: &Operation) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        self.preflight(operation)
-    }
-
-    fn verify(&mut self, operation: &Operation) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        self.preflight(operation)
-    }
-
-    fn rollback(
-        &mut self,
-        operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
-        self.preflight(operation)
     }
 }
 
@@ -4823,7 +4774,9 @@ impl BoundServer {
         let skills = skill_canary
             .as_ref()
             .map(|runtime| runtime.engine())
-            .or_else(|| configured_plugin_skill_engine(&paths.config.join("headless.json"), &paths.state));
+            .or_else(|| {
+                configured_plugin_skill_engine(&paths.config.join("headless.json"), &paths.state)
+            });
         if let Some(targets) = production_domains.targets.clone() {
             control.set_target_inventory(targets);
         }
@@ -5003,13 +4956,7 @@ async fn get_panel(State(state): State<ApiState>) -> Result<Json<PanelSnapshot>,
     };
     channels.insert("drift".into(), drift);
 
-    let plan_count = state
-        .control
-        .inner
-        .plans
-        .read()
-        .expect("plan lock")
-        .len() as u64;
+    let plan_count = state.control.inner.plans.read().expect("plan lock").len() as u64;
     channels.insert(
         "changes".into(),
         panel_channel(

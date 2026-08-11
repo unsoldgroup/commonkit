@@ -281,6 +281,7 @@ fn apt_recovery_rejects_foreign_architecture_before_backend_mutation() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
+        target_supported: true,
         observed: resolution.before.clone(),
         calls: calls.clone(),
     };
@@ -306,6 +307,7 @@ fn apt_recovery_does_not_treat_wrong_real_identity_as_after() {
         .unwrap();
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
+        target_supported: true,
         observed: PackageObservationV1 {
             installed_versions: BTreeSet::from(["logical-root:amd64=14.1.1-1ubuntu1".into()]),
         },
@@ -332,6 +334,7 @@ fn apt_recovery_does_not_treat_ambiguous_observed_architectures_as_after() {
         .unwrap();
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
+        target_supported: true,
         observed: PackageObservationV1 {
             installed_versions: BTreeSet::from([
                 "ripgrep:all=14.1.1-1ubuntu1".into(),
@@ -393,6 +396,7 @@ fn apt_recovery_matches_real_names_for_logical_root_and_hashed_dependencies() {
         .unwrap();
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
+        target_supported: true,
         observed: PackageObservationV1 {
             installed_versions: BTreeSet::from([
                 "curl:amd64=8.5.0-2ubuntu10.6".into(),
@@ -454,6 +458,7 @@ fn apt_recovery_resolves_all_and_native_architectures_in_the_closure() {
         .unwrap();
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
+        target_supported: true,
         observed: PackageObservationV1 {
             installed_versions: BTreeSet::from([
                 "debian-archive-keyring:all=2023.4ubuntu1".into(),

@@ -11,12 +11,13 @@ use commonkit_adapters::{
     ContentSensitivity, CredentialReference, CredentialResolver, DesiredStateProvider,
     ExactProviderVersion, FileAdapter, FilesystemIntent, GitRepository, GitSyncDisposition,
     LocalSensitiveFileStore, MaterializedState, NativeProvider, NormalizedManagedPath,
-    NormalizedResource, OpenSshConfig, OpenSshTransport, OwnershipRules, PlatformKeychain,
-    PlatformKeychainCredentialResolver, ProcessBwsRunner, ProcessGitRunner,
+    NormalizedResource, OpenSshConfig, OpenSshTransport, OwnershipRules, PackageAdapter,
+    PlatformKeychain, PlatformKeychainCredentialResolver, ProcessBwsRunner, ProcessGitRunner,
     ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
     ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
-    RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, SshTargetCapabilities,
-    build_provider_plan, materialize_mcp_client_state, validate_ownership,
+    RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter,
+    SshOfflinePackageBackend, SshTargetCapabilities, build_provider_plan,
+    materialize_mcp_client_state, validate_ownership,
 };
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
@@ -360,6 +361,8 @@ pub struct ProductionSshTarget {
     known_hosts: PathBuf,
     fingerprint: String,
     capabilities: SshTargetCapabilities,
+    operating_system: String,
+    architecture: String,
 }
 
 struct ProcessSshTransportFactory;
@@ -413,18 +416,30 @@ impl ProductionSshPlanExecutor {
     }
 
     fn adapter(&self) -> Result<Vec<Box<dyn Adapter>>, DomainFailure> {
-        let transport = self.factory.open(&self.target)?;
+        let file_transport = self.factory.open(&self.target)?;
+        let package_transport = self.factory.open(&self.target)?;
+        let package_artifacts = ArtifactStore::open(self.adapter_state.join("packages"))
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let package_backend = SshOfflinePackageBackend::with_target_platform(
+            self.target.root_id.clone(),
+            package_transport,
+            self.target.operating_system.clone(),
+            self.target.architecture.clone(),
+        );
         Ok(vec![
             Box::new(
                 SshFileAdapter::open_with_capabilities(
                     self.target.root_id.clone(),
                     &self.adapter_state,
-                    transport,
+                    file_transport,
                     self.target.capabilities,
                 )
                 .map_err(|_| DomainFailure::OperationFailed)?,
             ),
-            Box::new(super::UnavailablePackageAdapter),
+            Box::new(PackageAdapter::new_offline(
+                package_artifacts,
+                Box::new(package_backend),
+            )),
         ])
     }
 
@@ -548,22 +563,11 @@ impl PlanExecutor for ProductionSshPlanExecutor {
         if plan.operations.iter().any(|operation| {
             operation.adapter_id.as_str() == "packages"
                 || operation.resource.resource_type.as_str() == "package"
-        }) {
-            if Reconciler::validate_package_consent(plan, consent).is_err() {
-                return ExecutionResult {
-                    status: ApplyStatus::Failed,
-                    failure_code: Some(
-                        StableId::parse("package_consent_mismatch").expect("static ID"),
-                    ),
-                };
-            }
-            // The closed registry currently has no concrete offline package
-            // mutator. Fail before opening the SSH transport.
+        }) && Reconciler::validate_package_consent(plan, consent).is_err()
+        {
             return ExecutionResult {
                 status: ApplyStatus::Failed,
-                failure_code: Some(
-                    StableId::parse("package_adapter_unavailable").expect("static ID"),
-                ),
+                failure_code: Some(StableId::parse("package_consent_mismatch").expect("static ID")),
             };
         }
         let result = self
@@ -634,12 +638,15 @@ impl ProductionDomainRegistry {
                     let capabilities = config
                         .ssh_target_capabilities()
                         .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    let platform = config
+                        .provider_platform()
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
                     Arc::new(
                         ProductionSshPlanExecutor::with_factory(
                             plan_store.clone(),
                             receipt_root.as_ref(),
                             config.adapter_state.clone(),
-                            production_ssh_target(transport, capabilities)
+                            production_ssh_target(transport, capabilities, platform)
                                 .map_err(|_| ProductionDomainError::UnsafeConfig)?,
                             factory.clone(),
                         )
@@ -843,20 +850,27 @@ impl ProductionDomainRegistry {
                     port,
                     known_hosts,
                     fingerprint,
-                }) => Some((
-                    sync.adapter_state.clone(),
-                    ProductionSshTarget {
-                        root_id: root_id.clone(),
-                        host: host.clone(),
-                        user: user.clone(),
-                        port: *port,
-                        known_hosts: known_hosts.clone(),
-                        fingerprint: fingerprint.clone(),
-                        capabilities: sync
-                            .ssh_target_capabilities()
-                            .map_err(|_| ProductionDomainError::UnsafeConfig)?,
-                    },
-                )),
+                }) => {
+                    let platform = sync
+                        .provider_platform()
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    Some((
+                        sync.adapter_state.clone(),
+                        ProductionSshTarget {
+                            root_id: root_id.clone(),
+                            host: host.clone(),
+                            user: user.clone(),
+                            port: *port,
+                            known_hosts: known_hosts.clone(),
+                            fingerprint: fingerprint.clone(),
+                            capabilities: sync
+                                .ssh_target_capabilities()
+                                .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                            operating_system: platform.operating_system,
+                            architecture: platform.architecture,
+                        },
+                    ))
+                }
                 _ => None,
             },
             None => None,
@@ -1932,7 +1946,8 @@ impl ProductionSyncDomain {
             }
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
                 let capabilities = self.config.ssh_target_capabilities()?;
-                let target = production_ssh_target(transport, capabilities)?;
+                let platform = self.config.provider_platform()?;
+                let target = production_ssh_target(transport, capabilities, platform)?;
                 let mut ssh = self.ssh_factory.open(&target)?;
                 for state in &states {
                     let suffix = &state.digest.as_str()[7..39];
@@ -2000,6 +2015,7 @@ impl ProductionSyncDomain {
 fn production_ssh_target(
     config: &SyncTargetTransport,
     capabilities: SshTargetCapabilities,
+    platform: SyncTargetPlatform,
 ) -> Result<ProductionSshTarget, DomainFailure> {
     let SyncTargetTransport::Ssh {
         root_id,
@@ -2020,6 +2036,8 @@ fn production_ssh_target(
         known_hosts: known_hosts.clone(),
         fingerprint: fingerprint.clone(),
         capabilities,
+        operating_system: platform.operating_system,
+        architecture: platform.architecture,
     })
 }
 
@@ -2525,11 +2543,15 @@ impl SyncDomain for ProductionSyncDomain {
             }
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
                 let capabilities = self.config.ssh_target_capabilities()?;
+                let platform = self.config.provider_platform()?;
                 let mut adapter = SshFileAdapter::open_with_capabilities(
                     root_id.clone(),
                     &self.config.adapter_state,
-                    self.ssh_factory
-                        .open(&production_ssh_target(transport, capabilities)?)?,
+                    self.ssh_factory.open(&production_ssh_target(
+                        transport,
+                        capabilities,
+                        platform,
+                    )?)?,
                     capabilities,
                 )
                 .map_err(|_| DomainFailure::OperationFailed)?;
@@ -2575,12 +2597,16 @@ impl SyncDomain for ProductionSyncDomain {
             )],
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
                 let capabilities = self.config.ssh_target_capabilities()?;
+                let platform = self.config.provider_platform()?;
                 vec![Box::new(
                     SshFileAdapter::open_with_capabilities(
                         root_id.clone(),
                         &self.config.adapter_state,
-                        self.ssh_factory
-                            .open(&production_ssh_target(transport, capabilities)?)?,
+                        self.ssh_factory.open(&production_ssh_target(
+                            transport,
+                            capabilities,
+                            platform,
+                        )?)?,
                         capabilities,
                     )
                     .map_err(|_| DomainFailure::OperationFailed)?,

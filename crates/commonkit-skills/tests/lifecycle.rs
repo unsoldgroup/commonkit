@@ -76,7 +76,10 @@ fn plugin_inventory_uses_the_explicit_plugin_skill_root() {
         .expect("inventory");
 
     assert_eq!(inventory.len(), 1);
-    assert_eq!(inventory[0].source_path.as_str(), "plugin/skills/review/SKILL.md");
+    assert_eq!(
+        inventory[0].source_path.as_str(),
+        "plugin/skills/review/SKILL.md"
+    );
 }
 
 impl Drop for TestDirectory {
