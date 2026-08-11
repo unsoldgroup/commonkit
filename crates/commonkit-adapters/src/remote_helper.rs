@@ -157,6 +157,20 @@ impl TargetHelper {
                     }
                 }
             }
+            // A target resolver is intentionally a separate capability from
+            // mutation. Until the verified target resolver is installed, the
+            // helper rejects this request rather than authorizing a
+            // controller-side resolution against the wrong machine.
+            SshFilesystemRequest::PackageResolution {
+                request_id,
+                request_digest,
+                target_identity_digest,
+                ..
+            } => Ok(SshFilesystemResponse::PackageResolutionRejected {
+                request_id,
+                request_digest,
+                target_identity_digest,
+            }),
             SshFilesystemRequest::StageArtifact {
                 digest, content, ..
             } => {

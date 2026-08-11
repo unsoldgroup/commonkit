@@ -129,7 +129,7 @@ pub use ssh::{
 };
 pub use ssh_files::{SshFileAdapter, SshFileAdapterError, SshTargetCapabilities};
 pub use target::{
-    LocalTargetFilesystem, PackageMutationArtifact, PackageMutationPhase, SshFilesystemRequest,
-    SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem, TargetFilesystem,
-    TargetFilesystemError, TargetResource,
+    AptResolutionConstraints, LocalTargetFilesystem, PackageMutationArtifact, PackageMutationPhase,
+    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem,
+    TargetFilesystem, TargetFilesystemError, TargetResource,
 };

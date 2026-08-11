@@ -431,6 +431,57 @@ impl PlanStore {
         Ok(plan)
     }
 
+    /// Loads the most recently persisted valid plan. This is used by offline
+    /// drift checks which intentionally do not carry a plan id in their
+    /// legacy request shape.
+    pub fn load_latest(&self) -> Result<Option<Plan>, PlanStoreError> {
+        self.load_latest_matching(None)
+    }
+
+    pub fn load_latest_for_target(
+        &self,
+        target_id: &StableId,
+    ) -> Result<Option<Plan>, PlanStoreError> {
+        self.load_latest_matching(Some(target_id))
+    }
+
+    fn load_latest_matching(
+        &self,
+        target_id: Option<&StableId>,
+    ) -> Result<Option<Plan>, PlanStoreError> {
+        let mut latest: Option<(std::time::SystemTime, Plan)> = None;
+        for entry in fs::read_dir(&self.root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || path.extension().and_then(|value| value.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let bytes = read_plan_bytes(&path)?;
+            let plan: Plan = match serde_json::from_slice(&bytes) {
+                Ok(plan) => plan,
+                Err(_) => continue,
+            };
+            if validate_plan(&plan).is_err() {
+                continue;
+            }
+            if target_id.is_some_and(|target| target != &plan.target_id) {
+                continue;
+            }
+            let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if latest
+                .as_ref()
+                .is_none_or(|(current, _)| modified > *current)
+            {
+                latest = Some((modified, plan));
+            }
+        }
+        Ok(latest.map(|(_, plan)| plan))
+    }
+
     fn path(&self, id: &Sha256Digest) -> PathBuf {
         self.root.join(format!(
             "{}.json",

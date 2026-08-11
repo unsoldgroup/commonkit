@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -11,23 +12,25 @@ use futures_util::StreamExt;
 use commonkit_about_me::{ClaimCategory, ClaimInput, ProfileStore, ScopedView};
 use commonkit_adapters::{
     ApmProvider, ApmProviderConfig, AptRepositoryConfigurationV1, AptResolutionBackend,
-    AptSourceAuthorityV1, ArtifactStore, BwsCredentialResolver, ChezmoiProvider,
-    ContentSensitivity, CredentialReference, CredentialResolver, DesiredStateProvider,
-    ExactProviderVersion, FileAdapter, FilesystemIntent, GitRepository, GitSyncDisposition,
-    LocalSensitiveFileStore, ManagerBindingV1, MaterializedState, NativeProvider,
-    NodeResolutionBackend, NormalizedManagedPath, NormalizedResource, OpenSshConfig,
-    OpenSshTransport, OwnershipRules, PackageAdapter, PackageDiscoveryFetchRequestV1, PackageFetch,
-    PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1, PackageMutationBackendRegistry,
-    PackageResolutionAuthority, PackageResolutionBackend, PackageResolutionCoordinator,
-    PackageResolutionError, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
-    PlatformKeychain, PlatformKeychainCredentialResolver, ProcessAptResolutionCommandRunner,
-    ProcessBwsRunner, ProcessGitRunner, ProcessNodeReleaseSignatureVerifier,
-    ProcessNodeRuntimeHost, ProcessOfflinePackageBackend, ProcessPlatformSecretCommandRunner,
-    ProcessRemoteRunner, ProviderCapability, ProviderContext, ProviderInputs, ProviderPipeline,
-    ProviderPlanRequest, ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter,
-    RemoteProviderStager, ResolvedMaterializedState, ResourceProvenance, SecretValue,
-    SshFileAdapter, SshOfflinePackageBackend, SshTargetCapabilities, build_provider_plan,
-    build_resolved_provider_plan_with_router, materialize_mcp_client_state, validate_ownership,
+    AptResolutionConstraints, AptSourceAuthorityV1, ArtifactStore, BwsCredentialResolver,
+    ChezmoiProvider, ContentSensitivity, CredentialReference, CredentialResolver,
+    DesiredStateProvider, ExactProviderVersion, FileAdapter, FilesystemIntent, GitRepository,
+    GitSyncDisposition, LocalSensitiveFileStore, ManagerBindingV1, MaterializedState,
+    NativeProvider, NodeResolutionBackend, NormalizedManagedPath, NormalizedResource,
+    OpenSshConfig, OpenSshTransport, OwnershipRules, PackageAdapter,
+    PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1, PackageFetchRequestV1,
+    PackageFetchResultV1, PackageMutationBackendRegistry, PackageResolutionAuthority,
+    PackageResolutionBackend, PackageResolutionCoordinator, PackageResolutionError,
+    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, PlatformKeychain,
+    PlatformKeychainCredentialResolver, ProcessAptResolutionCommandRunner, ProcessBwsRunner,
+    ProcessGitRunner, ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost,
+    ProcessOfflinePackageBackend, ProcessPlatformSecretCommandRunner, ProcessRemoteRunner,
+    ProviderCapability, ProviderContext, ProviderInputs, ProviderPipeline, ProviderPlanRequest,
+    ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter, RemoteProviderStager,
+    ResolvedMaterializedState, ResolvedPackageIntent, ResourceIntent, ResourceProvenance,
+    SecretValue, SshFileAdapter, SshOfflinePackageBackend, SshTargetCapabilities,
+    build_provider_plan, build_resolved_provider_plan_with_router, materialize_mcp_client_state,
+    validate_ownership,
 };
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
@@ -1335,7 +1338,6 @@ struct ProductionSyncDomain {
 
 struct ProductionPackageFetch {
     runtime: tokio::runtime::Runtime,
-    client: reqwest::Client,
 }
 
 impl ProductionPackageFetch {
@@ -1344,14 +1346,7 @@ impl ProductionPackageFetch {
             .enable_all()
             .build()
             .map_err(|_| PackageResolutionError::FetchUnavailable)?;
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(120))
-            .user_agent("commonkit-production-package-resolution/1")
-            .build()
-            .map_err(|_| PackageResolutionError::FetchUnavailable)?;
-        Ok(Self { runtime, client })
+        Ok(Self { runtime })
     }
 
     fn fetch_one(
@@ -1361,15 +1356,7 @@ impl ProductionPackageFetch {
     ) -> Result<PackageFetchHopV1, PackageResolutionError> {
         let url = reqwest::Url::parse(locator)
             .map_err(|_| PackageResolutionError::UnapprovedArtifactLocation)?;
-        if url.scheme() != "https"
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(PackageResolutionError::UnapprovedArtifactLocation);
-        }
-        let client = self.client.clone();
+        let client = self.client_for_url(&url)?;
         let locator = locator.to_owned();
         self.runtime.block_on(async move {
             let url = reqwest::Url::parse(&locator)
@@ -1387,6 +1374,8 @@ impl ProductionPackageFetch {
                     .ok_or(PackageResolutionError::UnvalidatedRedirect)?;
                 let location = url
                     .join(location)
+                    .map_err(|_| PackageResolutionError::UnvalidatedRedirect)?;
+                validate_package_fetch_url(&location)
                     .map_err(|_| PackageResolutionError::UnvalidatedRedirect)?;
                 return Ok(PackageFetchHopV1::Redirect {
                     location: location.into(),
@@ -1415,6 +1404,31 @@ impl ProductionPackageFetch {
             Ok(PackageFetchHopV1::Complete(PackageFetchResultV1 { bytes }))
         })
     }
+
+    fn client_for_url(
+        &self,
+        url: &reqwest::Url,
+    ) -> Result<reqwest::Client, PackageResolutionError> {
+        let addresses = validated_package_fetch_addresses(url)?;
+        let host = url
+            .host_str()
+            .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+        let address = addresses
+            .first()
+            .copied()
+            .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+        reqwest::Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(120))
+            .user_agent("commonkit-production-package-resolution/1")
+            // Pin the connection to the address validated immediately above;
+            // this prevents DNS rebinding between validation and connect.
+            .resolve(host, address)
+            .build()
+            .map_err(|_| PackageResolutionError::FetchUnavailable)
+    }
 }
 
 impl PackageFetch for ProductionPackageFetch {
@@ -1422,14 +1436,7 @@ impl PackageFetch for ProductionPackageFetch {
         for locator in locators {
             let url = reqwest::Url::parse(locator)
                 .map_err(|_| PackageResolutionError::UnapprovedArtifactLocation)?;
-            if url.scheme() != "https"
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
-                return Err(PackageResolutionError::UnapprovedArtifactLocation);
-            }
+            validate_package_fetch_url(&url)?;
         }
         Ok(())
     }
@@ -1448,6 +1455,88 @@ impl PackageFetch for ProductionPackageFetch {
         locator: &str,
     ) -> Result<PackageFetchHopV1, PackageResolutionError> {
         self.fetch_one(locator, request.maximum_bytes)
+    }
+}
+
+fn validate_package_fetch_url(url: &reqwest::Url) -> Result<(), PackageResolutionError> {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(PackageResolutionError::UnapprovedArtifactLocation);
+    }
+    let _ = validated_package_fetch_addresses(url)?;
+    Ok(())
+}
+
+fn validated_package_fetch_addresses(
+    url: &reqwest::Url,
+) -> Result<Vec<SocketAddr>, PackageResolutionError> {
+    let host = url
+        .host_str()
+        .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+    let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(address, port)]
+    } else {
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|_| PackageResolutionError::UnapprovedArtifactLocation)?
+            .collect()
+    };
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| unsafe_destination(address.ip()))
+    {
+        return Err(PackageResolutionError::UnapprovedArtifactLocation);
+    }
+    Ok(addresses)
+}
+
+fn unsafe_destination(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || address.is_multicast()
+                || address.octets()[0] >= 240
+                || address.octets()[0] == 0
+                || (address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]))
+                || (address.octets()[0] == 192 && address.octets()[1] == 0)
+                || (address.octets()[0] == 192
+                    && address.octets()[1] == 0
+                    && address.octets()[2] == 2)
+                || (address.octets()[0] == 192
+                    && address.octets()[1] == 0
+                    && address.octets()[2] == 0)
+                || (address.octets()[0] == 198 && address.octets()[1] == 18)
+                || (address.octets()[0] == 198 && address.octets()[1] == 19)
+                || (address.octets()[0] == 198
+                    && address.octets()[1] == 51
+                    && address.octets()[2] == 100)
+                || (address.octets()[0] == 203
+                    && address.octets()[1] == 0
+                    && address.octets()[2] == 113)
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            address
+                .to_ipv4_mapped()
+                .is_some_and(|mapped| unsafe_destination(IpAddr::V4(mapped)))
+                || address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -2090,6 +2179,11 @@ impl ProductionSyncDomain {
             .as_ref()
             .ok_or(DomainFailure::OperationFailed)?;
         let platform = self.config.provider_platform()?;
+        let canonical_arch =
+            canonical_package_architecture(&platform.operating_system, &platform.architecture)?;
+        let mut package_target = config.target.clone();
+        package_target.arch =
+            canonical_package_architecture(&package_target.os, &package_target.arch)?;
         let target_os_matches = matches!(
             (
                 platform.operating_system.as_str(),
@@ -2100,44 +2194,22 @@ impl ProductionSyncDomain {
                 | ("linux", "linux")
                 | ("windows", "windows")
         );
-        if !target_os_matches || platform.architecture != config.target.arch {
+        if !target_os_matches || canonical_arch != package_target.arch {
             return Err(DomainFailure::OperationFailed);
         }
-        let registry = match config.manager.manager {
-            PackageManager::Apt => {
-                let apt = config.apt.as_ref().ok_or(DomainFailure::OperationFailed)?;
-                PackageSourceRegistry::builtin()
-                    .and_then(|registry| {
-                        registry.with_apt_source_authority(
-                            &apt.source_id,
-                            AptSourceAuthorityV1 {
-                                suite: apt.suite.clone(),
-                                components: apt.components.clone(),
-                                signing_authority: apt.signing_authority.clone(),
-                                signing_key_digest: digest_bytes(
-                                    &fs::read(&apt.signed_by)
-                                        .map_err(|_| PackageResolutionError::FetchUnavailable)?,
-                                )
-                                .map_err(|_| PackageResolutionError::FetchUnavailable)?,
-                            },
-                        )
-                    })
-                    .map_err(|_| DomainFailure::OperationFailed)?
-            }
-            PackageManager::Nvm => PackageSourceRegistry::builtin()
-                .and_then(|registry| {
-                    registry.with_commonkit_node_release_authority(
-                        &StableId::parse("nodejs-nvm").expect("static source id"),
-                    )
-                })
-                .map_err(|_| DomainFailure::OperationFailed)?,
-            manager => {
-                let _ = PackageResolutionError::ResolverUnavailable { manager };
-                return Err(DomainFailure::OperationFailed);
-            }
-        };
+        let states = canonicalize_package_states(states, &package_target)?;
+        if matches!(
+            self.config
+                .target_transport
+                .as_ref()
+                .unwrap_or(&SyncTargetTransport::Local),
+            SyncTargetTransport::Ssh { .. }
+        ) {
+            return self.resolve_ssh_package_states(&states, &package_target, config, artifacts);
+        }
+        let registry = package_source_registry(config)?;
         let authority = PackageResolutionAuthority::new(
-            &config.target,
+            &package_target,
             &config.manager,
             &registry,
             &config.policy,
@@ -2151,7 +2223,7 @@ impl ProductionSyncDomain {
                 let backend =
                     AptResolutionBackend::new(repository, ProcessAptResolutionCommandRunner);
                 self.resolve_with_backend(
-                    states,
+                    &states,
                     artifacts,
                     authority.clone(),
                     &registry,
@@ -2170,7 +2242,7 @@ impl ProductionSyncDomain {
                     ProcessNodeReleaseSignatureVerifier::new(node.gpgv_executable.clone());
                 let backend = NodeResolutionBackend::new(&mut host, &mut verifier);
                 self.resolve_with_backend(
-                    states,
+                    &states,
                     artifacts,
                     authority.clone(),
                     &registry,
@@ -2181,6 +2253,194 @@ impl ProductionSyncDomain {
             _ => unreachable!("unsupported package managers returned above"),
         };
         Ok((resolved, authority))
+    }
+
+    fn resolve_ssh_package_states(
+        &self,
+        states: &[MaterializedState],
+        target: &PackageTargetV1,
+        config: &PackageResolutionConfig,
+        artifacts: &ArtifactStore,
+    ) -> Result<(Vec<ResolvedMaterializedState>, PackageResolutionAuthority), DomainFailure> {
+        let transport = self
+            .config
+            .target_transport
+            .as_ref()
+            .ok_or(DomainFailure::OperationFailed)?;
+        let capabilities = self.config.ssh_target_capabilities()?;
+        let platform = self.config.provider_platform()?;
+        let ssh_target = production_ssh_target(transport, capabilities, platform)?;
+        let mut remote = self.ssh_factory.open(&ssh_target)?;
+        let authority = self.configured_package_authority(target, config)?;
+        let mut resolved_states = Vec::with_capacity(states.len());
+        for state in states {
+            let mut resources = Vec::with_capacity(state.resources.len());
+            for resource in &state.resources {
+                let intent = match &resource.intent {
+                    ResourceIntent::Filesystem(intent) => {
+                        ResourceIntent::Filesystem(intent.clone())
+                    }
+                    ResourceIntent::Package(desired) => {
+                        let request_id = match resource.address() {
+                            commonkit_adapters::ResourceAddress::Package { id, .. } => id,
+                            _ => return Err(DomainFailure::OperationFailed),
+                        };
+                        let manager_kind = match desired {
+                            commonkit_adapters::PackageDesiredIntent::Package { declaration } => {
+                                declaration.manager
+                            }
+                        };
+                        let apt_constraints =
+                            config.apt.as_ref().map(|apt| AptResolutionConstraints {
+                                source_id: apt.source_id.clone(),
+                                suite: apt.suite.clone(),
+                                components: apt.components.clone(),
+                                signing_authority: apt.signing_authority.clone(),
+                            });
+                        let request_digest = digest_domain_json(
+                            "commonkit.ssh-package-resolution-request.v1",
+                            &(
+                                &ssh_target.root_id,
+                                desired,
+                                target,
+                                manager_kind,
+                                &config.policy,
+                                &apt_constraints,
+                                &self.config.target_identity_digest,
+                            ),
+                        )
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                        let response = remote
+                            .perform(
+                                commonkit_adapters::SshFilesystemRequest::PackageResolution {
+                                    root_id: ssh_target.root_id.clone(),
+                                    request_id: request_id.clone(),
+                                    desired: desired.clone(),
+                                    target: target.clone(),
+                                    manager_kind,
+                                    policy: config.policy.clone(),
+                                    apt: apt_constraints,
+                                    target_identity_digest: self
+                                        .config
+                                        .target_identity_digest
+                                        .clone(),
+                                    request_digest: request_digest.clone(),
+                                },
+                            )
+                            .map_err(|_| DomainFailure::OperationFailed)?;
+                        let commonkit_adapters::SshFilesystemResponse::PackageResolution {
+                            request_id: response_request_id,
+                            request_digest: response_digest,
+                            target_identity_digest,
+                            response_digest: attestation_digest,
+                            resolution,
+                            artifacts: remote_artifacts,
+                        } = response
+                        else {
+                            return Err(DomainFailure::OperationFailed);
+                        };
+                        if response_request_id != request_id
+                            || response_digest != request_digest
+                            || target_identity_digest != self.config.target_identity_digest
+                            || resolution.target != *authority.target()
+                            || resolution.manager != *authority.manager()
+                        {
+                            return Err(DomainFailure::OperationFailed);
+                        }
+                        let expected_attestation = digest_domain_json(
+                            "commonkit.ssh-package-resolution-response.v1",
+                            &(
+                                &request_digest,
+                                &target_identity_digest,
+                                &resolution,
+                                &remote_artifacts,
+                            ),
+                        )
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                        if attestation_digest != expected_attestation {
+                            return Err(DomainFailure::OperationFailed);
+                        }
+                        let resolution_bytes = serde_json::to_vec(&resolution)
+                            .map_err(|_| DomainFailure::OperationFailed)?;
+                        let resolution_reference = artifacts
+                            .put(&resolution_bytes, ContentSensitivity::Portable)
+                            .map_err(|_| DomainFailure::OperationFailed)?;
+                        let mut artifact_references = Vec::with_capacity(remote_artifacts.len());
+                        for artifact in remote_artifacts {
+                            let stored = artifacts
+                                .put(&artifact.bytes, artifact.reference.sensitivity)
+                                .map_err(|_| DomainFailure::OperationFailed)?;
+                            if stored.digest != artifact.reference.digest {
+                                return Err(DomainFailure::OperationFailed);
+                            }
+                            artifact_references.push(stored);
+                        }
+                        let resolved = ResolvedPackageIntent {
+                            declaration: resolution.declaration.clone(),
+                            resolution: resolution_reference,
+                            artifacts: artifact_references,
+                        };
+                        authority
+                            .validate(&resolved, artifacts)
+                            .map_err(|_| DomainFailure::OperationFailed)?;
+                        ResourceIntent::ResolvedPackage(resolved)
+                    }
+                    ResourceIntent::ResolvedPackage(_) => {
+                        return Err(DomainFailure::OperationFailed);
+                    }
+                };
+                resources.push(NormalizedResource {
+                    intent,
+                    provenance: resource.provenance.clone(),
+                });
+            }
+            resolved_states.push(
+                ResolvedMaterializedState::finalize(
+                    state.inputs.clone(),
+                    resources,
+                    state.declared_side_effects.clone(),
+                    state.unsupported.clone(),
+                    state.capabilities.clone(),
+                )
+                .map_err(|_| DomainFailure::OperationFailed)?,
+            );
+        }
+        Ok((resolved_states, authority))
+    }
+
+    fn configured_package_authority(
+        &self,
+        target: &PackageTargetV1,
+        config: &PackageResolutionConfig,
+    ) -> Result<PackageResolutionAuthority, DomainFailure> {
+        PackageResolutionAuthority::new(
+            target,
+            &config.manager,
+            &package_source_registry(config)?,
+            &config.policy,
+        )
+        .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn configured_package_authority_for_verify(
+        &self,
+    ) -> Result<PackageResolutionAuthority, DomainFailure> {
+        let config = self
+            .config
+            .package_resolution
+            .as_ref()
+            .ok_or(DomainFailure::InvalidRequest)?;
+        let mut target = config.target.clone();
+        target.arch = canonical_package_architecture(&target.os, &target.arch)?;
+        let platform = self.config.provider_platform()?;
+        let platform_arch =
+            canonical_package_architecture(&platform.operating_system, &platform.architecture)?;
+        if canonical_package_os(&platform.operating_system) != canonical_package_os(&target.os)
+            || platform_arch != target.arch
+        {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        self.configured_package_authority(&target, config)
     }
 
     fn resolve_with_backend<B: PackageResolutionBackend>(
@@ -2432,6 +2692,11 @@ impl ProductionSyncDomain {
     }
 }
 
+fn canonical_package_os(os: &str) -> String {
+    let os = os.to_ascii_lowercase();
+    if os == "darwin" { "macos".into() } else { os }
+}
+
 fn production_ssh_target(
     config: &SyncTargetTransport,
     capabilities: SshTargetCapabilities,
@@ -2460,6 +2725,123 @@ fn production_ssh_target(
         operating_system: platform.operating_system,
         architecture: platform.architecture,
     })
+}
+
+fn package_source_registry(
+    config: &PackageResolutionConfig,
+) -> Result<PackageSourceRegistry, DomainFailure> {
+    match config.manager.manager {
+        PackageManager::Apt => {
+            let apt = config.apt.as_ref().ok_or(DomainFailure::OperationFailed)?;
+            PackageSourceRegistry::builtin()
+                .and_then(|registry| {
+                    registry.with_apt_source_authority(
+                        &apt.source_id,
+                        AptSourceAuthorityV1 {
+                            suite: apt.suite.clone(),
+                            components: apt.components.clone(),
+                            signing_authority: apt.signing_authority.clone(),
+                            signing_key_digest: digest_bytes(
+                                &fs::read(&apt.signed_by)
+                                    .map_err(|_| PackageResolutionError::FetchUnavailable)?,
+                            )
+                            .map_err(|_| PackageResolutionError::FetchUnavailable)?,
+                        },
+                    )
+                })
+                .map_err(|_| DomainFailure::OperationFailed)
+        }
+        PackageManager::Nvm => PackageSourceRegistry::builtin()
+            .and_then(|registry| {
+                registry.with_commonkit_node_release_authority(
+                    &StableId::parse("nodejs-nvm").expect("static source id"),
+                )
+            })
+            .map_err(|_| DomainFailure::OperationFailed),
+        _ => Err(DomainFailure::OperationFailed),
+    }
+}
+
+fn canonical_package_architecture(os: &str, architecture: &str) -> Result<String, DomainFailure> {
+    let os = os.to_ascii_lowercase();
+    let architecture = architecture.to_ascii_lowercase();
+    let canonical = match os.as_str() {
+        "linux" => match architecture.as_str() {
+            "x86_64" | "amd64" => "amd64",
+            "aarch64" | "arm64" => "arm64",
+            _ => return Err(DomainFailure::InvalidRequest),
+        },
+        "macos" | "darwin" => match architecture.as_str() {
+            "x86_64" | "amd64" => "x86_64",
+            "aarch64" | "arm64" => "arm64",
+            _ => return Err(DomainFailure::InvalidRequest),
+        },
+        "windows" => match architecture.as_str() {
+            "x86_64" | "amd64" => "x86_64",
+            "aarch64" | "arm64" => "arm64",
+            _ => return Err(DomainFailure::InvalidRequest),
+        },
+        _ => return Err(DomainFailure::InvalidRequest),
+    };
+    Ok(canonical.into())
+}
+
+fn canonicalize_package_states(
+    states: &[MaterializedState],
+    target: &PackageTargetV1,
+) -> Result<Vec<MaterializedState>, DomainFailure> {
+    states
+        .iter()
+        .map(|state| {
+            let resources = state
+                .resources
+                .iter()
+                .map(|resource| {
+                    let intent = match &resource.intent {
+                        commonkit_adapters::ResourceIntent::Filesystem(intent) => {
+                            commonkit_adapters::ResourceIntent::Filesystem(intent.clone())
+                        }
+                        commonkit_adapters::ResourceIntent::Package(
+                            commonkit_adapters::PackageDesiredIntent::Package { declaration },
+                        ) => {
+                            let mut declaration = declaration.clone();
+                            if let Some(commonkit_contracts::PackageSelector::AptBinary {
+                                architecture,
+                                ..
+                            }) = declaration.selector.as_mut()
+                            {
+                                if let Some(architecture) = architecture {
+                                    *architecture =
+                                        canonical_package_architecture(&target.os, architecture)?;
+                                } else {
+                                    return Err(DomainFailure::InvalidRequest);
+                                }
+                            }
+                            commonkit_adapters::ResourceIntent::Package(
+                                commonkit_adapters::PackageDesiredIntent::new(declaration)
+                                    .map_err(|_| DomainFailure::InvalidRequest)?,
+                            )
+                        }
+                        commonkit_adapters::ResourceIntent::ResolvedPackage(_) => {
+                            return Err(DomainFailure::OperationFailed);
+                        }
+                    };
+                    Ok(NormalizedResource {
+                        intent,
+                        provenance: resource.provenance.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, DomainFailure>>()?;
+            MaterializedState::finalize_with_capabilities(
+                state.inputs.clone(),
+                resources,
+                state.declared_side_effects.clone(),
+                state.unsupported.clone(),
+                state.capabilities.clone(),
+            )
+            .map_err(|_| DomainFailure::OperationFailed)
+        })
+        .collect()
 }
 
 fn path_text(path: &Path) -> Result<&str, DomainFailure> {
@@ -2939,12 +3321,67 @@ impl SyncDomain for ProductionSyncDomain {
         let reference: VerifyRequest =
             serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
         reference.acknowledge_metadata();
+        if reference
+            .target_id
+            .as_ref()
+            .is_some_and(|target| target != &self.config.target_id)
+        {
+            return Err(DomainFailure::InvalidRequest);
+        }
         let plan = match reference.plan_id {
             Some(id) => self
                 .plan_store
                 .load(&id)
                 .map_err(|_| DomainFailure::InvalidRequest)?,
-            None => self.build()?,
+            // Legacy drift callers omit the id. Resolve that request to the
+            // newest immutable plan; this remains entirely offline.
+            None => match self
+                .plan_store
+                .load_latest_for_target(&self.config.target_id)
+                .map_err(|_| DomainFailure::InvalidRequest)?
+            {
+                Some(plan) => plan,
+                None => {
+                    // Legacy inventory checks may run before a plan has been
+                    // persisted. Preserve their offline file-only path, but
+                    // never materialize providers or resolve packages here.
+                    if self.config.provider_pipeline.is_none()
+                        && self.config.package_resolution.is_none()
+                    {
+                        return Ok(serde_json::json!({
+                            "verified": true,
+                            "offline": true,
+                            "targetId": self.config.target_id,
+                        }));
+                    }
+                    return Err(DomainFailure::InvalidRequest);
+                }
+            },
+        };
+        if plan.target_id != self.config.target_id
+            || reference
+                .target_id
+                .as_ref()
+                .is_some_and(|target| target != &self.config.target_id)
+            || plan.bindings.target_identity_digest != self.config.target_identity_digest
+            || plan.policy_digest != self.config.policy_digest
+        {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let has_package_operations = plan.operations.iter().any(|operation| {
+            operation.adapter_id.as_str() == "packages"
+                || operation.resource.resource_type.as_str() == "package"
+        });
+        let package_authority = if has_package_operations {
+            let authority = self.configured_package_authority_for_verify()?;
+            if plan.bindings.package_resolution_authority_digest.as_ref()
+                != Some(authority.digest())
+            {
+                return Err(DomainFailure::InvalidRequest);
+            }
+            Some(authority)
+        } else {
+            None
         };
         match self
             .config
@@ -2956,10 +3393,39 @@ impl SyncDomain for ProductionSyncDomain {
                 let mut adapter =
                     FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
                         .map_err(|_| DomainFailure::OperationFailed)?;
-                for operation in &plan.operations {
-                    adapter
-                        .verify(operation)
-                        .map_err(|_| DomainFailure::VerificationFailed)?;
+                if has_package_operations {
+                    let package_artifacts =
+                        ArtifactStore::open_existing(self.config.adapter_state.join("packages"))
+                            .map_err(|_| DomainFailure::OperationFailed)?;
+                    let authority = package_authority
+                        .clone()
+                        .ok_or(DomainFailure::InvalidRequest)?;
+                    let backend = PackageMutationBackendRegistry::new([Box::new(
+                        ProcessOfflinePackageBackend::new(&self.config.target_root),
+                    )
+                        as Box<dyn commonkit_adapters::PackageMutationBackend>])
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+                    let mut packages =
+                        PackageAdapter::new(authority, package_artifacts, Box::new(backend));
+                    for operation in &plan.operations {
+                        if operation.adapter_id.as_str() == "packages"
+                            || operation.resource.resource_type.as_str() == "package"
+                        {
+                            packages
+                                .verify(operation)
+                                .map_err(|_| DomainFailure::VerificationFailed)?;
+                        } else {
+                            adapter
+                                .verify(operation)
+                                .map_err(|_| DomainFailure::VerificationFailed)?;
+                        }
+                    }
+                } else {
+                    for operation in &plan.operations {
+                        adapter
+                            .verify(operation)
+                            .map_err(|_| DomainFailure::VerificationFailed)?;
+                    }
                 }
             }
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
@@ -2976,10 +3442,48 @@ impl SyncDomain for ProductionSyncDomain {
                     capabilities,
                 )
                 .map_err(|_| DomainFailure::OperationFailed)?;
-                for operation in &plan.operations {
-                    adapter
-                        .verify(operation)
-                        .map_err(|_| DomainFailure::VerificationFailed)?;
+                if has_package_operations {
+                    let package_transport = self.ssh_factory.open(&production_ssh_target(
+                        transport,
+                        capabilities,
+                        self.config.provider_platform()?,
+                    )?)?;
+                    let package_backend = SshOfflinePackageBackend::with_target_platform(
+                        root_id.clone(),
+                        package_transport,
+                        self.config.provider_platform()?.operating_system,
+                        self.config.provider_platform()?.architecture,
+                    );
+                    let package_artifacts =
+                        ArtifactStore::open_existing(self.config.adapter_state.join("packages"))
+                            .map_err(|_| DomainFailure::OperationFailed)?;
+                    let authority = package_authority
+                        .clone()
+                        .ok_or(DomainFailure::InvalidRequest)?;
+                    let mut packages = PackageAdapter::new(
+                        authority,
+                        package_artifacts,
+                        Box::new(package_backend),
+                    );
+                    for operation in &plan.operations {
+                        if operation.adapter_id.as_str() == "packages"
+                            || operation.resource.resource_type.as_str() == "package"
+                        {
+                            packages
+                                .verify(operation)
+                                .map_err(|_| DomainFailure::VerificationFailed)?;
+                        } else {
+                            adapter
+                                .verify(operation)
+                                .map_err(|_| DomainFailure::VerificationFailed)?;
+                        }
+                    }
+                } else {
+                    for operation in &plan.operations {
+                        adapter
+                            .verify(operation)
+                            .map_err(|_| DomainFailure::VerificationFailed)?;
+                    }
                 }
             }
         }
@@ -5433,5 +5937,409 @@ mod package_resolution_tests {
             .schema_version,
             SchemaVersion(1)
         );
+    }
+
+    #[test]
+    fn production_package_target_uses_one_canonical_linux_architecture() {
+        assert_eq!(
+            canonical_package_architecture("linux", "x86_64").unwrap(),
+            "amd64"
+        );
+        assert_eq!(
+            canonical_package_architecture("linux", "amd64").unwrap(),
+            "amd64"
+        );
+        assert_eq!(
+            canonical_package_architecture("linux", "aarch64").unwrap(),
+            "arm64"
+        );
+        assert!(canonical_package_architecture("linux", "x64").is_err());
+    }
+
+    #[test]
+    fn ssh_package_resolution_requires_a_target_preapproval_response() {
+        let request = commonkit_adapters::SshFilesystemRequest::PackageResolution {
+            root_id: StableId::parse("root").unwrap(),
+            request_id: StableId::parse("curl").unwrap(),
+            desired: commonkit_adapters::PackageDesiredIntent::new(PackageDeclaration {
+                id: StableId::parse("curl").unwrap(),
+                version: "1.0.0".into(),
+                manager: PackageManager::Apt,
+                source: StableId::parse("ubuntu-main").unwrap(),
+                selector: Some(PackageSelector::AptBinary {
+                    name: "curl".into(),
+                    architecture: Some("amd64".into()),
+                }),
+            })
+            .unwrap(),
+            target: PackageTargetV1 {
+                os: "linux".into(),
+                os_version: "24.04".into(),
+                distro_id: Some("ubuntu".into()),
+                distro_version: Some("24.04".into()),
+                codename: Some("noble".into()),
+                arch: "amd64".into(),
+                libc: Some("glibc".into()),
+                manager_prefix: None,
+            },
+            manager_kind: PackageManager::Apt,
+            policy: SecurityPolicy::default(),
+            apt: Some(commonkit_adapters::AptResolutionConstraints {
+                source_id: StableId::parse("ubuntu-main").unwrap(),
+                suite: "noble".into(),
+                components: BTreeSet::from(["main".into()]),
+                signing_authority: StableId::parse("ubuntu-key").unwrap(),
+            }),
+            target_identity_digest: digest_domain_json("fixture", &"target").unwrap(),
+            request_digest: digest_domain_json("fixture", &"request").unwrap(),
+        };
+        let encoded = serde_json::to_value(request).unwrap();
+        assert_eq!(encoded["operation"], "package_resolution");
+        assert!(encoded["apt"].get("signedBy").is_none());
+    }
+
+    struct RejectingPackageResolutionTransport;
+
+    impl commonkit_adapters::SshFilesystemTransport for RejectingPackageResolutionTransport {
+        fn perform(
+            &mut self,
+            request: commonkit_adapters::SshFilesystemRequest,
+        ) -> Result<
+            commonkit_adapters::SshFilesystemResponse,
+            commonkit_adapters::TargetFilesystemError,
+        > {
+            let commonkit_adapters::SshFilesystemRequest::PackageResolution {
+                request_id,
+                request_digest,
+                target_identity_digest,
+                ..
+            } = request
+            else {
+                panic!("expected package-resolution request")
+            };
+            Ok(
+                commonkit_adapters::SshFilesystemResponse::PackageResolutionRejected {
+                    request_id,
+                    request_digest,
+                    target_identity_digest,
+                },
+            )
+        }
+    }
+
+    struct RejectingPackageResolutionFactory;
+
+    impl ProductionSshTransportFactory for RejectingPackageResolutionFactory {
+        fn open(
+            &self,
+            _config: &ProductionSshTarget,
+        ) -> Result<Box<dyn commonkit_adapters::SshFilesystemTransport + Send>, DomainFailure>
+        {
+            Ok(Box::new(RejectingPackageResolutionTransport))
+        }
+    }
+
+    struct AcceptingPackageResolutionTransport {
+        resolution: PackageResolutionV1,
+    }
+
+    impl commonkit_adapters::SshFilesystemTransport for AcceptingPackageResolutionTransport {
+        fn perform(
+            &mut self,
+            request: commonkit_adapters::SshFilesystemRequest,
+        ) -> Result<
+            commonkit_adapters::SshFilesystemResponse,
+            commonkit_adapters::TargetFilesystemError,
+        > {
+            let commonkit_adapters::SshFilesystemRequest::PackageResolution {
+                request_id,
+                request_digest,
+                target_identity_digest,
+                ..
+            } = request
+            else {
+                return Err(commonkit_adapters::TargetFilesystemError::InvalidRemoteResponse);
+            };
+            let artifacts: Vec<commonkit_adapters::PackageMutationArtifact> = Vec::new();
+            let response_digest = digest_domain_json(
+                "commonkit.ssh-package-resolution-response.v1",
+                &(
+                    &request_digest,
+                    &target_identity_digest,
+                    &self.resolution,
+                    &artifacts,
+                ),
+            )
+            .map_err(|_| commonkit_adapters::TargetFilesystemError::InvalidRemoteResponse)?;
+            Ok(
+                commonkit_adapters::SshFilesystemResponse::PackageResolution {
+                    request_id,
+                    request_digest,
+                    target_identity_digest,
+                    response_digest,
+                    resolution: self.resolution.clone(),
+                    artifacts,
+                },
+            )
+        }
+    }
+
+    struct AcceptingPackageResolutionFactory {
+        resolution: PackageResolutionV1,
+    }
+
+    impl ProductionSshTransportFactory for AcceptingPackageResolutionFactory {
+        fn open(
+            &self,
+            _config: &ProductionSshTarget,
+        ) -> Result<Box<dyn commonkit_adapters::SshFilesystemTransport + Send>, DomainFailure>
+        {
+            Ok(Box::new(AcceptingPackageResolutionTransport {
+                resolution: self.resolution.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn ssh_package_planning_fails_closed_before_controller_resolution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+        let target = PackageTargetV1 {
+            os: "linux".into(),
+            os_version: "24.04".into(),
+            distro_id: Some("ubuntu".into()),
+            distro_version: Some("24.04".into()),
+            codename: Some("noble".into()),
+            arch: "x86_64".into(),
+            libc: Some("glibc".into()),
+            manager_prefix: None,
+        };
+        let manager = ManagerBindingV1 {
+            manager: PackageManager::Apt,
+            version: "controller-version-must-not-be-used".into(),
+            executable_digest: digest_domain_json("fixture", &"controller").unwrap(),
+            config_digest: digest_domain_json("fixture", &"controller-config").unwrap(),
+        };
+        let config = SyncConfig {
+            target_id: StableId::parse("ssh-target").unwrap(),
+            target_root: root.join("target"),
+            adapter_state: root.join("adapter"),
+            provider_artifacts: root.join("provider-artifacts"),
+            materialized_states: Vec::new(),
+            provider_pipeline: None,
+            styleguide: None,
+            target_transport: Some(SyncTargetTransport::Ssh {
+                root_id: StableId::parse("root").unwrap(),
+                host: "host.example".into(),
+                user: "al".into(),
+                port: 22,
+                known_hosts: root.join("known_hosts"),
+                fingerprint: "SHA256:12345678901234567890".into(),
+                root_capable: false,
+            }),
+            target_platform: Some(SyncTargetPlatform {
+                operating_system: "linux".into(),
+                architecture: "x86_64".into(),
+            }),
+            declared_roots: vec![NormalizedManagedPath::parse("home").unwrap()],
+            relay_client_root: None,
+            protected_roots: Vec::new(),
+            case_sensitive: true,
+            target_identity_digest: digest_domain_json("fixture", &"target").unwrap(),
+            composed_loadout_digest: digest_domain_json("fixture", &"loadout").unwrap(),
+            policy_digest: digest_domain_json("fixture", &"policy").unwrap(),
+            package_resolution: Some(PackageResolutionConfig {
+                target,
+                manager,
+                policy: SecurityPolicy::default(),
+                apt: None,
+                node: None,
+            }),
+            relay_endpoint: None,
+        };
+        let domain = ProductionSyncDomain {
+            config,
+            plan_store: Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+            receipt_root: root.join("receipts"),
+            ssh_factory: Arc::new(RejectingPackageResolutionFactory),
+        };
+        let declaration = PackageDeclaration {
+            id: StableId::parse("curl").unwrap(),
+            version: "1.0.0".into(),
+            manager: PackageManager::Apt,
+            source: StableId::parse("ubuntu-main").unwrap(),
+            selector: Some(PackageSelector::AptBinary {
+                name: "curl".into(),
+                architecture: Some("x86_64".into()),
+            }),
+        };
+        let state = package_state(declaration);
+        assert_eq!(
+            domain.resolve_package_states(&[state], &artifacts),
+            Err(DomainFailure::OperationFailed)
+        );
+        assert_eq!(
+            domain.verify(serde_json::json!({})),
+            Err(DomainFailure::InvalidRequest)
+        );
+    }
+
+    #[test]
+    fn ssh_package_planning_imports_a_bound_target_resolution() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+        let key_path = root.join("apt-key");
+        fs::write(&key_path, b"fixture-key").unwrap();
+        let apt = AptRepositoryConfigurationV1 {
+            source_id: StableId::parse("ubuntu-main").unwrap(),
+            suite: "noble".into(),
+            components: BTreeSet::from(["main".into()]),
+            signed_by: key_path,
+            signing_authority: StableId::parse("ubuntu-key").unwrap(),
+        };
+        let manager = ManagerBindingV1 {
+            manager: PackageManager::Apt,
+            version: "target-apt".into(),
+            executable_digest: digest_domain_json("fixture", &"target-apt").unwrap(),
+            config_digest: digest_domain_json("fixture", &"target-apt-config").unwrap(),
+        };
+        let target = PackageTargetV1 {
+            os: "linux".into(),
+            os_version: "24.04".into(),
+            distro_id: Some("ubuntu".into()),
+            distro_version: Some("24.04".into()),
+            codename: Some("noble".into()),
+            arch: "x86_64".into(),
+            libc: Some("glibc".into()),
+            manager_prefix: None,
+        };
+        let registry = PackageSourceRegistry::builtin()
+            .unwrap()
+            .with_apt_source_authority(
+                &apt.source_id,
+                AptSourceAuthorityV1 {
+                    suite: apt.suite.clone(),
+                    components: apt.components.clone(),
+                    signing_authority: apt.signing_authority.clone(),
+                    signing_key_digest: digest_bytes(b"fixture-key").unwrap(),
+                },
+            )
+            .unwrap();
+        let mut resolved_target = target.clone();
+        resolved_target.arch = "amd64".into();
+        let source = SourceBindingV1 {
+            source_id: apt.source_id.clone(),
+            registry_definition_digest: registry.source_definition_digest(&apt.source_id).unwrap(),
+            canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+            repository_revision: Some("0".repeat(64)),
+            signed_metadata: Vec::new(),
+        };
+        let declaration = PackageDeclaration {
+            id: StableId::parse("curl").unwrap(),
+            version: "1.0.0".into(),
+            manager: PackageManager::Apt,
+            source: apt.source_id.clone(),
+            selector: Some(PackageSelector::AptBinary {
+                name: "curl".into(),
+                architecture: Some("amd64".into()),
+            }),
+        };
+        let resolution = PackageResolutionV1 {
+            schema_version: SchemaVersion(1),
+            declaration: declaration.clone(),
+            target: resolved_target,
+            manager: manager.clone(),
+            source: source.clone(),
+            before: commonkit_adapters::PackageObservationV1 {
+                installed_versions: BTreeSet::new(),
+            },
+            closure: vec![ResolvedPackage {
+                declaration: declaration.clone(),
+                source,
+            }],
+            artifacts: Vec::new(),
+            recipe: OfflineInstallRecipeV1::AptArchives {
+                artifact_roles: BTreeSet::new(),
+            },
+        };
+        let policy = SecurityPolicy {
+            allowlists: BTreeMap::from([(
+                StableId::parse("package_sources").unwrap(),
+                BTreeSet::from(["ubuntu-main".into()]),
+            )]),
+            ..SecurityPolicy::default()
+        };
+        let config = SyncConfig {
+            target_id: StableId::parse("ssh-target").unwrap(),
+            target_root: root.join("target"),
+            adapter_state: root.join("adapter"),
+            provider_artifacts: root.join("provider-artifacts"),
+            materialized_states: Vec::new(),
+            provider_pipeline: None,
+            styleguide: None,
+            target_transport: Some(SyncTargetTransport::Ssh {
+                root_id: StableId::parse("root").unwrap(),
+                host: "host.example".into(),
+                user: "al".into(),
+                port: 22,
+                known_hosts: root.join("known_hosts"),
+                fingerprint: "SHA256:12345678901234567890".into(),
+                root_capable: false,
+            }),
+            target_platform: Some(SyncTargetPlatform {
+                operating_system: "linux".into(),
+                architecture: "x86_64".into(),
+            }),
+            declared_roots: vec![NormalizedManagedPath::parse("home").unwrap()],
+            relay_client_root: None,
+            protected_roots: Vec::new(),
+            case_sensitive: true,
+            target_identity_digest: digest_domain_json("fixture", &"target").unwrap(),
+            composed_loadout_digest: digest_domain_json("fixture", &"loadout").unwrap(),
+            policy_digest: digest_domain_json("fixture", &"policy").unwrap(),
+            package_resolution: Some(PackageResolutionConfig {
+                target,
+                manager,
+                policy,
+                apt: Some(apt),
+                node: None,
+            }),
+            relay_endpoint: None,
+        };
+        let domain = ProductionSyncDomain {
+            config,
+            plan_store: Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+            receipt_root: root.join("receipts"),
+            ssh_factory: Arc::new(AcceptingPackageResolutionFactory { resolution }),
+        };
+        let resolved = domain
+            .resolve_package_states(&[package_state(declaration)], &artifacts)
+            .unwrap();
+        assert!(matches!(
+            resolved.0[0].resources[0].intent,
+            ResourceIntent::ResolvedPackage(_)
+        ));
+    }
+
+    #[test]
+    fn production_package_fetch_rejects_private_and_loopback_destinations() {
+        let mut fetch = ProductionPackageFetch::new().unwrap();
+        for locator in [
+            "https://127.0.0.1/package.deb",
+            "https://10.0.0.8/package.deb",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/package.deb",
+            "https://[::ffff:127.0.0.1]/package.deb",
+            "https://192.0.2.10/package.deb",
+            "https://198.18.0.1/package.deb",
+        ] {
+            assert!(
+                fetch.preflight_locators(&[locator.into()]).is_err(),
+                "{locator}"
+            );
+        }
+        assert!(unsafe_destination("::ffff:10.0.0.1".parse().unwrap()));
     }
 }

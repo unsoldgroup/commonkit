@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -316,6 +317,24 @@ pub enum SshFilesystemRequest {
         resolution: crate::PackageResolutionV1,
         artifacts: Vec<PackageMutationArtifact>,
     },
+    /// Requests target-local package resolution. The target must probe its own
+    /// manager and return the complete resolution plus exact artifact bytes;
+    /// callers must never fill in `before` or manager authority from the
+    /// controller.
+    PackageResolution {
+        root_id: StableId,
+        request_id: StableId,
+        desired: crate::PackageDesiredIntent,
+        target: crate::PackageTargetV1,
+        manager_kind: commonkit_contracts::PackageManager,
+        policy: commonkit_contracts::SecurityPolicy,
+        apt: Option<AptResolutionConstraints>,
+        /// Digest of the target identity attested by the SSH session.
+        target_identity_digest: commonkit_contracts::Sha256Digest,
+        /// Digest over the request fields, used to bind the response to this
+        /// exact preapproval request.
+        request_digest: commonkit_contracts::Sha256Digest,
+    },
     StageArtifact {
         run_id: StableId,
         digest: commonkit_contracts::Sha256Digest,
@@ -335,8 +354,20 @@ pub enum SshFilesystemRequest {
     },
 }
 
+/// Source constraints are safe to send over the wire. The target helper owns
+/// all local keyring and command paths and must not accept controller paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AptResolutionConstraints {
+    pub source_id: StableId,
+    pub suite: String,
+    pub components: BTreeSet<String>,
+    pub signing_authority: StableId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum SshFilesystemResponse {
     Absent,
     File {
@@ -348,6 +379,19 @@ pub enum SshFilesystemResponse {
     Applied,
     PackageObserved {
         installed_versions: std::collections::BTreeSet<String>,
+    },
+    PackageResolution {
+        request_id: StableId,
+        request_digest: commonkit_contracts::Sha256Digest,
+        target_identity_digest: commonkit_contracts::Sha256Digest,
+        response_digest: commonkit_contracts::Sha256Digest,
+        resolution: crate::PackageResolutionV1,
+        artifacts: Vec<PackageMutationArtifact>,
+    },
+    PackageResolutionRejected {
+        request_id: StableId,
+        request_digest: commonkit_contracts::Sha256Digest,
+        target_identity_digest: commonkit_contracts::Sha256Digest,
     },
     ArtifactStaged {
         digest: commonkit_contracts::Sha256Digest,

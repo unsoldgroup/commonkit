@@ -293,6 +293,11 @@ impl<R: RemoteProcessRunner> SshFilesystemTransport for OpenSshTransport<R> {
                 SshFilesystemRequest::PackageMutation { phase, .. },
                 SshFilesystemResponse::Applied,
             ) if *phase != crate::PackageMutationPhase::Observe => true,
+            (
+                SshFilesystemRequest::PackageResolution { .. },
+                SshFilesystemResponse::PackageResolution { .. }
+                | SshFilesystemResponse::PackageResolutionRejected { .. },
+            ) => true,
             _ => false,
         };
         if !matching {
