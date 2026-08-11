@@ -2420,43 +2420,175 @@ fn parse_simulated_packages(
     simulation: &str,
 ) -> Result<BTreeSet<(String, String, String)>, AptResolutionCommandError> {
     let mut simulated = BTreeSet::new();
-    for line in simulation.lines().map(str::trim) {
-        let Some(rest) = line.strip_prefix("Inst ") else {
-            continue;
+    for line in simulation.lines() {
+        if line.split_whitespace().next() == Some("Inst") && line != line.trim() {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT install action contains leading or trailing whitespace".into(),
+            ));
+        }
+        match line.strip_prefix("Inst ") {
+            Some(_) => {}
+            None if line.split_whitespace().next() == Some("Inst") => {
+                return Err(AptResolutionCommandError::InvalidOutput(
+                    "malformed APT install action".into(),
+                ));
+            }
+            None => continue,
         };
-        let (name_with_arch, after_name) = rest.split_once(' ').ok_or_else(|| {
-            AptResolutionCommandError::InvalidOutput("malformed APT simulation package".into())
-        })?;
-        let version = after_name
-            .strip_prefix('(')
-            .and_then(|value| value.split_whitespace().next())
-            .ok_or_else(|| {
-                AptResolutionCommandError::InvalidOutput("malformed APT simulation version".into())
-            })?;
-        let architecture = after_name
-            .rsplit_once('[')
-            .and_then(|(_, value)| value.strip_suffix("])"))
-            .or_else(|| {
-                after_name
-                    .rsplit_once('[')
-                    .and_then(|(_, value)| value.strip_suffix(']'))
-            })
-            .or_else(|| name_with_arch.split_once(':').map(|(_, arch)| arch))
-            .ok_or_else(|| {
-                AptResolutionCommandError::InvalidOutput(
-                    "APT simulation did not bind a package architecture".into(),
-                )
-            })?;
-        let name = name_with_arch
-            .split_once(':')
-            .map_or(name_with_arch, |(name, _)| name);
-        if !simulated.insert((name.to_owned(), architecture.to_owned(), version.to_owned())) {
+        let package = parse_simulated_install_line(line)?;
+        if !simulated.insert(package) {
             return Err(AptResolutionCommandError::InvalidOutput(
                 "APT simulation returned a duplicate package".into(),
             ));
         }
     }
     Ok(simulated)
+}
+
+fn parse_simulated_install_line(
+    line: &str,
+) -> Result<(String, String, String), AptResolutionCommandError> {
+    let rest = line.strip_prefix("Inst ").ok_or_else(|| {
+        AptResolutionCommandError::InvalidOutput("malformed APT simulation package".into())
+    })?;
+    let (name_with_arch, mut description) = rest.split_once(' ').ok_or_else(|| {
+        AptResolutionCommandError::InvalidOutput("malformed APT simulation package".into())
+    })?;
+    if description.starts_with('[') {
+        let (current_version, after_current) = take_apt_group(description, '[', ']')?;
+        if !safe_apt_version(current_version) {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "malformed APT simulation current version".into(),
+            ));
+        }
+        description = after_current.strip_prefix(' ').ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "malformed APT simulation current version group".into(),
+            )
+        })?;
+    }
+    let (primary, trailing) = take_apt_group(description, '(', ')')?;
+    validate_apt_install_annotations(trailing)?;
+    let (version, release_and_architecture) = primary.split_once(' ').ok_or_else(|| {
+        AptResolutionCommandError::InvalidOutput("malformed APT simulation version".into())
+    })?;
+    let (release, architecture) = release_and_architecture
+        .rsplit_once(" [")
+        .and_then(|(release, architecture)| {
+            architecture
+                .strip_suffix(']')
+                .map(|architecture| (release, architecture))
+        })
+        .ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "APT simulation did not bind a package architecture".into(),
+            )
+        })?;
+    let (name, qualified_architecture) = name_with_arch
+        .split_once(':')
+        .map_or((name_with_arch, None), |(name, architecture)| {
+            (name, Some(architecture))
+        });
+    if !safe_apt_token(name)
+        || !safe_apt_version(version)
+        || !safe_apt_token(architecture)
+        || !valid_apt_release_list(release)
+        || qualified_architecture.is_some_and(|qualified| qualified != architecture)
+    {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT simulation package identity is malformed".into(),
+        ));
+    }
+    Ok((name.into(), architecture.into(), version.into()))
+}
+
+fn take_apt_group(
+    input: &str,
+    open: char,
+    close: char,
+) -> Result<(&str, &str), AptResolutionCommandError> {
+    if !input.starts_with(open) {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "malformed APT simulation group".into(),
+        ));
+    }
+    let end = input[open.len_utf8()..]
+        .find(close)
+        .map(|index| index + open.len_utf8())
+        .ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput("unbalanced APT simulation group".into())
+        })?;
+    let contents = &input[open.len_utf8()..end];
+    if contents.contains([open, close]) {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "nested APT simulation group".into(),
+        ));
+    }
+    Ok((contents, &input[end + close.len_utf8()..]))
+}
+
+fn validate_apt_install_annotations(mut trailing: &str) -> Result<(), AptResolutionCommandError> {
+    while !trailing.is_empty() {
+        let group = trailing.strip_prefix(' ').ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "malformed APT simulation annotation separator".into(),
+            )
+        })?;
+        let (contents, remainder) = take_apt_group(group, '[', ']')?;
+        if contents.is_empty() {
+            if !remainder.is_empty() {
+                return Err(AptResolutionCommandError::InvalidOutput(
+                    "APT empty break annotation is not final".into(),
+                ));
+            }
+        } else if let Some((package, dependency)) = contents.split_once(" on ") {
+            if dependency.contains(" on ")
+                || !valid_apt_simulation_package(package)
+                || !valid_apt_simulation_package(dependency)
+            {
+                return Err(AptResolutionCommandError::InvalidOutput(
+                    "malformed APT dependency annotation".into(),
+                ));
+            }
+        } else {
+            let short_breaks = contents.strip_suffix(' ').ok_or_else(|| {
+                AptResolutionCommandError::InvalidOutput(
+                    "malformed APT short-break annotation".into(),
+                )
+            })?;
+            if !remainder.is_empty()
+                || short_breaks.is_empty()
+                || short_breaks
+                    .split(' ')
+                    .any(|package| !valid_apt_simulation_package(package))
+            {
+                return Err(AptResolutionCommandError::InvalidOutput(
+                    "malformed APT short-break annotation".into(),
+                ));
+            }
+        }
+        trailing = remainder;
+    }
+    Ok(())
+}
+
+fn valid_apt_simulation_package(value: &str) -> bool {
+    value.split_once(':').map_or_else(
+        || safe_apt_token(value),
+        |(name, architecture)| {
+            safe_apt_token(name) && safe_apt_token(architecture) && !architecture.contains(':')
+        },
+    )
+}
+
+fn valid_apt_release_list(value: &str) -> bool {
+    value.split(", ").all(|release| {
+        !release.is_empty()
+            && release.chars().all(|character| {
+                character.is_ascii_alphanumeric()
+                    || matches!(character, '.' | '+' | '-' | '_' | ':' | '/' | '~')
+            })
+    })
 }
 
 fn parse_configured_packages(
@@ -2515,13 +2647,7 @@ fn parse_configured_packages(
             || !safe_apt_token(name)
             || !safe_apt_token(listed_architecture)
             || !safe_apt_version(version)
-            || source_list.split(", ").any(|source| {
-                source.is_empty()
-                    || !source.chars().all(|character| {
-                        character.is_ascii_alphanumeric()
-                            || matches!(character, '.' | '+' | '-' | '_' | ':' | '/' | '~')
-                    })
-            })
+            || !valid_apt_release_list(source_list)
         {
             return Err(AptResolutionCommandError::InvalidOutput(
                 "malformed APT configure action identity".into(),
@@ -2826,6 +2952,70 @@ mod tests {
                 &archives,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_real_inst_line_with_a_trailing_empty_break_annotation() {
+        assert_eq!(
+            parse_simulated_packages(include_str!(
+                "../tests/fixtures/apt/simulate-inst-annotations.txt"
+            ))
+            .unwrap(),
+            BTreeSet::from([(
+                "libgcc-s1".into(),
+                "amd64".into(),
+                "14-20240412-0ubuntu1".into(),
+            )])
+        );
+    }
+
+    #[test]
+    fn parses_complete_inst_upgrade_and_dependency_annotation_grammar() {
+        let line = concat!(
+            "Inst curl:amd64 [8.5.0-2ubuntu10.5] ",
+            "(8.5.0-2ubuntu10.6 Ubuntu:24.04/noble, Ubuntu:24.04/noble-updates [amd64]) ",
+            "[libc6:amd64 on libssl3:amd64] [broken:amd64 other ]\n",
+        );
+
+        assert_eq!(
+            parse_simulated_packages(line).unwrap(),
+            BTreeSet::from([("curl".into(), "amd64".into(), "8.5.0-2ubuntu10.6".into(),)])
+        );
+    }
+
+    #[test]
+    fn inst_parser_rejects_malformed_groups_junk_and_architecture_conflicts() {
+        let valid_primary = "(14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64])";
+        let malformed = [
+            "Inst",
+            "Inst\tlibgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64])",
+            " Inst libgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64])",
+            "Inst libgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64]",
+            "Inst libgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64]))",
+            "Inst libgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64]) junk",
+            "Inst libgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64]) [",
+            "Inst libgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64]) [pkg on]",
+            "Inst libgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64]) [] [later:amd64 on dependency:amd64]",
+            "Inst libgcc-s1:arm64 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64])",
+            "Inst libgcc-s1 (14-20240412-0ubuntu1 Ubuntu:24.04/noble [])",
+            "Inst libgcc-s1 [] (14-20240412-0ubuntu1 Ubuntu:24.04/noble [amd64])",
+        ];
+        for line in malformed {
+            assert!(
+                parse_simulated_packages(&format!("{line}\n")).is_err(),
+                "accepted malformed Inst line: {line}"
+            );
+        }
+
+        assert_eq!(
+            parse_simulated_packages(&format!("Inst libgcc-s1 {valid_primary} [arm64 ]\n"))
+                .unwrap(),
+            BTreeSet::from([(
+                "libgcc-s1".into(),
+                "amd64".into(),
+                "14-20240412-0ubuntu1".into(),
+            )])
         );
     }
 
