@@ -85,6 +85,29 @@ impl LocalTargetFilesystem {
         })
     }
 
+    pub(crate) fn open_nofollow(
+        root: &Path,
+        access: RootAccess,
+    ) -> Result<Self, TargetFilesystemError> {
+        if !root.is_absolute() || root.parent().is_none() {
+            return Err(TargetFilesystemError::InvalidRoot);
+        }
+        let directory = open_absolute_directory_nofollow(root)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let expected = std::fs::metadata(root)?;
+            let opened = directory.try_clone()?.into_std_file().metadata()?;
+            if expected.dev() != opened.dev() || expected.ino() != opened.ino() {
+                return Err(TargetFilesystemError::InvalidRoot);
+            }
+        }
+        Ok(Self {
+            root: directory,
+            access,
+        })
+    }
+
     fn ensure_safe_ancestors(
         &self,
         path: &NormalizedManagedPath,
@@ -131,6 +154,26 @@ impl LocalTargetFilesystem {
             Err(error) => Err(error.into()),
         }
     }
+}
+
+fn open_absolute_directory_nofollow(path: &Path) -> Result<Dir, std::io::Error> {
+    #[cfg(unix)]
+    {
+        let mut current = Dir::open_ambient_dir(Path::new("/"), ambient_authority())?;
+        for component in path.components() {
+            let std::path::Component::Normal(name) = component else {
+                continue;
+            };
+            current = open_target_dir_nofollow(&current, Path::new(name))?;
+        }
+        return Ok(current);
+    }
+    #[cfg(windows)]
+    {
+        return Dir::open_ambient_dir(path, ambient_authority());
+    }
+    #[allow(unreachable_code)]
+    Err(std::io::Error::other("unsupported target platform"))
 }
 
 impl TargetFilesystem for LocalTargetFilesystem {

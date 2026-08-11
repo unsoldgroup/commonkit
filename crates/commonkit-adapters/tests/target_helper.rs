@@ -10,13 +10,11 @@ use commonkit_adapters::{
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, digest_domain_json,
 };
-use commonkit_core::{Sha256Digest, StableId};
+use commonkit_core::{RootAccess, Sha256Digest, StableId, TargetRoot};
 use sha2::{Digest, Sha256};
 
 fn temp(name: &str) -> std::path::PathBuf {
-    std::fs::canonicalize(std::env::temp_dir())
-        .unwrap()
-        .join(format!("commonkit-helper-{name}-{}", std::process::id()))
+    std::env::temp_dir().join(format!("commonkit-helper-{name}-{}", std::process::id()))
 }
 
 fn invoke(home: &std::path::Path, request: &SshFilesystemRequest) -> std::process::Output {
@@ -527,7 +525,11 @@ fn helper_rejects_any_command_surface_other_than_stdio_protocol() {
         .arg("touch /tmp/nope")
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert_eq!(
         String::from_utf8_lossy(&output.stderr),
         "commonkit target helper rejected the request\n"
@@ -843,7 +845,11 @@ fn helper_rejects_a_symlinked_root_ancestor_before_writefile() {
             content: b"must not write".to_vec(),
         },
     );
-    assert!(!output.status.success());
+    assert!(
+        !output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(!home.join(".config/commonkit/escaped.txt").exists());
 
     let _ = fs::remove_dir_all(home);
@@ -893,4 +899,91 @@ fn helper_rejects_group_world_writable_runtime_root_and_state() {
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_dir_all(state);
     }
+}
+
+#[test]
+fn helper_accepts_the_platform_temp_alias_when_it_resolves_to_private_storage() {
+    let home = {
+        let base = fs::canonicalize(std::env::temp_dir()).unwrap();
+        base.strip_prefix("/private/var")
+            .map(|relative| std::path::Path::new("/var").join(relative))
+            .unwrap_or_else(|_| temp("alias-platform-home"))
+            .join(format!(
+                "commonkit-helper-alias-platform-home-{}",
+                std::process::id()
+            ))
+    };
+    let root = std::path::PathBuf::from(format!(
+        "/tmp/commonkit-helper-alias-root-{}",
+        std::process::id()
+    ));
+    let state = temp("alias-platform-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state,
+            "roots": [{"id":"home","path":root,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = invoke(
+        &home,
+        &SshFilesystemRequest::WriteFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: NormalizedManagedPath::parse("alias.txt").unwrap(),
+            content: b"platform alias".to_vec(),
+        },
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(root.join("alias.txt")).unwrap(), b"platform alias");
+
+    let _ = fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(state);
+}
+
+#[test]
+fn helper_keeps_writing_to_the_bound_root_after_path_swap() {
+    let root = temp("swap-root");
+    let replacement = temp("swap-replacement");
+    let state = temp("swap-state");
+    fs::create_dir_all(&root).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let helper = TargetHelper::open(
+        vec![TargetRoot {
+            id: StableId::parse("home").unwrap(),
+            path: root.to_string_lossy().into_owned(),
+            access: RootAccess::ReadWrite,
+        }],
+        &state,
+    )
+    .unwrap();
+    fs::rename(&root, &replacement).unwrap();
+    fs::create_dir_all(&root).unwrap();
+
+    helper
+        .dispatch(SshFilesystemRequest::WriteFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: NormalizedManagedPath::parse("bound.txt").unwrap(),
+            content: b"bound handle".to_vec(),
+        })
+        .unwrap();
+    assert_eq!(
+        fs::read(replacement.join("bound.txt")).unwrap(),
+        b"bound handle"
+    );
+    assert!(!root.join("bound.txt").exists());
+
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(replacement);
+    let _ = fs::remove_dir_all(state);
 }

@@ -307,25 +307,20 @@ fn validate_config_parents(parent: &Path) -> Result<(), ()> {
     if !home.is_absolute() || !parent.starts_with(&home) {
         return Err(());
     }
-    let mut current = Some(parent);
-    while let Some(directory) = current {
-        let metadata = fs::symlink_metadata(directory).map_err(|_| ())?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    let home_metadata = fs::symlink_metadata(&home).map_err(|_| ())?;
+    if home_metadata.file_type().is_symlink() || !home_metadata.is_dir() {
+        return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if home_metadata.permissions().mode() & 0o022 != 0 || !owner_allowed(home_metadata.uid()) {
             return Err(());
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            if metadata.permissions().mode() & 0o022 != 0 || !owner_allowed(metadata.uid()) {
-                return Err(());
-            }
-        }
-        if directory == home {
-            return Ok(());
-        }
-        current = directory.parent();
     }
-    Err(())
+    TargetHelper::validate_path(parent, true, false)
+        .map(|_| ())
+        .map_err(|_| ())
 }
 
 fn validate_roots(config: &HelperConfig) -> Result<(), ()> {

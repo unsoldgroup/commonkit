@@ -36,7 +36,7 @@ const MAX_RESOLUTION_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RESOLUTION_ARTIFACT_COUNT: usize = 128;
 
 pub struct TargetHelper {
-    roots: BTreeMap<StableId, (PathBuf, RootAccess)>,
+    roots: BTreeMap<StableId, (LocalTargetFilesystem, PathBuf, RootAccess)>,
     artifacts: ArtifactStore,
     receipts: PathBuf,
     #[cfg(unix)]
@@ -72,8 +72,14 @@ impl TargetHelper {
         Self::validate_configuration(&roots, state_root, &protected_paths)?;
         let mut mapped = BTreeMap::new();
         for root in roots {
-            let path = PathBuf::from(&root.path);
-            if mapped.insert(root.id, (path, root.access)).is_some() {
+            let raw_path = PathBuf::from(&root.path);
+            let path = validate_secure_path(&raw_path, true, false)
+                .map_err(|_| TargetFilesystemError::InvalidRoot)?;
+            let filesystem = LocalTargetFilesystem::open_nofollow(&path, root.access)?;
+            if mapped
+                .insert(root.id, (filesystem, path, root.access))
+                .is_some()
+            {
                 return Err(TargetFilesystemError::InvalidSshConfig("duplicate root id"));
             }
         }
@@ -159,12 +165,20 @@ impl TargetHelper {
         Ok(())
     }
 
-    fn root(&self, id: &StableId) -> Result<LocalTargetFilesystem, TargetFilesystemError> {
-        let (path, access) = self
+    pub fn validate_path(
+        path: &Path,
+        expected_directory: bool,
+        allow_missing_leaf: bool,
+    ) -> Result<PathBuf, TargetFilesystemError> {
+        validate_secure_path(path, expected_directory, allow_missing_leaf)
+    }
+
+    fn root(&self, id: &StableId) -> Result<&LocalTargetFilesystem, TargetFilesystemError> {
+        let (filesystem, _, _) = self
             .roots
             .get(id)
             .ok_or_else(|| TargetFilesystemError::UnknownRoot(id.clone()))?;
-        LocalTargetFilesystem::open(path, *access)
+        Ok(filesystem)
     }
 
     fn ensure_unprotected(
@@ -172,7 +186,7 @@ impl TargetHelper {
         root_id: &StableId,
         path: &crate::NormalizedManagedPath,
     ) -> Result<(), TargetFilesystemError> {
-        let (root, _) = self
+        let (_, root, _) = self
             .roots
             .get(root_id)
             .ok_or_else(|| TargetFilesystemError::UnknownRoot(root_id.clone()))?;
@@ -777,7 +791,7 @@ impl TargetHelper {
                 resolution,
                 artifacts,
             } => {
-                let (root_path, access) = self
+                let (_, root_path, access) = self
                     .roots
                     .get(&root_id)
                     .ok_or_else(|| TargetFilesystemError::UnknownRoot(root_id.clone()))?;
@@ -998,8 +1012,15 @@ fn validate_secure_path(
     }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
-            if metadata.file_type().is_symlink()
-                || (expected_directory && !metadata.is_dir())
+            if metadata.file_type().is_symlink() {
+                let Some(identity) = allowed_platform_alias(path, expected_directory)? else {
+                    return Err(TargetFilesystemError::InvalidSshConfig(
+                        "target helper path has an unsafe type",
+                    ));
+                };
+                return Ok(identity);
+            }
+            if (expected_directory && !metadata.is_dir())
                 || (!expected_directory && !metadata.is_file() && !metadata.is_dir())
             {
                 return Err(TargetFilesystemError::InvalidSshConfig(
@@ -1030,7 +1051,17 @@ fn validate_secure_ancestors(start: Option<&Path>) -> Result<(), TargetFilesyste
     ))?;
     loop {
         let metadata = std::fs::symlink_metadata(current)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if metadata.file_type().is_symlink() {
+            if allowed_platform_alias(current, true)?.is_none() {
+                return Err(TargetFilesystemError::InvalidSshConfig(
+                    "target helper path ancestor is unsafe",
+                ));
+            }
+            let parent = current.parent();
+            validate_secure_ancestors(parent)?;
+            return Ok(());
+        }
+        if !metadata.is_dir() {
             return Err(TargetFilesystemError::InvalidSshConfig(
                 "target helper path ancestor is unsafe",
             ));
@@ -1044,6 +1075,32 @@ fn validate_secure_ancestors(start: Option<&Path>) -> Result<(), TargetFilesyste
         }
         current = parent;
     }
+}
+
+fn allowed_platform_alias(
+    path: &Path,
+    expected_directory: bool,
+) -> Result<Option<PathBuf>, TargetFilesystemError> {
+    if !expected_directory {
+        return Ok(None);
+    }
+    let expected = match path {
+        p if p == Path::new("/tmp") => Path::new("/private/tmp"),
+        p if p == Path::new("/var") => Path::new("/private/var"),
+        _ => return Ok(None),
+    };
+    let identity = std::fs::canonicalize(path)
+        .map_err(|_| TargetFilesystemError::InvalidSshConfig("cannot canonicalize path"))?;
+    if identity != expected {
+        return Ok(None);
+    }
+    let metadata = std::fs::symlink_metadata(&identity)?;
+    if !metadata.is_dir() {
+        return Ok(None);
+    }
+    validate_secure_metadata(&metadata, true)?;
+    validate_secure_ancestors(identity.parent())?;
+    Ok(Some(identity))
 }
 
 fn validate_secure_metadata(
