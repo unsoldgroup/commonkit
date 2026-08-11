@@ -189,7 +189,7 @@ impl TargetHelper {
                 let mut backend = ProcessOfflinePackageBackend::new(root_path);
                 match phase {
                     PackageMutationPhase::Observe => {
-                        let observed = commonkit_adapters::PackageMutationBackend::observe(
+                        let observed = crate::PackageMutationBackend::observe(
                             &mut backend,
                             &resolution,
                         )
@@ -199,7 +199,7 @@ impl TargetHelper {
                         })
                     }
                     PackageMutationPhase::Prepare => {
-                        commonkit_adapters::PackageMutationBackend::prepare_offline(
+                        crate::PackageMutationBackend::prepare_offline(
                             &mut backend,
                             &resolution,
                             &self.artifacts,
@@ -208,7 +208,7 @@ impl TargetHelper {
                         Ok(SshFilesystemResponse::Applied)
                     }
                     PackageMutationPhase::Apply => {
-                        commonkit_adapters::PackageMutationBackend::apply_offline(
+                        crate::PackageMutationBackend::apply_offline(
                             &mut backend,
                             &resolution,
                             &self.artifacts,
@@ -217,7 +217,7 @@ impl TargetHelper {
                         Ok(SshFilesystemResponse::Applied)
                     }
                     PackageMutationPhase::Verify => {
-                        commonkit_adapters::PackageMutationBackend::verify_offline(
+                        crate::PackageMutationBackend::verify_offline(
                             &mut backend,
                             &resolution,
                             &self.artifacts,

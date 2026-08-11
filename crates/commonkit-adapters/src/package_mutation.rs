@@ -66,7 +66,7 @@ impl PackageMutationBackendRegistry {
     pub fn new(
         backends: impl IntoIterator<Item = Box<dyn PackageMutationBackend>>,
     ) -> Result<Self, PackageMutationError> {
-        let mut registered = Vec::new();
+        let mut registered: Vec<Box<dyn PackageMutationBackend>> = Vec::new();
         for backend in backends {
             if registered.iter().any(|existing| {
                 [PackageManager::Apt, PackageManager::Nvm]
@@ -101,7 +101,9 @@ impl PackageMutationBackend for PackageMutationBackendRegistry {
     }
 
     fn supports_manager(&self, manager: PackageManager) -> bool {
-        self.backends.contains_key(&manager)
+        self.backends
+            .iter()
+            .any(|backend| backend.supports_manager(manager))
     }
 
     fn observe(
@@ -565,7 +567,7 @@ impl<T> SshOfflinePackageBackend<T> {
             .perform(crate::SshFilesystemRequest::PackageMutation {
                 root_id: self.root_id.clone(),
                 phase,
-                resolution: resolution.clone(),
+                resolution: Box::new(resolution.clone()),
                 artifacts: transferred,
             })
             .map_err(|_| PackageMutationError::Backend)
@@ -605,7 +607,7 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
             resolution,
             Some(artifacts),
         )?
-        .is_applied()
+        .into_applied()
     }
 
     fn apply_offline(
@@ -618,7 +620,7 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
             resolution,
             Some(artifacts),
         )?
-        .is_applied()
+        .into_applied()
     }
 
     fn verify_offline(
@@ -631,16 +633,16 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
             resolution,
             Some(artifacts),
         )?
-        .is_applied()
+        .into_applied()
     }
 }
 
 trait PackageMutationResponseExt {
-    fn is_applied(self) -> Result<(), PackageMutationError>;
+    fn into_applied(self) -> Result<(), PackageMutationError>;
 }
 
 impl PackageMutationResponseExt for crate::SshFilesystemResponse {
-    fn is_applied(self) -> Result<(), PackageMutationError> {
+    fn into_applied(self) -> Result<(), PackageMutationError> {
         matches!(self, crate::SshFilesystemResponse::Applied)
             .then_some(())
             .ok_or(PackageMutationError::Backend)

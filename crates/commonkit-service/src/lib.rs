@@ -25,9 +25,9 @@ use commonkit_adapters::{
     ProcessOfflinePackageBackend, ProcessPackageCommandRunner, ProviderCapability,
 };
 use commonkit_contracts::{
-    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, Operation,
-    PackageConsent, PackageDeclaration, Plan, PlanBindings, Principal, ReceiptState,
-    RecoveryCapability, RuntimeDiagnostic, SCHEMA_VERSION, SchemaVersion, SecurityPolicy,
+    CONTRACT_VERSION, ComponentDiagnostic, DiagnosticBundle, DiagnosticState, PackageConsent,
+    PackageDeclaration, Plan, PlanBindings, Principal, ReceiptState, RuntimeDiagnostic,
+    SCHEMA_VERSION, SchemaVersion, SecurityPolicy,
     Sha256Digest, StableId, assert_no_embedded_secrets, digest_domain_json,
 };
 use commonkit_core::{PlanDraft, ReceiptAudience, build_plan, resolve_principal};
@@ -2078,6 +2078,13 @@ impl LocalExecutionError {
             Self::Adapter(_) => "adapter_unavailable",
             Self::Relay(_) => "relay_unavailable",
             Self::Contract(_) => "contract_invalid",
+            Self::PackageArtifact(_) => "package_artifact_failed",
+            Self::PackageBackend(error) => match error {
+                commonkit_adapters::PackageMutationError::UnsupportedRecipe => {
+                    "package_operation_unsupported"
+                }
+                commonkit_adapters::PackageMutationError::Backend => "package_apply_failed",
+            },
         })
     }
 }

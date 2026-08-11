@@ -398,7 +398,11 @@ pub enum SshFilesystemRequest {
     PackageMutation {
         root_id: StableId,
         phase: PackageMutationPhase,
-        resolution: crate::PackageResolutionV1,
+        // Boxed so this variant does not set the size of every
+        // `SshFilesystemRequest`: inline it is ~760 bytes against 73 for the
+        // next-largest variant. `Box` is transparent to serde, so the wire
+        // form is unchanged.
+        resolution: Box<crate::PackageResolutionV1>,
         artifacts: Vec<PackageMutationArtifact>,
     },
     StageArtifact {

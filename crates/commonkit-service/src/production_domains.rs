@@ -609,15 +609,12 @@ impl PlanExecutor for ProductionSshPlanExecutor {
         if plan.operations.iter().any(|operation| {
             operation.adapter_id.as_str() == "packages"
                 || operation.resource.resource_type.as_str() == "package"
-        }) {
-            if Reconciler::validate_package_consent(plan, consent).is_err() {
-                return ExecutionResult {
-                    status: ApplyStatus::Failed,
-                    failure_code: Some(
-                        StableId::parse("package_consent_mismatch").expect("static ID"),
-                    ),
-                };
-            }
+        }) && Reconciler::validate_package_consent(plan, consent).is_err()
+        {
+            return ExecutionResult {
+                status: ApplyStatus::Failed,
+                failure_code: Some(StableId::parse("package_consent_mismatch").expect("static ID")),
+            };
         }
         let result = self
             .lock
@@ -2473,7 +2470,6 @@ mod package_registry_tests {
         OperationKind, RecoveryCapability, ResourceRef, Risk, Sha256Digest, StableId,
     };
     use commonkit_core::{OperationDraft, finalize_operation};
-    use commonkit_reconcile::Adapter;
 
     fn digest(seed: char) -> Sha256Digest {
         Sha256Digest::parse(format!("sha256:{}", seed.to_string().repeat(64))).unwrap()
