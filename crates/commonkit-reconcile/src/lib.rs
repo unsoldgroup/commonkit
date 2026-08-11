@@ -1358,23 +1358,27 @@ impl<'a> Reconciler<'a> {
             operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
                 && receipt.operation_progress.iter().any(|progress| {
                     progress.operation_id == operation.id
-                        && matches!(
+                        && (matches!(
                             progress.phase,
                             OperationPhase::ApplyStarted
                                 | OperationPhase::Applied
                                 | OperationPhase::ApplyFailed
                                 | OperationPhase::Verified
                                 | OperationPhase::VerifyFailed
-                                | OperationPhase::ForwardRecovered
                                 | OperationPhase::ForwardRecoveryFailed
-                        )
+                        ) || (progress.phase == OperationPhase::ForwardRecovered
+                            && receipt.state != ReceiptState::ForwardRecovered))
                 })
         }) || matches!(
             receipt.state,
             ReceiptState::ForwardRecoveryRequired
                 | ReceiptState::ConvergingForward
                 | ReceiptState::ForwardRecoveryFailed
-        );
+        ) || (receipt.state == ReceiptState::ForwardRecovered
+            && plan
+                .operations
+                .iter()
+                .any(|operation| package_evidence_pending(&journal, operation)));
         if after_forward_barrier {
             return self.converge_forward(&mut journal, plan, adapters);
         }
@@ -1490,11 +1494,14 @@ impl<'a> Reconciler<'a> {
             ReceiptState::ForwardRecoveryRequired => {}
             ReceiptState::ConvergingForward => {}
             ReceiptState::ForwardRecoveryFailed => {}
+            ReceiptState::ForwardRecovered => {}
             state => return Err(ReconcileError::RunAlreadyTerminal(state)),
         }
         if matches!(
             journal.receipt().state,
-            ReceiptState::ForwardRecoveryRequired | ReceiptState::ForwardRecoveryFailed
+            ReceiptState::ForwardRecoveryRequired
+                | ReceiptState::ForwardRecoveryFailed
+                | ReceiptState::ForwardRecovered
         ) {
             journal.transition(ReceiptState::ConvergingForward)?;
             self.persist(journal)?;
@@ -1507,8 +1514,37 @@ impl<'a> Reconciler<'a> {
             });
             if already_recovered {
                 if package_evidence_pending(journal, operation) {
-                    record_package_success(journal, operation, adapters)?;
-                    self.persist(journal)?;
+                    // A recovered phase alone is not current target evidence:
+                    // the process may have crashed before replacing the
+                    // package receipt entry. Re-observe the bound operation
+                    // before accepting its final digest.
+                    let observation = adapter_for(adapters, &operation.adapter_id)?
+                        .observe_recovery(operation)
+                        .map_err(|failure| stable_failure_code(&failure));
+                    let failure_code = match observation {
+                        Ok(RecoveryObservation::After) => {
+                            record_package_success(journal, operation, adapters)?;
+                            self.persist(journal)?;
+                            None
+                        }
+                        Ok(RecoveryObservation::Before | RecoveryObservation::Other) => {
+                            Some(StableId::parse("recovery_ambiguous").expect("static stable ID"))
+                        }
+                        Err(code) => Some(code),
+                    };
+                    if let Some(code) = failure_code {
+                        journal.record_operation(
+                            operation.id.clone(),
+                            OperationPhase::ForwardRecoveryFailed,
+                            Some(code.clone()),
+                        )?;
+                        self.persist(journal)?;
+                        record_package_failure_code(journal, operation, code)?;
+                        self.persist(journal)?;
+                        journal.transition(ReceiptState::ForwardRecoveryFailed)?;
+                        self.persist(journal)?;
+                        return Ok(ReconcileOutcome::ForwardRecoveryFailed);
+                    }
                 }
                 continue;
             }
@@ -1576,8 +1612,10 @@ impl<'a> Reconciler<'a> {
             }
             self.persist(journal)?;
         }
-        journal.transition(ReceiptState::ForwardRecovered)?;
-        self.persist(journal)?;
+        if journal.receipt().state != ReceiptState::ForwardRecovered {
+            journal.transition(ReceiptState::ForwardRecovered)?;
+            self.persist(journal)?;
+        }
         Ok(ReconcileOutcome::ForwardRecovered)
     }
 
@@ -2231,6 +2269,10 @@ fn legal_operation_transition(from: OperationPhase, to: OperationPhase) -> bool 
                 OperationPhase::ForwardRecoveryFailed,
                 OperationPhase::ForwardRecovered | OperationPhase::ForwardRecoveryFailed
             )
+            | (
+                OperationPhase::ForwardRecovered,
+                OperationPhase::ForwardRecoveryFailed
+            )
     )
 }
 
@@ -2267,6 +2309,10 @@ fn legal_transition(from: ReceiptState, to: ReceiptState) -> bool {
             )
             | (
                 ReceiptState::ForwardRecoveryFailed,
+                ReceiptState::ConvergingForward
+            )
+            | (
+                ReceiptState::ForwardRecovered,
                 ReceiptState::ConvergingForward
             )
             | (ReceiptState::Succeeded, ReceiptState::RollingBack)

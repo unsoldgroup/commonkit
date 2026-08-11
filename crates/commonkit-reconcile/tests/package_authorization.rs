@@ -11,6 +11,7 @@ use commonkit_contracts::{
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_reconcile::{
     Adapter, AdapterFailure, ReceiptStore, ReconcileError, ReconcileOutcome, Reconciler,
+    RecoveryObservation,
 };
 
 fn digest(character: char) -> Sha256Digest {
@@ -67,6 +68,7 @@ struct PackageAdapterStub {
     id: StableId,
     mutation_count: usize,
     forbid_observation: bool,
+    recovery_observation: RecoveryObservation,
     verify_failure: bool,
 }
 
@@ -91,7 +93,7 @@ impl Adapter for PackageAdapterStub {
             !self.forbid_observation,
             "recovery must use durable evidence only"
         );
-        Ok(commonkit_reconcile::RecoveryObservation::After)
+        Ok(self.recovery_observation)
     }
 
     fn package_authorization_binding(
@@ -205,6 +207,7 @@ fn interrupted_package_recovery_accepts_v2_plan_bound_to_v3_receipt() {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
         forbid_observation: false,
+        recovery_observation: RecoveryObservation::After,
         verify_failure: false,
     })];
     let outcome = Reconciler::with_store(&store)
@@ -220,7 +223,7 @@ fn interrupted_package_recovery_accepts_v2_plan_bound_to_v3_receipt() {
 }
 
 #[test]
-fn package_recovery_repairs_forward_evidence_gap_without_target_or_provider_work() {
+fn package_recovery_requires_after_observation_before_repairing_evidence() {
     let root = temporary_directory("package-recovery-evidence-gap");
     let store = ReceiptStore::open(&root).unwrap();
     let plan = package_plan();
@@ -271,32 +274,33 @@ fn package_recovery_repairs_forward_evidence_gap_without_target_or_provider_work
     let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
-        forbid_observation: true,
+        forbid_observation: false,
+        recovery_observation: RecoveryObservation::Before,
         verify_failure: false,
     })];
     let outcome = Reconciler::with_store(&store)
         .recover_run(run_id.clone(), &plan, &mut adapters)
         .unwrap();
 
-    assert_eq!(outcome, ReconcileOutcome::ForwardRecovered);
+    assert_eq!(outcome, ReconcileOutcome::ForwardRecoveryFailed);
     let receipt = store.load(run_id).unwrap();
+    assert_eq!(receipt.receipt().state, ReceiptState::ForwardRecoveryFailed);
     let evidence = &receipt
         .receipt()
         .package_authorization
         .as_ref()
         .unwrap()
         .evidence[0];
-    assert_eq!(
+    assert!(matches!(
         evidence.exit_classification,
-        PackageExitClassification::Succeeded
-    );
-    assert_eq!(evidence.final_digest, Some(digest('f')));
+        PackageExitClassification::Failed { .. }
+    ));
+    assert_eq!(evidence.final_digest, None);
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn package_recovery_repairs_forward_recovered_failed_evidence_gap_without_target_or_provider_work()
-{
+fn package_recovery_repairs_forward_recovered_failed_evidence_gap_after_after_observation() {
     let root = temporary_directory("package-recovery-failed-evidence-gap");
     let store = ReceiptStore::open(&root).unwrap();
     let plan = package_plan();
@@ -357,7 +361,8 @@ fn package_recovery_repairs_forward_recovered_failed_evidence_gap_without_target
     let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
-        forbid_observation: true,
+        forbid_observation: false,
+        recovery_observation: RecoveryObservation::After,
         verify_failure: false,
     })];
     let outcome = Reconciler::with_store(&store)
@@ -450,11 +455,16 @@ fn package_recovery_repairs_failed_evidence_after_forward_failure_checkpoint() {
         .record_operation(operation.id.clone(), OperationPhase::ForwardRecovered, None)
         .unwrap();
     store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::ConvergingForward).unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::ForwardRecovered).unwrap();
+    store.persist(&journal).unwrap();
 
     let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
-        forbid_observation: true,
+        forbid_observation: false,
+        recovery_observation: RecoveryObservation::After,
         verify_failure: false,
     })];
     let outcome = Reconciler::with_store(&store)
@@ -474,6 +484,23 @@ fn package_recovery_repairs_failed_evidence_after_forward_failure_checkpoint() {
         PackageExitClassification::Succeeded
     );
     assert_eq!(evidence.final_digest, Some(digest('f')));
+    let mut terminal_adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
+        id: StableId::parse("packages").unwrap(),
+        mutation_count: 0,
+        forbid_observation: true,
+        recovery_observation: RecoveryObservation::After,
+        verify_failure: false,
+    })];
+    assert!(matches!(
+        Reconciler::with_store(&store).recover_run(
+            StableId::parse("package-failed-checkpoint").unwrap(),
+            &plan,
+            &mut terminal_adapters,
+        ),
+        Err(ReconcileError::RunAlreadyTerminal(
+            ReceiptState::ForwardRecovered
+        ))
+    ));
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -494,6 +521,7 @@ fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
         forbid_observation: false,
+        recovery_observation: RecoveryObservation::After,
         verify_failure: false,
     })];
     let before = std::fs::read_dir(&root).unwrap().count();
@@ -564,6 +592,7 @@ fn package_verify_failure_records_only_sanitized_failed_evidence() {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
         forbid_observation: false,
+        recovery_observation: RecoveryObservation::After,
         verify_failure: true,
     })];
 
