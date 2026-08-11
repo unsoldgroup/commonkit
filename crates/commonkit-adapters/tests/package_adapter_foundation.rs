@@ -155,6 +155,10 @@ fn apt_resolution() -> (PackageResolutionV1, PackageResolutionAuthority) {
 #[test]
 fn offline_adapter_accepts_target_attested_apt_authority() {
     let (mut resolution, _) = apt_resolution();
+    resolution
+        .before
+        .installed_versions
+        .insert(apt_live_safety_marker());
     let source_id = resolution.source.source_id.clone();
     let registry = PackageSourceRegistry::builtin()
         .unwrap()
