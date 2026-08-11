@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use commonkit_adapters::{
     AptRepositoryConfigurationV1, AptResolutionBackend, AptResolutionCommandError,
     AptResolutionCommandRunner, AptResolutionSnapshotV1, AptResolutionSystemRequestV1,
-    AptResolvedArchiveV1, AptResolvedPackageV1, AptTransactionRisksV1, ArtifactEvidence,
-    ArtifactStore, ManagerBindingV1, OfflineInstallRecipeV1, PackageFetch, PackageFetchHopV1,
-    PackageFetchRequestV1, PackageFetchResultV1, PackageObservationV1,
+    AptResolvedArchiveV1, AptResolvedPackageV1, AptSourceAuthorityV1, AptTransactionRisksV1,
+    ArtifactEvidence, ArtifactStore, ManagerBindingV1, OfflineInstallRecipeV1, PackageFetch,
+    PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1, PackageObservationV1,
     PackageResolutionCoordinator, PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
     ProcessAptResolutionCommandRunner, ResolvedPackageIntent,
 };
@@ -85,6 +85,22 @@ fn repository() -> AptRepositoryConfigurationV1 {
         signed_by: PathBuf::from("/usr/share/keyrings/ubuntu-archive-keyring.gpg"),
         signing_authority: id("ubuntu-archive-keyring"),
     }
+}
+
+fn source_authority() -> AptSourceAuthorityV1 {
+    AptSourceAuthorityV1 {
+        suite: "noble".into(),
+        components: BTreeSet::from(["main".into()]),
+        signing_authority: id("ubuntu-archive-keyring"),
+        signing_key_digest: digest(b'd'),
+    }
+}
+
+fn apt_registry() -> PackageSourceRegistry {
+    PackageSourceRegistry::builtin()
+        .unwrap()
+        .with_apt_source_authority(&id("ubuntu-main"), source_authority())
+        .unwrap()
 }
 
 #[derive(Clone)]
@@ -199,7 +215,7 @@ fn apt_snapshot(curl_bytes: &[u8], libc_bytes: &[u8]) -> AptResolutionSnapshotV1
 
 #[test]
 fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
-    let registry = PackageSourceRegistry::builtin().unwrap();
+    let registry = apt_registry();
     let declaration = match desired() {
         commonkit_adapters::PackageDesiredIntent::Package { declaration } => declaration,
     };
@@ -212,6 +228,7 @@ fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
         registry_definition_digest: registry
             .source_definition_digest(&id("ubuntu-main"))
             .unwrap(),
+        source_authority: source_authority(),
         repository: repository(),
     };
 
@@ -230,6 +247,7 @@ fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
             "/usr/bin/dpkg-query",
             "/usr/bin/apt-mark",
             "/usr/bin/apt-get",
+            "/usr/bin/apt-cache",
             "/usr/bin/apt-get",
             "/usr/bin/apt-get",
         ]
@@ -240,7 +258,13 @@ fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(rendered.contains("Dir::State::lists=<private>/lists"));
-    assert!(rendered.contains("Dir::State::status=<private>/status"));
+    assert_eq!(
+        rendered
+            .matches("Dir::State::status=<private>/status")
+            .count(),
+        3,
+        "dependency inspection, simulation and archive enumeration must use one private solver state"
+    );
     assert!(rendered.contains("Dir::Cache::archives=<private>/archives"));
     assert!(rendered.contains("Acquire::AllowInsecureRepositories=false"));
     assert!(rendered.contains("Acquire::AllowWeakRepositories=false"));
@@ -253,6 +277,9 @@ fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
     assert!(rendered.contains("--simulate --no-remove"));
     assert!(rendered.contains("--print-uris --download-only --no-remove"));
     assert!(!rendered.contains("--allow-unauthenticated"));
+    assert!(commands.iter().all(|command| {
+        command.environment.get("APT_CONFIG").map(String::as_str) == Some("<private>/apt.conf")
+    }));
     assert_eq!(
         commands
             .iter()
@@ -263,10 +290,105 @@ fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
     );
 }
 
+#[test]
+fn apt_source_scope_and_key_are_part_of_registry_authority() {
+    let base = PackageSourceRegistry::builtin().unwrap();
+    let source_id = id("ubuntu-main");
+    let first = base
+        .clone()
+        .with_apt_source_authority(&source_id, source_authority())
+        .unwrap();
+    let mut changed_scope = source_authority();
+    changed_scope.components.insert("universe".into());
+    let widened = base
+        .clone()
+        .with_apt_source_authority(&source_id, changed_scope)
+        .unwrap();
+    let mut changed_key = source_authority();
+    changed_key.signing_key_digest = digest(b'e');
+    let rekeyed = base
+        .clone()
+        .with_apt_source_authority(&source_id, changed_key)
+        .unwrap();
+    let mut changed_suite = source_authority();
+    changed_suite.suite = "noble-updates".into();
+    let resuited = base
+        .clone()
+        .with_apt_source_authority(&source_id, changed_suite)
+        .unwrap();
+    let mut changed_signer = source_authority();
+    changed_signer.signing_authority = id("different-archive-keyring");
+    let resigned = base
+        .with_apt_source_authority(&source_id, changed_signer)
+        .unwrap();
+
+    assert_ne!(
+        first.source_definition_digest(&source_id).unwrap(),
+        widened.source_definition_digest(&source_id).unwrap()
+    );
+    assert_ne!(
+        first.source_definition_digest(&source_id).unwrap(),
+        rekeyed.source_definition_digest(&source_id).unwrap()
+    );
+    assert_ne!(
+        first.source_definition_digest(&source_id).unwrap(),
+        resuited.source_definition_digest(&source_id).unwrap()
+    );
+    assert_ne!(
+        first.source_definition_digest(&source_id).unwrap(),
+        resigned.source_definition_digest(&source_id).unwrap()
+    );
+}
+
+#[test]
+fn apt_backend_rejects_missing_registry_source_scope_before_runner_or_fetch() {
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let mut backend = AptResolutionBackend::new(repository(), PanicRunner);
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::new(),
+        calls: 0,
+    };
+
+    assert!(matches!(
+        PackageResolutionCoordinator::new(
+            &policy(),
+            &registry,
+            manager(),
+            &mut backend,
+            &mut fetch,
+        )
+        .resolve(&desired(), &target(), &store),
+        Err(PackageResolutionError::InvalidAptRequest)
+    ));
+    assert_eq!(fetch.calls, 0);
+
+    let mut mismatched = source_authority();
+    mismatched.components.insert("universe".into());
+    let registry = PackageSourceRegistry::builtin()
+        .unwrap()
+        .with_apt_source_authority(&id("ubuntu-main"), mismatched)
+        .unwrap();
+    let mut backend = AptResolutionBackend::new(repository(), PanicRunner);
+    assert!(matches!(
+        PackageResolutionCoordinator::new(
+            &policy(),
+            &registry,
+            manager(),
+            &mut backend,
+            &mut fetch,
+        )
+        .resolve(&desired(), &target(), &store),
+        Err(PackageResolutionError::InvalidAptRequest)
+    ));
+    assert_eq!(fetch.calls, 0);
+}
+
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn process_apt_runner_fails_closed_off_linux() {
-    let registry = PackageSourceRegistry::builtin().unwrap();
+    let registry = apt_registry();
     let declaration = match desired() {
         commonkit_adapters::PackageDesiredIntent::Package { declaration } => declaration,
     };
@@ -279,6 +401,7 @@ fn process_apt_runner_fails_closed_off_linux() {
         registry_definition_digest: registry
             .source_definition_digest(&id("ubuntu-main"))
             .unwrap(),
+        source_authority: source_authority(),
         repository: repository(),
     };
     let mut runner = ProcessAptResolutionCommandRunner;
@@ -300,6 +423,14 @@ fn apt_manager_authority_probe_fails_closed_off_linux() {
         ),
         Err(AptResolutionCommandError::Unavailable(_))
     ));
+    assert!(matches!(
+        ProcessAptResolutionCommandRunner::probe_source_authority(
+            &target(),
+            "https://archive.ubuntu.com/ubuntu",
+            &repository(),
+        ),
+        Err(AptResolutionCommandError::Unavailable(_))
+    ));
 }
 
 #[test]
@@ -312,7 +443,7 @@ fn apt_backend_requires_an_explicit_target_architecture_before_runner_or_fetch()
         architecture: None,
     });
     let desired = commonkit_adapters::PackageDesiredIntent::new(declaration).unwrap();
-    let registry = PackageSourceRegistry::builtin().unwrap();
+    let registry = apt_registry();
     let root = tempfile::tempdir().unwrap();
     let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
     let mut backend = AptResolutionBackend::new(repository(), PanicRunner);
@@ -347,7 +478,7 @@ fn apt_backend_rejects_source_line_unsafe_architecture_before_runner_or_fetch() 
         architecture: Some(target.arch.clone()),
     });
     let desired = commonkit_adapters::PackageDesiredIntent::new(declaration).unwrap();
-    let registry = PackageSourceRegistry::builtin().unwrap();
+    let registry = apt_registry();
     let root = tempfile::tempdir().unwrap();
     let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
     let mut backend = AptResolutionBackend::new(repository(), PanicRunner);
@@ -379,9 +510,11 @@ fn apt_backend_rejects_unauthenticated_or_unsafe_snapshots_before_fetch() {
         unauthenticated.signed_metadata.clear();
         let mut unsafe_transaction = apt_snapshot(curl_bytes, libc_bytes);
         unsafe_transaction.risks.removals.insert("old-lib".into());
-        [unauthenticated, unsafe_transaction]
+        let mut rekeyed = apt_snapshot(curl_bytes, libc_bytes);
+        rekeyed.signed_metadata[0].signature_digest = digest(b'e');
+        [unauthenticated, unsafe_transaction, rekeyed]
     } {
-        let registry = PackageSourceRegistry::builtin().unwrap();
+        let registry = apt_registry();
         let root = tempfile::tempdir().unwrap();
         let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
         let mut backend =
@@ -413,7 +546,7 @@ fn apt_archive_outside_the_controlled_repository_is_rejected_before_fetch() {
     let mut snapshot = apt_snapshot(curl_bytes, libc_bytes);
     snapshot.archives[0].immutable_locator =
         "https://mirror.attacker.invalid/curl_8.5.0-2ubuntu10.6_amd64.deb".into();
-    let registry = PackageSourceRegistry::builtin().unwrap();
+    let registry = apt_registry();
     let root = tempfile::tempdir().unwrap();
     let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
     let mut backend = AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
@@ -442,7 +575,7 @@ fn apt_archive_outside_the_controlled_repository_is_rejected_before_fetch() {
 fn apt_resolution_is_deterministic_across_solver_output_order() {
     let curl_bytes = b"exact curl deb";
     let libc_bytes = b"exact libc deb";
-    let registry = PackageSourceRegistry::builtin().unwrap();
+    let registry = apt_registry();
     let root = tempfile::tempdir().unwrap();
     let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
     let resolve = |snapshot: AptResolutionSnapshotV1| {
@@ -490,7 +623,7 @@ fn apt_backend_resolves_authenticated_exact_closure_and_fetches_every_archive() 
         ]),
         calls: 0,
     };
-    let registry = PackageSourceRegistry::builtin().unwrap();
+    let registry = apt_registry();
     let root = tempfile::tempdir().unwrap();
     let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
 
@@ -504,6 +637,12 @@ fn apt_backend_resolves_authenticated_exact_closure_and_fetches_every_archive() 
     .resolve(&desired(), &target(), &store)
     .unwrap();
     let resolution = persisted(&intent, &store);
+    let mut rekeyed_authority = source_authority();
+    rekeyed_authority.signing_key_digest = digest(b'e');
+    let rekeyed_registry = PackageSourceRegistry::builtin()
+        .unwrap()
+        .with_apt_source_authority(&id("ubuntu-main"), rekeyed_authority)
+        .unwrap();
 
     assert_eq!(resolution.closure.len(), 2);
     assert_eq!(resolution.artifacts.len(), 2);
@@ -512,4 +651,8 @@ fn apt_backend_resolves_authenticated_exact_closure_and_fetches_every_archive() 
         OfflineInstallRecipeV1::AptArchives { .. }
     ));
     assert_eq!(fetch.calls, 2);
+    assert!(matches!(
+        intent.load_and_validate(&target(), &manager(), &rekeyed_registry, &store),
+        Err(PackageResolutionError::SourceBindingMismatch)
+    ));
 }

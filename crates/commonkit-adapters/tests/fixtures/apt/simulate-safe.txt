@@ -1,2 +1,2 @@
-Remv old-lib [1.0-1]
 Inst curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])
+Inst libc6 (2.39-0ubuntu8.4 Ubuntu:24.04/noble [amd64])
