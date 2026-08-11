@@ -283,3 +283,60 @@ fn latest_matching_allows_only_a_strict_inflight_plan_temp_entry() {
     );
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn latest_matching_rejects_noncanonical_inflight_plan_temp_entries() {
+    let root = temporary_directory("plan-store-invalid-temp");
+    let store = PlanStore::open(&root).expect("store");
+    let plan = plan_for("local-target", '3', 'c');
+    store.persist(&plan).expect("persist");
+    let digest = plan.id.as_str().trim_start_matches("sha256:");
+    fs::write(
+        root.join(format!(".plan-123-{}-0.tmp", digest.to_ascii_uppercase())),
+        b"inflight",
+    )
+    .expect("write uppercase inflight temp");
+
+    assert!(matches!(
+        store.load_latest_for_target(&StableId::parse("local-target").expect("target")),
+        Err(PlanStoreError::InvalidPlan)
+    ));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn latest_matching_rejects_malformed_inflight_plan_temp_entries() {
+    let root = temporary_directory("plan-store-malformed-temp");
+    let store = PlanStore::open(&root).expect("store");
+    let plan = plan_for("local-target", '3', 'c');
+    store.persist(&plan).expect("persist");
+    fs::write(root.join(".plan-123-not-a-digest-0.tmp"), b"inflight")
+        .expect("write malformed inflight temp");
+
+    assert!(matches!(
+        store.load_latest_for_target(&StableId::parse("local-target").expect("target")),
+        Err(PlanStoreError::InvalidPlan)
+    ));
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn scans_remain_bound_to_the_original_plan_store_root() {
+    let root = temporary_directory("plan-store-root-replacement");
+    let store = PlanStore::open(&root).expect("store");
+    let plan = plan_for("local-target", '3', 'c');
+    store.persist(&plan).expect("persist");
+
+    let original = root.with_extension("original");
+    fs::rename(&root, &original).expect("move original root");
+    fs::create_dir(&root).expect("replace root");
+    fs::write(root.join("unexpected.json"), b"not a plan").expect("write replacement");
+
+    assert!(matches!(
+        store.load_latest_for_target(&StableId::parse("local-target").expect("target")),
+        Err(PlanStoreError::InvalidRoot)
+    ));
+    fs::remove_dir_all(root).expect("cleanup replacement");
+    fs::remove_dir_all(original).expect("cleanup original");
+}
