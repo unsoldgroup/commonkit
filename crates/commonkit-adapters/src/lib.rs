@@ -90,7 +90,8 @@ pub use package_resolution::{
     PackageResolutionCoordinator, PackageResolutionDraftV1, PackageResolutionError,
     PackageResolutionProbeV1, PackageResolutionRequestV1, PackageResolutionV1,
     PackageSourceRegistry, PackageTargetV1, ResolvedPackage, ResolvedPackageIntent,
-    SourceBindingV1, package_resolution_schema, package_resolution_v2_schema,
+    SourceBindingV1, TargetNodeResolutionConfig, TargetPackageResolutionConfig,
+    package_resolution_schema, package_resolution_v2_schema,
 };
 pub use packages::{
     PackageBackendEvidence, PackageCommandError, PackageCommandOutput, PackageCommandRunner,
@@ -131,5 +132,6 @@ pub use ssh_files::{SshFileAdapter, SshFileAdapterError, SshTargetCapabilities};
 pub use target::{
     AptResolutionConstraints, LocalTargetFilesystem, PackageMutationArtifact, PackageMutationPhase,
     SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem,
-    TargetFilesystem, TargetFilesystemError, TargetResource,
+    TargetFilesystem, TargetFilesystemError, TargetResource, package_resolution_request_digest,
+    package_resolution_response_digest,
 };

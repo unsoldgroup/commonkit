@@ -25,11 +25,43 @@ Example configuration (paths are target-local):
   "stateRoot": "/home/al/.local/state/commonkit/target-helper",
   "roots": [
     { "id": "home", "path": "/home/al", "access": "read_write" }
-  ]
+  ],
+  "packageResolution": {
+    "target": {
+      "os": "linux",
+      "osVersion": "24.04",
+      "distroId": "ubuntu",
+      "distroVersion": "24.04",
+      "codename": "noble",
+      "arch": "amd64",
+      "libc": "glibc"
+    },
+    "manager": {
+      "manager": "apt",
+      "version": "<target-probed-version>",
+      "executableDigest": "sha256:<64-hex>",
+      "configDigest": "sha256:<64-hex>"
+    },
+    "policy": { "allowlists": {} },
+    "apt": {
+      "sourceId": "ubuntu-main",
+      "suite": "noble",
+      "components": ["main"],
+      "signedBy": "/etc/commonkit/apt/archive-keyring.gpg",
+      "signingAuthority": "ubuntu-key"
+    },
+    "targetIdentityDigest": "sha256:<64-hex>"
+  }
 }
 ```
+
+`packageResolution` is optional and is disabled when absent. When present, its
+manager binding, policy, source authority, and all resolver paths are target
+local; the SSH request supplies only a typed desired package and a challenge.
+The helper probes the configured target before resolving. A Node/NVM target
+uses `node` instead of `apt` and keeps `nvmDir`, `shellExecutable`,
+`releaseKeyring`, and `gpgvExecutable` in this target-only file.
 
 The helper must be upgraded atomically with the controlling CommonKit release. Retain the prior
 verified binary until the first post-upgrade target verification succeeds so rollback does not
 depend on the network.
-

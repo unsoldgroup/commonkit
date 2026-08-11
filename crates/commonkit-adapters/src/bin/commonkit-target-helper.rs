@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use commonkit_adapters::{SshFilesystemRequest, TargetHelper};
+use commonkit_adapters::{SshFilesystemRequest, TargetHelper, TargetPackageResolutionConfig};
 use commonkit_core::TargetRoot;
 use serde::Deserialize;
 
@@ -12,6 +12,8 @@ const MAX_REQUEST_BYTES: u64 = 64 * 1024 * 1024;
 struct HelperConfig {
     state_root: PathBuf,
     roots: Vec<TargetRoot>,
+    #[serde(default)]
+    package_resolution: Option<TargetPackageResolutionConfig>,
 }
 
 fn main() {
@@ -39,7 +41,12 @@ fn run() -> Result<(), ()> {
     }
     let config: HelperConfig =
         serde_json::from_slice(&std::fs::read(config_path).map_err(|_| ())?).map_err(|_| ())?;
-    let helper = TargetHelper::open(config.roots, &config.state_root).map_err(|_| ())?;
+    let helper = TargetHelper::open_with_package_resolution(
+        config.roots,
+        &config.state_root,
+        config.package_resolution,
+    )
+    .map_err(|_| ())?;
     let mut input = Vec::new();
     std::io::stdin()
         .take(MAX_REQUEST_BYTES + 1)

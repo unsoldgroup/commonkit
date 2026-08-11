@@ -51,6 +51,31 @@ pub struct PackageTargetV1 {
     pub manager_prefix: Option<String>,
 }
 
+/// Target-local package resolution authority. This is installed beside the
+/// helper and is never accepted from a controller request. Paths in this
+/// structure are interpreted only by the target helper process.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TargetPackageResolutionConfig {
+    pub target: PackageTargetV1,
+    pub manager: ManagerBindingV1,
+    pub policy: SecurityPolicy,
+    #[serde(default)]
+    pub apt: Option<crate::AptRepositoryConfigurationV1>,
+    #[serde(default)]
+    pub node: Option<TargetNodeResolutionConfig>,
+    pub target_identity_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TargetNodeResolutionConfig {
+    pub nvm_dir: std::path::PathBuf,
+    pub shell_executable: std::path::PathBuf,
+    pub release_keyring: std::path::PathBuf,
+    pub gpgv_executable: std::path::PathBuf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ManagerBindingV1 {
@@ -793,6 +818,30 @@ impl PackageSourceRegistry {
             .ok_or_else(|| PackageResolutionError::UnknownSource {
                 source_id: source_id.clone(),
             })
+    }
+
+    /// Build the controller-side view of a source authority attested by a
+    /// verified target helper. The helper owns target-local keyring paths, so
+    /// the controller must not re-read those paths to reconstruct this
+    /// definition. Built-in source identity and canonical repository remain
+    /// fixed; only the helper-attested definition digest is carried across.
+    pub fn for_remote_resolution(
+        source: &SourceBindingV1,
+        manager: PackageManager,
+    ) -> Result<Self, PackageResolutionError> {
+        let mut registry = Self::builtin()?;
+        let definition = registry.sources.get_mut(&source.source_id).ok_or_else(|| {
+            PackageResolutionError::UnknownSource {
+                source_id: source.source_id.clone(),
+            }
+        })?;
+        if definition.manager != manager
+            || definition.canonical_repository != source.canonical_repository
+        {
+            return Err(PackageResolutionError::SourceBindingMismatch);
+        }
+        definition.digest = source.registry_definition_digest.clone();
+        Ok(registry)
     }
 
     pub fn with_apt_source_authority(

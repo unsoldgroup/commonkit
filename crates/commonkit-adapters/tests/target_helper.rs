@@ -3,8 +3,11 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use commonkit_adapters::{
-    FileMode, NormalizedManagedPath, SafeSymlinkTarget, SshFilesystemRequest,
-    SshFilesystemResponse, SymlinkTargetKind, TargetResource,
+    FileMode, NormalizedManagedPath, PackageDesiredIntent, SafeSymlinkTarget, SshFilesystemRequest,
+    SshFilesystemResponse, SymlinkTargetKind, TargetResource, package_resolution_request_digest,
+};
+use commonkit_contracts::{
+    PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, digest_domain_json,
 };
 use commonkit_core::{Sha256Digest, StableId};
 use sha2::{Digest, Sha256};
@@ -245,4 +248,84 @@ fn helper_rejects_any_command_surface_other_than_stdio_protocol() {
         String::from_utf8_lossy(&output.stderr),
         "commonkit target helper rejected the request\n"
     );
+}
+
+#[test]
+fn helper_without_target_resolver_capability_returns_typed_rejection() {
+    let home = temp("resolution-absent-home");
+    let target = temp("resolution-absent-target");
+    let state = temp("resolution-absent-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state,
+            "roots": [{"id":"home","path":target,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let target_facts = commonkit_adapters::PackageTargetV1 {
+        os: "linux".into(),
+        os_version: "24.04".into(),
+        distro_id: Some("ubuntu".into()),
+        distro_version: Some("24.04".into()),
+        codename: Some("noble".into()),
+        arch: "amd64".into(),
+        libc: Some("glibc".into()),
+        manager_prefix: None,
+    };
+    let desired = PackageDesiredIntent::new(PackageDeclaration {
+        id: StableId::parse("curl").unwrap(),
+        version: "1.0.0".into(),
+        manager: PackageManager::Apt,
+        source: StableId::parse("ubuntu-main").unwrap(),
+        selector: Some(PackageSelector::AptBinary {
+            name: "curl".into(),
+            architecture: Some("amd64".into()),
+        }),
+    })
+    .unwrap();
+    let identity = digest_domain_json("fixture", &"target").unwrap();
+    let request_digest = package_resolution_request_digest(
+        &StableId::parse("home").unwrap(),
+        &desired,
+        &target_facts,
+        PackageManager::Apt,
+        &SecurityPolicy::default(),
+        &None,
+        &identity,
+    )
+    .unwrap();
+    let output = invoke(
+        &home,
+        &SshFilesystemRequest::PackageResolution {
+            root_id: StableId::parse("home").unwrap(),
+            request_id: StableId::parse("curl").unwrap(),
+            desired,
+            target: target_facts,
+            manager_kind: PackageManager::Apt,
+            policy: SecurityPolicy::default(),
+            apt: None,
+            target_identity_digest: identity.clone(),
+            request_digest: request_digest.clone(),
+        },
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<SshFilesystemResponse>(&output.stdout).unwrap(),
+        SshFilesystemResponse::PackageResolutionRejected {
+            request_id: StableId::parse("curl").unwrap(),
+            request_digest,
+            target_identity_digest: identity,
+        }
+    );
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(state).unwrap();
 }

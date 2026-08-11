@@ -365,6 +365,49 @@ pub struct AptResolutionConstraints {
     pub signing_authority: StableId,
 }
 
+/// Computes the digest binding a target-local package resolution challenge to
+/// the exact controller request. Keep this in the protocol module so both
+/// sides hash the same typed fields.
+pub fn package_resolution_request_digest(
+    root_id: &StableId,
+    desired: &crate::PackageDesiredIntent,
+    target: &crate::PackageTargetV1,
+    manager_kind: commonkit_contracts::PackageManager,
+    policy: &commonkit_contracts::SecurityPolicy,
+    apt: &Option<AptResolutionConstraints>,
+    target_identity_digest: &commonkit_contracts::Sha256Digest,
+) -> Result<commonkit_contracts::Sha256Digest, commonkit_contracts::ContractError> {
+    commonkit_contracts::digest_domain_json(
+        "commonkit.ssh-package-resolution-request.v1",
+        &(
+            root_id,
+            desired,
+            target,
+            manager_kind,
+            policy,
+            apt,
+            target_identity_digest,
+        ),
+    )
+}
+
+pub fn package_resolution_response_digest(
+    request_digest: &commonkit_contracts::Sha256Digest,
+    target_identity_digest: &commonkit_contracts::Sha256Digest,
+    resolution: &crate::PackageResolutionV1,
+    artifacts: &[PackageMutationArtifact],
+) -> Result<commonkit_contracts::Sha256Digest, commonkit_contracts::ContractError> {
+    commonkit_contracts::digest_domain_json(
+        "commonkit.ssh-package-resolution-response.v1",
+        &(
+            request_digest,
+            target_identity_digest,
+            resolution,
+            artifacts,
+        ),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
@@ -608,6 +651,12 @@ pub enum TargetFilesystemError {
     RemoteArtifact,
     #[error("remote offline package mutation failed")]
     PackageCommandFailed,
+    #[error("target-local package resolution capability is unavailable")]
+    PackageResolutionUnavailable,
+    #[error("target-local package resolution challenge or authority was rejected")]
+    PackageResolutionRejected,
+    #[error("target-local package resolution failed")]
+    PackageResolutionFailed,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

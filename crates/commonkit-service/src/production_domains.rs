@@ -30,7 +30,7 @@ use commonkit_adapters::{
     ResolvedMaterializedState, ResolvedPackageIntent, ResourceIntent, ResourceProvenance,
     SecretValue, SshFileAdapter, SshOfflinePackageBackend, SshTargetCapabilities,
     build_provider_plan, build_resolved_provider_plan_with_router, materialize_mcp_client_state,
-    validate_ownership,
+    package_resolution_request_digest, package_resolution_response_digest, validate_ownership,
 };
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
@@ -1340,6 +1340,8 @@ struct ProductionPackageFetch {
     runtime: tokio::runtime::Runtime,
 }
 
+const MAX_REMOTE_PACKAGE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+
 impl ProductionPackageFetch {
     fn new() -> Result<Self, PackageResolutionError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2271,7 +2273,10 @@ impl ProductionSyncDomain {
         let platform = self.config.provider_platform()?;
         let ssh_target = production_ssh_target(transport, capabilities, platform)?;
         let mut remote = self.ssh_factory.open(&ssh_target)?;
-        let authority = self.configured_package_authority(target, config)?;
+        // SSH resolution authority is attested by the target helper. Do not
+        // read APT keyring or NVM paths from the controller while planning a
+        // remote target.
+        let mut authority: Option<PackageResolutionAuthority> = None;
         let mut resolved_states = Vec::with_capacity(states.len());
         for state in states {
             let mut resources = Vec::with_capacity(state.resources.len());
@@ -2297,17 +2302,14 @@ impl ProductionSyncDomain {
                                 components: apt.components.clone(),
                                 signing_authority: apt.signing_authority.clone(),
                             });
-                        let request_digest = digest_domain_json(
-                            "commonkit.ssh-package-resolution-request.v1",
-                            &(
-                                &ssh_target.root_id,
-                                desired,
-                                target,
-                                manager_kind,
-                                &config.policy,
-                                &apt_constraints,
-                                &self.config.target_identity_digest,
-                            ),
+                        let request_digest = package_resolution_request_digest(
+                            &ssh_target.root_id,
+                            desired,
+                            target,
+                            manager_kind,
+                            &config.policy,
+                            &apt_constraints,
+                            &self.config.target_identity_digest,
                         )
                         .map_err(|_| DomainFailure::OperationFailed)?;
                         let response = remote
@@ -2342,22 +2344,82 @@ impl ProductionSyncDomain {
                         if response_request_id != request_id
                             || response_digest != request_digest
                             || target_identity_digest != self.config.target_identity_digest
-                            || resolution.target != *authority.target()
-                            || resolution.manager != *authority.manager()
+                            || resolution.target != *target
+                            || resolution.manager != config.manager
                         {
                             return Err(DomainFailure::OperationFailed);
                         }
-                        let expected_attestation = digest_domain_json(
-                            "commonkit.ssh-package-resolution-response.v1",
-                            &(
-                                &request_digest,
-                                &target_identity_digest,
-                                &resolution,
-                                &remote_artifacts,
-                            ),
+                        let expected_attestation = package_resolution_response_digest(
+                            &request_digest,
+                            &target_identity_digest,
+                            &resolution,
+                            &remote_artifacts,
                         )
                         .map_err(|_| DomainFailure::OperationFailed)?;
                         if attestation_digest != expected_attestation {
+                            return Err(DomainFailure::OperationFailed);
+                        }
+                        let requested_declaration = match desired {
+                            commonkit_adapters::PackageDesiredIntent::Package { declaration } => {
+                                declaration
+                            }
+                        };
+                        if resolution.declaration != *requested_declaration {
+                            return Err(DomainFailure::OperationFailed);
+                        }
+                        let remote_registry = PackageSourceRegistry::for_remote_resolution(
+                            &resolution.source,
+                            resolution.manager.manager,
+                        )
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                        let remote_authority = PackageResolutionAuthority::new(
+                            target,
+                            &resolution.manager,
+                            &remote_registry,
+                            &config.policy,
+                        )
+                        .map_err(|_| DomainFailure::OperationFailed)?;
+                        if authority
+                            .as_ref()
+                            .is_some_and(|current| current.digest() != remote_authority.digest())
+                        {
+                            return Err(DomainFailure::OperationFailed);
+                        }
+                        let expected_artifacts = resolution
+                            .artifacts
+                            .iter()
+                            .map(|artifact| {
+                                (
+                                    artifact.content.digest.as_str().to_owned(),
+                                    artifact.content.bytes,
+                                    format!("{:?}", artifact.content.sensitivity),
+                                )
+                            })
+                            .collect::<BTreeSet<_>>();
+                        let returned_artifacts = remote_artifacts
+                            .iter()
+                            .map(|artifact| {
+                                (
+                                    artifact.reference.digest.as_str().to_owned(),
+                                    artifact.reference.bytes,
+                                    format!("{:?}", artifact.reference.sensitivity),
+                                )
+                            })
+                            .collect::<BTreeSet<_>>();
+                        if expected_artifacts != returned_artifacts
+                            || expected_artifacts.len() != remote_artifacts.len()
+                            || remote_artifacts.iter().any(|artifact| {
+                                u64::try_from(artifact.bytes.len()).ok()
+                                    != Some(artifact.reference.bytes)
+                                    || artifact.reference.bytes > MAX_REMOTE_PACKAGE_ARTIFACT_BYTES
+                                    || Sha256Digest::parse(format!(
+                                        "sha256:{:x}",
+                                        Sha256::digest(&artifact.bytes)
+                                    ))
+                                    .ok()
+                                        != Some(artifact.reference.digest.clone())
+                            })
+                        {
                             return Err(DomainFailure::OperationFailed);
                         }
                         let resolution_bytes = serde_json::to_vec(&resolution)
@@ -2380,9 +2442,10 @@ impl ProductionSyncDomain {
                             resolution: resolution_reference,
                             artifacts: artifact_references,
                         };
-                        authority
+                        remote_authority
                             .validate(&resolved, artifacts)
                             .map_err(|_| DomainFailure::OperationFailed)?;
+                        authority = Some(remote_authority);
                         ResourceIntent::ResolvedPackage(resolved)
                     }
                     ResourceIntent::ResolvedPackage(_) => {
@@ -2405,7 +2468,10 @@ impl ProductionSyncDomain {
                 .map_err(|_| DomainFailure::OperationFailed)?,
             );
         }
-        Ok((resolved_states, authority))
+        Ok((
+            resolved_states,
+            authority.ok_or(DomainFailure::OperationFailed)?,
+        ))
     }
 
     fn configured_package_authority(
