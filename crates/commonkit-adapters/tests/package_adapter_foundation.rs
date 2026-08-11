@@ -285,6 +285,154 @@ fn operation(resolution_digest: Sha256Digest) -> Operation {
     .unwrap()
 }
 
+fn apt_live_safety_marker() -> String {
+    format!("commonkit-apt-live-safety={}", digest('e').as_str())
+}
+
+#[test]
+fn apt_recovery_matches_pre_apply_state_without_live_safety_marker() {
+    let (mut resolution, authority) = apt_resolution();
+    resolution.before = PackageObservationV1 {
+        installed_versions: BTreeSet::from([
+            apt_live_safety_marker(),
+            "libc6:amd64=2.39-0ubuntu8.6".into(),
+        ]),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from(["libc6:amd64=2.39-0ubuntu8.6".into()]),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Before)
+    );
+}
+
+#[test]
+fn apt_recovery_accepts_exact_installed_closure_with_live_safety_marker() {
+    let (mut resolution, authority) = apt_resolution();
+    resolution.before = PackageObservationV1 {
+        installed_versions: BTreeSet::from([apt_live_safety_marker()]),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from(["ripgrep:amd64=14.1.1-1ubuntu1".into()]),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::After)
+    );
+}
+
+#[test]
+fn apt_recovery_fails_closed_for_marker_drift_or_substitution() {
+    let cases = [
+        (
+            BTreeSet::from(["libc6:amd64=2.39-0ubuntu8.6".into()]),
+            BTreeSet::from(["libc6:amd64=2.39-0ubuntu8.6".into()]),
+        ),
+        (
+            BTreeSet::from([
+                "commonkit-apt-live-safety=not-a-digest".into(),
+                "libc6:amd64=2.39-0ubuntu8.6".into(),
+            ]),
+            BTreeSet::from(["libc6:amd64=2.39-0ubuntu8.6".into()]),
+        ),
+        (
+            BTreeSet::from([
+                apt_live_safety_marker(),
+                "libc6:amd64=2.39-0ubuntu8.6".into(),
+            ]),
+            BTreeSet::from(["openssl:amd64=3.0.13-0ubuntu3.1".into()]),
+        ),
+    ];
+    for (before, observed) in cases {
+        let (mut resolution, authority) = apt_resolution();
+        resolution.before = PackageObservationV1 {
+            installed_versions: before,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let artifacts = ArtifactStore::open(root.path()).unwrap();
+        let resolution_ref = artifacts
+            .put(
+                &serde_json::to_vec(&resolution).unwrap(),
+                ContentSensitivity::Portable,
+            )
+            .unwrap();
+        let backend = FakeMutationBackend {
+            manager: PackageManager::Apt,
+            target_supported: true,
+            observed: PackageObservationV1 {
+                installed_versions: observed,
+            },
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+        assert_eq!(
+            adapter.observe_recovery(&operation(resolution_ref.digest)),
+            Ok(RecoveryObservation::Other)
+        );
+    }
+
+    let (mut resolution, authority) = apt_resolution();
+    resolution.before = PackageObservationV1 {
+        installed_versions: BTreeSet::from([apt_live_safety_marker()]),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from([
+                "commonkit-apt-live-safety=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            ]),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Other)
+    );
+}
+
 #[test]
 fn approved_apt_resolution_delegates_only_offline_mutation_calls() {
     let (resolution, authority) = apt_resolution();
@@ -691,6 +839,10 @@ fn process_verify_rejects_missing_desired_state_instead_of_preparing_artifacts()
 #[test]
 fn apt_recovery_matches_real_names_for_logical_root_and_hashed_dependencies() {
     let (mut resolution, authority) = apt_resolution();
+    resolution
+        .before
+        .installed_versions
+        .insert(apt_live_safety_marker());
     let source = resolution.source.clone();
     let root = PackageDeclaration {
         id: StableId::parse("logical-root").unwrap(),
@@ -753,6 +905,10 @@ fn apt_recovery_matches_real_names_for_logical_root_and_hashed_dependencies() {
 #[test]
 fn apt_recovery_resolves_all_and_native_architectures_in_the_closure() {
     let (mut resolution, authority) = apt_resolution();
+    resolution
+        .before
+        .installed_versions
+        .insert(apt_live_safety_marker());
     let source = resolution.source.clone();
     let root = PackageDeclaration {
         id: StableId::parse("logical-all-root").unwrap(),

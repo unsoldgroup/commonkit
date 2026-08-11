@@ -26,6 +26,7 @@ use crate::{
 };
 
 const CLOSED_NVM_PATH: &str = "/usr/bin:/bin";
+const APT_LIVE_SAFETY_MARKER_PREFIX: &str = "commonkit-apt-live-safety=";
 
 /// The only target-side capability exposed to package mutation.
 ///
@@ -437,8 +438,16 @@ impl Adapter for PackageAdapter {
         {
             return Ok(RecoveryObservation::Other);
         }
+        let before = if resolution.manager.manager == PackageManager::Apt {
+            apt_before_observation(&resolution)
+        } else {
+            Some(resolution.before.clone())
+        };
+        let Some(before) = before else {
+            return Ok(RecoveryObservation::Other);
+        };
         Ok(
-            if observed.installed_versions == resolution.before.installed_versions {
+            if observed.installed_versions == before.installed_versions {
                 RecoveryObservation::Before
             } else if Self::after_resolution(&resolution, &observed) {
                 RecoveryObservation::After
@@ -589,6 +598,23 @@ fn valid_apt_observation(observed: &PackageObservationV1, target_architecture: &
     !name_versions.values().any(|architectures| {
         architectures.contains("all") && architectures.contains(target_architecture)
     })
+}
+
+fn apt_before_observation(resolution: &PackageResolutionV1) -> Option<PackageObservationV1> {
+    let mut marker = None;
+    let mut installed_versions = BTreeSet::new();
+    for identity in &resolution.before.installed_versions {
+        if let Some(digest) = identity.strip_prefix(APT_LIVE_SAFETY_MARKER_PREFIX) {
+            if marker.replace(digest).is_some() || Sha256Digest::parse(digest).is_err() {
+                return None;
+            }
+        } else {
+            installed_versions.insert(identity.clone());
+        }
+    }
+    marker?;
+    let observed = PackageObservationV1 { installed_versions };
+    valid_apt_observation(&observed, &resolution.target.arch).then_some(observed)
 }
 
 fn parse_apt_observation_identity(identity: &str) -> Option<(&str, &str, &str)> {
