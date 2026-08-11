@@ -641,6 +641,10 @@ fn apt_declaration_key(
     ))
 }
 
+pub(crate) fn apt_package_identity(name: &str, architecture: &str, version: &str) -> String {
+    format!("{name}:{architecture}={version}")
+}
+
 fn apt_architecture_matches(resolved: &str, requested: &str) -> bool {
     resolved == requested || resolved == "all"
 }
@@ -1480,7 +1484,7 @@ fn resolve_apt_on_linux(
     )?;
     let mut installed_versions = installed
         .iter()
-        .map(|((name, architecture), version)| format!("{name}:{architecture}={version}"))
+        .map(|((name, architecture), version)| apt_package_identity(name, architecture, version))
         .collect::<BTreeSet<_>>();
     installed_versions.insert(format!(
         "commonkit-apt-live-safety={}",

@@ -3,15 +3,16 @@ use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
     ArtifactStore, ContentSensitivity, ManagerBindingV1, OfflineInstallRecipeV1, PackageAdapter,
-    PackageMutationBackend, PackageMutationError, PackageObservationV1, PackageResolutionAuthority,
-    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ResolvedPackage, SourceBindingV1,
+    PackageMutationBackend, PackageMutationBackendRegistry, PackageMutationError,
+    PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1, PackageSourceRegistry,
+    PackageTargetV1, ResolvedPackage, SourceBindingV1,
 };
 use commonkit_contracts::{
     Operation, OperationKind, PackageDeclaration, PackageManager, PackageSelector,
     RecoveryCapability, ResourceRef, Risk, SchemaVersion, SecurityPolicy, Sha256Digest, StableId,
 };
 use commonkit_core::OperationDraft;
-use commonkit_reconcile::Adapter;
+use commonkit_reconcile::{Adapter, RecoveryObservation};
 
 #[test]
 fn package_adapter_api_exposes_only_the_typed_offline_backend_seam() {
@@ -215,4 +216,171 @@ fn unsupported_manager_fails_before_backend_mutation() {
         .unwrap_err();
     assert_eq!(error.code, "package_manager_unsupported");
     assert!(calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn apt_recovery_matches_real_names_for_logical_root_and_hashed_dependencies() {
+    let (mut resolution, authority) = apt_resolution();
+    let source = resolution.source.clone();
+    let root = PackageDeclaration {
+        id: StableId::parse("logical-root").unwrap(),
+        version: "8.5.0-2ubuntu10.6".into(),
+        manager: PackageManager::Apt,
+        source: source.source_id.clone(),
+        selector: Some(PackageSelector::AptBinary {
+            name: "curl".into(),
+            architecture: Some("amd64".into()),
+        }),
+    };
+    resolution.declaration = root.clone();
+    resolution.closure = vec![
+        ResolvedPackage {
+            declaration: PackageDeclaration {
+                id: StableId::parse("apt-dep-0123456789abcdef012345678").unwrap(),
+                version: "2.39-0ubuntu8.6".into(),
+                manager: PackageManager::Apt,
+                source: source.source_id.clone(),
+                selector: Some(PackageSelector::AptBinary {
+                    name: "libc6".into(),
+                    architecture: Some("amd64".into()),
+                }),
+            },
+            source: source.clone(),
+        },
+        ResolvedPackage {
+            declaration: root,
+            source,
+        },
+    ];
+
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from([
+                "curl:amd64=8.5.0-2ubuntu10.6".into(),
+                "libc6:amd64=2.39-0ubuntu8.6".into(),
+            ]),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::After)
+    );
+}
+
+#[test]
+fn apt_recovery_resolves_all_and_native_architectures_in_the_closure() {
+    let (mut resolution, authority) = apt_resolution();
+    let source = resolution.source.clone();
+    let root = PackageDeclaration {
+        id: StableId::parse("logical-all-root").unwrap(),
+        version: "2023.4ubuntu1".into(),
+        manager: PackageManager::Apt,
+        source: source.source_id.clone(),
+        selector: Some(PackageSelector::AptBinary {
+            name: "debian-archive-keyring".into(),
+            architecture: Some("all".into()),
+        }),
+    };
+    resolution.declaration = root.clone();
+    resolution.closure = vec![
+        ResolvedPackage {
+            declaration: PackageDeclaration {
+                id: StableId::parse("apt-dep-fedcba9876543210fedcba98").unwrap(),
+                version: "2.39-0ubuntu8.6".into(),
+                manager: PackageManager::Apt,
+                source: source.source_id.clone(),
+                selector: Some(PackageSelector::AptBinary {
+                    name: "libc6".into(),
+                    architecture: None,
+                }),
+            },
+            source: source.clone(),
+        },
+        ResolvedPackage {
+            declaration: root,
+            source,
+        },
+    ];
+
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from([
+                "debian-archive-keyring:all=2023.4ubuntu1".into(),
+                "libc6:amd64=2.39-0ubuntu8.6".into(),
+            ]),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::After)
+    );
+}
+
+fn fake_backend(manager: PackageManager) -> Box<dyn PackageMutationBackend> {
+    Box::new(FakeMutationBackend {
+        manager,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+/// The registry's duplicate-claim check previously probed only Apt and Nvm,
+/// so two backends claiming any other manager registered silently and
+/// dispatch went to whichever was inserted first. Every manager must be
+/// covered for the closed-dispatch guarantee to hold.
+#[test]
+fn registry_rejects_two_backends_claiming_the_same_manager() {
+    for manager in [
+        PackageManager::Homebrew,
+        PackageManager::Apt,
+        PackageManager::Fnm,
+        PackageManager::Nvm,
+        PackageManager::Rustup,
+    ] {
+        assert_eq!(
+            PackageMutationBackendRegistry::new([fake_backend(manager), fake_backend(manager)])
+                .err(),
+            Some(PackageMutationError::Backend),
+            "duplicate {manager:?} backends were accepted"
+        );
+    }
+}
+
+#[test]
+fn registry_accepts_distinct_managers_and_reports_only_those() {
+    let registry = PackageMutationBackendRegistry::new([
+        fake_backend(PackageManager::Homebrew),
+        fake_backend(PackageManager::Rustup),
+    ])
+    .expect("distinct managers register");
+
+    assert!(registry.supports_manager(PackageManager::Homebrew));
+    assert!(registry.supports_manager(PackageManager::Rustup));
+    assert!(!registry.supports_manager(PackageManager::Fnm));
 }
