@@ -2668,6 +2668,7 @@ impl ProductionSyncDomain {
 
     fn configured_package_authority_for_verify(
         &self,
+        expected_digest: Option<&Sha256Digest>,
     ) -> Result<PackageResolutionAuthority, DomainFailure> {
         let config = self
             .config
@@ -2683,7 +2684,22 @@ impl ProductionSyncDomain {
         {
             return Err(DomainFailure::InvalidRequest);
         }
-        self.configured_package_authority(&target, config)
+        let canonical = self.configured_package_authority(&target, config)?;
+        if expected_digest.is_none_or(|digest| digest == canonical.digest()) {
+            return Ok(canonical);
+        }
+
+        // Plans written before target aliases were canonicalized used
+        // `darwin` in the authority digest. Preserve verification for those
+        // immutable plans, but only when the binding is exactly the trusted
+        // legacy authority for this configured target.
+        if config.target.os.eq_ignore_ascii_case("darwin") {
+            let legacy = self.configured_package_authority(&config.target, config)?;
+            if expected_digest == Some(legacy.digest()) {
+                return Ok(legacy);
+            }
+        }
+        Err(DomainFailure::InvalidRequest)
     }
 
     fn resolve_with_backend<B: PackageResolutionBackend>(
@@ -3685,7 +3701,9 @@ impl SyncDomain for ProductionSyncDomain {
                 .map(|(authority, _, _)| authority)
                 .map_err(|_| DomainFailure::OperationFailed)?
             } else {
-                self.configured_package_authority_for_verify()?
+                self.configured_package_authority_for_verify(
+                    plan.bindings.package_resolution_authority_digest.as_ref(),
+                )?
             };
             if plan.bindings.package_resolution_authority_digest.as_ref()
                 != Some(authority.digest())
@@ -6362,6 +6380,81 @@ mod package_resolution_tests {
         .unwrap();
         assert_eq!(macos.target.os, "macos");
         assert_eq!(macos.target.arch, "x86_64");
+    }
+
+    #[test]
+    fn legacy_darwin_plan_authority_remains_verifiable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        let target = PackageTargetV1 {
+            os: "darwin".into(),
+            os_version: "14".into(),
+            distro_id: None,
+            distro_version: None,
+            codename: None,
+            arch: "x86_64".into(),
+            libc: None,
+            manager_prefix: Some("/Users/al/.nvm".into()),
+        };
+        let manager = ManagerBindingV1 {
+            manager: PackageManager::Nvm,
+            version: "0.40.6".into(),
+            executable_digest: digest_domain_json("fixture", &"nvm").unwrap(),
+            config_digest: digest_domain_json("fixture", &"nvm-config").unwrap(),
+        };
+        let policy = SecurityPolicy::default();
+        let config = SyncConfig {
+            target_id: StableId::parse("legacy-darwin-target").unwrap(),
+            target_root: root.join("target"),
+            adapter_state: root.join("adapter"),
+            provider_artifacts: root.join("provider-artifacts"),
+            materialized_states: Vec::new(),
+            provider_pipeline: None,
+            styleguide: None,
+            target_transport: Some(SyncTargetTransport::Local),
+            target_platform: Some(SyncTargetPlatform {
+                operating_system: "macos".into(),
+                architecture: "x86_64".into(),
+            }),
+            declared_roots: vec![NormalizedManagedPath::parse("home").unwrap()],
+            relay_client_root: None,
+            protected_roots: Vec::new(),
+            case_sensitive: true,
+            target_identity_digest: digest_domain_json("fixture", &"target").unwrap(),
+            composed_loadout_digest: digest_domain_json("fixture", &"loadout").unwrap(),
+            policy_digest: digest_domain_json("fixture", &"policy").unwrap(),
+            package_resolution: Some(PackageResolutionConfig {
+                target: target.clone(),
+                manager: manager.clone(),
+                policy: policy.clone(),
+                apt: None,
+                node: None,
+            }),
+            relay_endpoint: None,
+        };
+        let domain = ProductionSyncDomain {
+            config,
+            plan_store: Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+            receipt_root: root.join("receipts"),
+            ssh_factory: Arc::new(ProcessSshTransportFactory),
+        };
+        let registry =
+            package_source_registry(domain.config.package_resolution.as_ref().unwrap()).unwrap();
+        let legacy_authority =
+            PackageResolutionAuthority::new(&target, &manager, &registry, &policy).unwrap();
+
+        let verified = domain
+            .configured_package_authority_for_verify(Some(legacy_authority.digest()))
+            .unwrap();
+        assert_eq!(verified.digest(), legacy_authority.digest());
+        assert_eq!(verified.target().os, "darwin");
+        assert!(
+            domain
+                .configured_package_authority_for_verify(Some(
+                    &digest_domain_json("fixture", &"foreign-authority").unwrap()
+                ))
+                .is_err()
+        );
     }
 
     #[test]
