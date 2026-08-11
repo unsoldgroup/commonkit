@@ -1,0 +1,7 @@
+Package: libc6
+Version: 2.39-0ubuntu8.4
+Architecture: amd64
+Filename: pool/main/g/glibc/libc6_2.39-0ubuntu8.4_amd64.deb
+Size: 14
+SHA256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Description: GNU C Library shared libraries
