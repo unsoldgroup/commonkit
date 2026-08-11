@@ -1158,7 +1158,10 @@ fn package_evidence_pending(journal: &ReceiptJournal, operation: &Operation) -> 
         .is_some_and(|authorization| {
             authorization.evidence.iter().any(|evidence| {
                 evidence.operation_id == operation.id
-                    && evidence.exit_classification == PackageExitClassification::NotRun
+                    && !matches!(
+                        evidence.exit_classification,
+                        PackageExitClassification::Succeeded
+                    )
             })
         })
 }
