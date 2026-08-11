@@ -159,7 +159,10 @@ function renderShell() {
       <section class="list-alternative" aria-label="Accessible issue list"><div class="list-heading"><h2>Accessible list</h2><span>Use this view if the graph is too dense.</span></div><div id="issue-list"></div></section>
     </section>
   </main><div id="toast" role="status" aria-live="polite"></div>`;
-  if (existingGraphContainer && cy) $("#cy").replaceWith(existingGraphContainer);
+  if (existingGraphContainer && cy) {
+    $("#cy").replaceWith(existingGraphContainer);
+    cy.resize();
+  }
   renderRecommendations(); renderZones(); renderList(); renderGraph(); renderContext();
 }
 
@@ -318,8 +321,8 @@ async function loadGraph() {
     if (!response.ok) throw new Error("Graph unavailable");
     const body = await response.json() as Record<string, unknown>;
     if (requestId !== graphRequestId || controller.signal.aborted || requestedView !== view) return;
-    if (body.snapshot && typeof body.snapshot === "object" && "nodes" in body.snapshot) { const snapshot = body.snapshot as Parameters<typeof normalizePayload>[0]; payload = normalizePayload(snapshot, body.brief as Parameters<typeof normalizePayload>[1], body.analysis as Parameters<typeof normalizePayload>[2]); graphRevision += 1; }
-    else if ("nodes" in body) { payload = normalizePayload(body as Parameters<typeof normalizePayload>[0]); graphRevision += 1; }
+    if (body.snapshot && typeof body.snapshot === "object" && "nodes" in body.snapshot) { const snapshot = body.snapshot as Parameters<typeof normalizePayload>[0]; payload = normalizePayload(snapshot, body.brief as Parameters<typeof normalizePayload>[1], body.analysis as Parameters<typeof normalizePayload>[2]); graphRevision += 1; fitNextGraph = true; }
+    else if ("nodes" in body) { payload = normalizePayload(body as Parameters<typeof normalizePayload>[0]); graphRevision += 1; fitNextGraph = true; }
     graphError = null;
     initialLoading = false;
     renderShell();
