@@ -47,11 +47,21 @@ fi
 
 systemctl --user restart "$SERVICE"
 
-pid="$(systemctl --user show "$SERVICE" -p MainPID --value)"
-port="$(tr '\0' '\n' < "/proc/${pid}/environ" | sed -n 's/^LINEAR_GRAPH_PORT=//p')"
-port="${port:-8790}"
+# Read the port from the unit's EnvironmentFile, not from a just-restarted
+# MainPID: that races the restart, and an empty result silently fell back to
+# 8790, where an unrelated service answered and the deploy reported success.
+env_file="$(systemctl --user show "$SERVICE" -p EnvironmentFiles --value | sed 's/ (ignore_errors=.*//')"
+if [[ -z "$env_file" || ! -r "$env_file" ]]; then
+  echo "error: cannot read the EnvironmentFile for ${SERVICE}; refusing to guess the port" >&2
+  exit 1
+fi
+port="$(sed -n 's/^LINEAR_GRAPH_PORT=//p' "$env_file" | tr -d '"'"'"'')"
+port="${port:-8790}"  # main.ts default, only reached when the file omits the key
+
+# Require the hub's own response. Any listener can answer a port; only this one
+# reports ok.
 for _ in $(seq 1 15); do
-  if curl -fsS "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+  if curl -fsS "http://127.0.0.1:${port}/health" 2>/dev/null | grep -q '"ok":true'; then
     echo "healthy on ${port} at $(git rev-parse --short HEAD)"
     exit 0
   fi
