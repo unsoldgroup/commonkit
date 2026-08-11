@@ -83,12 +83,15 @@
           "type": "string"
         },
         "installLatestNpm": {
+          "const": false,
           "type": "boolean"
         },
         "migratePackages": {
+          "const": false,
           "type": "boolean"
         },
         "noSourceFallback": {
+          "const": true,
           "type": "boolean"
         },
         "nodeVersion": {
@@ -101,9 +104,11 @@
           "type": "string"
         },
         "offline": {
+          "const": true,
           "type": "boolean"
         },
         "perVersionLock": {
+          "const": true,
           "type": "boolean"
         },
         "shellExecutableDigest": {
@@ -126,103 +131,29 @@
       "type": "object"
     },
     "OfflineInstallRecipeV1": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "artifact_roles": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array",
-              "uniqueItems": true
-            },
-            "type": {
-              "const": "homebrew_bottle",
-              "type": "string"
-            }
+      "additionalProperties": false,
+      "properties": {
+        "artifact_roles": {
+          "items": {
+            "type": "string"
           },
-          "required": [
-            "type",
-            "artifact_roles"
-          ],
-          "type": "object"
+          "type": "array",
+          "uniqueItems": true
         },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "artifact_roles": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array",
-              "uniqueItems": true
-            },
-            "type": {
-              "const": "apt_archives",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "artifact_roles"
-          ],
-          "type": "object"
+        "install": {
+          "$ref": "#/$defs/NodeOfflineInstallRecipeV1"
         },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "artifact_roles": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array",
-              "uniqueItems": true
-            },
-            "install": {
-              "anyOf": [
-                {
-                  "$ref": "#/$defs/NodeOfflineInstallRecipeV1"
-                },
-                {
-                  "type": "null"
-                }
-              ]
-            },
-            "type": {
-              "const": "node_archive",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "artifact_roles",
-            "install"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "artifact_roles": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array",
-              "uniqueItems": true
-            },
-            "type": {
-              "const": "rust_toolchain",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "artifact_roles"
-          ],
-          "type": "object"
+        "type": {
+          "const": "node_archive",
+          "type": "string"
         }
-      ]
+      },
+      "required": [
+        "type",
+        "artifact_roles",
+        "install"
+      ],
+      "type": "object"
     },
     "PackageArtifactV1": {
       "additionalProperties": false,
@@ -269,14 +200,7 @@
           "$ref": "#/$defs/PackageManager"
         },
         "selector": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PackageSelector"
-            },
-            {
-              "type": "null"
-            }
-          ]
+          "$ref": "#/$defs/PackageSelector"
         },
         "source": {
           "type": "string"
@@ -289,19 +213,13 @@
         "id",
         "version",
         "manager",
-        "source"
+        "source",
+        "selector"
       ],
       "type": "object"
     },
     "PackageManager": {
-      "description": "A package/toolchain backend supported by read-only package observation.",
-      "enum": [
-        "homebrew",
-        "apt",
-        "fnm",
-        "nvm",
-        "rustup"
-      ],
+      "const": "nvm",
       "type": "string"
     },
     "PackageObservationV1": {
@@ -321,92 +239,17 @@
       "type": "object"
     },
     "PackageSelector": {
-      "oneOf": [
-        {
-          "additionalProperties": false,
-          "properties": {
-            "name": {
-              "type": "string"
-            },
-            "type": {
-              "const": "homebrew_formula",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "name"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "architecture": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "name": {
-              "type": "string"
-            },
-            "type": {
-              "const": "apt_binary",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "name"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "type": {
-              "const": "node_runtime",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type"
-          ],
-          "type": "object"
-        },
-        {
-          "additionalProperties": false,
-          "properties": {
-            "components": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array",
-              "uniqueItems": true
-            },
-            "profile": {
-              "$ref": "#/$defs/RustToolchainProfile"
-            },
-            "targets": {
-              "items": {
-                "type": "string"
-              },
-              "type": "array",
-              "uniqueItems": true
-            },
-            "type": {
-              "const": "rust_toolchain",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "profile"
-          ],
-          "type": "object"
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "node_runtime",
+          "type": "string"
         }
-      ]
+      },
+      "required": [
+        "type"
+      ],
+      "type": "object"
     },
     "PackageTargetV1": {
       "additionalProperties": false,
@@ -469,7 +312,8 @@
         }
       },
       "required": [
-        "declaration"
+        "declaration",
+        "source"
       ],
       "type": "object"
     },
@@ -542,8 +386,7 @@
       "$ref": "#/$defs/OfflineInstallRecipeV1"
     },
     "schemaVersion": {
-      "format": "uint32",
-      "minimum": 0,
+      "const": 2,
       "type": "integer"
     },
     "source": {

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 
 use commonkit_adapters::{
     ArtifactStore, ContentSensitivity, ControlledPackageSourceV1, ManagerBindingV1,
@@ -8,7 +9,7 @@ use commonkit_adapters::{
     PackageFetchResultV1, PackageObservationV1, PackageResolutionCoordinator,
     PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
     ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, ResolvedPackageIntent,
-    package_resolution_v2_schema, validate_nvm_environment,
+    package_resolution_v2_schema, validate_nvm_environment, validate_nvm_environment_os,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, Sha256Digest, StableId,
@@ -350,6 +351,25 @@ fn node_source_key_drift_invalidates_persisted_authority() {
 }
 
 #[test]
+fn production_node_source_authority_rejects_unapproved_signers() {
+    let arbitrary = NodeSourceAuthorityV1 {
+        release_key_fingerprints: BTreeSet::from(["00".repeat(20)]),
+    };
+    assert!(matches!(
+        PackageSourceRegistry::builtin()
+            .unwrap()
+            .with_node_source_authority(&id("nodejs-nvm"), arbitrary),
+        Err(PackageResolutionError::MutableSourceMetadata)
+    ));
+    assert!(
+        PackageSourceRegistry::builtin()
+            .unwrap()
+            .with_node_source_authority(&id("nodejs-nvm"), source_authority())
+            .is_ok()
+    );
+}
+
+#[test]
 fn node_backend_rejects_signature_or_checksum_mismatch() {
     let archive = b"exact node archive";
     let (bytes, sums, _, _, _) = release_fixture(archive);
@@ -678,6 +698,38 @@ fn nvm_environment_and_signature_command_are_closed_and_typed() {
     }
     assert!(validate_nvm_environment(&BTreeMap::new()).is_ok());
 
+    for variable in [
+        "npm_config_prefix",
+        "NPM_CONFIG_USERCONFIG",
+        "npm_config_registry",
+    ] {
+        assert!(
+            validate_nvm_environment_os(&BTreeMap::from([(
+                OsString::from(variable),
+                OsString::from("x"),
+            )]))
+            .is_err()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        assert!(
+            validate_nvm_environment_os(&BTreeMap::from([(
+                OsString::from_vec(b"npm_config_\xff".to_vec()),
+                OsString::from("x"),
+            )]))
+            .is_err()
+        );
+        assert!(
+            validate_nvm_environment_os(&BTreeMap::from([(
+                OsString::from("npm_config_prefix"),
+                OsString::from_vec(vec![0xff]),
+            )]))
+            .is_err()
+        );
+    }
+
     let command = ProcessNodeReleaseSignatureVerifier::new("/usr/bin/gpgv").command_snapshot();
     assert_eq!(command.executable.to_string_lossy(), "/usr/bin/gpgv");
     assert_eq!(command.args[0], "--status-fd=1");
@@ -793,4 +845,66 @@ fn checked_in_v2_schema_matches_and_requires_the_bound_nvm_recipe() {
         })
         .unwrap();
     assert!(validator.is_valid(&legacy_node));
+    assert!(
+        serde_json::from_value::<commonkit_adapters::PackageResolutionV1>(legacy_node.clone())
+            .is_ok()
+    );
+
+    for malicious in [
+        {
+            let mut value = legacy_node.clone();
+            value["schemaVersion"] = serde_json::json!(3);
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["recipe"]["install"] = serde_json::Value::Null;
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["manager"]["manager"] = serde_json::json!("apt");
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["declaration"]["manager"] = serde_json::json!("apt");
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["recipe"] = serde_json::json!({
+                "type": "apt_archives",
+                "artifact_roles": []
+            });
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["recipe"]["install"]["offline"] = serde_json::json!(false);
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["recipe"]["install"]["noSourceFallback"] = serde_json::json!(false);
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["recipe"]["install"]["perVersionLock"] = serde_json::json!(false);
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["recipe"]["install"]["installLatestNpm"] = serde_json::json!(true);
+            value
+        },
+        {
+            let mut value = legacy_node.clone();
+            value["recipe"]["install"]["migratePackages"] = serde_json::json!(true);
+            value
+        },
+    ] {
+        assert!(!validator.is_valid(&malicious), "{malicious}");
+    }
 }

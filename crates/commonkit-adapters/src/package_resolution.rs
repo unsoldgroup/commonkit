@@ -243,16 +243,41 @@ pub fn package_resolution_schema() -> Result<serde_json::Value, serde_json::Erro
 
 pub fn package_resolution_v2_schema() -> Result<serde_json::Value, serde_json::Error> {
     let mut schema = serde_json::to_value(schema_for!(PackageResolutionV1))?;
-    if let Some(required) = schema["$defs"]["ResolvedPackage"]["required"].as_array_mut() {
-        required.retain(|field| field != "source");
+    schema["properties"]["schemaVersion"] = serde_json::json!({
+        "const": 2,
+        "type": "integer"
+    });
+    schema["$defs"]["PackageManager"] = serde_json::json!({
+        "const": "nvm",
+        "type": "string"
+    });
+    let node_selector = schema["$defs"]["PackageSelector"]["oneOf"][2].take();
+    schema["$defs"]["PackageSelector"] = node_selector;
+    schema["$defs"]["PackageDeclaration"]["properties"]["selector"] = serde_json::json!({
+        "$ref": "#/$defs/PackageSelector"
+    });
+    if let Some(required) = schema["$defs"]["PackageDeclaration"]["required"].as_array_mut() {
+        required.push(serde_json::Value::String("selector".into()));
     }
-    if let Some(node_recipe) = schema["$defs"]["OfflineInstallRecipeV1"]["oneOf"]
-        .as_array_mut()
-        .and_then(|variants| variants.get_mut(2))
-    {
-        if let Some(required) = node_recipe["required"].as_array_mut() {
-            required.push(serde_json::Value::String("install".into()));
-        }
+    let mut node_recipe = schema["$defs"]["OfflineInstallRecipeV1"]["oneOf"][2].take();
+    node_recipe["properties"]["install"] = serde_json::json!({
+        "$ref": "#/$defs/NodeOfflineInstallRecipeV1"
+    });
+    if let Some(required) = node_recipe["required"].as_array_mut() {
+        required.push(serde_json::Value::String("install".into()));
+    }
+    schema["$defs"]["OfflineInstallRecipeV1"] = node_recipe;
+    for (property, value) in [
+        ("offline", true),
+        ("noSourceFallback", true),
+        ("perVersionLock", true),
+        ("installLatestNpm", false),
+        ("migratePackages", false),
+    ] {
+        schema["$defs"]["NodeOfflineInstallRecipeV1"]["properties"][property] = serde_json::json!({
+            "const": value,
+            "type": "boolean"
+        });
     }
     schema["$id"] = serde_json::Value::String(
         "https://schemas.commonkit.dev/v2/package-resolution.schema.json".into(),
@@ -1404,12 +1429,17 @@ impl PackageFetch for RecordingPackageFetch<'_> {
 }
 
 fn valid_node_release_fingerprints(fingerprints: &BTreeSet<String>) -> bool {
+    let approved = COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
     !fingerprints.is_empty()
         && fingerprints.iter().all(|fingerprint| {
             fingerprint.len() == 40
                 && fingerprint.chars().all(|character| {
                     character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
                 })
+                && approved.contains(fingerprint.as_str())
         })
 }
 
