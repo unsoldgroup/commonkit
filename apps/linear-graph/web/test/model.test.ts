@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, matchesNode, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
+import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, matchesNode, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
 import { demoPayload } from "../src/protocol.js";
 
 const base: Filters = { query: "", teams: new Set(), topics: new Set(), showSemantic: true, showCompleted: false };
@@ -74,6 +74,13 @@ describe("linear graph view model", () => {
     expect(selectionViewportAction(true, false)).toBe("fit");
     expect(selectionViewportAction(false, false)).toBe("preserve");
     expect(selectionViewportAction(true, true)).toBe("preserve");
+  });
+
+  test("shell-only updates keep the same graph render key", () => {
+    const first = graphRenderKey(7, "universe", base);
+    expect(graphRenderKey(7, "universe", { ...base, teams: new Set([...base.teams]) })).toBe(first);
+    expect(graphRenderKey(7, "universe", { ...base, teams: new Set(["CommonKit"]) })).not.toBe(first);
+    expect(graphRenderKey(8, "universe", base)).not.toBe(first);
   });
 
   test("topic fills and status shapes are deterministic and redundant", () => {
