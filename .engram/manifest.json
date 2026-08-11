@@ -120,6 +120,14 @@
       "sessions": 1,
       "memories": 1,
       "prompts": 0
+    },
+    {
+      "id": "1e8ae585",
+      "created_by": "astemarie",
+      "created_at": "2026-08-11T14:44:02Z",
+      "sessions": 0,
+      "memories": 1,
+      "prompts": 0
     }
   ]
 }

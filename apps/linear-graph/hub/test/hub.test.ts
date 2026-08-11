@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { applyCodexAnalysis, focusSnapshot } from "../src/analysis.js";
-import { parseCodexEvents } from "../src/codex.js";
+import { parseCodexEvents, sanitizeAnalysis } from "../src/codex.js";
 import { inferTopicAssignment, normalizeLinearEdges, normalizeLinearIssue, summarizeTeams } from "../src/normalizer.js";
 import { startGraphHub, trustedNonDestructiveMutation } from "../src/server.js";
 
@@ -44,6 +44,28 @@ describe("linear graph hub", () => {
       normalizeLinearIssue({ ...raw("cancelled"), state: { id: "state-cancelled", name: "Cancelled", type: "canceled" } }),
     ];
     expect(summarizeTeams(issues)).toEqual([{ id: "team", key: "USG", name: "Unsold", issueCount: 3, activeIssueCount: 1, completedIssueCount: 1, canceledIssueCount: 1 }]);
+  });
+
+  test("keeps a Codex run alive when individual rows are malformed", () => {
+    const assignment = (issueId: string, zone: string) => ({ issueId, zone, topicTags: ["quote"], confidence: 0.8, rationale: "why" });
+    const result = sanitizeAnalysis({
+      assignments: [
+        assignment("issue-1", "Product"),          // prose case, coerced
+        assignment("issue-2", "Quote pipeline"),    // not a real zone, becomes unsorted
+        assignment("issue-3", "platform"),          // already valid
+        { issueId: "issue-4" },                     // malformed, dropped
+      ],
+      semanticEdges: [
+        { sourceId: "issue-1", targetId: "issue-3", confidence: 0.9, rationale: "shared carrier path" },
+        { sourceId: "issue-1" },                    // malformed, dropped
+      ],
+      recommendations: [{ issueId: "issue-1", rank: 1, score: 90, whyNow: "now", nextAction: "do it", evidenceIssueIds: [], confidence: 0.9 }],
+    });
+    expect(result.assignments.map((item) => [item.issueId, item.zone])).toEqual([
+      ["issue-1", "product"], ["issue-2", "unsorted"], ["issue-3", "platform"],
+    ]);
+    expect(result.semanticEdges).toHaveLength(1);
+    expect(result.recommendations).toHaveLength(1);
   });
 
   test("assigns unsorted issues to deterministic topic zones from metadata", () => {

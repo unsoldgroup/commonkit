@@ -23,9 +23,9 @@ const relationNodes = (value: unknown): unknown[] => {
 };
 
 const fallbackKeywords: Readonly<Record<Exclude<ZoneId, "unsorted">, readonly string[]>> = {
-  product: ["product", "customer", "user", "checkout", "quote", "booking", "pricing", "price", "ui", "ux", "feature", "workflow", "journey", "frontend", "mobile"],
-  platform: ["api", "database", "db", "schema", "sdk", "agent", "codex", "graph", "integration", "sync", "worker", "service", "migration", "queue", "backend", "reliability", "recovery"],
-  operations: ["deploy", "deployment", "hosting", "server", "vps", "monitoring", "observability", "support", "incident", "scrape", "cron", "ops", "runbook", "alert", "release"],
+  product: ["product", "customer", "user", "checkout", "quote", "booking", "pricing", "price", "ui", "ux", "feature", "workflow", "journey", "frontend", "mobile", "plan", "policy", "coverage", "addon", "addons", "option", "market", "destination"],
+  platform: ["api", "database", "db", "schema", "sdk", "agent", "codex", "graph", "integration", "sync", "worker", "service", "migration", "queue", "backend", "reliability", "recovery", "ontology", "corpus", "grammar", "parser", "normalize", "cms"],
+  operations: ["deploy", "deployment", "hosting", "server", "vps", "monitoring", "observability", "support", "incident", "scrape", "cron", "ops", "runbook", "alert", "release", "carrier", "portal", "selector", "ci", "test", "typecheck", "lint", "enrollment"],
   security: ["auth", "authentication", "token", "credential", "password", "secret", "permission", "access", "security", "encryption", "vulnerability", "oauth"],
   documentation: ["docs", "documentation", "guide", "readme", "context", "knowledge", "adr", "glossary", "runbook"],
 };
