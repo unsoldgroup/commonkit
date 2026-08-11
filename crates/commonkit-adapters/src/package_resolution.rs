@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use commonkit_contracts::{
-    ContractError, PackageDeclaration, PackageManager, SchemaVersion, SecurityPolicy, Sha256Digest,
-    StableId, digest_domain_json,
+    ContractError, PackageDeclaration, PackageManager, PackageSelector, SchemaVersion,
+    SecurityPolicy, Sha256Digest, StableId, digest_domain_json,
 };
 use commonkit_core::enforce_package_source_policy;
 use schemars::{JsonSchema, schema_for};
@@ -1113,10 +1113,9 @@ impl<'a> PackageResolutionCoordinator<'a> {
         root: &PackageDeclaration,
         source: &SourceBindingV1,
     ) -> Result<(), PackageResolutionError> {
-        if !closure
-            .iter()
-            .any(|package| package.declaration == *root && package.source == *source)
-        {
+        if !closure.iter().any(|package| {
+            resolved_root_matches(&package.declaration, root) && package.source == *source
+        }) {
             return Err(PackageResolutionError::MissingRootPackage);
         }
         for package in closure {
@@ -1285,7 +1284,7 @@ fn validate_persisted_resolution(
     if !resolution
         .closure
         .iter()
-        .any(|package| package.declaration == resolution.declaration)
+        .any(|package| resolved_root_matches(&package.declaration, &resolution.declaration))
     {
         return Err(PackageResolutionError::MissingRootPackage);
     }
@@ -1346,6 +1345,35 @@ fn validate_persisted_resolution(
         (PackageManager::Nvm, _) => Err(PackageResolutionError::InvalidNodeRequest),
         (_, _) => Ok(()),
     }
+}
+
+fn resolved_root_matches(resolved: &PackageDeclaration, requested: &PackageDeclaration) -> bool {
+    if resolved == requested {
+        return true;
+    }
+    if resolved.id != requested.id
+        || resolved.version != requested.version
+        || resolved.manager != PackageManager::Apt
+        || requested.manager != PackageManager::Apt
+        || resolved.source != requested.source
+    {
+        return false;
+    }
+    let (
+        Some(PackageSelector::AptBinary {
+            name: resolved_name,
+            architecture: Some(resolved_architecture),
+        }),
+        Some(PackageSelector::AptBinary {
+            name: requested_name,
+            architecture: Some(requested_architecture),
+        }),
+    ) = (&resolved.selector, &requested.selector)
+    else {
+        return false;
+    };
+    resolved_name == requested_name
+        && (resolved_architecture == requested_architecture || resolved_architecture == "all")
 }
 
 struct RecordingPackageFetch<'a> {

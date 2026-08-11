@@ -731,7 +731,7 @@ fn apt_backend_resolves_authenticated_exact_closure_and_fetches_every_archive() 
 }
 
 #[test]
-fn architecture_all_root_resolves_for_the_exact_target_architecture() {
+fn architecture_all_root_persists_actual_architecture_and_target_authority() {
     let package_bytes = b"exact debian archive keyring deb";
     let package_url = "https://archive.ubuntu.com/ubuntu/pool/main/d/debian-archive-keyring/debian-archive-keyring_2023.4ubuntu1_all.deb";
     let declaration = apt_declaration("debian-archive-keyring", "2023.4ubuntu1", "amd64");
@@ -771,7 +771,11 @@ fn architecture_all_root_resolves_for_the_exact_target_architecture() {
     let resolution = persisted(&intent, &store);
 
     assert_eq!(resolution.declaration, declaration);
-    assert_eq!(resolution.closure[0].declaration, declaration);
+    assert_eq!(resolution.target.arch, "amd64");
+    assert_eq!(
+        resolution.closure[0].declaration,
+        apt_declaration("debian-archive-keyring", "2023.4ubuntu1", "all")
+    );
     assert_eq!(resolution.artifacts.len(), 1);
     assert_eq!(
         resolution.artifacts[0].role,
@@ -819,7 +823,51 @@ fn foreign_architecture_does_not_satisfy_the_requested_root() {
     .resolve(&desired, &target(), &store)
     .unwrap_err();
 
-    assert!(matches!(error, PackageResolutionError::MissingRootPackage));
+    assert!(matches!(
+        error,
+        PackageResolutionError::IncompleteAptClosure
+    ));
+    assert_eq!(fetch.calls, 0);
+}
+
+#[test]
+fn foreign_dependency_architecture_is_rejected_before_fetch() {
+    let curl_bytes = b"exact curl deb";
+    let libc_bytes = b"foreign libc deb";
+    let curl_url =
+        "https://archive.ubuntu.com/ubuntu/pool/main/c/curl/curl_8.5.0-2ubuntu10.6_amd64.deb";
+    let foreign_url =
+        "https://archive.ubuntu.com/ubuntu/pool/main/g/glibc/libc6_2.39-0ubuntu8.4_arm64.deb";
+    let mut snapshot = apt_snapshot(curl_bytes, libc_bytes);
+    snapshot.closure[0].architecture = "arm64".into();
+    snapshot.archives[1].architecture = "arm64".into();
+    snapshot.archives[1].immutable_locator = foreign_url.into();
+    let mut backend = AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::from([
+            (curl_url.into(), curl_bytes.to_vec()),
+            (foreign_url.into(), libc_bytes.to_vec()),
+        ]),
+        calls: 0,
+    };
+    let registry = apt_registry();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+
+    let error = PackageResolutionCoordinator::new(
+        &policy(),
+        &registry,
+        manager(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve(&desired(), &target(), &store)
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PackageResolutionError::IncompleteAptClosure
+    ));
     assert_eq!(fetch.calls, 0);
 }
 

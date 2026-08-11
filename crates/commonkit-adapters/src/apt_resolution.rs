@@ -518,11 +518,20 @@ fn validate_snapshot(
     let has_native_all_ambiguity = closure_architectures.values().any(|architectures| {
         architectures.contains("all") && architectures.contains(request.target.arch.as_str())
     });
+    let has_foreign_architecture = snapshot
+        .closure
+        .iter()
+        .any(|package| !apt_architecture_matches(&package.architecture, &request.target.arch))
+        || snapshot
+            .archives
+            .iter()
+            .any(|archive| !apt_architecture_matches(&archive.architecture, &request.target.arch));
     if closure_keys.is_empty()
         || closure_keys.windows(2).any(|pair| pair[0] == pair[1])
         || archive_keys.windows(2).any(|pair| pair[0] == pair[1])
         || closure_keys != archive_keys
         || has_native_all_ambiguity
+        || has_foreign_architecture
         || snapshot.archives.iter().any(|archive| archive.size == 0)
     {
         return Err(PackageResolutionError::IncompleteAptClosure);
@@ -562,7 +571,12 @@ fn draft_from_snapshot(
             && package.version == root.version
             && apt_architecture_matches(&package.architecture, &root_key.1);
         let declaration = if is_root {
-            root.clone()
+            let mut resolved_root = root.clone();
+            resolved_root.selector = Some(PackageSelector::AptBinary {
+                name: package.name,
+                architecture: Some(package.architecture),
+            });
+            resolved_root
         } else {
             let id = stable_hashed_id(
                 "apt-dep",
