@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
+use std::path::Path;
 
 use commonkit_adapters::{
     ManagerBindingV1, NodeOfflineInstallRecipeV1, OfflineInstallRecipeV1, PackageMutationBackend,
@@ -15,7 +16,7 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
 
-fn resolution(script_digest: Sha256Digest) -> PackageResolutionV1 {
+fn resolution(target_root: &Path, script_digest: Sha256Digest) -> PackageResolutionV1 {
     let source_id = StableId::parse("nodejs").unwrap();
     let declaration = PackageDeclaration {
         id: StableId::parse("node").unwrap(),
@@ -42,7 +43,7 @@ fn resolution(script_digest: Sha256Digest) -> PackageResolutionV1 {
             codename: Some("noble".into()),
             arch: "x86_64".into(),
             libc: Some("glibc".into()),
-            manager_prefix: Some("/target/.nvm".into()),
+            manager_prefix: Some(target_root.join(".nvm").to_string_lossy().into_owned()),
         },
         manager: ManagerBindingV1 {
             manager: PackageManager::Nvm,
@@ -93,7 +94,7 @@ fn nvm_observe_rejects_script_drift_before_sourcing_or_side_effects() {
     let bound = digest(b"the-already-bound-script");
     let mut backend = ProcessOfflinePackageBackend::new(root.path());
 
-    let result = backend.observe(&resolution(bound));
+    let result = backend.observe(&resolution(root.path(), bound));
 
     assert!(result.is_err(), "drifted nvm.sh must fail closed");
     assert!(!marker.exists(), "drift must be rejected before sourcing");
@@ -114,10 +115,29 @@ fn nvm_observe_uses_a_scrubbed_closed_environment() {
     fs::write(nvm.join("nvm.sh"), script_bytes).unwrap();
     let mut backend = ProcessOfflinePackageBackend::new(root.path());
 
-    backend.observe(&resolution(digest(script_bytes))).unwrap();
+    backend
+        .observe(&resolution(root.path(), digest(script_bytes)))
+        .unwrap();
 
     assert!(
         !marker.exists(),
         "nvm must not receive the controller environment"
+    );
+}
+
+#[test]
+fn nvm_observe_rejects_manager_prefix_that_does_not_match_backend_target() {
+    let root = tempfile::tempdir().unwrap();
+    let nvm = root.path().join(".nvm");
+    fs::create_dir(&nvm).unwrap();
+    let script = b"nvm() { printf '%s\\n' '-> v20.0.0'; }\n";
+    fs::write(nvm.join("nvm.sh"), script).unwrap();
+    let mut mismatched = resolution(root.path(), digest(script));
+    mismatched.target.manager_prefix = Some("/another-target/.nvm".into());
+    let mut backend = ProcessOfflinePackageBackend::new(root.path());
+
+    assert!(
+        backend.observe(&mismatched).is_err(),
+        "NVM must reject a resolution bound to a different target directory"
     );
 }

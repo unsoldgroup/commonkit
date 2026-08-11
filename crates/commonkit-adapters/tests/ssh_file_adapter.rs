@@ -381,6 +381,116 @@ fn fresh_adapter_can_recover_a_legacy_v1_ssh_operation_payload() {
 }
 
 #[test]
+fn fresh_adapter_can_recover_an_existing_v2_payload_when_root_is_false() {
+    let temp = root("legacy-v2-operation-payload");
+    let artifacts = ArtifactStore::open(temp.join("artifacts")).unwrap();
+    let desired = state(&artifacts);
+    let resource = &desired.resources[0];
+    let remote = Memory::default();
+    let adapter_state = temp.join("adapter");
+    let mut planning = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        &adapter_state,
+        remote.clone(),
+        linux_capabilities(),
+    )
+    .unwrap();
+    let current = planning
+        .register_materialized_resource(
+            StableId::parse("managed-file").unwrap(),
+            resource,
+            &artifacts,
+        )
+        .unwrap()
+        .unwrap();
+    let legacy_capabilities = serde_json::json!({
+        "unixModes": true,
+        "storesSymlinkTargetKind": false,
+    });
+    let legacy_payload = digest_domain_json(
+        "commonkit.ssh-filesystem-payload.v2",
+        &(legacy_capabilities, &resource.intent),
+    )
+    .unwrap();
+    let legacy = finalize_operation(OperationDraft {
+        adapter_id: current.adapter_id.clone(),
+        kind: current.kind,
+        resource: current.resource.clone(),
+        risk: current.risk,
+        requires_confirmation: current.requires_confirmation,
+        recovery_capability: current.recovery_capability,
+        depends_on: current.depends_on.clone(),
+        before_digest: current.before_digest.clone(),
+        after_digest: current.after_digest.clone(),
+        payload_digest: legacy_payload,
+        provenance: current.provenance.clone(),
+        summary: current.summary.clone(),
+    })
+    .unwrap();
+    let record = serde_json::json!({
+        "operationId": legacy.id,
+        "intent": resource.intent,
+    });
+    std::fs::write(
+        adapter_state.join("operations").join(format!(
+            "{}.json",
+            legacy.id.as_str().trim_start_matches("sha256:")
+        )),
+        serde_json::to_vec(&record).unwrap(),
+    )
+    .unwrap();
+
+    let mut fresh = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        &adapter_state,
+        remote.clone(),
+        linux_capabilities(),
+    )
+    .unwrap();
+    fresh.prepare(&legacy).unwrap();
+    fresh.apply(&legacy).unwrap();
+    fresh.verify(&legacy).unwrap();
+    assert_eq!(remote.0.lock().unwrap().files["home/a"], b"a\n");
+
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
+fn root_capable_adapter_does_not_accept_a_non_root_v2_operation() {
+    let temp = root("root-capable-v3-operation-payload");
+    let artifacts = ArtifactStore::open(temp.join("artifacts")).unwrap();
+    let desired = state(&artifacts);
+    let resource = &desired.resources[0];
+    let remote = Memory::default();
+    let adapter_state = temp.join("adapter");
+    let mut planning = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        &adapter_state,
+        remote.clone(),
+        linux_capabilities(),
+    )
+    .unwrap();
+    let operation = planning
+        .register_materialized_resource(
+            StableId::parse("managed-file").unwrap(),
+            resource,
+            &artifacts,
+        )
+        .unwrap()
+        .unwrap();
+    let mut root_capable = SshFileAdapter::open_with_capabilities(
+        StableId::parse("home-root").unwrap(),
+        &adapter_state,
+        remote,
+        SshTargetCapabilities::for_operating_system_with_root_capability("linux", true).unwrap(),
+    )
+    .unwrap();
+
+    assert!(root_capable.prepare(&operation).is_err());
+    std::fs::remove_dir_all(temp).unwrap();
+}
+
+#[test]
 fn stale_plan_is_rejected_crash_rolls_back_and_fresh_adapter_verifies() {
     let temp = root("transaction");
     let artifacts = ArtifactStore::open(temp.join("artifacts")).unwrap();

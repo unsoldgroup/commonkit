@@ -72,7 +72,12 @@ struct BackupRecord {
 pub struct SshTargetCapabilities {
     unix_modes: bool,
     stores_symlink_target_kind: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
     root_capable: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl SshTargetCapabilities {
@@ -172,7 +177,7 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
         observed.sort_by(|left, right| left.0.cmp(&right.0));
         observed.dedup_by(|left, right| left.0 == right.0);
         digest_domain_json(
-            "commonkit.ssh-observed-managed-resources.v2",
+            ssh_observed_digest_domain(self.capabilities),
             &(self.capabilities, observed),
         )
         .map_err(SshFileAdapterError::Contract)
@@ -290,7 +295,7 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
                 )
             })?;
         let digest = digest_domain_json(
-            "commonkit.ssh-filesystem-payload.v2",
+            ssh_payload_digest_domain(self.capabilities),
             &(self.capabilities, &record.intent),
         )
         .map_err(|_| {
@@ -299,17 +304,23 @@ impl<T: SshFilesystemTransport> SshFileAdapter<T> {
                 "remote operation payload is invalid",
             )
         })?;
-        let legacy_digest =
-            digest_domain_json("commonkit.ssh-filesystem-payload.v1", &record.intent).map_err(
-                |_| {
-                    failure(
-                        "operation_payload_mismatch",
-                        "remote operation payload is invalid",
-                    )
-                },
-            )?;
+        let legacy_digest = if self.capabilities.root_capable {
+            None
+        } else {
+            Some(
+                digest_domain_json("commonkit.ssh-filesystem-payload.v1", &record.intent).map_err(
+                    |_| {
+                        failure(
+                            "operation_payload_mismatch",
+                            "remote operation payload is invalid",
+                        )
+                    },
+                )?,
+            )
+        };
         if record.operation_id != operation.id
-            || (digest != operation.payload_digest && legacy_digest != operation.payload_digest)
+            || (digest != operation.payload_digest
+                && legacy_digest.as_ref() != Some(&operation.payload_digest))
         {
             return Err(failure(
                 "operation_payload_mismatch",
@@ -706,10 +717,26 @@ pub(crate) fn provider_operation_binding(
     .expect("static resource type");
     let after_digest = preimage_digest(&desired_preimage(intent), capabilities)?;
     let payload_digest = digest_domain_json(
-        "commonkit.ssh-filesystem-payload.v2",
+        ssh_payload_digest_domain(capabilities),
         &(capabilities, intent),
     )?;
     Ok((resource_type, after_digest, payload_digest))
+}
+
+fn ssh_payload_digest_domain(capabilities: SshTargetCapabilities) -> &'static str {
+    if capabilities.root_capable {
+        "commonkit.ssh-filesystem-payload.v3"
+    } else {
+        "commonkit.ssh-filesystem-payload.v2"
+    }
+}
+
+fn ssh_observed_digest_domain(capabilities: SshTargetCapabilities) -> &'static str {
+    if capabilities.root_capable {
+        "commonkit.ssh-observed-managed-resources.v3"
+    } else {
+        "commonkit.ssh-observed-managed-resources.v2"
+    }
 }
 fn project_preimage_for_intent(
     intent: &FilesystemIntent,

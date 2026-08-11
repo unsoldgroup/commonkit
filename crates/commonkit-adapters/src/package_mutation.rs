@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::fs::OpenOptions;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -818,13 +818,15 @@ impl ProcessOfflinePackageBackend {
         &self,
         resolution: &PackageResolutionV1,
     ) -> Result<PackageObservationV1, PackageMutationError> {
+        self.ensure_nvm_target(resolution)?;
         let nvm_dir = self.target_root.join(".nvm");
         let script = self.validate_nvm_script(resolution)?;
+        let script_copy = script.materialize()?;
         let output = Command::new("/bin/bash")
             .arg("-c")
             .arg("set -eu; . \"$1\"; nvm ls --no-colors")
             .arg("commonkit")
-            .arg(script)
+            .arg(script_copy.path())
             .env_clear()
             .env("HOME", &self.target_root)
             .env("NVM_DIR", &nvm_dir)
@@ -848,7 +850,7 @@ impl ProcessOfflinePackageBackend {
     fn validate_nvm_script(
         &self,
         resolution: &PackageResolutionV1,
-    ) -> Result<PathBuf, PackageMutationError> {
+    ) -> Result<ValidatedNvmScript, PackageMutationError> {
         let script = self.target_root.join(".nvm/nvm.sh");
         let bytes = read_regular_no_follow(&script)?;
         let digest = Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&bytes)))
@@ -856,7 +858,22 @@ impl ProcessOfflinePackageBackend {
         if digest != resolution.manager.executable_digest {
             return Err(PackageMutationError::Backend);
         }
-        Ok(script)
+        Ok(ValidatedNvmScript { bytes })
+    }
+
+    fn ensure_nvm_target(
+        &self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<(), PackageMutationError> {
+        if !self.nvm_target_matches(resolution) {
+            return Err(PackageMutationError::Backend);
+        }
+        Ok(())
+    }
+
+    fn nvm_target_matches(&self, resolution: &PackageResolutionV1) -> bool {
+        let expected = self.target_root.join(".nvm");
+        resolution.target.manager_prefix.as_deref() == expected.to_str()
     }
 
     fn artifact_bytes(
@@ -891,7 +908,8 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
             resolution.manager.manager,
             std::env::consts::OS,
             std::env::consts::ARCH,
-        )
+        ) && (resolution.manager.manager != PackageManager::Nvm
+            || self.nvm_target_matches(resolution))
     }
 
     fn observe(
@@ -910,6 +928,9 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         resolution: &PackageResolutionV1,
         artifacts: &ArtifactStore,
     ) -> Result<(), PackageMutationError> {
+        if resolution.manager.manager == PackageManager::Nvm {
+            self.ensure_nvm_target(resolution)?;
+        }
         match &resolution.recipe {
             OfflineInstallRecipeV1::AptArchives { artifact_roles }
             | OfflineInstallRecipeV1::NodeArchive { artifact_roles, .. } => {
@@ -970,7 +991,9 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                 else {
                     return Err(PackageMutationError::UnsupportedRecipe);
                 };
+                self.ensure_nvm_target(resolution)?;
                 let script = self.validate_nvm_script(resolution)?;
+                let script_copy = script.materialize()?;
                 let archive = self.artifact_bytes(resolution, artifacts, "node-archive")?;
                 let cache = self
                     .target_root
@@ -984,7 +1007,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                     .arg("-c")
                     .arg("set -eu; export NVM_NO_SOURCE_FALLBACK=1 NVM_OFFLINE=1; . \"$1\"; nvm install --offline \"$2\"")
                     .arg("commonkit")
-                    .arg(script)
+                    .arg(script_copy.path())
                     .arg(&install.node_version)
                     .env_clear()
                     .env("HOME", &self.target_root)
@@ -1014,6 +1037,60 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         } else {
             Err(PackageMutationError::Backend)
         }
+    }
+}
+
+struct ValidatedNvmScript {
+    bytes: Vec<u8>,
+}
+
+struct NvmScriptCopy {
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl ValidatedNvmScript {
+    fn materialize(&self) -> Result<NvmScriptCopy, PackageMutationError> {
+        let directory = tempfile::Builder::new()
+            .prefix("commonkit-nvm-script-")
+            .tempdir()
+            .map_err(|_| PackageMutationError::Backend)?;
+        let path = directory.path().join("nvm.sh");
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+            options.mode(0o600);
+            let mut file = options
+                .open(&path)
+                .map_err(|_| PackageMutationError::Backend)?;
+            file.write_all(&self.bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| PackageMutationError::Backend)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o400))
+                .map_err(|_| PackageMutationError::Backend)?;
+        }
+        #[cfg(not(unix))]
+        {
+            let mut file = options
+                .open(&path)
+                .map_err(|_| PackageMutationError::Backend)?;
+            file.write_all(&self.bytes)
+                .and_then(|()| file.sync_all())
+                .map_err(|_| PackageMutationError::Backend)?;
+        }
+        Ok(NvmScriptCopy {
+            _directory: directory,
+            path,
+        })
+    }
+}
+
+impl NvmScriptCopy {
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -1099,4 +1176,29 @@ fn package_version_key(
 
 fn failure(code: &'static str) -> AdapterFailure {
     AdapterFailure::new(code, "package operation rejected")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ValidatedNvmScript;
+    use std::fs;
+
+    #[test]
+    fn validated_nvm_script_materializes_an_immutable_copy() {
+        let bytes = b"validated nvm bytes\n".to_vec();
+        let copy = ValidatedNvmScript {
+            bytes: bytes.clone(),
+        }
+        .materialize()
+        .unwrap();
+        assert_eq!(fs::read(copy.path()).unwrap(), bytes);
+        let metadata = fs::symlink_metadata(copy.path()).unwrap();
+        assert!(metadata.is_file());
+        assert!(!metadata.file_type().is_symlink());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(metadata.permissions().mode() & 0o222, 0);
+        }
+    }
 }
