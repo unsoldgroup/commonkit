@@ -72,21 +72,35 @@ struct BackupRecord {
 pub struct SshTargetCapabilities {
     unix_modes: bool,
     stores_symlink_target_kind: bool,
+    root_capable: bool,
 }
 
 impl SshTargetCapabilities {
     pub fn for_operating_system(operating_system: &str) -> Result<Self, SshFileAdapterError> {
+        Self::for_operating_system_with_root_capability(operating_system, false)
+    }
+
+    pub fn for_operating_system_with_root_capability(
+        operating_system: &str,
+        root_capable: bool,
+    ) -> Result<Self, SshFileAdapterError> {
         match operating_system.trim().to_ascii_lowercase().as_str() {
             "linux" | "macos" | "freebsd" | "openbsd" | "netbsd" | "dragonfly" => Ok(Self {
                 unix_modes: true,
                 stores_symlink_target_kind: false,
+                root_capable,
             }),
             "windows" => Ok(Self {
                 unix_modes: false,
                 stores_symlink_target_kind: true,
+                root_capable: false,
             }),
             _ => Err(SshFileAdapterError::UnsupportedTargetPlatform),
         }
+    }
+
+    pub fn permits_direct_apt(&self) -> bool {
+        self.root_capable
     }
 }
 

@@ -2,7 +2,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use commonkit_contracts::{
@@ -12,6 +14,7 @@ use commonkit_contracts::{
 };
 use commonkit_core::{OperationDraft, finalize_operation};
 use commonkit_reconcile::{Adapter, AdapterFailure, RecoveryObservation};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
@@ -19,6 +22,8 @@ use crate::{
     PackageResolutionAuthority, PackageResolutionV1, PackageResourcePlanner, ProviderPlanError,
     ResolvedPackageIntent, ResourceProvenance, apt_resolution::apt_package_identity,
 };
+
+const CLOSED_NVM_PATH: &str = "/usr/bin:/bin";
 
 /// The only target-side capability exposed to package mutation.
 ///
@@ -809,14 +814,23 @@ impl ProcessOfflinePackageBackend {
             .ok_or(PackageMutationError::Backend)
     }
 
-    fn observe_nvm(&self) -> Result<PackageObservationV1, PackageMutationError> {
+    fn observe_nvm(
+        &self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<PackageObservationV1, PackageMutationError> {
         let nvm_dir = self.target_root.join(".nvm");
-        let script = nvm_dir.join("nvm.sh");
+        let script = self.validate_nvm_script(resolution)?;
         let output = Command::new("/bin/bash")
             .arg("-c")
             .arg("set -eu; . \"$1\"; nvm ls --no-colors")
             .arg("commonkit")
             .arg(script)
+            .env_clear()
+            .env("HOME", &self.target_root)
+            .env("NVM_DIR", &nvm_dir)
+            .env("PATH", CLOSED_NVM_PATH)
+            .env("NVM_NO_SOURCE_FALLBACK", "1")
+            .env("NVM_OFFLINE", "1")
             .output()
             .map_err(|_| PackageMutationError::Backend)?;
         if !output.status.success() {
@@ -829,6 +843,20 @@ impl ProcessOfflinePackageBackend {
             .map(str::to_owned)
             .collect();
         Ok(PackageObservationV1 { installed_versions })
+    }
+
+    fn validate_nvm_script(
+        &self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<PathBuf, PackageMutationError> {
+        let script = self.target_root.join(".nvm/nvm.sh");
+        let bytes = read_regular_no_follow(&script)?;
+        let digest = Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&bytes)))
+            .map_err(|_| PackageMutationError::Backend)?;
+        if digest != resolution.manager.executable_digest {
+            return Err(PackageMutationError::Backend);
+        }
+        Ok(script)
     }
 
     fn artifact_bytes(
@@ -872,7 +900,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
     ) -> Result<PackageObservationV1, PackageMutationError> {
         match resolution.manager.manager {
             PackageManager::Apt => self.observe_apt(resolution),
-            PackageManager::Nvm => self.observe_nvm(),
+            PackageManager::Nvm => self.observe_nvm(resolution),
             _ => Err(PackageMutationError::UnsupportedRecipe),
         }
     }
@@ -942,6 +970,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                 else {
                     return Err(PackageMutationError::UnsupportedRecipe);
                 };
+                let script = self.validate_nvm_script(resolution)?;
                 let archive = self.artifact_bytes(resolution, artifacts, "node-archive")?;
                 let cache = self
                     .target_root
@@ -951,13 +980,18 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                     fs::create_dir_all(parent).map_err(|_| PackageMutationError::Backend)?;
                 }
                 fs::write(&cache, archive).map_err(|_| PackageMutationError::Backend)?;
-                let script = self.target_root.join(".nvm/nvm.sh");
                 let status = Command::new("/bin/bash")
                     .arg("-c")
                     .arg("set -eu; export NVM_NO_SOURCE_FALLBACK=1 NVM_OFFLINE=1; . \"$1\"; nvm install --offline \"$2\"")
                     .arg("commonkit")
                     .arg(script)
                     .arg(&install.node_version)
+                    .env_clear()
+                    .env("HOME", &self.target_root)
+                    .env("NVM_DIR", self.target_root.join(".nvm"))
+                    .env("PATH", CLOSED_NVM_PATH)
+                    .env("NVM_NO_SOURCE_FALLBACK", "1")
+                    .env("NVM_OFFLINE", "1")
                     .status()
                     .map_err(|_| PackageMutationError::Backend)?;
                 status
@@ -981,6 +1015,27 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
             Err(PackageMutationError::Backend)
         }
     }
+}
+
+fn read_regular_no_follow(path: &Path) -> Result<Vec<u8>, PackageMutationError> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| PackageMutationError::Backend)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(PackageMutationError::Backend);
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| PackageMutationError::Backend)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|_| PackageMutationError::Backend)?;
+    Ok(bytes)
 }
 
 fn package_target_matches_platform(

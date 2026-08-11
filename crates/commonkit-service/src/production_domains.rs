@@ -12,10 +12,10 @@ use commonkit_adapters::{
     ExactProviderVersion, FileAdapter, FilesystemIntent, GitRepository, GitSyncDisposition,
     LocalSensitiveFileStore, MaterializedState, NativeProvider, NormalizedManagedPath,
     NormalizedResource, OpenSshConfig, OpenSshTransport, OwnershipRules, PackageAdapter,
-    PlatformKeychain, PlatformKeychainCredentialResolver, ProcessBwsRunner, ProcessGitRunner,
-    ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
-    ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
-    RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter,
+    PackageResolutionV1, PlatformKeychain, PlatformKeychainCredentialResolver, ProcessBwsRunner,
+    ProcessGitRunner, ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability,
+    ProviderContext, ProviderInputs, ProviderPipeline, ProviderPlanRequest,
+    ProviderResourcePlanner, RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter,
     SshOfflinePackageBackend, SshTargetCapabilities, build_provider_plan,
     materialize_mcp_client_state, validate_ownership,
 };
@@ -177,8 +177,21 @@ impl SyncConfig {
 
     fn ssh_target_capabilities(&self) -> Result<SshTargetCapabilities, DomainFailure> {
         let platform = self.provider_platform()?;
-        SshTargetCapabilities::for_operating_system(&platform.operating_system)
-            .map_err(|_| DomainFailure::InvalidRequest)
+        let root_capable = match self
+            .target_transport
+            .as_ref()
+            .unwrap_or(&SyncTargetTransport::Local)
+        {
+            SyncTargetTransport::Ssh {
+                root_capable, user, ..
+            } => *root_capable && user == "root",
+            SyncTargetTransport::Local => false,
+        };
+        SshTargetCapabilities::for_operating_system_with_root_capability(
+            &platform.operating_system,
+            root_capable,
+        )
+        .map_err(|_| DomainFailure::InvalidRequest)
     }
 }
 
@@ -195,6 +208,8 @@ enum SyncTargetTransport {
         #[serde(rename = "knownHosts")]
         known_hosts: PathBuf,
         fingerprint: String,
+        #[serde(rename = "rootCapable", default)]
+        root_capable: bool,
     },
 }
 
@@ -456,6 +471,7 @@ impl ProductionSshPlanExecutor {
         if durable != *plan {
             return Err(DomainFailure::StalePlan);
         }
+        self.validate_package_privilege(plan)?;
         let run_digest =
             digest_domain_json("commonkit.production-ssh-run.v1", &(&plan.id, confirmation))
                 .map_err(|_| DomainFailure::OperationFailed)?;
@@ -512,6 +528,27 @@ impl ProductionSshPlanExecutor {
             }
             Err(_) => Err(DomainFailure::OperationFailed),
         }
+    }
+
+    fn validate_package_privilege(&self, plan: &Plan) -> Result<(), DomainFailure> {
+        let package_artifacts = ArtifactStore::open(self.adapter_state.join("packages"))
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        for operation in plan.operations.iter().filter(|operation| {
+            operation.adapter_id.as_str() == "packages"
+                || operation.resource.resource_type.as_str() == "package"
+        }) {
+            let bytes = package_artifacts
+                .load_by_digest(&operation.payload_digest)
+                .map_err(|_| DomainFailure::OperationFailed)?;
+            let resolution: PackageResolutionV1 =
+                serde_json::from_slice(&bytes).map_err(|_| DomainFailure::OperationFailed)?;
+            if resolution.manager.manager == commonkit_contracts::PackageManager::Apt
+                && !self.target.capabilities.permits_direct_apt()
+            {
+                return Err(DomainFailure::OperationFailed);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -850,6 +887,7 @@ impl ProductionDomainRegistry {
                     port,
                     known_hosts,
                     fingerprint,
+                    ..
                 }) => {
                     let platform = sync
                         .provider_platform()
@@ -2024,6 +2062,7 @@ fn production_ssh_target(
         port,
         known_hosts,
         fingerprint,
+        ..
     } = config
     else {
         return Err(DomainFailure::OperationFailed);

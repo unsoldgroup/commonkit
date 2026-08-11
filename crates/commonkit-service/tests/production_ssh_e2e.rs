@@ -286,13 +286,26 @@ fn setup(
     Arc<dyn PlanExecutor>,
     Arc<dyn PlanExecutor>,
 ) {
-    setup_with_capabilities(root, remote, false)
+    setup_with_capabilities(root, remote, false, true)
+}
+
+fn setup_non_root(
+    root: &std::path::Path,
+    remote: Memory,
+) -> (
+    ProductionDomainRegistry,
+    Arc<PlanStore>,
+    Arc<dyn PlanExecutor>,
+    Arc<dyn PlanExecutor>,
+) {
+    setup_with_capabilities(root, remote, false, false)
 }
 
 fn setup_with_capabilities(
     root: &std::path::Path,
     remote: Memory,
     with_mcp: bool,
+    root_capable: bool,
 ) -> (
     ProductionDomainRegistry,
     Arc<PlanStore>,
@@ -354,7 +367,7 @@ fn setup_with_capabilities(
     let config = serde_json::json!({"sync":{
         "targetId":"remote-linux", "targetRoot":root.join("controller-target"), "adapterState":root.join("adapter"),
         "providerArtifacts":root.join("artifacts"), "materializedStates":[state_path],
-        "targetTransport":{"type":"ssh","rootId":"home-root","host":"fixture","user":"al","port":22,
+        "targetTransport":{"type":"ssh","rootId":"home-root","host":"fixture","user":if root_capable {"root"} else {"al"},"port":22,"rootCapable":root_capable,
             "knownHosts":root.join("known_hosts"),"fingerprint":"SHA256:fixturefixturefixture"},
         "targetPlatform":{"operatingSystem":"linux","architecture":"x86_64"},
         "declaredRoots":["home"],"relayClientRoot":"home","protectedRoots":[],"caseSensitive":true,
@@ -386,7 +399,7 @@ fn setup_with_capabilities(
 fn ssh_target_with_provider_mcp_requires_a_target_resident_daemon() {
     let temporary = tempfile::tempdir().unwrap();
     let remote = Memory::default();
-    let (registry, _, _, _) = setup_with_capabilities(temporary.path(), remote, true);
+    let (registry, _, _, _) = setup_with_capabilities(temporary.path(), remote, true, true);
     assert_eq!(
         registry.sync.as_ref().unwrap().plan(serde_json::json!({
             "confirmed": true,
@@ -438,6 +451,46 @@ fn approved_package_plan_opens_the_typed_ssh_adapter_instead_of_the_unavailable_
             PackageMutationPhase::Verify,
             PackageMutationPhase::Observe,
         ]
+    );
+}
+
+#[test]
+fn non_root_ssh_apt_rejects_before_receipt_or_transport() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote = Memory::default();
+    let (_, plans, _, executor) = setup_non_root(temporary.path(), remote.clone());
+    let (resolution, authority) = apt_resolution();
+    let package_artifacts = ArtifactStore::open(temporary.path().join("adapter/packages")).unwrap();
+    let resolution_ref = package_artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let plan = package_plan(resolution_ref.digest, authority.digest().clone());
+    plans.persist(&plan).unwrap();
+    let confirmation_id = StableId::parse("package-confirmation").unwrap();
+    let consent = PackageConsent {
+        confirmation_id: confirmation_id.clone(),
+        operation_set_digest: package_operation_set_digest(
+            &plan,
+            &[PackageOperationConsentBinding {
+                operation_id: plan.operations[0].id.clone(),
+                resolution_digest: plan.operations[0].payload_digest.clone(),
+            }],
+        )
+        .unwrap(),
+    };
+
+    let result = executor.execute_with_package_consent(&plan, &confirmation_id, &consent);
+
+    assert_eq!(result.status, ApplyStatus::Failed);
+    assert_eq!(remote.0.lock().unwrap().opens, 0);
+    assert!(
+        std::fs::read_dir(temporary.path().join("receipts"))
+            .unwrap()
+            .next()
+            .is_none()
     );
 }
 
