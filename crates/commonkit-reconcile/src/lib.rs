@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use commonkit_contracts::{
     CONTRACT_VERSION, ContractError, FORWARD_CONTRACT_VERSION, FORWARD_SCHEMA_VERSION, Operation,
     OperationPhase, OperationProgress, PACKAGE_RECEIPT_CONTRACT_VERSION,
-    PACKAGE_RECEIPT_SCHEMA_VERSION, PackageExitClassification, PackageReceiptAuthorization, Plan,
+    PACKAGE_RECEIPT_SCHEMA_VERSION, PackageConsent, PackageExitClassification,
+    PackageOperationConsentBinding, PackageReceiptAuthorization, PackageReceiptEvidence, Plan,
     PlanBindings, ReceiptState, ReceiptTransition, RecoveryCapability, RunReceipt, SCHEMA_VERSION,
     SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
 };
@@ -498,6 +499,18 @@ pub trait Adapter {
     fn supports_operation(&self, operation: &Operation) -> bool {
         self.supports_recovery(operation.recovery_capability)
     }
+    /// Read-only execution preflight. This runs before any receipt is created.
+    fn preflight(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
+    /// Returns consent binding and sanitized before-evidence for package operations.
+    fn package_authorization_binding(
+        &self,
+        _operation: &Operation,
+    ) -> Result<Option<(PackageOperationConsentBinding, PackageReceiptEvidence)>, AdapterFailure>
+    {
+        Ok(None)
+    }
     fn observe_recovery(
         &mut self,
         _operation: &Operation,
@@ -583,7 +596,57 @@ impl<'a> Reconciler<'a> {
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
         preflight_adapters(plan, adapters)?;
-        let mut journal = ReceiptJournal::for_plan(run_id, plan)?;
+        if plan.operations.iter().any(is_package_operation) {
+            return Err(ReconcileError::PackageConsentRequired);
+        }
+        let journal = ReceiptJournal::for_plan(run_id, plan)?;
+        self.execute_preflighted(plan, adapters, journal)
+    }
+
+    pub fn execute_with_package_consent(
+        &self,
+        plan: &Plan,
+        run_id: StableId,
+        consent: &PackageConsent,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        validate_plan(plan)?;
+        preflight_adapters(plan, adapters)?;
+        let mut bindings = Vec::new();
+        let mut evidence = Vec::new();
+        for operation in plan.operations.iter().filter(|operation| is_package_operation(operation)) {
+            let adapter = adapters
+                .iter()
+                .find(|adapter| adapter.id() == &operation.adapter_id)
+                .ok_or_else(|| ReconcileError::AdapterNotFound(operation.adapter_id.clone()))?;
+            let (binding, operation_evidence) = adapter
+                .package_authorization_binding(operation)
+                .map_err(ReconcileError::AdapterPreflightFailed)?
+                .ok_or_else(|| ReconcileError::PackageAuthorizationUnavailable {
+                    adapter_id: operation.adapter_id.clone(),
+                })?;
+            bindings.push(binding);
+            evidence.push(operation_evidence);
+        }
+        consent
+            .validate(plan, &bindings)
+            .map_err(ReceiptError::from)?;
+        let authorization = PackageReceiptAuthorization {
+            consent_digest: consent.digest().map_err(ReceiptError::from)?,
+            confirmation_id: consent.confirmation_id.clone(),
+            operation_set_digest: consent.operation_set_digest.clone(),
+            evidence,
+        };
+        let journal = ReceiptJournal::for_package_plan(run_id, plan, authorization)?;
+        self.execute_preflighted(plan, adapters, journal)
+    }
+
+    fn execute_preflighted(
+        &self,
+        plan: &Plan,
+        adapters: &mut [Box<dyn Adapter>],
+        mut journal: ReceiptJournal,
+    ) -> Result<ReconcileOutcome, ReconcileError> {
         self.persist(&journal)?;
 
         for operation in &plan.operations {
@@ -1005,14 +1068,14 @@ fn adapter_for<'a>(
     Err(ReconcileError::AdapterNotFound(id.clone()))
 }
 
-fn preflight_adapters(plan: &Plan, adapters: &[Box<dyn Adapter>]) -> Result<(), ReconcileError> {
+fn preflight_adapters(plan: &Plan, adapters: &mut [Box<dyn Adapter>]) -> Result<(), ReconcileError> {
     let crosses_forward_barrier = plan
         .operations
         .iter()
         .any(|operation| operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly);
     for operation in &plan.operations {
         let adapter = adapters
-            .iter()
+            .iter_mut()
             .find(|adapter| adapter.id() == &operation.adapter_id)
             .ok_or_else(|| ReconcileError::AdapterNotFound(operation.adapter_id.clone()))?;
         if !adapter.supports_operation(operation) {
@@ -1026,8 +1089,16 @@ fn preflight_adapters(plan: &Plan, adapters: &[Box<dyn Adapter>]) -> Result<(), 
                 adapter_id: operation.adapter_id.clone(),
             });
         }
+        adapter
+            .preflight(operation)
+            .map_err(ReconcileError::AdapterPreflightFailed)?;
     }
     Ok(())
+}
+
+fn is_package_operation(operation: &Operation) -> bool {
+    operation.adapter_id.as_str() == "packages"
+        || operation.resource.resource_type.as_str() == "package"
 }
 
 fn validate_plan(plan: &Plan) -> Result<(), ReconcileError> {
@@ -1053,6 +1124,12 @@ pub enum ReconcileError {
     Plan(#[from] PlanBuildError),
     #[error("plan content does not match its content-addressed identity")]
     PlanMismatch,
+    #[error("package operations require explicit package consent")]
+    PackageConsentRequired,
+    #[error("package authorization evidence is unavailable from adapter {adapter_id}")]
+    PackageAuthorizationUnavailable { adapter_id: StableId },
+    #[error("adapter preflight failed: {0:?}")]
+    AdapterPreflightFailed(AdapterFailure),
     #[error("adapter is not registered: {0}")]
     AdapterNotFound(StableId),
     #[error("adapter {adapter_id} does not support recovery capability {capability:?}")]
