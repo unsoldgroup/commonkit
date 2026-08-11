@@ -637,8 +637,15 @@ fn parse_apt_observation_identity(identity: &str) -> Option<(&str, &str, &str)> 
 fn runtime_authority(
     resolution: &PackageResolutionV1,
 ) -> Result<PackageResolutionAuthority, PackageMutationError> {
-    let registry =
-        crate::PackageSourceRegistry::builtin().map_err(|_| PackageMutationError::Backend)?;
+    // The persisted resolution carries the target-attested source-definition
+    // digest. Rebuild the trusted built-in registry and enrich only the
+    // matching source identity; never accept source IDs or repositories from
+    // the payload as new authority.
+    let registry = crate::PackageSourceRegistry::for_remote_resolution(
+        &resolution.source,
+        resolution.manager.manager,
+    )
+    .map_err(|_| PackageMutationError::Backend)?;
     let source = resolution.source.source_id.clone();
     let policy = SecurityPolicy {
         allowlists: [(

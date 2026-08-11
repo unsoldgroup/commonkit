@@ -4,10 +4,11 @@ use commonkit_adapters::{
     ArtifactEvidence, ArtifactStore, ControlledPackageSourceV1, ExactProviderVersion,
     ManagerBindingV1, MaterializedState, NormalizedResource, OfflineInstallRecipeV1,
     PackageDesiredIntent, PackageFetch, PackageFetchHopV1, PackageFetchRequestV1,
-    PackageFetchResultV1, PackageObservationV1, PackageResolutionBackend,
-    PackageResolutionCoordinator, PackageResolutionDraftV1, PackageResolutionError,
-    PackageResolutionProbeV1, PackageResolutionRequestV1, PackageSourceRegistry, PackageTargetV1,
-    ProviderInputs, ResolvedPackage, ResourceProvenance, SourceBindingV1,
+    PackageFetchResultV1, PackageObservationV1, PackageResolutionAuthority,
+    PackageResolutionBackend, PackageResolutionCoordinator, PackageResolutionDraftV1,
+    PackageResolutionError, PackageResolutionProbeV1, PackageResolutionRequestV1,
+    PackageSourceRegistry, PackageTargetV1, ProviderInputs, ResolvedPackage, ResourceProvenance,
+    SourceBindingV1,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, Sha256Digest, StableId,
@@ -835,6 +836,43 @@ fn builtin_source_registry_preserves_the_filesystem_and_generic_v1_digest() {
         PackageSourceRegistry::builtin().unwrap().digest().as_str(),
         "sha256:188316c18c44cefdc652d4828a1904ce35621cd19ee7c4e99f8985df5b6dd2fc"
     );
+}
+
+#[test]
+fn remote_source_enrichment_rebinds_registry_and_authority_digests() {
+    let builtin = PackageSourceRegistry::builtin().unwrap();
+    let source_id = id("homebrew-core");
+    let source = SourceBindingV1 {
+        source_id: source_id.clone(),
+        registry_definition_digest: digest('a'),
+        canonical_repository: "https://github.com/Homebrew/homebrew-core".into(),
+        repository_revision: Some("0123456789abcdef0123456789abcdef0123456789".into()),
+        signed_metadata: Vec::new(),
+    };
+    let enriched =
+        PackageSourceRegistry::for_remote_resolution(&source, PackageManager::Homebrew).unwrap();
+    assert_ne!(builtin.digest(), enriched.digest());
+
+    let policy = SecurityPolicy {
+        allowlists: [(
+            id("package_sources"),
+            BTreeSet::from([source_id.as_str().into()]),
+        )]
+        .into_iter()
+        .collect(),
+        ..SecurityPolicy::default()
+    };
+    let baseline =
+        PackageResolutionAuthority::new(&target(), &manager_binding(), &builtin, &policy).unwrap();
+    let remote =
+        PackageResolutionAuthority::new(&target(), &manager_binding(), &enriched, &policy).unwrap();
+    assert_ne!(baseline.digest(), remote.digest());
+
+    let mut changed = source;
+    changed.registry_definition_digest = digest('b');
+    let changed_registry =
+        PackageSourceRegistry::for_remote_resolution(&changed, PackageManager::Homebrew).unwrap();
+    assert_ne!(enriched.digest(), changed_registry.digest());
 }
 
 #[test]

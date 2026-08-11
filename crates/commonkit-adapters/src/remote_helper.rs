@@ -15,12 +15,12 @@ use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
+use crate::target::TargetDirectoryIdentity;
 #[cfg(unix)]
 use crate::{
     ARTIFACT_CHUNK_SIZE, ContentReference, MAX_ARTIFACT_TRANSFER_BYTES,
     artifact_chunk_response_digest,
 };
-use crate::target::TargetDirectoryIdentity;
 use crate::{
     AptResolutionBackend, AptSourceAuthorityV1, ArtifactStore, ContentSensitivity,
     LocalTargetFilesystem, NodeResolutionBackend, NodeRuntimeHost, PackageDiscoveryFetchRequestV1,
@@ -826,6 +826,33 @@ impl TargetHelper {
                 resolution,
                 artifacts,
             } => {
+                let config = self
+                    .package_resolution
+                    .as_ref()
+                    .ok_or(TargetFilesystemError::PackageResolutionRejected)?;
+                let registry = target_package_source_registry(config)?;
+                let authority = crate::PackageResolutionAuthority::new(
+                    &config.target,
+                    &config.manager,
+                    &registry,
+                    &config.policy,
+                )
+                .map_err(|_| TargetFilesystemError::PackageResolutionRejected)?;
+                authority
+                    .validate_resolution(&resolution)
+                    .map_err(|_| TargetFilesystemError::PackageResolutionRejected)?;
+                let expected_artifacts = resolution
+                    .artifacts
+                    .iter()
+                    .map(|artifact| artifact.content.clone())
+                    .collect::<Vec<_>>();
+                let received_artifacts = artifacts
+                    .iter()
+                    .map(|artifact| artifact.reference.clone())
+                    .collect::<Vec<_>>();
+                if expected_artifacts != received_artifacts {
+                    return Err(TargetFilesystemError::RemoteArtifact);
+                }
                 let (filesystem, root_path, access) = self
                     .roots
                     .get(&root_id)

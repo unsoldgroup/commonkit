@@ -482,6 +482,20 @@ struct PackageSourceDefinitionV1<'a> {
     node_source_authority: Option<&'a NodeSourceAuthorityV1>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AttestedPackageSourceDefinitionV1<'a> {
+    source_id: &'a StableId,
+    manager: PackageManager,
+    canonical_repository: &'a str,
+    approved_artifact_roots: &'a BTreeSet<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    apt_source_authority: Option<&'a AptSourceAuthorityV1>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_source_authority: Option<&'a NodeSourceAuthorityV1>,
+    definition_digest: &'a Sha256Digest,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AptSourceAuthorityV1 {
@@ -584,6 +598,26 @@ fn package_source_registry_digest<'a>(
         "commonkit.package-source-registry.v1"
     };
     Ok(digest_domain_json(domain, &entries)?)
+}
+
+fn attested_package_source_registry_digest<'a>(
+    sources: impl Iterator<Item = &'a PackageSourceDefinition>,
+) -> Result<Sha256Digest, PackageResolutionError> {
+    let entries = sources
+        .map(|source| AttestedPackageSourceDefinitionV1 {
+            source_id: &source.source_id,
+            manager: source.manager,
+            canonical_repository: &source.canonical_repository,
+            approved_artifact_roots: &source.approved_artifact_roots,
+            apt_source_authority: source.apt_source_authority.as_ref(),
+            node_source_authority: source.node_source_authority.as_ref(),
+            definition_digest: &source.digest,
+        })
+        .collect::<Vec<_>>();
+    Ok(digest_domain_json(
+        "commonkit.package-source-registry.attested.v1",
+        &entries,
+    )?)
 }
 
 impl PackageResolutionAuthority {
@@ -703,6 +737,41 @@ impl PackageResolutionAuthority {
             enforce_current_package_sources(&self.package_sources, &package.declaration)?;
         }
         Ok(resolution)
+    }
+
+    /// Validate a persisted resolution against this authority without
+    /// requiring the resolution JSON itself to already be present in an
+    /// artifact store. Target helpers use this seam after receiving a typed
+    /// mutation request, before they invoke any package backend.
+    pub fn validate_resolution(
+        &self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<(), PackageResolutionError> {
+        validate_persisted_resolution(resolution)?;
+        if resolution.target != self.target {
+            return Err(PackageResolutionError::TargetBindingMismatch);
+        }
+        if resolution.manager != self.manager {
+            return Err(PackageResolutionError::ManagerBindingMismatch);
+        }
+        let definition = self
+            .registry
+            .sources
+            .get(&resolution.source.source_id)
+            .ok_or_else(|| PackageResolutionError::UnknownSource {
+                source_id: resolution.source.source_id.clone(),
+            })?;
+        if definition.manager != resolution.manager.manager
+            || definition.digest != resolution.source.registry_definition_digest
+            || definition.canonical_repository != resolution.source.canonical_repository
+        {
+            return Err(PackageResolutionError::SourceBindingMismatch);
+        }
+        enforce_current_package_sources(&self.package_sources, &resolution.declaration)?;
+        for package in &resolution.closure {
+            enforce_current_package_sources(&self.package_sources, &package.declaration)?;
+        }
+        Ok(())
     }
 }
 
@@ -881,6 +950,7 @@ impl PackageSourceRegistry {
             return Err(PackageResolutionError::SourceBindingMismatch);
         }
         definition.digest = source.registry_definition_digest.clone();
+        registry.digest = attested_package_source_registry_digest(registry.sources.values())?;
         Ok(registry)
     }
 

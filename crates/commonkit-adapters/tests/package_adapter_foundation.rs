@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
-    ARTIFACT_CHUNK_SIZE, ArtifactStore, ContentSensitivity, ManagerBindingV1,
+    ARTIFACT_CHUNK_SIZE, AptSourceAuthorityV1, ArtifactStore, ContentSensitivity, ManagerBindingV1,
     OfflineInstallRecipeV1, PackageAdapter, PackageArtifactV1, PackageMutationBackend,
     PackageMutationError, PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1,
     PackageSourceRegistry, PackageTargetV1, ProcessOfflinePackageBackend, ResolvedPackage,
@@ -150,6 +150,97 @@ fn apt_resolution() -> (PackageResolutionV1, PackageResolutionAuthority) {
         },
     };
     (resolution, authority)
+}
+
+#[test]
+fn offline_adapter_accepts_target_attested_apt_authority() {
+    let (mut resolution, _) = apt_resolution();
+    let source_id = resolution.source.source_id.clone();
+    let registry = PackageSourceRegistry::builtin()
+        .unwrap()
+        .with_apt_source_authority(
+            &source_id,
+            AptSourceAuthorityV1 {
+                suite: "noble".into(),
+                components: BTreeSet::from(["main".into()]),
+                signing_authority: StableId::parse("ubuntu-archive").unwrap(),
+                signing_key_digest: digest('e'),
+            },
+        )
+        .unwrap();
+    resolution.source.registry_definition_digest =
+        registry.source_definition_digest(&source_id).unwrap();
+    resolution.closure[0].source = resolution.source.clone();
+
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        calls: calls.clone(),
+    };
+    let mut adapter = PackageAdapter::new_offline(artifacts, Box::new(backend));
+
+    let operation = operation(resolution_ref.digest.clone());
+    adapter.preflight(&operation).unwrap();
+    adapter.prepare(&operation).unwrap();
+    adapter.apply(&operation).unwrap();
+    adapter.verify(&operation).unwrap();
+    assert_eq!(
+        adapter.observe_recovery(&operation),
+        Ok(RecoveryObservation::Before)
+    );
+    assert!(
+        adapter
+            .package_authorization_binding(&operation)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec!["prepare", "apply", "verify", "observe"]
+    );
+}
+
+#[test]
+fn offline_adapter_rejects_source_substitution_before_backend() {
+    let (mut resolution, _) = apt_resolution();
+    resolution.source.canonical_repository = "https://attacker.invalid/ubuntu".into();
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        calls: calls.clone(),
+    };
+    let mut adapter = PackageAdapter::new_offline(artifacts, Box::new(backend));
+
+    assert!(
+        adapter
+            .preflight(&operation(resolution_ref.digest))
+            .is_err()
+    );
+    assert!(calls.lock().unwrap().is_empty());
 }
 
 #[derive(Clone)]
