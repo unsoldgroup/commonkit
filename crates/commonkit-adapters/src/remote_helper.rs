@@ -850,7 +850,10 @@ impl TargetHelper {
                     .iter()
                     .map(|artifact| artifact.reference.clone())
                     .collect::<Vec<_>>();
-                if expected_artifacts != received_artifacts {
+                if (phase == PackageMutationPhase::Observe && !received_artifacts.is_empty())
+                    || (phase != PackageMutationPhase::Observe
+                        && expected_artifacts != received_artifacts)
+                {
                     return Err(TargetFilesystemError::RemoteArtifact);
                 }
                 let (filesystem, root_path, access) = self

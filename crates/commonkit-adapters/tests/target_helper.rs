@@ -5,9 +5,9 @@ use std::process::{Command, Stdio};
 
 use commonkit_adapters::{
     AptRepositoryConfigurationV1, AptSourceAuthorityV1, FileMode, ManagerBindingV1,
-    NormalizedManagedPath, PackageDesiredIntent, PackageMutationArtifact, PackageMutationPhase,
-    PackageObservationV1, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
-    ResolvedPackage, SafeSymlinkTarget, SourceBindingV1, SshFilesystemRequest,
+    NormalizedManagedPath, PackageArtifactV1, PackageDesiredIntent, PackageMutationArtifact,
+    PackageMutationPhase, PackageObservationV1, PackageResolutionV1, PackageSourceRegistry,
+    PackageTargetV1, ResolvedPackage, SafeSymlinkTarget, SourceBindingV1, SshFilesystemRequest,
     SshFilesystemResponse, SymlinkTargetKind, TargetHelper, TargetPackageResolutionConfig,
     TargetResource, package_resolution_request_digest,
 };
@@ -213,6 +213,34 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
                 | Err(commonkit_adapters::TargetFilesystemError::RemoteArtifact)
         ),
         "valid package mutation was rejected: {accepted:?}"
+    );
+
+    let mut observed_resolution = resolution.clone();
+    let observed_reference = commonkit_adapters::ContentReference {
+        digest: Sha256Digest::parse(format!("sha256:{}", "e".repeat(64))).unwrap(),
+        bytes: 1,
+        sensitivity: commonkit_adapters::ContentSensitivity::Portable,
+    };
+    let artifact_role = StableId::parse("apt-archive-ripgrep").unwrap();
+    observed_resolution.artifacts = vec![PackageArtifactV1 {
+        role: artifact_role.clone(),
+        content: observed_reference.clone(),
+        upstream_checksum: observed_reference.digest.clone(),
+        size: observed_reference.bytes,
+        materialization_key: StableId::parse("ripgrep-deb").unwrap(),
+        source_metadata_digest: observed_resolution.source.metadata_digest().unwrap(),
+    }];
+    observed_resolution.recipe = commonkit_adapters::OfflineInstallRecipeV1::AptArchives {
+        artifact_roles: [artifact_role].into_iter().collect(),
+    };
+    let observed = helper.dispatch(request(observed_resolution, Vec::new()));
+    assert!(
+        !matches!(
+            observed,
+            Err(commonkit_adapters::TargetFilesystemError::PackageResolutionRejected)
+                | Err(commonkit_adapters::TargetFilesystemError::RemoteArtifact)
+        ),
+        "observe with persisted artifacts was rejected: {observed:?}"
     );
 
     let mut altered = resolution.clone();
