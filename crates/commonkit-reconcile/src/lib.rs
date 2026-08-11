@@ -17,6 +17,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use commonkit_contracts::{
     CONTRACT_VERSION, ContractError, FORWARD_CONTRACT_VERSION, FORWARD_SCHEMA_VERSION, Operation,
     OperationPhase, OperationProgress, PACKAGE_RECEIPT_CONTRACT_VERSION,
@@ -362,7 +363,8 @@ pub struct ReceiptStore {
 /// Immutable content-addressed storage for approved plans.
 pub struct PlanStore {
     root: PathBuf,
-    root_handle: std::fs::File,
+    root_handle: Dir,
+    root_sync: std::fs::File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -377,11 +379,28 @@ pub struct PlanScanResult {
 
 impl PlanStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, PlanStoreError> {
-        fs::create_dir_all(root.as_ref())?;
-        set_private_directory(root.as_ref())?;
-        let root = root.as_ref().canonicalize()?;
-        let root_handle = open_plan_root(&root)?;
-        Ok(Self { root, root_handle })
+        let root = root.as_ref().to_path_buf();
+        match fs::symlink_metadata(&root) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink()
+                    || metadata_is_reparse_point(&metadata)
+                    || !metadata.is_dir() =>
+            {
+                return Err(PlanStoreError::InvalidRoot);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&root)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        set_private_directory(&root)?;
+        let (root_handle, root_sync) = open_plan_root(&root)?;
+        Ok(Self {
+            root,
+            root_handle,
+            root_sync,
+        })
     }
 
     pub fn persist(&self, plan: &Plan) -> Result<(), PlanStoreError> {
@@ -389,53 +408,61 @@ impl PlanStore {
         validate_plan(plan).map_err(|_| PlanStoreError::InvalidPlan)?;
         let bytes = canonical_json(plan)?;
         let destination = self.path(&plan.id);
-        if destination.exists() {
-            return if read_plan_bytes(&destination)? == bytes {
-                Ok(())
-            } else {
-                Err(PlanStoreError::PlanConflict)
-            };
+        match self.root_handle.symlink_metadata(&destination) {
+            Ok(_) => {
+                return if read_plan_bytes(&self.root_handle, &destination)? == bytes {
+                    Ok(())
+                } else {
+                    Err(PlanStoreError::PlanConflict)
+                };
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
         let nonce = PLAN_TEMP_NONCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = self.root.join(format!(
+        let temporary = PathBuf::from(format!(
             ".plan-{}-{}-{nonce}.tmp",
             std::process::id(),
             plan.id.as_str().trim_start_matches("sha256:")
         ));
         let result = (|| -> Result<(), PlanStoreError> {
-            let mut options = OpenOptions::new();
+            let mut options = CapOpenOptions::new();
             options.write(true).create_new(true);
             #[cfg(unix)]
             {
-                use std::os::unix::fs::OpenOptionsExt;
+                use cap_std::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            let mut file = options.open(&temporary)?;
+            let mut file = self.root_handle.open_with(&temporary, &options)?;
             file.write_all(&bytes)?;
             file.sync_all()?;
-            match fs::hard_link(&temporary, &destination) {
+            drop(file);
+            match self
+                .root_handle
+                .hard_link(&temporary, &self.root_handle, &destination)
+            {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if read_plan_bytes(&destination)? != bytes {
+                    if read_plan_bytes(&self.root_handle, &destination)? != bytes {
                         return Err(PlanStoreError::PlanConflict);
                     }
                 }
                 Err(error) => return Err(error.into()),
             }
-            fs::remove_file(&temporary)?;
-            sync_directory(&self.root)?;
+            self.root_handle.remove_file(&temporary)?;
+            self.root_sync.sync_all()?;
             self.ensure_root()?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temporary);
+            let _ = self.root_handle.remove_file(&temporary);
         }
         result
     }
 
     pub fn load(&self, id: &Sha256Digest) -> Result<Plan, PlanStoreError> {
         self.ensure_root()?;
-        let bytes = read_plan_bytes(&self.path(id))?;
+        let bytes = read_plan_bytes(&self.root_handle, &self.path(id))?;
         let plan: Plan = serde_json::from_slice(&bytes)?;
         if &plan.id != id || validate_plan(&plan).is_err() {
             return Err(PlanStoreError::InvalidPlan);
@@ -509,21 +536,21 @@ impl PlanStore {
         let mut latest: Option<(std::time::SystemTime, Sha256Digest, Plan)> = None;
         let mut has_target_candidate = false;
         let mut has_invalid_candidate = false;
-        for entry in fs::read_dir(&self.root)? {
+        for entry in self.root_handle.entries()? {
             let entry = entry?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else {
                 has_invalid_candidate = true;
                 continue;
             };
             if is_allowed_plan_store_entry(name) {
                 continue;
             }
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            if Path::new(name).extension().and_then(|value| value.to_str()) != Some("json") {
                 has_invalid_candidate = true;
                 continue;
             }
-            let (bytes, modified) = read_plan_file(&path)?;
+            let (bytes, modified) = read_plan_file(&self.root_handle, Path::new(name))?;
             let plan: Plan = match serde_json::from_slice(&bytes) {
                 Ok(plan) => plan,
                 Err(_) => {
@@ -566,22 +593,15 @@ impl PlanStore {
     }
 
     fn ensure_root(&self) -> Result<(), PlanStoreError> {
-        let opened = self.root_handle.metadata()?;
-        let current = fs::symlink_metadata(&self.root)?;
-        if !opened.is_dir()
-            || metadata_is_reparse_point(&opened)
-            || current.file_type().is_symlink()
-            || metadata_is_reparse_point(&current)
-            || !current.is_dir()
-            || !same_file(&opened, &current)
-        {
+        let (_, current) = open_plan_root(&self.root)?;
+        if !same_directory(&self.root_sync, &current)? {
             return Err(PlanStoreError::InvalidRoot);
         }
         Ok(())
     }
 
     fn path(&self, id: &Sha256Digest) -> PathBuf {
-        self.root.join(format!(
+        PathBuf::from(format!(
             "{}.json",
             id.as_str().trim_start_matches("sha256:")
         ))
@@ -619,7 +639,7 @@ fn is_allowed_plan_store_entry(name: &str) -> bool {
         && nonce.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-fn open_plan_root(path: &Path) -> Result<std::fs::File, PlanStoreError> {
+fn open_plan_root(path: &Path) -> Result<(Dir, std::fs::File), PlanStoreError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -630,8 +650,11 @@ fn open_plan_root(path: &Path) -> Result<std::fs::File, PlanStoreError> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path).map_err(|error| {
@@ -645,27 +668,38 @@ fn open_plan_root(path: &Path) -> Result<std::fs::File, PlanStoreError> {
     if !metadata.is_dir() || metadata_is_reparse_point(&metadata) {
         return Err(PlanStoreError::InvalidRoot);
     }
-    Ok(file)
+    let root_sync = file.try_clone()?;
+    Ok((Dir::from_std_file(file), root_sync))
 }
 
-fn read_plan_bytes(path: &Path) -> Result<Vec<u8>, PlanStoreError> {
-    let (bytes, _) = read_plan_file(path)?;
+fn read_plan_bytes(directory: &Dir, name: &Path) -> Result<Vec<u8>, PlanStoreError> {
+    let (bytes, _) = read_plan_file(directory, name)?;
     Ok(bytes)
 }
 
-fn read_plan_file(path: &Path) -> Result<(Vec<u8>, std::time::SystemTime), PlanStoreError> {
-    let (mut file, metadata) = open_plan_file(path)?;
-    let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
+fn read_plan_file(
+    directory: &Dir,
+    name: &Path,
+) -> Result<(Vec<u8>, std::time::SystemTime), PlanStoreError> {
+    let (mut file, metadata) = open_plan_file(directory, name)?;
+    let modified = metadata
+        .modified()
+        .map(|time| time.into_std())
+        .unwrap_or(std::time::UNIX_EPOCH);
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let current = fs::symlink_metadata(path)?;
-    if current.file_type().is_symlink() || !current.is_file() || !same_file(&metadata, &current) {
+    let current = directory.symlink_metadata(name)?;
+    if current.file_type().is_symlink() || !current.is_file() || !same_cap_file(&metadata, &current)
+    {
         return Err(PlanStoreError::InvalidPlan);
     }
     Ok((bytes, modified))
 }
 
-fn open_plan_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), PlanStoreError> {
+#[cfg(test)]
+fn open_plan_file_from_path(
+    path: &Path,
+) -> Result<(std::fs::File, std::fs::Metadata), PlanStoreError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -693,6 +727,37 @@ fn open_plan_file(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), Pla
     Ok((file, metadata))
 }
 
+fn open_plan_file(
+    directory: &Dir,
+    name: &Path,
+) -> Result<(cap_std::fs::File, cap_std::fs::Metadata), PlanStoreError> {
+    let mut options = CapOpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = directory.open_with(name, &options).map_err(|error| {
+        if no_follow_open_error(&error) {
+            PlanStoreError::UnsafeEntry
+        } else {
+            error.into()
+        }
+    })?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || cap_metadata_is_reparse_point(&metadata) {
+        return Err(PlanStoreError::UnsafeEntry);
+    }
+    Ok((file, metadata))
+}
+
 fn no_follow_open_error(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -705,22 +770,57 @@ fn no_follow_open_error(error: &std::io::Error) -> bool {
     }
 }
 
-fn same_file(opened: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
+fn same_cap_file(opened: &cap_std::fs::Metadata, current: &cap_std::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
+        use cap_std::fs::MetadataExt;
         opened.dev() == current.dev() && opened.ino() == current.ino()
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        opened.volume_serial_number() == current.volume_serial_number()
-            && opened.file_index() == current.file_index()
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         opened.len() == current.len() && opened.modified().ok() == current.modified().ok()
     }
+}
+
+fn same_directory(opened: &std::fs::File, current: &std::fs::File) -> Result<bool, std::io::Error> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = opened.metadata()?;
+        let current = current.metadata()?;
+        Ok(opened.dev() == current.dev() && opened.ino() == current.ino())
+    }
+    #[cfg(windows)]
+    {
+        Ok(windows_file_identity(opened)? == windows_file_identity(current)?)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(opened.metadata()?.modified().ok() == current.metadata()?.modified().ok())
+    }
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &std::fs::File) -> Result<(u32, u64), std::io::Error> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the live handle is valid and Windows initializes the output on success.
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful GetFileInformationByHandle initialized the structure.
+    let information = unsafe { information.assume_init() };
+    Ok((
+        information.dwVolumeSerialNumber,
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    ))
 }
 
 #[cfg(windows)]
@@ -732,6 +832,18 @@ fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
 
 #[cfg(not(windows))]
 fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn cap_metadata_is_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
+    use cap_std::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn cap_metadata_is_reparse_point(_metadata: &cap_std::fs::Metadata) -> bool {
     false
 }
 
@@ -2178,7 +2290,7 @@ mod plan_file_tests {
         fs::create_dir(&root).expect("temporary directory");
         let path = root.join("plan.json");
         fs::write(&path, b"original").expect("original plan");
-        let (mut descriptor, _) = open_plan_file(&path).expect("open plan");
+        let (mut descriptor, _) = open_plan_file_from_path(&path).expect("open plan");
 
         fs::rename(&path, root.join("old-plan.json")).expect("replace original path");
         fs::write(&path, b"replacement").expect("replacement plan");
@@ -2207,5 +2319,18 @@ mod plan_file_windows_tests {
         let metadata = fs::symlink_metadata(&path).expect("plan metadata");
         assert!(!metadata_is_reparse_point(&metadata));
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn windows_directory_identity_uses_the_stable_handle_api() {
+        let path = std::env::temp_dir().join(format!(
+            "commonkit-plan-root-{}-{}",
+            std::process::id(),
+            PLAN_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).expect("temporary root");
+        let (_directory, handle) = open_plan_root(&path).expect("open root");
+        assert!(same_directory(&handle, &handle).expect("identity"));
+        fs::remove_dir(path).expect("cleanup");
     }
 }

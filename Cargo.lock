@@ -706,6 +706,7 @@ dependencies = [
 name = "commonkit-reconcile"
 version = "0.2.0"
 dependencies = [
+ "cap-std",
  "commonkit-contracts",
  "commonkit-core",
  "libc",
@@ -714,6 +715,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.19",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

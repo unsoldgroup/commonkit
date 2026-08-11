@@ -7,6 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+cap-std.workspace = true
 commonkit-contracts = { path = "../commonkit-contracts" }
 commonkit-core = { path = "../commonkit-core" }
 serde.workspace = true
@@ -15,3 +16,8 @@ sha2.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",
+] }

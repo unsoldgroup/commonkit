@@ -333,10 +333,45 @@ fn scans_remain_bound_to_the_original_plan_store_root() {
     fs::create_dir(&root).expect("replace root");
     fs::write(root.join("unexpected.json"), b"not a plan").expect("write replacement");
 
+    let replacement_plan = plan_for("local-target", '3', 'e');
+    assert!(matches!(
+        store.persist(&replacement_plan),
+        Err(PlanStoreError::InvalidRoot)
+    ));
+    assert!(
+        !root
+            .join(format!(
+                "{}.json",
+                replacement_plan.id.as_str().trim_start_matches("sha256:")
+            ))
+            .exists()
+    );
+    assert!(matches!(
+        store.load(&plan.id),
+        Err(PlanStoreError::InvalidRoot)
+    ));
     assert!(matches!(
         store.load_latest_for_target(&StableId::parse("local-target").expect("target")),
         Err(PlanStoreError::InvalidRoot)
     ));
     fs::remove_dir_all(root).expect("cleanup replacement");
     fs::remove_dir_all(original).expect("cleanup original");
+}
+
+#[cfg(unix)]
+#[test]
+fn opening_a_symlink_plan_store_root_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let target = temporary_directory("plan-store-root-target");
+    fs::create_dir_all(&target).expect("target directory");
+    let root = temporary_directory("plan-store-root-symlink");
+    symlink(&target, &root).expect("symlink root");
+
+    assert!(matches!(
+        PlanStore::open(&root),
+        Err(PlanStoreError::InvalidRoot)
+    ));
+    fs::remove_file(root).expect("cleanup symlink");
+    fs::remove_dir_all(target).expect("cleanup target");
 }
