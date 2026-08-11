@@ -2236,13 +2236,17 @@ fn parse_configured_packages(
                     "APT configure action must have balanced parentheses".into(),
                 )
             })?;
-        let fields = body.split_whitespace().collect::<Vec<_>>();
-        let [version, source, architecture_field] = fields.as_slice() else {
-            return Err(AptResolutionCommandError::InvalidOutput(
-                "APT configure action must contain exact version, source, and architecture fields"
-                    .into(),
-            ));
-        };
+        let (version, after_version) = body.split_once(' ').ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "APT configure action lacks source and architecture fields".into(),
+            )
+        })?;
+        let (source_list, architecture_field) =
+            after_version.rsplit_once(' ').ok_or_else(|| {
+                AptResolutionCommandError::InvalidOutput(
+                    "APT configure action lacks a source or architecture field".into(),
+                )
+            })?;
         let listed_architecture = architecture_field
             .strip_prefix('[')
             .and_then(|value| value.strip_suffix(']'))
@@ -2258,10 +2262,12 @@ fn parse_configured_packages(
             || !safe_apt_token(name)
             || !safe_apt_token(listed_architecture)
             || !safe_apt_version(version)
-            || source.is_empty()
-            || !source.chars().all(|character| {
-                character.is_ascii_alphanumeric()
-                    || matches!(character, '.' | '+' | '-' | '_' | ':' | '/' | '~')
+            || source_list.split(", ").any(|source| {
+                source.is_empty()
+                    || !source.chars().all(|character| {
+                        character.is_ascii_alphanumeric()
+                            || matches!(character, '.' | '+' | '-' | '_' | ':' | '/' | '~')
+                    })
             })
         {
             return Err(AptResolutionCommandError::InvalidOutput(
@@ -2271,7 +2277,7 @@ fn parse_configured_packages(
         if !configured.insert((
             name.to_owned(),
             listed_architecture.to_owned(),
-            (*version).to_owned(),
+            version.to_owned(),
         )) {
             return Err(AptResolutionCommandError::InvalidOutput(
                 "APT simulation returned a duplicate configure action".into(),
@@ -2496,6 +2502,56 @@ mod tests {
             assert!(
                 validate_live_safety_simulation(unsafe_output, &closure).is_err(),
                 "{unsafe_output}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_safety_simulation_accepts_a_real_multi_origin_conf_action() {
+        let closure = vec![AptResolvedPackageV1 {
+            name: "curl".into(),
+            version: "8.5.0-2ubuntu10.6".into(),
+            architecture: "amd64".into(),
+        }];
+        let simulation = "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble-updates, Ubuntu:24.04/noble-security [amd64])\n";
+
+        validate_live_safety_simulation(simulation, &closure).unwrap();
+    }
+
+    #[test]
+    fn live_safety_simulation_rejects_malformed_multi_origin_conf_actions() {
+        let closure = vec![AptResolvedPackageV1 {
+            name: "curl".into(),
+            version: "8.5.0-2ubuntu10.6".into(),
+            architecture: "amd64".into(),
+        }];
+        let prefix = "Conf curl (8.5.0-2ubuntu10.6 ";
+        let suffix = " [amd64])\n";
+
+        for malformed_sources in [
+            "Ubuntu:24.04/noble-updates,Ubuntu:24.04/noble-security",
+            "Ubuntu:24.04/noble-updates,  Ubuntu:24.04/noble-security",
+            "Ubuntu:24.04/noble-updates , Ubuntu:24.04/noble-security",
+            "Ubuntu:24.04/noble-updates,, Ubuntu:24.04/noble-security",
+            "Ubuntu:24.04/noble-updates, , Ubuntu:24.04/noble-security",
+            ", Ubuntu:24.04/noble-security",
+            "Ubuntu:24.04/noble-updates,",
+        ] {
+            let simulation = format!("{prefix}{malformed_sources}{suffix}");
+            assert!(
+                validate_live_safety_simulation(&simulation, &closure).is_err(),
+                "{simulation}"
+            );
+        }
+
+        for malformed_line in [
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble-updates, Ubuntu:24.04/noble-security [amd64]\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble-updates, Ubuntu:24.04/noble-security amd64)\n",
+            "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble-updates, Ubuntu:24.04/noble-security [amd64]) junk\n",
+        ] {
+            assert!(
+                validate_live_safety_simulation(malformed_line, &closure).is_err(),
+                "{malformed_line}"
             );
         }
     }
