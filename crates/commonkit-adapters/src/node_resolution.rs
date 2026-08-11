@@ -753,25 +753,69 @@ fn read_optional_regular_no_follow(path: &Path) -> Result<Option<Vec<u8>>, NodeR
 fn parse_nvm_version(bytes: &[u8]) -> Result<String, NodeRuntimeHostError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| NodeRuntimeHostError::UnsafeConfiguration("nvm.sh is not UTF-8".into()))?;
-    let versions = text
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("NVM_VERSION="))
-        .map(|value| value.trim_matches(['\'', '"']))
-        .collect::<BTreeSet<_>>();
-    if versions.len() != 1 {
-        return Err(NodeRuntimeHostError::UnsafeConfiguration(
-            "nvm.sh does not declare exactly one NVM_VERSION".into(),
-        ));
+    let lines = text.lines().map(str::trim).collect::<Vec<_>>();
+    let malformed =
+        || NodeRuntimeHostError::UnsafeConfiguration("nvm.sh version dispatch is malformed".into());
+    let mut dispatch = None;
+    let mut static_version_literals = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if line.contains("NVM_VERSION=") {
+            return Err(malformed());
+        }
+        if let Some(version) = static_nvm_echo_version(line) {
+            if semantic_nvm_version(version).is_some() {
+                static_version_literals.push((index, version));
+            }
+        }
+        if !line.starts_with("\"--version\"") && !line.starts_with("\"-v\"") {
+            continue;
+        }
+        if *line != "\"--version\" | \"-v\")" || dispatch.is_some() {
+            return Err(malformed());
+        }
+        let version = lines
+            .get(index + 1)
+            .and_then(|line| static_nvm_echo_version(line));
+        if lines.get(index + 2) != Some(&";;")
+            || version.is_none_or(|version| semantic_nvm_version(version).is_none())
+        {
+            return Err(malformed());
+        }
+        dispatch = Some((index + 1, version.expect("validated semantic version")));
     }
-    Ok(versions.into_iter().next().expect("one version").into())
+    let Some((body_index, version)) = dispatch else {
+        return Err(NodeRuntimeHostError::UnsafeConfiguration(
+            "nvm.sh does not contain exactly one version dispatch".into(),
+        ));
+    };
+    if static_version_literals != [(body_index, version)] {
+        return Err(malformed());
+    }
+    Ok(version.into())
+}
+
+fn static_nvm_echo_version(line: &str) -> Option<&str> {
+    line.strip_prefix("nvm_echo '")?.strip_suffix('\'')
+}
+
+fn semantic_nvm_version(version: &str) -> Option<(u64, u64, u64)> {
+    let [major, minor, patch] = version.split('.').collect::<Vec<_>>().try_into().ok()?;
+    if [major, minor, patch]
+        .iter()
+        .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let parsed = (
+        major.parse().ok()?,
+        minor.parse().ok()?,
+        patch.parse().ok()?,
+    );
+    (format!("{}.{}.{}", parsed.0, parsed.1, parsed.2) == version).then_some(parsed)
 }
 
 fn nvm_at_least_0_40_6(version: &str) -> bool {
-    let parts = version
-        .split('.')
-        .map(str::parse::<u64>)
-        .collect::<Result<Vec<_>, _>>();
-    matches!(parts.as_deref(), Ok([major, minor, patch]) if (*major, *minor, *patch) >= (0, 40, 6))
+    semantic_nvm_version(version).is_some_and(|version| version >= (0, 40, 6))
 }
 
 fn observe_installed_versions(
