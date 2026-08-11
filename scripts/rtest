@@ -43,7 +43,7 @@ printf '%s\n' "rtest: ${name} → ${vps}:${remote}"
 rsync -az --delete \
   --rsync-path="mkdir -p '${remote}' && rsync" \
   -e "ssh -i ${key} -o BatchMode=yes -o ConnectTimeout=10" \
-  --exclude='.git/' --exclude='node_modules/' --exclude='.env*' --exclude='*.log' \
+  --exclude='.git' --exclude='node_modules/' --exclude='.env*' --exclude='*.log' \
   --exclude='/dist/' --exclude='/build/' --exclude='/.next/' --exclude='/.wrangler/' \
   --exclude='/coverage/' --exclude='/playwright-report/' --exclude='/test-results/' \
   --exclude='/.turbo/' --exclude='.build/' --exclude='target/' \

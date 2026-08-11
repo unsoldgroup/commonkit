@@ -27,7 +27,7 @@ const ignoredDirectories = new Set([".git", ".cache", "build", "dist", "node_mod
 async function repositoryFiles(directory = repositoryRoot) {
   const files = [];
   for (const entry of await readdir(directory, { withFileTypes: true })) {
-    if (entry.isDirectory() && ignoredDirectories.has(entry.name)) continue;
+    if (ignoredDirectories.has(entry.name)) continue;
     const path = join(directory, entry.name);
     if (entry.isDirectory()) files.push(...await repositoryFiles(path));
     else if (entry.isFile()) files.push(relative(repositoryRoot, path));
