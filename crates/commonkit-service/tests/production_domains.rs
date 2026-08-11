@@ -2,9 +2,13 @@ use std::collections::BTreeMap;
 
 use commonkit_adapters::{
     ArtifactStore, ContentSensitivity, ExactProviderVersion, FilesystemIntent, MaterializedState,
-    NormalizedManagedPath, NormalizedResource, ProviderInputs, ResourceProvenance,
+    NormalizedManagedPath, NormalizedResource, PackageDesiredIntent, ProviderInputs,
+    ResourceProvenance,
 };
-use commonkit_contracts::{StableId, digest_domain_json};
+use commonkit_contracts::{
+    PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, StableId,
+    digest_domain_json,
+};
 use commonkit_reconcile::PlanStore;
 use commonkit_reconcile::{Adapter, ReceiptStore, ReconcileOutcome, Reconciler};
 use commonkit_service::{
@@ -388,6 +392,147 @@ fn git_executable() -> std::path::PathBuf {
 
 fn write_json(path: &std::path::Path, value: &impl serde::Serialize) {
     std::fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+}
+
+fn unresolved_package_state(
+    root: &std::path::Path,
+    manager: PackageManager,
+    source: &str,
+) -> std::path::PathBuf {
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "commonkit.native-provider.v1".into(),
+        BTreeMap::from([(
+            "fixture".into(),
+            digest_domain_json("test.package-input", &source).unwrap(),
+        )]),
+        vec!["packages".into()],
+    )
+    .unwrap();
+    let selector = match manager {
+        PackageManager::Nvm | PackageManager::Fnm => PackageSelector::NodeRuntime {},
+        PackageManager::Rustup => PackageSelector::RustToolchain {
+            profile: commonkit_contracts::RustToolchainProfile::Minimal,
+            components: Default::default(),
+            targets: Default::default(),
+        },
+        PackageManager::Homebrew => PackageSelector::HomebrewFormula {
+            name: "ripgrep".into(),
+        },
+        PackageManager::Apt => PackageSelector::AptBinary {
+            name: "ripgrep".into(),
+            architecture: None,
+        },
+    };
+    let declaration = PackageDeclaration {
+        id: StableId::parse("ripgrep").unwrap(),
+        version: "14.1.1".into(),
+        manager,
+        source: StableId::parse(source).unwrap(),
+        selector: Some(selector),
+    };
+    let state = MaterializedState::finalize(
+        inputs.clone(),
+        vec![NormalizedResource {
+            intent: PackageDesiredIntent::new(declaration).unwrap().into(),
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id,
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest,
+                source: "fixture-package".into(),
+            },
+        }],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let path = root.join("package-state.json");
+    write_json(&path, &state);
+    path
+}
+
+#[test]
+fn production_denied_package_resolution_registers_no_operations_or_package_artifacts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let target = root.join("target");
+    let state = root.join("state");
+    std::fs::create_dir_all(&target).unwrap();
+    let materialized = unresolved_package_state(root, PackageManager::Nvm, "nodejs-nvm");
+    let config = root.join("headless.json");
+    write_json(
+        &config,
+        &serde_json::json!({
+            "sync": {
+                "targetId": "local", "targetRoot": target, "adapterState": state.join("filesystem"),
+                "providerArtifacts": root.join("provider-artifacts"), "materializedStates": [materialized],
+                "declaredRoots": ["home"], "protectedRoots": [], "caseSensitive": true,
+                "targetIdentityDigest": digest_domain_json("test", &"target").unwrap(),
+                "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
+                "policyDigest": digest_domain_json("test", &"policy").unwrap(),
+                "packageResolution": {
+                    "target": {"os": "macos", "osVersion": "15", "arch": std::env::consts::ARCH},
+                    "manager": {"manager": "nvm", "version": "0.40.6", "executableDigest": digest_domain_json("test", &"nvm").unwrap(), "configDigest": digest_domain_json("test", &"config").unwrap()},
+                    "policy": serde_json::to_value(SecurityPolicy::default()).unwrap(),
+                    "node": {"nvmDir": root.join(".nvm"), "shellExecutable": "/bin/sh", "releaseKeyring": root.join("keyring"), "gpgvExecutable": "/usr/bin/gpgv"}
+                }
+            }
+        }),
+    );
+    let registry = ProductionDomainRegistry::load(
+        &config,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap();
+    let sync = registry.sync.unwrap();
+    assert!(
+        sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"denied"}))
+            .is_err()
+    );
+    assert!(!state.join("filesystem/packages").exists());
+}
+
+#[test]
+fn production_unsupported_package_resolution_registers_no_operations_or_package_artifacts() {
+    let temporary = tempfile::tempdir().unwrap();
+    let root = temporary.path();
+    let target = root.join("target");
+    let state = root.join("state");
+    std::fs::create_dir_all(&target).unwrap();
+    let materialized = unresolved_package_state(root, PackageManager::Rustup, "rustup-official");
+    let config = root.join("headless.json");
+    write_json(
+        &config,
+        &serde_json::json!({
+            "sync": {
+                "targetId": "local", "targetRoot": target, "adapterState": state.join("filesystem"),
+                "providerArtifacts": root.join("provider-artifacts"), "materializedStates": [materialized],
+                "declaredRoots": ["home"], "protectedRoots": [], "caseSensitive": true,
+                "targetIdentityDigest": digest_domain_json("test", &"target").unwrap(),
+                "composedLoadoutDigest": digest_domain_json("test", &"loadout").unwrap(),
+                "policyDigest": digest_domain_json("test", &"policy").unwrap(),
+                "packageResolution": {
+                    "target": {"os": "macos", "osVersion": "15", "arch": std::env::consts::ARCH},
+                    "manager": {"manager": "rustup", "version": "1.0.0", "executableDigest": digest_domain_json("test", &"rustup").unwrap(), "configDigest": digest_domain_json("test", &"config").unwrap()},
+                    "policy": serde_json::to_value(SecurityPolicy::default()).unwrap()
+                }
+            }
+        }),
+    );
+    let registry = ProductionDomainRegistry::load(
+        &config,
+        std::sync::Arc::new(PlanStore::open(root.join("plans")).unwrap()),
+        root.join("receipts"),
+    )
+    .unwrap();
+    let sync = registry.sync.unwrap();
+    assert!(
+        sync.plan(serde_json::json!({"confirmed":true,"confirmationId":"unsupported"}))
+            .is_err()
+    );
+    assert!(!state.join("filesystem/packages").exists());
 }
 
 fn lifecycle_config() -> serde_json::Value {
