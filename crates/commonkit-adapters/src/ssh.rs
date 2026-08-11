@@ -1,6 +1,8 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use commonkit_contracts::Sha256Digest;
 use sha2::{Digest, Sha256};
@@ -95,29 +97,98 @@ impl RemoteProcessRunner for ProcessRemoteRunner {
         args: &[String],
         stdin: &[u8],
     ) -> Result<ProcessOutput, std::io::Error> {
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Do not buffer untrusted remote diagnostics; stdout is the only
-            // typed channel and is independently bounded below.
-            .stderr(Stdio::null())
-            .spawn()?;
-        child.stdin.take().expect("piped stdin").write_all(stdin)?;
-        let mut stdout = Vec::new();
-        child
-            .stdout
-            .take()
-            .expect("piped stdout")
-            .take((MAX_SSH_RESPONSE_BYTES + 1) as u64)
-            .read_to_end(&mut stdout)?;
-        let status = child.wait()?.code().unwrap_or(-1);
-        Ok(ProcessOutput {
-            status,
-            stdout,
-            stderr: Vec::new(),
-        })
+        run_process_bounded(program, args, stdin, MAX_SSH_RESPONSE_BYTES)
     }
+}
+
+pub fn run_process_bounded(
+    program: &str,
+    args: &[String],
+    stdin: &[u8],
+    output_limit: usize,
+) -> Result<ProcessOutput, std::io::Error> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let mut child_stdin = child.stdin.take().expect("piped stdin");
+    let (sender, receiver) = mpsc::channel();
+    let streams: [(u8, Box<dyn Read + Send>); 2] =
+        [(0u8, Box::new(stdout)), (1u8, Box::new(stderr))];
+    for (kind, stream) in streams {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stream
+                .take((output_limit + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes);
+            let _ = sender.send((kind, result));
+        });
+    }
+    let sender_for_stdin = sender.clone();
+    let stdin = stdin.to_vec();
+    std::thread::spawn(move || {
+        let result = child_stdin.write_all(&stdin).map(|_| ());
+        let _ = sender_for_stdin.send((2, result.map(|_| Vec::new())));
+    });
+    drop(sender);
+
+    let mut stdout = None;
+    let mut stderr = None;
+    let mut stdin_done = false;
+    let mut overflow = false;
+    let mut input_error = None;
+    while stdout.is_none() || stderr.is_none() || !stdin_done {
+        let (kind, result) = match receiver.recv_timeout(Duration::from_millis(20)) {
+            Ok(value) => value,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if overflow {
+                    let _ = child.kill();
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        match result {
+            Ok(bytes) if (kind == 0 || kind == 1) && bytes.len() > output_limit => {
+                overflow = true;
+                let _ = child.kill();
+            }
+            Ok(bytes) if kind == 0 => stdout = Some(bytes),
+            Ok(bytes) if kind == 1 => stderr = Some(bytes),
+            Ok(_) => stdin_done = true,
+            Err(_) => {
+                input_error = Some(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "remote process closed stdin",
+                ));
+                let _ = child.kill();
+            }
+        }
+    }
+    if overflow {
+        let _ = child.kill();
+    }
+    let status = child.wait()?.code().unwrap_or(-1);
+    if overflow {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "remote process output exceeded limit",
+        ));
+    }
+    if let Some(error) = input_error {
+        return Err(error);
+    }
+    Ok(ProcessOutput {
+        status,
+        stdout: stdout.unwrap_or_default(),
+        stderr: stderr.unwrap_or_default(),
+    })
 }
 
 pub struct OpenSshTransport<R> {

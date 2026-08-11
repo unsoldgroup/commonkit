@@ -9,6 +9,8 @@ use commonkit_contracts::{PackageManager, StableId};
 use commonkit_core::{RootAccess, TargetRoot};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use crate::{
     ARTIFACT_CHUNK_SIZE, AptResolutionBackend, AptSourceAuthorityV1, ArtifactStore,
@@ -77,6 +79,8 @@ impl TargetHelper {
             .clone_directory()
             .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         validate_staging_directory(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        let _lock =
+            acquire_staging_lock(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         cleanup_staging(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         #[cfg(unix)]
         {
@@ -440,6 +444,8 @@ impl TargetHelper {
             .staging
             .lock()
             .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        let _lock =
+            acquire_staging_lock(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         let (part, meta) = Self::transfer_paths(&transfer_id, &digest);
         let part_exists = staging.metadata(&part).is_ok();
         let reference = ContentReference {
@@ -522,7 +528,7 @@ impl TargetHelper {
             let meta_file = staging.open_with(&meta, &meta_options)?;
             let mut metadata_bytes = Vec::new();
             meta_file.take(4097).read_to_end(&mut metadata_bytes)?;
-            if metadata_bytes != identity.as_bytes() {
+            if !metadata_bytes.starts_with(format!("{identity}|").as_bytes()) {
                 return Err(TargetFilesystemError::RemoteArtifact);
             }
             let mut part_options = staging_open_options();
@@ -545,6 +551,11 @@ impl TargetHelper {
                 }
             }
         }
+        let mut touch_options = staging_open_options();
+        touch_options.write(true).truncate(true);
+        let mut meta_file = staging.open_with(&meta, &touch_options)?;
+        meta_file.write_all(format!("{identity}|{sequence}").as_bytes())?;
+        meta_file.sync_all()?;
         if sequence + 1 == total_chunks {
             let mut part_options = staging_open_options();
             part_options.read(true);
@@ -926,6 +937,56 @@ const STAGING_MAX_PARTS: usize = 128;
 const STAGING_MAX_BYTES: u64 = MAX_ARTIFACT_TRANSFER_BYTES;
 const STAGING_STALE_AFTER_SECS: u64 = 24 * 60 * 60;
 
+struct StagingLock {
+    file: cap_std::fs::File,
+}
+
+fn acquire_staging_lock(staging: &Dir) -> Result<StagingLock, std::io::Error> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
+    }
+    let file = staging.open_with(".lock", &options)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsafe staging lock",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe staging lock ownership",
+            ));
+        }
+    }
+    #[cfg(unix)]
+    {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(StagingLock { file })
+}
+
+impl Drop for StagingLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 fn staging_open_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     #[cfg(unix)]
@@ -943,11 +1004,42 @@ fn staging_open_options() -> OpenOptions {
 
 fn cleanup_staging(staging: &Dir) -> Result<(), std::io::Error> {
     let now = cap_std::time::SystemClock::new(cap_std::ambient_authority()).now();
+    let mut entries = Vec::new();
     for entry in staging.read_dir(".")? {
-        let entry = entry?;
+        entries.push(entry?);
+    }
+    for entry in &entries {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if !(name.ends_with(".part") || name.ends_with(".meta")) {
+        if !name.ends_with(".part") {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsafe staging entry",
+            ));
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() > STAGING_STALE_AFTER_SECS);
+        if stale {
+            entry.remove_file()?;
+            let meta = format!("{}.meta", name.trim_end_matches(".part"));
+            let _ = staging.remove_file(meta);
+        }
+    }
+    for entry in entries {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".meta") {
+            continue;
+        }
+        let part = format!("{}.part", name.trim_end_matches(".meta"));
+        if staging.metadata(&part).is_ok() {
             continue;
         }
         let metadata = entry.metadata()?;

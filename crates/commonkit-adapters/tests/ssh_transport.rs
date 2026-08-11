@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 
 use commonkit_adapters::{
     ARTIFACT_CHUNK_SIZE, OpenSshConfig, OpenSshTransport, ProcessOutput, RemoteProcessRunner,
-    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
+    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, run_process_bounded,
 };
 use commonkit_core::{Sha256Digest, StableId};
 use sha2::{Digest, Sha256};
@@ -518,4 +518,22 @@ fn pinned_transport_uses_fixed_argv_and_typed_stdio_protocol() {
         runner.calls[2].1[8],
         format!("UserKnownHostsFile={}", known_hosts_argument())
     );
+}
+
+#[test]
+fn process_runner_kills_bounded_stdout_overflow_without_pipe_deadlock() {
+    let started = std::time::Instant::now();
+    let error =
+        run_process_bounded("/bin/sh", &["-c".into(), "yes x".into()], &[], 16).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+}
+
+#[test]
+fn process_runner_drains_and_kills_bounded_stderr_overflow() {
+    let started = std::time::Instant::now();
+    let error =
+        run_process_bounded("/bin/sh", &["-c".into(), "yes x >&2".into()], &[], 16).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
 }

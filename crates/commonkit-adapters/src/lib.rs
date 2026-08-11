@@ -127,6 +127,7 @@ pub use service_lifecycle::{
 };
 pub use ssh::{
     OpenSshConfig, OpenSshTransport, ProcessOutput, ProcessRemoteRunner, RemoteProcessRunner,
+    run_process_bounded,
 };
 pub use ssh_files::{SshFileAdapter, SshFileAdapterError, SshTargetCapabilities};
 pub use target::{
