@@ -236,6 +236,91 @@ fn artifacts_and_recovery_receipts_survive_helper_process_restarts() {
 }
 
 #[test]
+fn chunk_transfer_rejects_gaps_and_tampering_but_accepts_safe_retry() {
+    let home = temp("chunk-home");
+    let target = temp("chunk-target");
+    let state = temp("chunk-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state, "roots": [{"id":"home","path":target,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bytes = vec![b'a'; 1_048_577];
+    let first_chunk = vec![b'a'; 1_048_576];
+    let second_chunk = vec![b'a'];
+    let digest = Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&bytes))).unwrap();
+    let transfer = StableId::parse("transfer-one").unwrap();
+    let gap = invoke(
+        &home,
+        &SshFilesystemRequest::StageArtifactChunk {
+            run_id: transfer.clone(),
+            transfer_id: transfer.clone(),
+            digest: digest.clone(),
+            byte_count: bytes.len() as u64,
+            chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+            sequence: 1,
+            offset: commonkit_adapters::ARTIFACT_CHUNK_SIZE as u64,
+            total_chunks: 2,
+            content: second_chunk.clone(),
+        },
+    );
+    assert!(!gap.status.success());
+    let first = SshFilesystemRequest::StageArtifactChunk {
+        run_id: transfer.clone(),
+        transfer_id: transfer.clone(),
+        digest: digest.clone(),
+        byte_count: bytes.len() as u64,
+        chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+        sequence: 0,
+        offset: 0,
+        total_chunks: 2,
+        content: first_chunk.clone(),
+    };
+    assert!(invoke(&home, &first).status.success());
+    assert!(invoke(&home, &first).status.success());
+    let tampered = SshFilesystemRequest::StageArtifactChunk {
+        run_id: transfer.clone(),
+        transfer_id: transfer.clone(),
+        digest: digest.clone(),
+        byte_count: bytes.len() as u64,
+        chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+        sequence: 0,
+        offset: 0,
+        total_chunks: 2,
+        content: vec![b'W'; 1_048_576],
+    };
+    assert!(!invoke(&home, &tampered).status.success());
+    let second = SshFilesystemRequest::StageArtifactChunk {
+        run_id: transfer.clone(),
+        transfer_id: transfer.clone(),
+        digest: digest.clone(),
+        byte_count: bytes.len() as u64,
+        chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+        sequence: 1,
+        offset: commonkit_adapters::ARTIFACT_CHUNK_SIZE as u64,
+        total_chunks: 2,
+        content: second_chunk,
+    };
+    assert!(invoke(&home, &second).status.success());
+    let verified = invoke(
+        &home,
+        &SshFilesystemRequest::VerifyArtifact {
+            run_id: transfer,
+            digest: digest.clone(),
+        },
+    );
+    assert!(verified.status.success());
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
+#[test]
 fn helper_rejects_any_command_surface_other_than_stdio_protocol() {
     let output = Command::new(env!("CARGO_BIN_EXE_commonkit-target-helper"))
         .arg("sh")

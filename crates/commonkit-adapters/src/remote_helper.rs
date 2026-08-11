@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -9,15 +10,16 @@ use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AptResolutionBackend, AptSourceAuthorityV1, ArtifactStore, ContentSensitivity,
-    LocalTargetFilesystem, NodeResolutionBackend, NodeRuntimeHost, PackageDiscoveryFetchRequestV1,
-    PackageFetch, PackageFetchHopV1, PackageFetchRequestV1, PackageMutationArtifact,
-    PackageMutationBackend, PackageMutationPhase, PackageResolutionBackend,
-    PackageResolutionCoordinator, PackageResolutionError, PackageSourceRegistry,
-    ProcessAptResolutionCommandRunner, ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost,
-    ProcessOfflinePackageBackend, SshFilesystemRequest, SshFilesystemResponse, TargetFilesystem,
-    TargetFilesystemError, TargetPackageResolutionConfig, package_resolution_request_digest,
-    package_resolution_response_digest,
+    ARTIFACT_CHUNK_SIZE, AptResolutionBackend, AptSourceAuthorityV1, ArtifactStore,
+    ContentReference, ContentSensitivity, LocalTargetFilesystem, MAX_ARTIFACT_TRANSFER_BYTES,
+    NodeResolutionBackend, NodeRuntimeHost, PackageDiscoveryFetchRequestV1, PackageFetch,
+    PackageFetchHopV1, PackageFetchRequestV1, PackageMutationArtifact, PackageMutationBackend,
+    PackageMutationPhase, PackageResolutionBackend, PackageResolutionCoordinator,
+    PackageResolutionError, PackageSourceRegistry, ProcessAptResolutionCommandRunner,
+    ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, ProcessOfflinePackageBackend,
+    SshFilesystemRequest, SshFilesystemResponse, TargetFilesystem, TargetFilesystemError,
+    TargetPackageResolutionConfig, artifact_chunk_response_digest,
+    package_resolution_request_digest, package_resolution_response_digest,
 };
 
 const MAX_RESOLUTION_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
@@ -27,6 +29,7 @@ pub struct TargetHelper {
     roots: BTreeMap<StableId, (PathBuf, RootAccess)>,
     artifacts: ArtifactStore,
     receipts: PathBuf,
+    staging: PathBuf,
     package_resolution: Option<TargetPackageResolutionConfig>,
 }
 
@@ -51,6 +54,8 @@ impl TargetHelper {
             .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         let receipts = state_root.join("receipts");
         std::fs::create_dir_all(&receipts)?;
+        let staging = state_root.join("artifact-staging");
+        std::fs::create_dir_all(&staging)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -60,6 +65,7 @@ impl TargetHelper {
             roots: mapped,
             artifacts,
             receipts,
+            staging,
             package_resolution,
         })
     }
@@ -241,13 +247,7 @@ impl TargetHelper {
         }
         let mut total_artifact_bytes = 0u64;
         for reference in intent.artifacts {
-            let bytes = self
-                .artifacts
-                .load(&reference)
-                .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
-            if u64::try_from(bytes.len()).ok() != Some(reference.bytes)
-                || reference.bytes > MAX_RESOLUTION_ARTIFACT_BYTES
-            {
+            if reference.bytes > MAX_RESOLUTION_ARTIFACT_BYTES {
                 return Err(TargetFilesystemError::RemoteArtifact);
             }
             total_artifact_bytes = total_artifact_bytes
@@ -256,7 +256,7 @@ impl TargetHelper {
             if total_artifact_bytes > MAX_RESOLUTION_ARTIFACT_BYTES {
                 return Err(TargetFilesystemError::RemoteArtifact);
             }
-            artifacts.push(PackageMutationArtifact { reference, bytes });
+            artifacts.push(PackageMutationArtifact { reference });
         }
         let response_digest = package_resolution_response_digest(
             &request_digest,
@@ -274,6 +274,216 @@ impl TargetHelper {
             response_digest,
             resolution,
             artifacts,
+        })
+    }
+
+    fn transfer_paths(
+        &self,
+        transfer_id: &StableId,
+        digest: &commonkit_contracts::Sha256Digest,
+    ) -> (PathBuf, PathBuf) {
+        let stem = format!(
+            "{}-{}",
+            transfer_id.as_str(),
+            digest.as_str().trim_start_matches("sha256:")
+        );
+        (
+            self.staging.join(format!("{stem}.part")),
+            self.staging.join(format!("{stem}.meta")),
+        )
+    }
+
+    fn validate_chunk(
+        byte_count: u64,
+        chunk_size: u32,
+        sequence: u32,
+        offset: u64,
+        total_chunks: u32,
+        content_len: usize,
+    ) -> Result<(), TargetFilesystemError> {
+        if byte_count > MAX_ARTIFACT_TRANSFER_BYTES
+            || chunk_size != ARTIFACT_CHUNK_SIZE
+            || total_chunks == 0
+            || total_chunks as u64 != byte_count.div_ceil(u64::from(chunk_size))
+            || sequence >= total_chunks
+            || offset != u64::from(sequence) * u64::from(chunk_size)
+            || content_len == 0 && byte_count != 0
+            || content_len as u64 > u64::from(chunk_size)
+            || offset
+                .checked_add(content_len as u64)
+                .is_none_or(|end| end > byte_count)
+            || (sequence + 1 < total_chunks && content_len as u32 != chunk_size)
+            || (sequence + 1 == total_chunks && content_len as u64 != byte_count - offset)
+        {
+            return Err(TargetFilesystemError::RemoteArtifact);
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stage_artifact_chunk(
+        &self,
+        run_id: StableId,
+        transfer_id: StableId,
+        digest: commonkit_contracts::Sha256Digest,
+        byte_count: u64,
+        chunk_size: u32,
+        sequence: u32,
+        offset: u64,
+        total_chunks: u32,
+        content: Vec<u8>,
+    ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+        Self::validate_chunk(
+            byte_count,
+            chunk_size,
+            sequence,
+            offset,
+            total_chunks,
+            content.len(),
+        )?;
+        let (part, meta) = self.transfer_paths(&transfer_id, &digest);
+        if std::fs::symlink_metadata(&part)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+            || std::fs::symlink_metadata(&meta)
+                .map(|metadata| metadata.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            return Err(TargetFilesystemError::RemoteArtifact);
+        }
+        let identity = format!("{digest}|{byte_count}|{chunk_size}|{total_chunks}");
+        if sequence == 0 && offset == 0 && !part.exists() {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&part)?;
+            file.write_all(&content)?;
+            file.sync_all()?;
+            std::fs::write(&meta, identity.as_bytes())?;
+        } else {
+            if std::fs::read(&meta).ok().as_deref() != Some(identity.as_bytes()) {
+                return Err(TargetFilesystemError::RemoteArtifact);
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&part)?;
+            let current = file.metadata()?.len();
+            if current < offset {
+                return Err(TargetFilesystemError::RemoteArtifact);
+            }
+            if current == offset {
+                file.seek(SeekFrom::Start(offset))?;
+                file.write_all(&content)?;
+                file.sync_all()?;
+            } else {
+                let mut existing = vec![0; content.len()];
+                file.seek(SeekFrom::Start(offset))?;
+                file.read_exact(&mut existing)?;
+                if existing != content {
+                    return Err(TargetFilesystemError::RemoteArtifact);
+                }
+            }
+        }
+        if sequence + 1 == total_chunks {
+            let reference = ContentReference {
+                digest: digest.clone(),
+                bytes: byte_count,
+                sensitivity: ContentSensitivity::Portable,
+            };
+            self.artifacts
+                .put_file(&part, &reference)
+                .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(&meta);
+        }
+        let response_digest = artifact_chunk_response_digest(
+            &run_id,
+            &transfer_id,
+            &digest,
+            byte_count,
+            chunk_size,
+            sequence,
+            offset,
+            total_chunks,
+            &content,
+        )
+        .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        Ok(SshFilesystemResponse::ArtifactChunkStaged {
+            run_id,
+            transfer_id,
+            digest,
+            byte_count,
+            chunk_size,
+            sequence,
+            offset,
+            total_chunks,
+            response_digest,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_artifact_chunk(
+        &self,
+        request_id: StableId,
+        transfer_id: StableId,
+        digest: commonkit_contracts::Sha256Digest,
+        byte_count: u64,
+        chunk_size: u32,
+        sequence: u32,
+        offset: u64,
+        total_chunks: u32,
+    ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+        let expected = usize::try_from((byte_count - offset).min(u64::from(chunk_size)))
+            .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        Self::validate_chunk(
+            byte_count,
+            chunk_size,
+            sequence,
+            offset,
+            total_chunks,
+            expected,
+        )?;
+        let reference = ContentReference {
+            digest: digest.clone(),
+            bytes: byte_count,
+            sensitivity: ContentSensitivity::Portable,
+        };
+        let content = self
+            .artifacts
+            .read_chunk(&reference, offset, chunk_size)
+            .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        Self::validate_chunk(
+            byte_count,
+            chunk_size,
+            sequence,
+            offset,
+            total_chunks,
+            content.len(),
+        )?;
+        let response_digest = artifact_chunk_response_digest(
+            &request_id,
+            &transfer_id,
+            &digest,
+            byte_count,
+            chunk_size,
+            sequence,
+            offset,
+            total_chunks,
+            &content,
+        )
+        .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        Ok(SshFilesystemResponse::ArtifactChunk {
+            request_id,
+            transfer_id,
+            digest,
+            byte_count,
+            chunk_size,
+            sequence,
+            offset,
+            total_chunks,
+            content,
+            response_digest,
         })
     }
 
@@ -337,12 +547,15 @@ impl TargetHelper {
                     return Err(TargetFilesystemError::ReadOnly);
                 }
                 for artifact in artifacts {
-                    let stored = self
-                        .artifacts
-                        .put(&artifact.bytes, artifact.reference.sensitivity)
+                    self.artifacts
+                        .verify_digest(&artifact.reference.digest)
                         .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
-                    if stored.digest != artifact.reference.digest
-                        || stored.bytes != artifact.reference.bytes
+                    let metadata = self
+                        .artifacts
+                        .read_chunk(&artifact.reference, 0, 1)
+                        .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+                    if artifact.reference.bytes > MAX_RESOLUTION_ARTIFACT_BYTES
+                        || metadata.is_empty() && artifact.reference.bytes != 0
                     {
                         return Err(TargetFilesystemError::RemoteArtifact);
                     }
@@ -432,6 +645,46 @@ impl TargetHelper {
                 }
                 Ok(SshFilesystemResponse::ArtifactStaged { digest })
             }
+            SshFilesystemRequest::StageArtifactChunk {
+                run_id,
+                transfer_id,
+                digest,
+                byte_count,
+                chunk_size,
+                sequence,
+                offset,
+                total_chunks,
+                content,
+            } => self.stage_artifact_chunk(
+                run_id,
+                transfer_id,
+                digest,
+                byte_count,
+                chunk_size,
+                sequence,
+                offset,
+                total_chunks,
+                content,
+            ),
+            SshFilesystemRequest::ReadArtifactChunk {
+                request_id,
+                transfer_id,
+                digest,
+                byte_count,
+                chunk_size,
+                sequence,
+                offset,
+                total_chunks,
+            } => self.read_artifact_chunk(
+                request_id,
+                transfer_id,
+                digest,
+                byte_count,
+                chunk_size,
+                sequence,
+                offset,
+                total_chunks,
+            ),
             SshFilesystemRequest::VerifyArtifact { digest, .. } => {
                 self.artifacts
                     .verify_digest(&digest)

@@ -6,7 +6,8 @@ use commonkit_contracts::Sha256Digest;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, TargetFilesystemError,
+    ARTIFACT_CHUNK_SIZE, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
+    TargetFilesystemError, artifact_chunk_response_digest,
 };
 
 pub const MAX_SSH_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -257,6 +258,11 @@ impl<R: RemoteProcessRunner> SshFilesystemTransport for OpenSshTransport<R> {
                 return Err(TargetFilesystemError::InvalidRemoteResponse);
             }
         }
+        if let SshFilesystemRequest::StageArtifactChunk { content, .. } = &request {
+            if content.len() > ARTIFACT_CHUNK_SIZE as usize {
+                return Err(TargetFilesystemError::InvalidRemoteResponse);
+            }
+        }
         let input = serde_json::to_vec(&request)
             .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?;
         if input.len() > MAX_SSH_REQUEST_BYTES {
@@ -316,6 +322,99 @@ impl<R: RemoteProcessRunner> SshFilesystemTransport for OpenSshTransport<R> {
                 SshFilesystemResponse::PackageResolution { .. }
                 | SshFilesystemResponse::PackageResolutionRejected { .. },
             ) => true,
+            (
+                SshFilesystemRequest::StageArtifactChunk {
+                    run_id,
+                    transfer_id,
+                    digest,
+                    byte_count,
+                    chunk_size,
+                    sequence,
+                    offset,
+                    total_chunks,
+                    content,
+                    ..
+                },
+                SshFilesystemResponse::ArtifactChunkStaged {
+                    run_id: response_run,
+                    transfer_id: response_transfer,
+                    digest: response_digest_value,
+                    byte_count: response_bytes,
+                    chunk_size: response_size,
+                    sequence: response_sequence,
+                    offset: response_offset,
+                    total_chunks: response_total,
+                    response_digest,
+                },
+            ) => {
+                artifact_chunk_response_digest(
+                    run_id,
+                    transfer_id,
+                    digest,
+                    *byte_count,
+                    *chunk_size,
+                    *sequence,
+                    *offset,
+                    *total_chunks,
+                    content,
+                )
+                .ok()
+                    == Some(response_digest.clone())
+                    && run_id == response_run
+                    && transfer_id == response_transfer
+                    && digest == response_digest_value
+                    && byte_count == response_bytes
+                    && chunk_size == response_size
+                    && sequence == response_sequence
+                    && offset == response_offset
+                    && total_chunks == response_total
+            }
+            (
+                SshFilesystemRequest::ReadArtifactChunk {
+                    request_id,
+                    transfer_id,
+                    digest,
+                    byte_count,
+                    chunk_size,
+                    sequence,
+                    offset,
+                    total_chunks,
+                },
+                SshFilesystemResponse::ArtifactChunk {
+                    request_id: response_request,
+                    transfer_id: response_transfer,
+                    digest: response_digest_value,
+                    byte_count: response_bytes,
+                    chunk_size: response_size,
+                    sequence: response_sequence,
+                    offset: response_offset,
+                    total_chunks: response_total,
+                    content,
+                    response_digest,
+                },
+            ) => {
+                artifact_chunk_response_digest(
+                    request_id,
+                    transfer_id,
+                    digest,
+                    *byte_count,
+                    *chunk_size,
+                    *sequence,
+                    *offset,
+                    *total_chunks,
+                    content,
+                )
+                .ok()
+                    == Some(response_digest.clone())
+                    && request_id == response_request
+                    && transfer_id == response_transfer
+                    && digest == response_digest_value
+                    && byte_count == response_bytes
+                    && chunk_size == response_size
+                    && sequence == response_sequence
+                    && offset == response_offset
+                    && total_chunks == response_total
+            }
             _ => false,
         };
         if !matching {

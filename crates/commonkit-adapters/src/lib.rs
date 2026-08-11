@@ -130,8 +130,10 @@ pub use ssh::{
 };
 pub use ssh_files::{SshFileAdapter, SshFileAdapterError, SshTargetCapabilities};
 pub use target::{
-    AptResolutionConstraints, LocalTargetFilesystem, PackageMutationArtifact, PackageMutationPhase,
-    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, SshTargetFilesystem,
-    TargetFilesystem, TargetFilesystemError, TargetResource, package_resolution_request_digest,
+    ARTIFACT_CHUNK_SIZE, AptResolutionConstraints, LocalTargetFilesystem,
+    MAX_ARTIFACT_TRANSFER_BYTES, MAX_ARTIFACT_TRANSFER_COUNT, PackageMutationArtifact,
+    PackageMutationPhase, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
+    SshTargetFilesystem, TargetFilesystem, TargetFilesystemError, TargetResource,
+    artifact_chunk_response_digest, artifact_transfer_id, package_resolution_request_digest,
     package_resolution_response_digest,
 };

@@ -672,21 +672,14 @@ impl<T> SshOfflinePackageBackend<T> {
     where
         T: crate::SshFilesystemTransport,
     {
-        let transferred = match artifacts {
-            Some(store) => resolution
-                .artifacts
-                .iter()
-                .map(|artifact| {
-                    Ok(crate::PackageMutationArtifact {
-                        reference: artifact.content.clone(),
-                        bytes: store
-                            .load(&artifact.content)
-                            .map_err(|_| PackageMutationError::Backend)?,
-                    })
-                })
-                .collect::<Result<Vec<_>, PackageMutationError>>()?,
-            None => Vec::new(),
-        };
+        let _ = artifacts;
+        let transferred = resolution
+            .artifacts
+            .iter()
+            .map(|artifact| crate::PackageMutationArtifact {
+                reference: artifact.content.clone(),
+            })
+            .collect::<Vec<_>>();
         self.transport
             .perform(crate::SshFilesystemRequest::PackageMutation {
                 root_id: self.root_id.clone(),

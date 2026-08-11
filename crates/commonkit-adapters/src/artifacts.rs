@@ -1,6 +1,6 @@
 #[cfg(unix)]
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use cap_std::fs::{Dir, OpenOptions};
@@ -118,12 +118,120 @@ impl ArtifactStore {
     }
 
     pub fn verify_digest(&self, digest: &Sha256Digest) -> Result<(), ArtifactError> {
-        let bytes = self.load_unbounded(digest)?;
-        if digest_bytes(&bytes)? == *digest {
+        let mut file = self.open_artifact(digest)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual = Sha256Digest::parse(format!("sha256:{:x}", hasher.finalize()))?;
+        if actual == *digest {
             Ok(())
         } else {
             Err(ArtifactError::DigestMismatch)
         }
+    }
+
+    /// Reads one bounded range without materializing the complete artifact.
+    pub fn read_chunk(
+        &self,
+        reference: &ContentReference,
+        offset: u64,
+        maximum_bytes: u32,
+    ) -> Result<Vec<u8>, ArtifactError> {
+        if reference.bytes > 512 * 1024 * 1024 || maximum_bytes == 0 {
+            return Err(ArtifactError::ArtifactTooLarge);
+        }
+        let mut file = self.open_artifact(&reference.digest)?;
+        let length = file.metadata()?.len();
+        if length != reference.bytes || offset > length {
+            return Err(ArtifactError::DigestMismatch);
+        }
+        let count = (length - offset).min(u64::from(maximum_bytes));
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes =
+            vec![0u8; usize::try_from(count).map_err(|_| ArtifactError::ArtifactTooLarge)?];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Commits a verified temporary file to the CAS without buffering the
+    /// complete artifact in memory. The destination is created atomically and
+    /// an existing object is accepted only when its exact reference matches.
+    pub fn put_file(
+        &self,
+        path: &Path,
+        reference: &ContentReference,
+    ) -> Result<ContentReference, ArtifactError> {
+        let mut source = std::fs::File::open(path)?;
+        let metadata = source.metadata()?;
+        if !metadata.is_file()
+            || metadata.len() != reference.bytes
+            || reference.bytes > 512 * 1024 * 1024
+        {
+            return Err(ArtifactError::DigestMismatch);
+        }
+        let destination = self.relative_path_for(&reference.digest);
+        let temporary = PathBuf::from(format!(
+            "{}.partial-{}-{}",
+            destination.to_string_lossy(),
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        let mut options = nofollow_options();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match self.directory.open_with(&temporary, &options) {
+            Ok(mut target) => {
+                let mut hasher = Sha256::new();
+                let mut buffer = [0u8; 1024 * 1024];
+                loop {
+                    let count = source.read(&mut buffer)?;
+                    if count == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..count]);
+                    target.write_all(&buffer[..count])?;
+                }
+                let actual = Sha256Digest::parse(format!("sha256:{:x}", hasher.finalize()))?;
+                if actual != reference.digest {
+                    let _ = self.directory.remove_file(&temporary);
+                    return Err(ArtifactError::DigestMismatch);
+                }
+                target.sync_all()?;
+                drop(target);
+                if let Err(error) = self.directory.rename(
+                    &temporary,
+                    &self.directory,
+                    self.relative_path_for(&reference.digest),
+                ) {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        let _ = self.directory.remove_file(&temporary);
+                        self.load(reference)?;
+                    } else {
+                        let _ = self.directory.remove_file(&temporary);
+                        return Err(error.into());
+                    }
+                }
+                sync_directory(&self.directory)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        }
+        Ok(reference.clone())
     }
 
     fn relative_path_for(&self, digest: &Sha256Digest) -> PathBuf {

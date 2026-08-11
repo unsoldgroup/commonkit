@@ -11,25 +11,26 @@ use futures_util::StreamExt;
 
 use commonkit_about_me::{ClaimCategory, ClaimInput, ProfileStore, ScopedView};
 use commonkit_adapters::{
-    ApmProvider, ApmProviderConfig, AptRepositoryConfigurationV1, AptResolutionBackend,
-    AptResolutionConstraints, AptSourceAuthorityV1, ArtifactStore, BwsCredentialResolver,
-    ChezmoiProvider, ContentSensitivity, CredentialReference, CredentialResolver,
-    DesiredStateProvider, ExactProviderVersion, FileAdapter, FilesystemIntent, GitRepository,
-    GitSyncDisposition, LocalSensitiveFileStore, ManagerBindingV1, MaterializedState,
-    NativeProvider, NodeResolutionBackend, NormalizedManagedPath, NormalizedResource,
-    OpenSshConfig, OpenSshTransport, OwnershipRules, PackageAdapter,
-    PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1, PackageFetchRequestV1,
-    PackageFetchResultV1, PackageMutationBackendRegistry, PackageResolutionAuthority,
-    PackageResolutionBackend, PackageResolutionCoordinator, PackageResolutionError,
-    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, PlatformKeychain,
-    PlatformKeychainCredentialResolver, ProcessAptResolutionCommandRunner, ProcessBwsRunner,
-    ProcessGitRunner, ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost,
-    ProcessOfflinePackageBackend, ProcessPlatformSecretCommandRunner, ProcessRemoteRunner,
-    ProviderCapability, ProviderContext, ProviderInputs, ProviderPipeline, ProviderPlanRequest,
-    ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter, RemoteProviderStager,
-    ResolvedMaterializedState, ResolvedPackageIntent, ResourceIntent, ResourceProvenance,
-    SecretValue, SshFileAdapter, SshOfflinePackageBackend, SshTargetCapabilities,
-    build_provider_plan, build_resolved_provider_plan_with_router, materialize_mcp_client_state,
+    ARTIFACT_CHUNK_SIZE, ApmProvider, ApmProviderConfig, AptRepositoryConfigurationV1,
+    AptResolutionBackend, AptResolutionConstraints, AptSourceAuthorityV1, ArtifactStore,
+    BwsCredentialResolver, ChezmoiProvider, ContentSensitivity, CredentialReference,
+    CredentialResolver, DesiredStateProvider, ExactProviderVersion, FileAdapter, FilesystemIntent,
+    GitRepository, GitSyncDisposition, LocalSensitiveFileStore, MAX_ARTIFACT_TRANSFER_BYTES,
+    MAX_ARTIFACT_TRANSFER_COUNT, ManagerBindingV1, MaterializedState, NativeProvider,
+    NodeResolutionBackend, NormalizedManagedPath, NormalizedResource, OpenSshConfig,
+    OpenSshTransport, OwnershipRules, PackageAdapter, PackageDiscoveryFetchRequestV1, PackageFetch,
+    PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1, PackageMutationBackendRegistry,
+    PackageResolutionAuthority, PackageResolutionBackend, PackageResolutionCoordinator,
+    PackageResolutionError, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
+    PlatformKeychain, PlatformKeychainCredentialResolver, ProcessAptResolutionCommandRunner,
+    ProcessBwsRunner, ProcessGitRunner, ProcessNodeReleaseSignatureVerifier,
+    ProcessNodeRuntimeHost, ProcessOfflinePackageBackend, ProcessPlatformSecretCommandRunner,
+    ProcessRemoteRunner, ProviderCapability, ProviderContext, ProviderInputs, ProviderPipeline,
+    ProviderPlanRequest, ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter,
+    RemoteProviderStager, ResolvedMaterializedState, ResolvedPackageIntent, ResourceIntent,
+    ResourceProvenance, SecretValue, SshFileAdapter, SshFilesystemRequest, SshFilesystemResponse,
+    SshOfflinePackageBackend, SshTargetCapabilities, build_provider_plan,
+    build_resolved_provider_plan_with_router, materialize_mcp_client_state,
     package_resolution_request_digest, package_resolution_response_digest, validate_ownership,
 };
 use commonkit_config::{
@@ -1346,6 +1347,90 @@ struct ProductionPackageFetch {
 const MAX_REMOTE_PACKAGE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_REMOTE_PACKAGE_ARTIFACT_COUNT: usize = 128;
 
+fn pull_remote_package_artifact(
+    remote: &mut dyn commonkit_adapters::SshFilesystemTransport,
+    request_id: &StableId,
+    reference: &commonkit_adapters::ContentReference,
+    artifacts: &ArtifactStore,
+) -> Result<commonkit_adapters::ContentReference, DomainFailure> {
+    if reference.bytes == 0 || reference.bytes > MAX_ARTIFACT_TRANSFER_BYTES {
+        return Err(DomainFailure::OperationFailed);
+    }
+    let transfer_id = commonkit_adapters::artifact_transfer_id("resolve", &reference.digest)
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    let total_chunks = u32::try_from(reference.bytes.div_ceil(u64::from(ARTIFACT_CHUNK_SIZE)))
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    let temporary = tempfile::NamedTempFile::new().map_err(|_| DomainFailure::OperationFailed)?;
+    let mut output = temporary.as_file();
+    for sequence in 0..total_chunks {
+        let offset = u64::from(sequence) * u64::from(ARTIFACT_CHUNK_SIZE);
+        let response = remote
+            .perform(SshFilesystemRequest::ReadArtifactChunk {
+                request_id: request_id.clone(),
+                transfer_id: transfer_id.clone(),
+                digest: reference.digest.clone(),
+                byte_count: reference.bytes,
+                chunk_size: ARTIFACT_CHUNK_SIZE,
+                sequence,
+                offset,
+                total_chunks,
+            })
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let SshFilesystemResponse::ArtifactChunk {
+            request_id: response_request,
+            transfer_id: response_transfer,
+            digest: response_digest,
+            byte_count,
+            chunk_size,
+            sequence: response_sequence,
+            offset: response_offset,
+            total_chunks: response_total,
+            content,
+            response_digest: attestation,
+        } = response
+        else {
+            return Err(DomainFailure::OperationFailed);
+        };
+        let expected_size =
+            usize::try_from((reference.bytes - offset).min(u64::from(ARTIFACT_CHUNK_SIZE)))
+                .map_err(|_| DomainFailure::OperationFailed)?;
+        let expected_attestation = commonkit_adapters::artifact_chunk_response_digest(
+            request_id,
+            &transfer_id,
+            &reference.digest,
+            reference.bytes,
+            ARTIFACT_CHUNK_SIZE,
+            sequence,
+            offset,
+            total_chunks,
+            &content,
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        if response_request != *request_id
+            || response_transfer != transfer_id
+            || response_digest != reference.digest
+            || byte_count != reference.bytes
+            || chunk_size != ARTIFACT_CHUNK_SIZE
+            || response_sequence != sequence
+            || response_offset != offset
+            || response_total != total_chunks
+            || content.len() != expected_size
+            || attestation != expected_attestation
+        {
+            return Err(DomainFailure::OperationFailed);
+        }
+        output
+            .write_all(&content)
+            .map_err(|_| DomainFailure::OperationFailed)?;
+    }
+    output
+        .sync_all()
+        .map_err(|_| DomainFailure::OperationFailed)?;
+    artifacts
+        .put_file(temporary.path(), reference)
+        .map_err(|_| DomainFailure::OperationFailed)
+}
+
 fn fresh_package_resolution_nonce() -> Result<Sha256Digest, DomainFailure> {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -2379,6 +2464,7 @@ impl ProductionSyncDomain {
                             return Err(DomainFailure::OperationFailed);
                         }
                         if remote_artifacts.len() > MAX_REMOTE_PACKAGE_ARTIFACT_COUNT
+                            || remote_artifacts.len() > MAX_ARTIFACT_TRANSFER_COUNT
                             || remote_artifacts
                                 .iter()
                                 .try_fold(0u64, |total, artifact| {
@@ -2449,15 +2535,8 @@ impl ProductionSyncDomain {
                         if expected_artifacts != returned_artifacts
                             || expected_artifacts.len() != remote_artifacts.len()
                             || remote_artifacts.iter().any(|artifact| {
-                                u64::try_from(artifact.bytes.len()).ok()
-                                    != Some(artifact.reference.bytes)
+                                artifact.reference.bytes == 0
                                     || artifact.reference.bytes > MAX_REMOTE_PACKAGE_ARTIFACT_BYTES
-                                    || Sha256Digest::parse(format!(
-                                        "sha256:{:x}",
-                                        Sha256::digest(&artifact.bytes)
-                                    ))
-                                    .ok()
-                                        != Some(artifact.reference.digest.clone())
                             })
                         {
                             return Err(DomainFailure::OperationFailed);
@@ -2469,13 +2548,12 @@ impl ProductionSyncDomain {
                             .map_err(|_| DomainFailure::OperationFailed)?;
                         let mut artifact_references = Vec::with_capacity(remote_artifacts.len());
                         for artifact in remote_artifacts {
-                            let stored = artifacts
-                                .put(&artifact.bytes, artifact.reference.sensitivity)
-                                .map_err(|_| DomainFailure::OperationFailed)?;
-                            if stored.digest != artifact.reference.digest {
-                                return Err(DomainFailure::OperationFailed);
-                            }
-                            artifact_references.push(stored);
+                            artifact_references.push(pull_remote_package_artifact(
+                                &mut *remote,
+                                &request_id,
+                                &artifact.reference,
+                                artifacts,
+                            )?);
                         }
                         let resolved = ResolvedPackageIntent {
                             declaration: resolution.declaration.clone(),

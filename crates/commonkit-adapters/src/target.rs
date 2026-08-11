@@ -344,6 +344,32 @@ pub enum SshFilesystemRequest {
         digest: commonkit_contracts::Sha256Digest,
         content: Vec<u8>,
     },
+    /// Transfers one bounded chunk into the target CAS. Chunks are addressed
+    /// by the complete artifact identity and may be retried idempotently.
+    StageArtifactChunk {
+        run_id: StableId,
+        transfer_id: StableId,
+        digest: commonkit_contracts::Sha256Digest,
+        byte_count: u64,
+        chunk_size: u32,
+        sequence: u32,
+        offset: u64,
+        total_chunks: u32,
+        content: Vec<u8>,
+    },
+    /// Reads one bounded chunk from the target CAS during preapproval
+    /// resolution. The response is authenticated by the request identity and
+    /// carries every framing field so reordering and replay are detectable.
+    ReadArtifactChunk {
+        request_id: StableId,
+        transfer_id: StableId,
+        digest: commonkit_contracts::Sha256Digest,
+        byte_count: u64,
+        chunk_size: u32,
+        sequence: u32,
+        offset: u64,
+        total_chunks: u32,
+    },
     VerifyArtifact {
         run_id: StableId,
         digest: commonkit_contracts::Sha256Digest,
@@ -450,6 +476,29 @@ pub enum SshFilesystemResponse {
     ArtifactStaged {
         digest: commonkit_contracts::Sha256Digest,
     },
+    ArtifactChunkStaged {
+        run_id: StableId,
+        transfer_id: StableId,
+        digest: commonkit_contracts::Sha256Digest,
+        byte_count: u64,
+        chunk_size: u32,
+        sequence: u32,
+        offset: u64,
+        total_chunks: u32,
+        response_digest: commonkit_contracts::Sha256Digest,
+    },
+    ArtifactChunk {
+        request_id: StableId,
+        transfer_id: StableId,
+        digest: commonkit_contracts::Sha256Digest,
+        byte_count: u64,
+        chunk_size: u32,
+        sequence: u32,
+        offset: u64,
+        total_chunks: u32,
+        content: Vec<u8>,
+        response_digest: commonkit_contracts::Sha256Digest,
+    },
     ArtifactVerified {
         digest: commonkit_contracts::Sha256Digest,
     },
@@ -474,7 +523,48 @@ pub enum PackageMutationPhase {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PackageMutationArtifact {
     pub reference: crate::ContentReference,
-    pub bytes: Vec<u8>,
+}
+
+/// Maximum payload carried by an artifact transfer message. Keeping this
+/// below the SSH request cap leaves room for JSON framing and prevents a
+/// single untrusted chunk from exhausting the helper.
+pub const ARTIFACT_CHUNK_SIZE: u32 = 1024 * 1024;
+pub const MAX_ARTIFACT_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_ARTIFACT_TRANSFER_COUNT: usize = 128;
+
+pub fn artifact_transfer_id(
+    prefix: &str,
+    digest: &commonkit_contracts::Sha256Digest,
+) -> Result<StableId, commonkit_contracts::ContractError> {
+    StableId::parse(format!("{prefix}-{}", &digest.as_str()[7..23]))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn artifact_chunk_response_digest(
+    request_id: &StableId,
+    transfer_id: &StableId,
+    digest: &commonkit_contracts::Sha256Digest,
+    byte_count: u64,
+    chunk_size: u32,
+    sequence: u32,
+    offset: u64,
+    total_chunks: u32,
+    content: &[u8],
+) -> Result<commonkit_contracts::Sha256Digest, commonkit_contracts::ContractError> {
+    commonkit_contracts::digest_domain_json(
+        "commonkit.ssh-artifact-chunk.v1",
+        &(
+            request_id,
+            transfer_id,
+            digest,
+            byte_count,
+            chunk_size,
+            sequence,
+            offset,
+            total_chunks,
+            content,
+        ),
+    )
 }
 
 pub trait SshFilesystemTransport {
