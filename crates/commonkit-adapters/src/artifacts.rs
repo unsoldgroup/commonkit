@@ -31,6 +31,9 @@ pub struct ArtifactStore {
 }
 
 impl ArtifactStore {
+    pub(crate) fn clone_directory(&self) -> Result<Dir, ArtifactError> {
+        self.directory.try_clone().map_err(ArtifactError::Io)
+    }
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ArtifactError> {
         let directory = open_or_create_directory_handle(root.as_ref())?;
         let metadata = directory.dir_metadata()?;
@@ -136,6 +139,26 @@ impl ArtifactStore {
         }
     }
 
+    pub fn verify_reference(&self, reference: &ContentReference) -> Result<(), ArtifactError> {
+        let mut file = self.open_artifact(&reference.digest)?;
+        if file.metadata()?.len() != reference.bytes {
+            return Err(ArtifactError::DigestMismatch);
+        }
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 1024 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        let actual = Sha256Digest::parse(format!("sha256:{:x}", hasher.finalize()))?;
+        (actual == reference.digest)
+            .then_some(())
+            .ok_or(ArtifactError::DigestMismatch)
+    }
+
     /// Reads one bounded range without materializing the complete artifact.
     pub fn read_chunk(
         &self,
@@ -167,7 +190,7 @@ impl ArtifactStore {
         path: &Path,
         reference: &ContentReference,
     ) -> Result<ContentReference, ArtifactError> {
-        let mut source = std::fs::File::open(path)?;
+        let mut source = open_source_no_follow(path)?;
         let metadata = source.metadata()?;
         if !metadata.is_file()
             || metadata.len() != reference.bytes
@@ -175,6 +198,29 @@ impl ArtifactStore {
         {
             return Err(ArtifactError::DigestMismatch);
         }
+        self.put_reader(&mut source, reference)
+    }
+
+    pub(crate) fn put_file_handle(
+        &self,
+        source: &mut cap_std::fs::File,
+        reference: &ContentReference,
+    ) -> Result<ContentReference, ArtifactError> {
+        let metadata = source.metadata()?;
+        if !metadata.is_file()
+            || metadata.len() != reference.bytes
+            || reference.bytes > 512 * 1024 * 1024
+        {
+            return Err(ArtifactError::DigestMismatch);
+        }
+        self.put_reader(source, reference)
+    }
+
+    fn put_reader<R: Read>(
+        &self,
+        source: &mut R,
+        reference: &ContentReference,
+    ) -> Result<ContentReference, ArtifactError> {
         let destination = self.relative_path_for(&reference.digest);
         let temporary = PathBuf::from(format!(
             "{}.partial-{}-{}",
@@ -218,7 +264,7 @@ impl ArtifactStore {
                 ) {
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         let _ = self.directory.remove_file(&temporary);
-                        self.load(reference)?;
+                        self.verify_reference(reference)?;
                     } else {
                         let _ = self.directory.remove_file(&temporary);
                         return Err(error.into());
@@ -455,6 +501,22 @@ fn nofollow_options() -> OpenOptions {
     #[cfg(windows)]
     nofollow_windows(&mut options);
     options
+}
+
+fn open_source_no_follow(path: &Path) -> Result<std::fs::File, ArtifactError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0200_0000 | 0x0020_0000);
+    }
+    Ok(options.open(path)?)
 }
 
 #[cfg(unix)]

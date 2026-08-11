@@ -255,6 +255,21 @@ fn chunk_transfer_rejects_gaps_and_tampering_but_accepts_safe_retry() {
     let second_chunk = vec![b'a'];
     let digest = Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&bytes))).unwrap();
     let transfer = StableId::parse("transfer-one").unwrap();
+    let malformed = invoke(
+        &home,
+        &SshFilesystemRequest::StageArtifactChunk {
+            run_id: transfer.clone(),
+            transfer_id: transfer.clone(),
+            digest: digest.clone(),
+            byte_count: bytes.len() as u64,
+            chunk_size: commonkit_adapters::ARTIFACT_CHUNK_SIZE,
+            sequence: 0,
+            offset: bytes.len() as u64 + 1,
+            total_chunks: 2,
+            content: first_chunk.clone(),
+        },
+    );
+    assert!(!malformed.status.success());
     let gap = invoke(
         &home,
         &SshFilesystemRequest::StageArtifactChunk {

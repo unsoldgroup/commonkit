@@ -4,6 +4,7 @@ use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use cap_std::fs::{Dir, OpenOptions};
 use commonkit_contracts::{PackageManager, StableId};
 use commonkit_core::{RootAccess, TargetRoot};
 use futures_util::StreamExt;
@@ -29,7 +30,7 @@ pub struct TargetHelper {
     roots: BTreeMap<StableId, (PathBuf, RootAccess)>,
     artifacts: ArtifactStore,
     receipts: PathBuf,
-    staging: PathBuf,
+    staging: std::sync::Mutex<Dir>,
     package_resolution: Option<TargetPackageResolutionConfig>,
 }
 
@@ -54,8 +55,13 @@ impl TargetHelper {
             .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         let receipts = state_root.join("receipts");
         std::fs::create_dir_all(&receipts)?;
-        let staging = state_root.join("artifact-staging");
-        std::fs::create_dir_all(&staging)?;
+        let staging_store = ArtifactStore::open(state_root.join("artifact-staging"))
+            .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        let staging = staging_store
+            .clone_directory()
+            .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        validate_staging_directory(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        cleanup_staging(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -65,7 +71,7 @@ impl TargetHelper {
             roots: mapped,
             artifacts,
             receipts,
-            staging,
+            staging: std::sync::Mutex::new(staging),
             package_resolution,
         })
     }
@@ -278,7 +284,6 @@ impl TargetHelper {
     }
 
     fn transfer_paths(
-        &self,
         transfer_id: &StableId,
         digest: &commonkit_contracts::Sha256Digest,
     ) -> (PathBuf, PathBuf) {
@@ -288,8 +293,8 @@ impl TargetHelper {
             digest.as_str().trim_start_matches("sha256:")
         );
         (
-            self.staging.join(format!("{stem}.part")),
-            self.staging.join(format!("{stem}.meta")),
+            PathBuf::from(format!("{stem}.part")),
+            PathBuf::from(format!("{stem}.meta")),
         )
     }
 
@@ -301,19 +306,34 @@ impl TargetHelper {
         total_chunks: u32,
         content_len: usize,
     ) -> Result<(), TargetFilesystemError> {
-        if byte_count > MAX_ARTIFACT_TRANSFER_BYTES
-            || chunk_size != ARTIFACT_CHUNK_SIZE
-            || total_chunks == 0
-            || total_chunks as u64 != byte_count.div_ceil(u64::from(chunk_size))
-            || sequence >= total_chunks
-            || offset != u64::from(sequence) * u64::from(chunk_size)
-            || content_len == 0 && byte_count != 0
+        Self::validate_chunk_shape(byte_count, chunk_size, sequence, offset, total_chunks)?;
+        if content_len == 0 && byte_count != 0
             || content_len as u64 > u64::from(chunk_size)
             || offset
                 .checked_add(content_len as u64)
                 .is_none_or(|end| end > byte_count)
             || (sequence + 1 < total_chunks && content_len as u32 != chunk_size)
             || (sequence + 1 == total_chunks && content_len as u64 != byte_count - offset)
+        {
+            return Err(TargetFilesystemError::RemoteArtifact);
+        }
+        Ok(())
+    }
+
+    fn validate_chunk_shape(
+        byte_count: u64,
+        chunk_size: u32,
+        sequence: u32,
+        offset: u64,
+        total_chunks: u32,
+    ) -> Result<(), TargetFilesystemError> {
+        if byte_count > MAX_ARTIFACT_TRANSFER_BYTES
+            || chunk_size != ARTIFACT_CHUNK_SIZE
+            || total_chunks == 0
+            || total_chunks as u64 != byte_count.div_ceil(u64::from(chunk_size))
+            || sequence >= total_chunks
+            || offset > byte_count
+            || offset != u64::from(sequence) * u64::from(chunk_size)
         {
             return Err(TargetFilesystemError::RemoteArtifact);
         }
@@ -341,33 +361,98 @@ impl TargetHelper {
             total_chunks,
             content.len(),
         )?;
-        let (part, meta) = self.transfer_paths(&transfer_id, &digest);
-        if std::fs::symlink_metadata(&part)
-            .map(|metadata| metadata.file_type().is_symlink())
-            .unwrap_or(false)
-            || std::fs::symlink_metadata(&meta)
-                .map(|metadata| metadata.file_type().is_symlink())
-                .unwrap_or(false)
+        let staging = self
+            .staging
+            .lock()
+            .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        let (part, meta) = Self::transfer_paths(&transfer_id, &digest);
+        let part_exists = staging.metadata(&part).is_ok();
+        let reference = ContentReference {
+            digest: digest.clone(),
+            bytes: byte_count,
+            sensitivity: ContentSensitivity::Portable,
+        };
+        if sequence + 1 == total_chunks
+            && !part_exists
+            && self.artifacts.verify_reference(&reference).is_ok()
+        {
+            let response_digest = artifact_chunk_response_digest(
+                &run_id,
+                &transfer_id,
+                &digest,
+                byte_count,
+                chunk_size,
+                sequence,
+                offset,
+                total_chunks,
+                &content,
+            )
+            .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+            return Ok(SshFilesystemResponse::ArtifactChunkStaged {
+                run_id,
+                transfer_id,
+                digest,
+                byte_count,
+                chunk_size,
+                sequence,
+                offset,
+                total_chunks,
+                response_digest,
+            });
+        }
+        let (part_count, staged_bytes) =
+            staging_usage(&staging).map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+        let current_len = staging
+            .metadata(&part)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if !part_exists && part_count >= STAGING_MAX_PARTS {
+            return Err(TargetFilesystemError::RemoteArtifact);
+        }
+        if current_len == offset
+            && staged_bytes
+                .checked_add(content.len() as u64)
+                .is_none_or(|total| total > STAGING_MAX_BYTES)
         {
             return Err(TargetFilesystemError::RemoteArtifact);
         }
         let identity = format!("{digest}|{byte_count}|{chunk_size}|{total_chunks}");
-        if sequence == 0 && offset == 0 && !part.exists() {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&part)?;
+        if sequence == 0 && offset == 0 && !part_exists {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = staging.open_with(&part, &options)?;
             file.write_all(&content)?;
             file.sync_all()?;
-            std::fs::write(&meta, identity.as_bytes())?;
+            let mut meta_options = OpenOptions::new();
+            meta_options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use cap_std::fs::OpenOptionsExt;
+                meta_options.mode(0o600);
+            }
+            let mut meta_file = staging.open_with(&meta, &meta_options)?;
+            meta_file.write_all(identity.as_bytes())?;
+            meta_file.sync_all()?;
         } else {
-            if std::fs::read(&meta).ok().as_deref() != Some(identity.as_bytes()) {
+            if !part_exists {
                 return Err(TargetFilesystemError::RemoteArtifact);
             }
-            let mut file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&part)?;
+            let mut meta_options = staging_open_options();
+            meta_options.read(true);
+            let meta_file = staging.open_with(&meta, &meta_options)?;
+            let mut metadata_bytes = Vec::new();
+            meta_file.take(4097).read_to_end(&mut metadata_bytes)?;
+            if metadata_bytes != identity.as_bytes() {
+                return Err(TargetFilesystemError::RemoteArtifact);
+            }
+            let mut part_options = staging_open_options();
+            part_options.read(true).write(true);
+            let mut file = staging.open_with(&part, &part_options)?;
             let current = file.metadata()?.len();
             if current < offset {
                 return Err(TargetFilesystemError::RemoteArtifact);
@@ -386,16 +471,14 @@ impl TargetHelper {
             }
         }
         if sequence + 1 == total_chunks {
-            let reference = ContentReference {
-                digest: digest.clone(),
-                bytes: byte_count,
-                sensitivity: ContentSensitivity::Portable,
-            };
+            let mut part_options = staging_open_options();
+            part_options.read(true);
+            let mut part_file = staging.open_with(&part, &part_options)?;
             self.artifacts
-                .put_file(&part, &reference)
+                .put_file_handle(&mut part_file, &reference)
                 .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
-            let _ = std::fs::remove_file(&part);
-            let _ = std::fs::remove_file(&meta);
+            let _ = staging.remove_file(&part);
+            let _ = staging.remove_file(&meta);
         }
         let response_digest = artifact_chunk_response_digest(
             &run_id,
@@ -434,6 +517,7 @@ impl TargetHelper {
         offset: u64,
         total_chunks: u32,
     ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+        Self::validate_chunk_shape(byte_count, chunk_size, sequence, offset, total_chunks)?;
         let expected = usize::try_from((byte_count - offset).min(u64::from(chunk_size)))
             .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
         Self::validate_chunk(
@@ -750,6 +834,98 @@ fn package_resolution_rejected(
         request_digest,
         target_identity_digest,
     }
+}
+
+const STAGING_MAX_PARTS: usize = 128;
+const STAGING_MAX_BYTES: u64 = MAX_ARTIFACT_TRANSFER_BYTES;
+const STAGING_STALE_AFTER_SECS: u64 = 24 * 60 * 60;
+
+fn staging_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(0x0200_0000 | 0x0020_0000);
+    }
+    options
+}
+
+fn cleanup_staging(staging: &Dir) -> Result<(), std::io::Error> {
+    let now = cap_std::time::SystemClock::new(cap_std::ambient_authority()).now();
+    for entry in staging.read_dir(".")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.ends_with(".part") || name.ends_with(".meta")) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsafe staging entry",
+            ));
+        }
+        let stale = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() > STAGING_STALE_AFTER_SECS);
+        if stale {
+            entry.remove_file()?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_staging_directory(staging: &Dir) -> Result<(), std::io::Error> {
+    let metadata = staging.dir_metadata()?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unsafe staging root",
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use cap_std::fs::{MetadataExt, PermissionsExt};
+        let uid = unsafe { libc::geteuid() };
+        if metadata.permissions().mode() & 0o777 != 0o700 || metadata.uid() != uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe staging root ownership",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn staging_usage(staging: &Dir) -> Result<(usize, u64), std::io::Error> {
+    let mut count = 0;
+    let mut bytes: u64 = 0;
+    for entry in staging.read_dir(".")? {
+        let entry = entry?;
+        if !entry.file_name().to_string_lossy().ends_with(".part") {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "unsafe staging entry",
+            ));
+        }
+        count += 1;
+        bytes = bytes
+            .checked_add(metadata.len())
+            .ok_or_else(|| std::io::Error::other("staging usage overflow"))?;
+    }
+    Ok((count, bytes))
 }
 
 fn expected_apt_constraints(

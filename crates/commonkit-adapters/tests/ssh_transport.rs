@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
+use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 
 use commonkit_adapters::{
-    OpenSshConfig, OpenSshTransport, ProcessOutput, RemoteProcessRunner, SshFilesystemRequest,
-    SshFilesystemResponse, SshFilesystemTransport,
+    ARTIFACT_CHUNK_SIZE, OpenSshConfig, OpenSshTransport, ProcessOutput, RemoteProcessRunner,
+    SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
 };
 use commonkit_core::{Sha256Digest, StableId};
 use sha2::{Digest, Sha256};
@@ -278,6 +280,165 @@ fn config() -> OpenSshConfig {
         "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
     )
     .unwrap()
+}
+
+struct LocalHelperRunner {
+    home: PathBuf,
+    drop_final_response: bool,
+}
+
+impl RemoteProcessRunner for LocalHelperRunner {
+    fn run(
+        &mut self,
+        program: &str,
+        _args: &[String],
+        stdin: &[u8],
+    ) -> Result<ProcessOutput, std::io::Error> {
+        if program == "ssh-keygen" {
+            return Ok(if stdin.is_empty() {
+                ProcessOutput {
+                    status: 0,
+                    stdout: b"build.example.com ssh-ed25519 AAAAcorrect\n".to_vec(),
+                    stderr: vec![],
+                }
+            } else {
+                ProcessOutput {
+                    status: 0,
+                    stdout: b"256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA build.example.com (ED25519)\n".to_vec(),
+                    stderr: vec![],
+                }
+            });
+        }
+        let mut child = Command::new(env!("CARGO_BIN_EXE_commonkit-target-helper"))
+            .arg("--stdio-v1")
+            .env("HOME", &self.home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().expect("helper stdin").write_all(stdin)?;
+        let output = child.wait_with_output()?;
+        if self.drop_final_response
+            && serde_json::from_slice::<SshFilesystemRequest>(stdin)
+                .ok()
+                .is_some_and(|request| {
+                    matches!(
+                        request,
+                        SshFilesystemRequest::StageArtifactChunk {
+                            sequence: 1,
+                            total_chunks: 2,
+                            ..
+                        }
+                    )
+                })
+        {
+            self.drop_final_response = false;
+            return Ok(ProcessOutput {
+                status: 1,
+                stdout: vec![],
+                stderr: vec![],
+            });
+        }
+        Ok(ProcessOutput {
+            status: output.status.code().unwrap_or(-1),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+}
+
+#[test]
+fn process_backed_transport_round_trips_chunked_artifact_without_monolithic_json() {
+    let temporary = tempfile::tempdir().unwrap();
+    let home = temporary.path().join("home");
+    let target = temporary.path().join("target");
+    let state = temporary.path().join("state");
+    std::fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state,
+            "roots": [{"id":"home","path":target,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            home.join(".config/commonkit/target-helper.json"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+    }
+    let bytes = vec![b'x'; ARTIFACT_CHUNK_SIZE as usize + 1];
+    let digest = content_digest(&bytes);
+    let transfer = StableId::parse("transport-artifact").unwrap();
+    let mut transport = OpenSshTransport::new(
+        config(),
+        LocalHelperRunner {
+            home,
+            drop_final_response: true,
+        },
+    )
+    .unwrap();
+    for (sequence, content) in [
+        bytes[..ARTIFACT_CHUNK_SIZE as usize].to_vec(),
+        bytes[ARTIFACT_CHUNK_SIZE as usize..].to_vec(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let offset = sequence as u64 * ARTIFACT_CHUNK_SIZE as u64;
+        let request = SshFilesystemRequest::StageArtifactChunk {
+            run_id: transfer.clone(),
+            transfer_id: transfer.clone(),
+            digest: digest.clone(),
+            byte_count: bytes.len() as u64,
+            chunk_size: ARTIFACT_CHUNK_SIZE,
+            sequence: sequence as u32,
+            offset,
+            total_chunks: 2,
+            content,
+        };
+        if sequence == 1 {
+            assert!(transport.perform(request.clone()).is_err());
+        }
+        let response = transport.perform(request).unwrap();
+        assert!(matches!(
+            response,
+            SshFilesystemResponse::ArtifactChunkStaged { .. }
+        ));
+    }
+    let verified = transport
+        .perform(SshFilesystemRequest::VerifyArtifact {
+            run_id: transfer.clone(),
+            digest: digest.clone(),
+        })
+        .unwrap();
+    assert_eq!(
+        verified,
+        SshFilesystemResponse::ArtifactVerified {
+            digest: digest.clone()
+        }
+    );
+    let response = transport
+        .perform(SshFilesystemRequest::ReadArtifactChunk {
+            request_id: StableId::parse("resolution-request").unwrap(),
+            transfer_id: transfer,
+            digest,
+            byte_count: bytes.len() as u64,
+            chunk_size: ARTIFACT_CHUNK_SIZE,
+            sequence: 1,
+            offset: ARTIFACT_CHUNK_SIZE as u64,
+            total_chunks: 2,
+        })
+        .unwrap();
+    assert!(
+        matches!(response, SshFilesystemResponse::ArtifactChunk { content, .. } if content == vec![b'x'])
+    );
 }
 
 #[test]
