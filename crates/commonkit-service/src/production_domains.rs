@@ -1425,18 +1425,7 @@ impl ProductionPackageFetch {
         &mut self,
         url: &reqwest::Url,
     ) -> Result<reqwest::Client, PackageResolutionError> {
-        validate_package_fetch_url(url)?;
-        let key = url.as_str().to_owned();
-        let address = if let Some(address) = self.pinned_addresses.get(&key) {
-            *address
-        } else {
-            let address = validated_package_fetch_addresses(url)?
-                .into_iter()
-                .next()
-                .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
-            self.pinned_addresses.insert(key, address);
-            address
-        };
+        let address = self.pin_url(url)?;
         let host = url
             .host_str()
             .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
@@ -1446,11 +1435,23 @@ impl ProductionPackageFetch {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(120))
             .user_agent("commonkit-production-package-resolution/1")
-            // Pin the connection to the address validated immediately above;
-            // this prevents DNS rebinding between validation and connect.
             .resolve(host, address)
             .build()
             .map_err(|_| PackageResolutionError::FetchUnavailable)
+    }
+
+    fn pin_url(&mut self, url: &reqwest::Url) -> Result<SocketAddr, PackageResolutionError> {
+        validate_package_fetch_url(url)?;
+        let key = url.as_str().to_owned();
+        if let Some(address) = self.pinned_addresses.get(&key) {
+            return Ok(*address);
+        }
+        let address = validated_package_fetch_addresses(url)?
+            .into_iter()
+            .next()
+            .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+        self.pinned_addresses.insert(key, address);
+        Ok(address)
     }
 }
 
@@ -1459,7 +1460,7 @@ impl PackageFetch for ProductionPackageFetch {
         for locator in locators {
             let url = reqwest::Url::parse(locator)
                 .map_err(|_| PackageResolutionError::UnapprovedArtifactLocation)?;
-            validate_package_fetch_url(&url)?;
+            self.pin_url(&url)?;
         }
         Ok(())
     }
