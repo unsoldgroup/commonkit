@@ -1,11 +1,14 @@
 //! Offline, forward-only mutation of controller-resolved package plans.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
 
 use commonkit_contracts::{
     Operation, OperationKind, PackageExitClassification, PackageManager,
     PackageOperationConsentBinding, PackageReceiptEvidence, PackageSelector, RecoveryCapability,
-    ResourceRef, Risk, Sha256Digest, StableId, digest_domain_json,
+    ResourceRef, Risk, SecurityPolicy, Sha256Digest, StableId, digest_domain_json,
 };
 use commonkit_core::{OperationDraft, finalize_operation};
 use commonkit_reconcile::{Adapter, AdapterFailure, RecoveryObservation};
@@ -24,6 +27,10 @@ use crate::{
 /// capability, which makes applying and recovering a durable plan offline.
 pub trait PackageMutationBackend: Send {
     fn manager(&self) -> PackageManager;
+
+    fn supports_manager(&self, manager: PackageManager) -> bool {
+        self.manager() == manager
+    }
 
     fn observe(
         &mut self,
@@ -49,6 +56,91 @@ pub trait PackageMutationBackend: Send {
     ) -> Result<(), PackageMutationError>;
 }
 
+/// Closed dispatch for production package mutation. The adapter has one
+/// stable route, while this registry permits only explicitly registered
+/// manager backends to handle a persisted resolution.
+pub struct PackageMutationBackendRegistry {
+    backends: Vec<Box<dyn PackageMutationBackend>>,
+}
+
+impl PackageMutationBackendRegistry {
+    pub fn new(
+        backends: impl IntoIterator<Item = Box<dyn PackageMutationBackend>>,
+    ) -> Result<Self, PackageMutationError> {
+        let mut registered = Vec::new();
+        for backend in backends {
+            if registered.iter().any(|existing| {
+                [PackageManager::Apt, PackageManager::Nvm]
+                    .iter()
+                    .any(|manager| {
+                        existing.supports_manager(*manager) && backend.supports_manager(*manager)
+                    })
+            }) {
+                return Err(PackageMutationError::Backend);
+            }
+            registered.push(backend);
+        }
+        Ok(Self {
+            backends: registered,
+        })
+    }
+
+    fn backend(
+        &mut self,
+        manager: PackageManager,
+    ) -> Result<&mut Box<dyn PackageMutationBackend>, PackageMutationError> {
+        self.backends
+            .iter_mut()
+            .find(|backend| backend.supports_manager(manager))
+            .ok_or(PackageMutationError::UnsupportedRecipe)
+    }
+}
+
+impl PackageMutationBackend for PackageMutationBackendRegistry {
+    fn manager(&self) -> PackageManager {
+        PackageManager::Apt
+    }
+
+    fn supports_manager(&self, manager: PackageManager) -> bool {
+        self.backends.contains_key(&manager)
+    }
+
+    fn observe(
+        &mut self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<PackageObservationV1, PackageMutationError> {
+        self.backend(resolution.manager.manager)?
+            .observe(resolution)
+    }
+
+    fn prepare_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        self.backend(resolution.manager.manager)?
+            .prepare_offline(resolution, artifacts)
+    }
+
+    fn apply_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        self.backend(resolution.manager.manager)?
+            .apply_offline(resolution, artifacts)
+    }
+
+    fn verify_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        self.backend(resolution.manager.manager)?
+            .verify_offline(resolution, artifacts)
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum PackageMutationError {
     #[error("package mutation backend failed")]
@@ -64,7 +156,7 @@ pub enum PackageMutationError {
 /// a generic implementation detail to callers.
 pub struct PackageAdapter {
     id: StableId,
-    authority: PackageResolutionAuthority,
+    authority: Option<PackageResolutionAuthority>,
     artifacts: ArtifactStore,
     backend: Box<dyn PackageMutationBackend>,
 }
@@ -77,7 +169,7 @@ impl PackageAdapter {
     ) -> Self {
         Self {
             id: StableId::parse("packages").expect("static package adapter ID"),
-            authority,
+            authority: Some(authority),
             artifacts,
             backend,
         }
@@ -91,7 +183,20 @@ impl PackageAdapter {
     ) -> Self {
         Self {
             id,
-            authority,
+            authority: Some(authority),
+            artifacts,
+            backend,
+        }
+    }
+
+    /// Opens a target-side adapter from the persisted resolution and artifact
+    /// store only. The controller has already approved the plan; runtime
+    /// apply/recovery still revalidates the immutable built-in registry and
+    /// never receives provider or network capabilities.
+    pub fn new_offline(artifacts: ArtifactStore, backend: Box<dyn PackageMutationBackend>) -> Self {
+        Self {
+            id: StableId::parse("packages").expect("static package adapter ID"),
+            authority: None,
             artifacts,
             backend,
         }
@@ -102,10 +207,9 @@ impl PackageAdapter {
             return Err(failure("package_adapter_mismatch"));
         }
         let (_, resolution) = self
-            .authority
-            .load_by_resolution_digest(&operation.payload_digest, &self.artifacts)
+            .load_resolution(operation)
             .map_err(|_| failure("package_resolution_invalid"))?;
-        ensure_supported(&resolution, self.backend.manager())?;
+        ensure_supported(&resolution, self.backend.as_ref())?;
         Ok(resolution)
     }
 
@@ -142,6 +246,41 @@ impl PackageAdapter {
             .map(Some)
             .map_err(|_| failure("package_digest_failed"))
     }
+
+    fn load_resolution(
+        &self,
+        operation: &Operation,
+    ) -> Result<(ResolvedPackageIntent, PackageResolutionV1), PackageMutationError> {
+        if let Some(authority) = &self.authority {
+            return authority
+                .load_by_resolution_digest(&operation.payload_digest, &self.artifacts)
+                .map_err(|_| PackageMutationError::Backend);
+        }
+        let bytes = self
+            .artifacts
+            .load_by_digest(&operation.payload_digest)
+            .map_err(|_| PackageMutationError::Backend)?;
+        let resolution: PackageResolutionV1 =
+            serde_json::from_slice(&bytes).map_err(|_| PackageMutationError::Backend)?;
+        let intent = ResolvedPackageIntent {
+            declaration: resolution.declaration.clone(),
+            resolution: crate::ContentReference {
+                digest: operation.payload_digest.clone(),
+                bytes: bytes.len() as u64,
+                sensitivity: crate::ContentSensitivity::Portable,
+            },
+            artifacts: resolution
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.content.clone())
+                .collect(),
+        };
+        let authority = runtime_authority(&resolution)?;
+        let validated = authority
+            .validate(&intent, &self.artifacts)
+            .map_err(|_| PackageMutationError::Backend)?;
+        Ok((intent, validated))
+    }
 }
 
 impl PackageResourcePlanner for PackageAdapter {
@@ -156,7 +295,11 @@ impl PackageResourcePlanner for PackageAdapter {
         provenance: &ResourceProvenance,
         provider_artifacts: &ArtifactStore,
     ) -> Result<Option<Operation>, ProviderPlanError> {
-        let resolution = self.authority.validate(intent, provider_artifacts)?;
+        let authority = self
+            .authority
+            .as_ref()
+            .ok_or(ProviderPlanError::MissingPackageResolutionAuthority)?;
+        let resolution = authority.validate(intent, provider_artifacts)?;
         let resolution_bytes = provider_artifacts.load(&intent.resolution)?;
         let stored_resolution = self
             .artifacts
@@ -225,10 +368,9 @@ impl Adapter for PackageAdapter {
     ) -> Result<Option<(PackageOperationConsentBinding, PackageReceiptEvidence)>, AdapterFailure>
     {
         let (_, resolution) = self
-            .authority
-            .load_by_resolution_digest(&operation.payload_digest, &self.artifacts)
+            .load_resolution(operation)
             .map_err(|_| failure("package_resolution_invalid"))?;
-        ensure_supported(&resolution, self.backend.manager())?;
+        ensure_supported(&resolution, self.backend.as_ref())?;
         let manager_authority_digest = digest_domain_json(
             "commonkit.package-manager-authority.v1",
             &resolution.manager,
@@ -242,7 +384,16 @@ impl Adapter for PackageAdapter {
             PackageReceiptEvidence {
                 operation_id: operation.id.clone(),
                 resolution_digest: operation.payload_digest.clone(),
-                target_authority_digest: self.authority.digest().clone(),
+                target_authority_digest: self
+                    .authority
+                    .as_ref()
+                    .map(|authority| authority.digest().clone())
+                    .unwrap_or_else(|| {
+                        runtime_authority(&resolution)
+                            .expect("validated authority")
+                            .digest()
+                            .clone()
+                    }),
                 manager: resolution.manager.manager,
                 manager_authority_digest,
                 source_id: resolution.source.source_id.clone(),
@@ -321,9 +472,9 @@ impl Adapter for PackageAdapter {
 
 fn ensure_supported(
     resolution: &PackageResolutionV1,
-    backend_manager: PackageManager,
+    backend: &dyn PackageMutationBackend,
 ) -> Result<(), AdapterFailure> {
-    if resolution.manager.manager != backend_manager {
+    if !backend.supports_manager(resolution.manager.manager) {
         return Err(failure("package_manager_mismatch"));
     }
     if resolution.manager.manager == PackageManager::Apt
@@ -415,6 +566,344 @@ fn apt_observation_has_ambiguous_identity(
     name_versions.values().any(|architectures| {
         architectures.contains("all") && architectures.contains(target_architecture)
     })
+}
+
+fn runtime_authority(
+    resolution: &PackageResolutionV1,
+) -> Result<PackageResolutionAuthority, PackageMutationError> {
+    let registry =
+        crate::PackageSourceRegistry::builtin().map_err(|_| PackageMutationError::Backend)?;
+    let source = resolution.source.source_id.clone();
+    let policy = SecurityPolicy {
+        allowlists: [(
+            StableId::parse("package_sources").unwrap(),
+            [source.as_str().into()].into_iter().collect(),
+        )]
+        .into_iter()
+        .collect(),
+        ..SecurityPolicy::default()
+    };
+    PackageResolutionAuthority::new(&resolution.target, &resolution.manager, &registry, &policy)
+        .map_err(|_| PackageMutationError::Backend)
+}
+
+/// Native target implementation for the two production offline recipes.
+/// Every archive is loaded from the controller-persisted artifact store;
+/// package commands are fixed and never receive a repository or URL.
+pub struct ProcessOfflinePackageBackend {
+    target_root: PathBuf,
+}
+
+/// SSH counterpart to the native offline backend. It uses only the typed
+/// package request in the closed filesystem protocol; arbitrary remote shell
+/// commands are never exposed to the controller.
+pub struct SshOfflinePackageBackend<T> {
+    root_id: StableId,
+    transport: T,
+}
+
+impl<T> SshOfflinePackageBackend<T> {
+    pub fn new(root_id: StableId, transport: T) -> Self {
+        Self { root_id, transport }
+    }
+
+    fn request(
+        &mut self,
+        phase: crate::PackageMutationPhase,
+        resolution: &PackageResolutionV1,
+        artifacts: Option<&ArtifactStore>,
+    ) -> Result<crate::SshFilesystemResponse, PackageMutationError>
+    where
+        T: crate::SshFilesystemTransport,
+    {
+        let transferred = match artifacts {
+            Some(store) => resolution
+                .artifacts
+                .iter()
+                .map(|artifact| {
+                    Ok(crate::PackageMutationArtifact {
+                        reference: artifact.content.clone(),
+                        bytes: store
+                            .load(&artifact.content)
+                            .map_err(|_| PackageMutationError::Backend)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, PackageMutationError>>()?,
+            None => Vec::new(),
+        };
+        self.transport
+            .perform(crate::SshFilesystemRequest::PackageMutation {
+                root_id: self.root_id.clone(),
+                phase,
+                resolution: resolution.clone(),
+                artifacts: transferred,
+            })
+            .map_err(|_| PackageMutationError::Backend)
+    }
+}
+
+impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
+    for SshOfflinePackageBackend<T>
+{
+    fn manager(&self) -> PackageManager {
+        PackageManager::Apt
+    }
+
+    fn supports_manager(&self, manager: PackageManager) -> bool {
+        matches!(manager, PackageManager::Apt | PackageManager::Nvm)
+    }
+
+    fn observe(
+        &mut self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<PackageObservationV1, PackageMutationError> {
+        match self.request(crate::PackageMutationPhase::Observe, resolution, None)? {
+            crate::SshFilesystemResponse::PackageObserved { installed_versions } => {
+                Ok(PackageObservationV1 { installed_versions })
+            }
+            _ => Err(PackageMutationError::Backend),
+        }
+    }
+
+    fn prepare_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        self.request(
+            crate::PackageMutationPhase::Prepare,
+            resolution,
+            Some(artifacts),
+        )?
+        .is_applied()
+    }
+
+    fn apply_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        self.request(
+            crate::PackageMutationPhase::Apply,
+            resolution,
+            Some(artifacts),
+        )?
+        .is_applied()
+    }
+
+    fn verify_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        self.request(
+            crate::PackageMutationPhase::Verify,
+            resolution,
+            Some(artifacts),
+        )?
+        .is_applied()
+    }
+}
+
+trait PackageMutationResponseExt {
+    fn is_applied(self) -> Result<(), PackageMutationError>;
+}
+
+impl PackageMutationResponseExt for crate::SshFilesystemResponse {
+    fn is_applied(self) -> Result<(), PackageMutationError> {
+        matches!(self, crate::SshFilesystemResponse::Applied)
+            .then_some(())
+            .ok_or(PackageMutationError::Backend)
+    }
+}
+
+impl ProcessOfflinePackageBackend {
+    pub fn new(target_root: impl Into<PathBuf>) -> Self {
+        Self {
+            target_root: target_root.into(),
+        }
+    }
+
+    fn observe_apt(&self) -> Result<PackageObservationV1, PackageMutationError> {
+        let output = Command::new("/usr/bin/dpkg-query")
+            .args(["-W", "-f=${binary:Package}=${Version}\\n"])
+            .output()
+            .map_err(|_| PackageMutationError::Backend)?;
+        if !output.status.success() {
+            return Err(PackageMutationError::Backend);
+        }
+        Ok(PackageObservationV1 {
+            installed_versions: String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        })
+    }
+
+    fn observe_nvm(&self) -> Result<PackageObservationV1, PackageMutationError> {
+        let nvm_dir = self.target_root.join(".nvm");
+        let script = nvm_dir.join("nvm.sh");
+        let output = Command::new("/bin/bash")
+            .arg("-c")
+            .arg("set -eu; . \"$1\"; nvm ls --no-colors")
+            .arg("commonkit")
+            .arg(script)
+            .output()
+            .map_err(|_| PackageMutationError::Backend)?;
+        if !output.status.success() {
+            return Err(PackageMutationError::Backend);
+        }
+        let installed_versions = String::from_utf8_lossy(&output.stdout)
+            .split_whitespace()
+            .filter_map(|field| field.strip_prefix('v'))
+            .filter(|version| version.chars().next().is_some_and(|c| c.is_ascii_digit()))
+            .map(str::to_owned)
+            .collect();
+        Ok(PackageObservationV1 { installed_versions })
+    }
+
+    fn artifact_bytes(
+        &self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+        role: &str,
+    ) -> Result<Vec<u8>, PackageMutationError> {
+        let artifact = resolution
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.role.as_str() == role)
+            .ok_or(PackageMutationError::UnsupportedRecipe)?;
+        artifacts
+            .load(&artifact.content)
+            .map_err(|_| PackageMutationError::Backend)
+    }
+}
+
+impl PackageMutationBackend for ProcessOfflinePackageBackend {
+    fn manager(&self) -> PackageManager {
+        PackageManager::Apt
+    }
+
+    fn supports_manager(&self, manager: PackageManager) -> bool {
+        matches!(manager, PackageManager::Apt | PackageManager::Nvm)
+    }
+
+    fn observe(
+        &mut self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<PackageObservationV1, PackageMutationError> {
+        match resolution.manager.manager {
+            PackageManager::Apt => self.observe_apt(),
+            PackageManager::Nvm => self.observe_nvm(),
+            _ => Err(PackageMutationError::UnsupportedRecipe),
+        }
+    }
+
+    fn prepare_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        match &resolution.recipe {
+            OfflineInstallRecipeV1::AptArchives { artifact_roles }
+            | OfflineInstallRecipeV1::NodeArchive { artifact_roles, .. } => {
+                for artifact in &resolution.artifacts {
+                    if artifact_roles.contains(&artifact.role) {
+                        artifacts
+                            .load(&artifact.content)
+                            .map_err(|_| PackageMutationError::Backend)?;
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(PackageMutationError::UnsupportedRecipe),
+        }
+    }
+
+    fn apply_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        match resolution.manager.manager {
+            PackageManager::Apt => {
+                let OfflineInstallRecipeV1::AptArchives { artifact_roles } = &resolution.recipe
+                else {
+                    return Err(PackageMutationError::UnsupportedRecipe);
+                };
+                let staging = tempfile::tempdir().map_err(|_| PackageMutationError::Backend)?;
+                let mut archives = Vec::new();
+                for artifact in &resolution.artifacts {
+                    if artifact_roles.contains(&artifact.role) {
+                        let path = staging.path().join(artifact.role.as_str());
+                        fs::write(
+                            &path,
+                            artifacts
+                                .load(&artifact.content)
+                                .map_err(|_| PackageMutationError::Backend)?,
+                        )
+                        .map_err(|_| PackageMutationError::Backend)?;
+                        archives.push(path);
+                    }
+                }
+                let status = Command::new("/usr/bin/dpkg")
+                    .arg("--install")
+                    .args(&archives)
+                    .status()
+                    .map_err(|_| PackageMutationError::Backend)?;
+                status
+                    .success()
+                    .then_some(())
+                    .ok_or(PackageMutationError::Backend)
+            }
+            PackageManager::Nvm => {
+                let OfflineInstallRecipeV1::NodeArchive {
+                    install: Some(install),
+                    ..
+                } = &resolution.recipe
+                else {
+                    return Err(PackageMutationError::UnsupportedRecipe);
+                };
+                let archive = self.artifact_bytes(resolution, artifacts, "node-archive")?;
+                let cache = self
+                    .target_root
+                    .join(".nvm")
+                    .join(&install.cache_relative_path);
+                if let Some(parent) = cache.parent() {
+                    fs::create_dir_all(parent).map_err(|_| PackageMutationError::Backend)?;
+                }
+                fs::write(&cache, archive).map_err(|_| PackageMutationError::Backend)?;
+                let script = self.target_root.join(".nvm/nvm.sh");
+                let status = Command::new("/bin/bash")
+                    .arg("-c")
+                    .arg("set -eu; export NVM_NO_SOURCE_FALLBACK=1 NVM_OFFLINE=1; . \"$1\"; nvm install --offline \"$2\"")
+                    .arg("commonkit")
+                    .arg(script)
+                    .arg(&install.node_version)
+                    .status()
+                    .map_err(|_| PackageMutationError::Backend)?;
+                status
+                    .success()
+                    .then_some(())
+                    .ok_or(PackageMutationError::Backend)
+            }
+            _ => Err(PackageMutationError::UnsupportedRecipe),
+        }
+    }
+
+    fn verify_offline(
+        &mut self,
+        resolution: &PackageResolutionV1,
+        artifacts: &ArtifactStore,
+    ) -> Result<(), PackageMutationError> {
+        let observed = self.observe(resolution)?;
+        if PackageAdapter::after_resolution(resolution, &observed) {
+            Ok(())
+        } else {
+            self.prepare_offline(resolution, artifacts)
+        }
+    }
 }
 
 fn package_version_key(

@@ -285,6 +285,14 @@ impl<R: RemoteProcessRunner> SshFilesystemTransport for OpenSshTransport<R> {
                 SshFilesystemRequest::WriteFile { .. } | SshFilesystemRequest::Remove { .. },
                 SshFilesystemResponse::Applied,
             ) => true,
+            (
+                SshFilesystemRequest::PackageMutation { phase, .. },
+                SshFilesystemResponse::PackageObserved { .. },
+            ) if *phase == crate::PackageMutationPhase::Observe => true,
+            (
+                SshFilesystemRequest::PackageMutation { phase, .. },
+                SshFilesystemResponse::Applied,
+            ) if *phase != crate::PackageMutationPhase::Observe => true,
             _ => false,
         };
         if !matching {

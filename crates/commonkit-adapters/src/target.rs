@@ -309,6 +309,12 @@ pub enum SshFilesystemRequest {
         root_id: StableId,
         path: NormalizedManagedPath,
     },
+    PackageMutation {
+        root_id: StableId,
+        phase: PackageMutationPhase,
+        resolution: crate::PackageResolutionV1,
+        artifacts: Vec<PackageMutationArtifact>,
+    },
     StageArtifact {
         run_id: StableId,
         digest: commonkit_contracts::Sha256Digest,
@@ -339,6 +345,9 @@ pub enum SshFilesystemResponse {
         resource: TargetResource,
     },
     Applied,
+    PackageObserved {
+        installed_versions: std::collections::BTreeSet<String>,
+    },
     ArtifactStaged {
         digest: commonkit_contracts::Sha256Digest,
     },
@@ -351,6 +360,22 @@ pub enum SshFilesystemResponse {
     RecoveryReady {
         receipt_digest: commonkit_contracts::Sha256Digest,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageMutationPhase {
+    Observe,
+    Prepare,
+    Apply,
+    Verify,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageMutationArtifact {
+    pub reference: crate::ContentReference,
+    pub bytes: Vec<u8>,
 }
 
 pub trait SshFilesystemTransport {
@@ -536,6 +561,8 @@ pub enum TargetFilesystemError {
     UnknownRoot(StableId),
     #[error("remote artifact validation failed")]
     RemoteArtifact,
+    #[error("remote offline package mutation failed")]
+    PackageCommandFailed,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

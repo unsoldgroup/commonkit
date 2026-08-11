@@ -5,7 +5,8 @@ use commonkit_contracts::StableId;
 use commonkit_core::{RootAccess, TargetRoot};
 
 use crate::{
-    ArtifactStore, ContentSensitivity, LocalTargetFilesystem, SshFilesystemRequest,
+    ArtifactStore, ContentSensitivity, LocalTargetFilesystem, PackageMutationPhase,
+    ProcessOfflinePackageBackend, SshFilesystemRequest,
     SshFilesystemResponse, TargetFilesystem, TargetFilesystemError,
 };
 
@@ -93,6 +94,71 @@ impl TargetHelper {
             SshFilesystemRequest::Remove { root_id, path } => {
                 self.root(&root_id)?.remove_resource(&path)?;
                 Ok(SshFilesystemResponse::Applied)
+            }
+            SshFilesystemRequest::PackageMutation {
+                root_id,
+                phase,
+                resolution,
+                artifacts,
+            } => {
+                let (root_path, access) = self
+                    .roots
+                    .get(&root_id)
+                    .ok_or_else(|| TargetFilesystemError::UnknownRoot(root_id.clone()))?;
+                if phase != PackageMutationPhase::Observe && access != &RootAccess::ReadWrite {
+                    return Err(TargetFilesystemError::ReadOnly);
+                }
+                for artifact in artifacts {
+                    let stored = self
+                        .artifacts
+                        .put(&artifact.bytes, artifact.reference.sensitivity)
+                        .map_err(|_| TargetFilesystemError::RemoteArtifact)?;
+                    if stored.digest != artifact.reference.digest
+                        || stored.bytes != artifact.reference.bytes
+                    {
+                        return Err(TargetFilesystemError::RemoteArtifact);
+                    }
+                }
+                let mut backend = ProcessOfflinePackageBackend::new(root_path);
+                match phase {
+                    PackageMutationPhase::Observe => {
+                        let observed = commonkit_adapters::PackageMutationBackend::observe(
+                            &mut backend,
+                            &resolution,
+                        )
+                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
+                        Ok(SshFilesystemResponse::PackageObserved {
+                            installed_versions: observed.installed_versions,
+                        })
+                    }
+                    PackageMutationPhase::Prepare => {
+                        commonkit_adapters::PackageMutationBackend::prepare_offline(
+                            &mut backend,
+                            &resolution,
+                            &self.artifacts,
+                        )
+                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
+                        Ok(SshFilesystemResponse::Applied)
+                    }
+                    PackageMutationPhase::Apply => {
+                        commonkit_adapters::PackageMutationBackend::apply_offline(
+                            &mut backend,
+                            &resolution,
+                            &self.artifacts,
+                        )
+                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
+                        Ok(SshFilesystemResponse::Applied)
+                    }
+                    PackageMutationPhase::Verify => {
+                        commonkit_adapters::PackageMutationBackend::verify_offline(
+                            &mut backend,
+                            &resolution,
+                            &self.artifacts,
+                        )
+                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
+                        Ok(SshFilesystemResponse::Applied)
+                    }
+                }
             }
             SshFilesystemRequest::StageArtifact {
                 digest, content, ..
