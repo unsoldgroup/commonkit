@@ -57,6 +57,24 @@ pub struct AptTransactionRisksV1 {
     pub unresolved_alternatives: BTreeSet<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AptInstalledPackageEvidenceV2 {
+    name: String,
+    architecture: String,
+    version: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AptLiveSafetyEvidenceV2<'a> {
+    live_status_digest: &'a Sha256Digest,
+    installed_packages: Vec<AptInstalledPackageEvidenceV2>,
+    installed_actions: BTreeSet<(String, String, String)>,
+    configured_actions: BTreeSet<(String, String, String)>,
+    risks: &'a AptTransactionRisksV1,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AptResolutionSnapshotV1 {
@@ -1418,17 +1436,17 @@ fn resolve_apt_on_linux(
         .unresolved_alternatives
         .extend(live_risks.unresolved_alternatives);
     let live_status_digest = content_digest(&live_status_bytes)?;
-    let live_safety_digest = digest_domain_json(
-        "commonkit.apt-live-safety-evidence.v1",
-        &(
-            &live_status_digest,
-            &installed,
-            parse_simulated_packages(&live_safety_output)?,
-            parse_configured_packages(&live_safety_output)?,
-            &risks,
-        ),
-    )
-    .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))?;
+    let live_safety_digest = apt_live_safety_evidence_digest(
+        &live_status_digest,
+        installed
+            .iter()
+            .map(|((name, architecture), version)| {
+                (name.clone(), architecture.clone(), version.clone())
+            })
+            .collect(),
+        &live_safety_output,
+        &risks,
+    )?;
     let mut installed_versions = installed
         .iter()
         .map(|((name, architecture), version)| format!("{name}:{architecture}={version}"))
@@ -1765,6 +1783,43 @@ fn load_single_inrelease(lists: &std::path::Path) -> Result<Vec<u8>, AptResoluti
 }
 
 type InstalledPackageState = BTreeMap<(String, String), String>;
+
+fn apt_live_safety_evidence_digest(
+    live_status_digest: &Sha256Digest,
+    mut installed: Vec<(String, String, String)>,
+    simulation: &str,
+    risks: &AptTransactionRisksV1,
+) -> Result<Sha256Digest, AptResolutionCommandError> {
+    installed.sort();
+    let mut identities = BTreeSet::new();
+    let mut installed_packages = Vec::with_capacity(installed.len());
+    for (name, architecture, version) in installed {
+        if !safe_apt_token(&name) || !safe_apt_token(&architecture) || !safe_apt_version(&version) {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT live-safety installed identity is malformed".into(),
+            ));
+        }
+        if !identities.insert((name.clone(), architecture.clone())) {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT live-safety installed identity is duplicated".into(),
+            ));
+        }
+        installed_packages.push(AptInstalledPackageEvidenceV2 {
+            name,
+            architecture,
+            version,
+        });
+    }
+    let evidence = AptLiveSafetyEvidenceV2 {
+        live_status_digest,
+        installed_packages,
+        installed_actions: parse_simulated_packages(simulation)?,
+        configured_actions: parse_configured_packages(simulation)?,
+        risks,
+    };
+    digest_domain_json("commonkit.apt-live-safety-evidence.v2", &evidence)
+        .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))
+}
 
 fn parse_complete_installed_state(
     status: &str,
@@ -2669,6 +2724,73 @@ fn parse_configured_packages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_safety_evidence_digest_is_stable_for_nonempty_multiarch_state() {
+        let live_status_digest = Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let risks = AptTransactionRisksV1::default();
+        let simulation = "Inst curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])\n\
+Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])\n";
+        let installed = vec![
+            ("libc6".into(), "arm64".into(), "2.39-0ubuntu8.6".into()),
+            ("curl".into(), "amd64".into(), "8.5.0-2ubuntu10.6".into()),
+            ("libc6".into(), "amd64".into(), "2.39-0ubuntu8.6".into()),
+        ];
+        let mut reversed = installed.clone();
+        reversed.reverse();
+
+        let digest =
+            apt_live_safety_evidence_digest(&live_status_digest, installed, simulation, &risks)
+                .unwrap();
+        assert_eq!(
+            digest,
+            apt_live_safety_evidence_digest(&live_status_digest, reversed, simulation, &risks,)
+                .unwrap()
+        );
+        assert_eq!(
+            digest.as_str(),
+            "sha256:075fde09ddb525b7397d5b2fa680093bcc54b373c88022c89f1db59b309b21a7"
+        );
+    }
+
+    #[test]
+    fn live_safety_evidence_rejects_duplicate_or_malformed_installed_identity() {
+        let live_status_digest = Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let risks = AptTransactionRisksV1::default();
+        let valid = ("curl".into(), "amd64".into(), "8.5.0-2ubuntu10.6".into());
+        let cases = [
+            vec![valid.clone(), valid],
+            vec![("curl/bad".into(), "amd64".into(), "1.0".into())],
+            vec![("curl".into(), "amd64/bad".into(), "1.0".into())],
+            vec![("curl".into(), "amd64".into(), "1.0 bad".into())],
+        ];
+
+        for installed in cases {
+            assert!(
+                apt_live_safety_evidence_digest(&live_status_digest, installed, "", &risks,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn empty_live_safety_installed_state_has_an_explicit_v2_digest() {
+        let live_status_digest = Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
+
+        let digest = apt_live_safety_evidence_digest(
+            &live_status_digest,
+            Vec::new(),
+            "",
+            &AptTransactionRisksV1::default(),
+        )
+        .unwrap();
+
+        // V2 intentionally replaces V1's tuple-keyed JSON object with a closed array.
+        assert_eq!(
+            digest.as_str(),
+            "sha256:b2a66dac8a8a832f4384ad73d49a67f4ea7984595deb19389ce28e1d0388a81b"
+        );
+    }
 
     fn fixture_archives(
         print_uris: &str,
