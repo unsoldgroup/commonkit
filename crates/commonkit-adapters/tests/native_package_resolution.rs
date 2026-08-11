@@ -13,10 +13,10 @@ use std::time::Duration;
 #[cfg(unix)]
 use commonkit_adapters::{
     AptCommandSpecV1, AptRepositoryConfigurationV1, AptResolutionBackend,
-    AptResolutionSystemRequestV1, AptSourceAuthorityV1, ArtifactStore, ControlledPackageSourceV1,
-    ManagerBindingV1, NodeResolutionBackend, NodeRuntimeHost, NodeRuntimeHostError,
-    PackageDesiredIntent, PackageDiscoveryFetchRequestV1, PackageFetch, PackageFetchHopV1,
-    PackageFetchRequestV1, PackageFetchResultV1, PackageResolutionCoordinator,
+    AptResolutionSystemRequestV1, AptResolvedPackageV1, AptSourceAuthorityV1, ArtifactStore,
+    ControlledPackageSourceV1, ManagerBindingV1, NodeResolutionBackend, NodeRuntimeHost,
+    NodeRuntimeHostError, PackageDesiredIntent, PackageDiscoveryFetchRequestV1, PackageFetch,
+    PackageFetchHopV1, PackageFetchRequestV1, PackageFetchResultV1, PackageResolutionCoordinator,
     PackageResolutionError, PackageSourceRegistry, PackageTargetV1,
     ProcessAptResolutionCommandRunner, ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost,
 };
@@ -109,7 +109,22 @@ fn production_apt_command_plan_matches_only_closed_read_only_shapes() {
         },
     };
 
-    let commands = ProcessAptResolutionCommandRunner::command_snapshot(&request).unwrap();
+    let mut commands = ProcessAptResolutionCommandRunner::command_snapshot(&request).unwrap();
+    commands.extend(
+        ProcessAptResolutionCommandRunner::package_metadata_command_snapshot(&[
+            AptResolvedPackageV1 {
+                name: "curl".into(),
+                version: "8.5.0-2ubuntu10.6".into(),
+                architecture: "amd64".into(),
+            },
+            AptResolvedPackageV1 {
+                name: "libc6".into(),
+                version: "2.39-0ubuntu8.4".into(),
+                architecture: "amd64".into(),
+            },
+        ])
+        .unwrap(),
+    );
 
     for (index, command) in commands.into_iter().enumerate() {
         assert_eq!(
@@ -548,10 +563,28 @@ fn assert_read_only_apt_plan(
         source_authority: authority.clone(),
         repository: repository.clone(),
     };
-    let commands = redacted(
+    let mut commands = redacted(
         ProcessAptResolutionCommandRunner::command_snapshot(&request),
         "APT read-only command plan",
     );
+    let PackageSelector::AptBinary { name, architecture } = declaration
+        .selector
+        .as_ref()
+        .expect("validated native APT selector")
+    else {
+        unreachable!("validated native APT selector")
+    };
+    let metadata_commands = redacted(
+        ProcessAptResolutionCommandRunner::package_metadata_command_snapshot(&[
+            AptResolvedPackageV1 {
+                name: name.clone(),
+                version: declaration.version.clone(),
+                architecture: architecture.clone().unwrap_or_else(|| target.arch.clone()),
+            },
+        ]),
+        "APT signed package metadata command plan",
+    );
+    commands.extend(metadata_commands);
     assert!(
         validate_read_only_apt_commands(&commands).is_ok(),
         "native evidence command plan could mutate target state"
@@ -642,6 +675,9 @@ fn validate_apt_cache_command(command: &AptCommandSpecV1) -> Result<(), &'static
                 && recurse == "--recurse"
                 && is_exact_package(package) =>
         {
+            require_canonical_apt_options(&options, true)
+        }
+        [show, package] if !command.network && show == "show" && is_exact_package(package) => {
             require_canonical_apt_options(&options, true)
         }
         _ => Err("apt-cache command does not match the closed dependency-inspection shape"),

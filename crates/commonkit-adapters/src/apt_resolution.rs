@@ -117,6 +117,15 @@ impl ProcessAptResolutionCommandRunner {
         apt_live_safety_command(closure, "<private>")
     }
 
+    pub fn package_metadata_command_snapshot(
+        closure: &[AptResolvedPackageV1],
+    ) -> Result<Vec<AptCommandSpecV1>, AptResolutionCommandError> {
+        closure
+            .iter()
+            .map(|package| apt_package_metadata_command(package, "<private>"))
+            .collect()
+    }
+
     pub fn probe_manager_binding(
         target: &PackageTargetV1,
         canonical_repository: &str,
@@ -860,6 +869,36 @@ fn apt_live_safety_command(
     })
 }
 
+fn apt_package_metadata_command(
+    package: &AptResolvedPackageV1,
+    workspace: &str,
+) -> Result<AptCommandSpecV1, AptResolutionCommandError> {
+    if !safe_apt_token(&package.name)
+        || !safe_apt_token(&package.architecture)
+        || !safe_apt_version(&package.version)
+    {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT package metadata request identity is invalid".into(),
+        ));
+    }
+    let mut args = apt_options(workspace);
+    args.extend([
+        "-o".into(),
+        format!("Dir::State::status={workspace}/status"),
+        "show".into(),
+        format!(
+            "{}:{}={}",
+            package.name, package.architecture, package.version
+        ),
+    ]);
+    Ok(AptCommandSpecV1 {
+        executable: "/usr/bin/apt-cache".into(),
+        args,
+        environment: apt_command_environment(workspace),
+        network: false,
+    })
+}
+
 fn apt_command_environment(workspace: &str) -> BTreeMap<String, String> {
     BTreeMap::from([("APT_CONFIG".into(), format!("{workspace}/apt.conf"))])
 }
@@ -1332,7 +1371,10 @@ fn resolve_apt_on_linux(
         metadata_digest,
         signature_digest: key_digest,
     }];
-    let archives = parse_print_uris(&outputs[9])?;
+    let archives = resolve_archives_from_package_metadata(&outputs[8], &outputs[9], |package| {
+        let command = apt_package_metadata_command(package, workspace_text)?;
+        run_fixed_command(&command, workspace_text)
+    })?;
     validate_simulated_archive_closure(&outputs[8], &archives)?;
     let mut risks = parse_solver_risks(&outputs[8], &outputs[7], &outputs[5]);
     let closure_names = archives
@@ -1947,8 +1989,28 @@ fn content_digest(bytes: &[u8]) -> Result<Sha256Digest, AptResolutionCommandErro
         .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))
 }
 
-fn parse_print_uris(output: &str) -> Result<Vec<AptResolvedArchiveV1>, AptResolutionCommandError> {
-    let mut archives = Vec::new();
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AptPrintUriRecord {
+    immutable_locator: String,
+    filename: String,
+    size: u64,
+    reported_sha256: Option<Sha256Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AptPackageMetadataRecord {
+    package: AptResolvedPackageV1,
+    filename: String,
+    size: u64,
+    sha256: Sha256Digest,
+}
+
+fn parse_print_uri_records(
+    output: &str,
+) -> Result<Vec<AptPrintUriRecord>, AptResolutionCommandError> {
+    let mut records = Vec::new();
+    let mut locators = BTreeSet::new();
+    let mut filenames = BTreeSet::new();
     for line in output
         .lines()
         .map(str::trim)
@@ -1976,74 +2038,212 @@ fn parse_print_uris(output: &str) -> Result<Vec<AptResolvedArchiveV1>, AptResolu
                 "APT archive URI is not HTTPS".into(),
             ));
         }
-        let filename = fields[1]
-            .trim_matches('\'')
-            .strip_suffix(".deb")
-            .ok_or_else(|| {
-                AptResolutionCommandError::InvalidOutput("APT archive filename is not a deb".into())
-            })?;
-        let mut name_parts = filename.rsplitn(3, '_');
-        let architecture = name_parts.next().unwrap_or_default();
-        let version = name_parts.next().unwrap_or_default();
-        let package_name = name_parts.next().unwrap_or_default();
-        if package_name.is_empty()
-            || version.is_empty()
-            || architecture.is_empty()
-            || !package_name.chars().all(|character| {
-                character.is_ascii_lowercase()
-                    || character.is_ascii_digit()
-                    || matches!(character, '+' | '-' | '.')
-            })
-            || !architecture
-                .chars()
-                .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit())
+        let filename = unquote_apt_field(fields[1]).ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "APT archive filename quoting is invalid".into(),
+            )
+        })?;
+        let uri_filename = locator.rsplit('/').next().unwrap_or_default();
+        if filename.is_empty()
+            || !filename.ends_with(".deb")
+            || filename.contains('/')
+            || filename != uri_filename
         {
             return Err(AptResolutionCommandError::InvalidOutput(
-                "APT archive identity is invalid".into(),
+                "APT archive filename and URI basename disagree".into(),
             ));
         }
         let size = fields[2].parse::<u64>().map_err(|_| {
             AptResolutionCommandError::InvalidOutput("APT archive size is invalid".into())
         })?;
-        let checksum = fields[3].strip_prefix("SHA256:").ok_or_else(|| {
-            AptResolutionCommandError::InvalidOutput("APT archive lacks a SHA-256 checksum".into())
-        })?;
-        let upstream_checksum = Sha256Digest::parse(format!("sha256:{checksum}"))
-            .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))?;
-        archives.push(AptResolvedArchiveV1 {
-            package_name: package_name.into(),
-            version: version.into(),
-            architecture: architecture.into(),
+        if size == 0 {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT archive size is zero".into(),
+            ));
+        }
+        let reported_sha256 = if let Some(checksum) = fields[3].strip_prefix("SHA256:") {
+            Some(
+                Sha256Digest::parse(format!("sha256:{checksum}"))
+                    .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))?,
+            )
+        } else if let Some(checksum) = fields[3].strip_prefix("MD5Sum:") {
+            if checksum.len() != 32
+                || !checksum.chars().all(|character| {
+                    character.is_ascii_hexdigit() && !character.is_ascii_uppercase()
+                })
+            {
+                return Err(AptResolutionCommandError::InvalidOutput(
+                    "APT archive MD5 diagnostic is malformed".into(),
+                ));
+            }
+            None
+        } else {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT archive reported an unsupported checksum kind".into(),
+            ));
+        };
+        if !locators.insert(locator) || !filenames.insert(filename) {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT returned duplicate archive URI records".into(),
+            ));
+        }
+        records.push(AptPrintUriRecord {
             immutable_locator: locator.into(),
-            upstream_checksum,
+            filename: filename.into(),
             size,
+            reported_sha256,
         });
     }
-    if archives.is_empty() {
+    if records.is_empty() {
         return Err(AptResolutionCommandError::InvalidOutput(
             "APT returned no exact archive records".into(),
         ));
     }
-    archives.sort_by(|left, right| {
-        (&left.package_name, &left.architecture, &left.version).cmp(&(
-            &right.package_name,
-            &right.architecture,
-            &right.version,
-        ))
-    });
-    if archives.windows(2).any(|pair| {
-        (
-            &pair[0].package_name,
-            &pair[0].architecture,
-            &pair[0].version,
-        ) == (
-            &pair[1].package_name,
-            &pair[1].architecture,
-            &pair[1].version,
-        )
-    }) {
+    records.sort_by(|left, right| left.filename.cmp(&right.filename));
+    Ok(records)
+}
+
+fn unquote_apt_field(value: &str) -> Option<&str> {
+    match (value.strip_prefix('\''), value.strip_suffix('\'')) {
+        (Some(without_prefix), Some(_)) => without_prefix.strip_suffix('\''),
+        (None, None) if !value.contains('\'') => Some(value),
+        _ => None,
+    }
+}
+
+fn parse_package_metadata_record(
+    output: &str,
+    expected: &AptResolvedPackageV1,
+) -> Result<AptPackageMetadataRecord, AptResolutionCommandError> {
+    let paragraphs = output
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|paragraph| !paragraph.is_empty())
+        .collect::<Vec<_>>();
+    if paragraphs.len() != 1 {
         return Err(AptResolutionCommandError::InvalidOutput(
-            "APT returned duplicate archive records".into(),
+            "APT package metadata did not contain exactly one record".into(),
+        ));
+    }
+    let required = [
+        "Package",
+        "Version",
+        "Architecture",
+        "Filename",
+        "Size",
+        "SHA256",
+    ];
+    let mut fields = BTreeMap::new();
+    for raw_line in paragraphs[0].lines() {
+        let line = raw_line.trim_end_matches('\r');
+        if line.starts_with([' ', '\t']) {
+            continue;
+        }
+        let (key, value) = line.split_once(": ").ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "APT package metadata line is malformed".into(),
+            )
+        })?;
+        if required.contains(&key) && fields.insert(key, value).is_some() {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT package metadata contains a duplicate required field".into(),
+            ));
+        }
+    }
+    if fields.len() != required.len() || required.iter().any(|key| !fields.contains_key(key)) {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT package metadata lacks a required signed field".into(),
+        ));
+    }
+    if fields["Package"] != expected.name
+        || fields["Version"] != expected.version
+        || fields["Architecture"] != expected.architecture
+    {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT package metadata identity differs from the exact closure".into(),
+        ));
+    }
+    let filename = fields["Filename"];
+    if filename.starts_with('/')
+        || filename.contains(['\\', '?', '#'])
+        || filename
+            .split('/')
+            .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+        || !filename.ends_with(".deb")
+    {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT package metadata filename is unsafe".into(),
+        ));
+    }
+    let size = fields["Size"].parse::<u64>().map_err(|_| {
+        AptResolutionCommandError::InvalidOutput("APT package metadata size is invalid".into())
+    })?;
+    if size == 0 {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT package metadata size is zero".into(),
+        ));
+    }
+    let sha256 = Sha256Digest::parse(format!("sha256:{}", fields["SHA256"]))
+        .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))?;
+    Ok(AptPackageMetadataRecord {
+        package: expected.clone(),
+        filename: filename.into(),
+        size,
+        sha256,
+    })
+}
+
+fn resolve_archives_from_package_metadata(
+    simulation: &str,
+    print_uris: &str,
+    mut load_metadata: impl FnMut(&AptResolvedPackageV1) -> Result<String, AptResolutionCommandError>,
+) -> Result<Vec<AptResolvedArchiveV1>, AptResolutionCommandError> {
+    let simulated = parse_simulated_packages(simulation)?;
+    if simulated.is_empty() {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT simulation returned no exact package closure".into(),
+        ));
+    }
+    let mut print_records = parse_print_uri_records(print_uris)?
+        .into_iter()
+        .map(|record| (record.filename.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut archives = Vec::with_capacity(simulated.len());
+    for (name, architecture, version) in simulated {
+        let package = AptResolvedPackageV1 {
+            name,
+            version,
+            architecture,
+        };
+        let metadata = parse_package_metadata_record(&load_metadata(&package)?, &package)?;
+        let basename = metadata.filename.rsplit('/').next().unwrap_or_default();
+        let print_record = print_records.remove(basename).ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "APT signed package metadata has no matching archive URI".into(),
+            )
+        })?;
+        if metadata.size != print_record.size
+            || print_record
+                .reported_sha256
+                .as_ref()
+                .is_some_and(|checksum| checksum != &metadata.sha256)
+        {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT archive URI and signed package metadata disagree".into(),
+            ));
+        }
+        archives.push(AptResolvedArchiveV1 {
+            package_name: metadata.package.name,
+            version: metadata.package.version,
+            architecture: metadata.package.architecture,
+            immutable_locator: print_record.immutable_locator,
+            upstream_checksum: metadata.sha256,
+            size: metadata.size,
+        });
+    }
+    if !print_records.is_empty() {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT archive URI output contains records outside the exact closure".into(),
         ));
     }
     Ok(archives)
@@ -2291,10 +2491,24 @@ fn parse_configured_packages(
 mod tests {
     use super::*;
 
+    fn fixture_archives(
+        print_uris: &str,
+    ) -> Result<Vec<AptResolvedArchiveV1>, AptResolutionCommandError> {
+        resolve_archives_from_package_metadata(
+            include_str!("../tests/fixtures/apt/simulate-safe.txt"),
+            print_uris,
+            |package| match package.name.as_str() {
+                "curl" => Ok(include_str!("../tests/fixtures/apt/package-show-curl.txt").into()),
+                "libc6" => Ok(include_str!("../tests/fixtures/apt/package-show-libc6.txt").into()),
+                _ => panic!("unexpected package metadata request"),
+            },
+        )
+    }
+
     #[test]
     fn parses_sha256_print_uris_fixture_into_exact_archives() {
         let archives =
-            parse_print_uris(include_str!("../tests/fixtures/apt/print-uris.txt")).unwrap();
+            fixture_archives(include_str!("../tests/fixtures/apt/print-uris.txt")).unwrap();
 
         assert_eq!(archives.len(), 2);
         assert_eq!(archives[0].package_name, "curl");
@@ -2304,11 +2518,90 @@ mod tests {
     }
 
     #[test]
-    fn rejects_weak_archive_checksum_metadata() {
-        let error = parse_print_uris(include_str!("../tests/fixtures/apt/print-uris-weak.txt"))
-            .unwrap_err();
+    fn md5_print_uri_diagnostics_use_signed_package_sha256_metadata() {
+        let archives =
+            fixture_archives(include_str!("../tests/fixtures/apt/print-uris-md5.txt")).unwrap();
 
-        assert!(matches!(error, AptResolutionCommandError::InvalidOutput(_)));
+        assert_eq!(archives.len(), 2);
+        assert_eq!(
+            archives[0].upstream_checksum.as_str(),
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            archives[1].upstream_checksum.as_str(),
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+    }
+
+    #[test]
+    fn signed_package_metadata_rejects_missing_duplicate_or_mismatched_archive_fields() {
+        let simulation = "Inst curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])\n";
+        let md5_print_uri = include_str!("../tests/fixtures/apt/print-uris-weak.txt");
+        let base = include_str!("../tests/fixtures/apt/package-show-curl.txt");
+        let multiple = format!("{base}\n{base}");
+        let cases = [
+            base.replace("Version: 8.5.0-2ubuntu10.6", "Version: 8.5.0-unsafe"),
+            base.replace("Architecture: amd64", "Architecture: arm64"),
+            base.replace("Size: 14", "Size: 15"),
+            base.replace(
+                "curl_8.5.0-2ubuntu10.6_amd64.deb",
+                "curl_8.5.0-unsafe_amd64.deb",
+            ),
+            base.replace(
+                "SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+                "",
+            ),
+            format!("Package: other\n{base}"),
+            multiple,
+        ];
+
+        for metadata in cases {
+            assert!(
+                resolve_archives_from_package_metadata(simulation, md5_print_uri, |_| {
+                    Ok(metadata.clone())
+                })
+                .is_err()
+            );
+        }
+
+        let sha256_mismatch = include_str!("../tests/fixtures/apt/print-uris.txt")
+            .lines()
+            .next()
+            .unwrap()
+            .replace(
+                "SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "SHA256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            );
+        assert!(
+            resolve_archives_from_package_metadata(simulation, &sha256_mismatch, |_| {
+                Ok(base.into())
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn package_metadata_command_is_fixed_private_and_exact() {
+        let commands = ProcessAptResolutionCommandRunner::package_metadata_command_snapshot(&[
+            AptResolvedPackageV1 {
+                name: "curl".into(),
+                version: "8.5.0-2ubuntu10.6".into(),
+                architecture: "amd64".into(),
+            },
+        ])
+        .unwrap();
+        let command = &commands[0];
+        let rendered = command.args.join(" ");
+
+        assert_eq!(command.executable, "/usr/bin/apt-cache");
+        assert!(!command.network);
+        assert_eq!(
+            command.environment.get("APT_CONFIG").map(String::as_str),
+            Some("<private>/apt.conf")
+        );
+        assert!(rendered.contains("Dir::State::lists=<private>/lists"));
+        assert!(rendered.contains("Dir::State::status=<private>/status"));
+        assert!(rendered.ends_with("show curl:amd64=8.5.0-2ubuntu10.6"));
     }
 
     #[test]
@@ -2380,7 +2673,7 @@ mod tests {
     #[test]
     fn simulation_and_archive_records_must_name_the_same_exact_closure() {
         let archives =
-            parse_print_uris(include_str!("../tests/fixtures/apt/print-uris.txt")).unwrap();
+            fixture_archives(include_str!("../tests/fixtures/apt/print-uris.txt")).unwrap();
         validate_simulated_archive_closure(
             include_str!("../tests/fixtures/apt/simulate-safe.txt"),
             &archives,
