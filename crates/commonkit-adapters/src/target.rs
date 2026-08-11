@@ -279,6 +279,7 @@ impl TargetFilesystem for LocalTargetFilesystem {
 /// constrained helper, but cannot accept arbitrary shell commands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum SshFilesystemRequest {
     ReadFile {
         root_id: StableId,

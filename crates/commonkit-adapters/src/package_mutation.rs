@@ -677,7 +677,7 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
             resolution,
             Some(artifacts),
         )?
-        .is_applied()
+        .ensure_applied()
     }
 
     fn apply_offline(
@@ -690,7 +690,7 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
             resolution,
             Some(artifacts),
         )?
-        .is_applied()
+        .ensure_applied()
     }
 
     fn verify_offline(
@@ -703,16 +703,16 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
             resolution,
             Some(artifacts),
         )?
-        .is_applied()
+        .ensure_applied()
     }
 }
 
 trait PackageMutationResponseExt {
-    fn is_applied(self) -> Result<(), PackageMutationError>;
+    fn ensure_applied(self) -> Result<(), PackageMutationError>;
 }
 
 impl PackageMutationResponseExt for crate::SshFilesystemResponse {
-    fn is_applied(self) -> Result<(), PackageMutationError> {
+    fn ensure_applied(self) -> Result<(), PackageMutationError> {
         matches!(self, crate::SshFilesystemResponse::Applied)
             .then_some(())
             .ok_or(PackageMutationError::Backend)
