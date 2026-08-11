@@ -14,11 +14,12 @@ use commonkit_adapters::{
     EngramTargetRuntime, EngramTargetSyncMode, ExactProviderVersion, FileAdapter, FilesystemIntent,
     GitRepository, GitSyncDisposition, LocalSensitiveFileStore, LocalTargetFilesystem,
     MaterializedState, NativeProvider, NormalizedManagedPath, NormalizedResource, OpenSshConfig,
-    OpenSshTransport, OwnershipRules, PlatformKeychain, PlatformKeychainCredentialResolver,
-    ProcessBwsRunner, ProcessEngramCommandRunner, ProcessGitRunner,
-    ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
-    ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
-    RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, SshTargetCapabilities,
+    OpenSshTransport, OwnershipRules, PackageAdapter, PackageMutationBackendRegistry,
+    PlatformKeychain, PlatformKeychainCredentialResolver, ProcessBwsRunner,
+    ProcessEngramCommandRunner, ProcessGitRunner, ProcessPlatformSecretCommandRunner,
+    ProcessRemoteRunner, ProviderCapability, ProviderContext, ProviderInputs, ProviderPipeline,
+    ProviderPlanRequest, ProviderResourcePlanner, RemoteProviderStager, ResourceProvenance,
+    SecretValue, SshFileAdapter, SshOfflinePackageBackend, SshTargetCapabilities,
     SshTargetFilesystem, TargetFilesystem, build_provider_plan, materialize_mcp_client_state,
     validate_ownership,
 };
@@ -462,18 +463,29 @@ impl ProductionSshPlanExecutor {
     }
 
     fn adapter(&self) -> Result<Vec<Box<dyn Adapter>>, DomainFailure> {
-        let transport = self.factory.open(&self.target)?;
+        let file_transport = self.factory.open(&self.target)?;
+        let package_transport = self.factory.open(&self.target)?;
+        let package_artifacts = ArtifactStore::open(self.adapter_state.join("packages"))
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let package_backend = PackageMutationBackendRegistry::new([Box::new(
+            SshOfflinePackageBackend::new(self.target.root_id.clone(), package_transport),
+        )
+            as Box<dyn commonkit_adapters::PackageMutationBackend>])
+        .map_err(|_| DomainFailure::OperationFailed)?;
         Ok(vec![
             Box::new(
                 SshFileAdapter::open_with_capabilities(
                     self.target.root_id.clone(),
                     &self.adapter_state,
-                    transport,
+                    file_transport,
                     self.target.capabilities,
                 )
                 .map_err(|_| DomainFailure::OperationFailed)?,
             ),
-            Box::new(super::UnavailablePackageAdapter),
+            Box::new(PackageAdapter::new_offline(
+                package_artifacts,
+                Box::new(package_backend),
+            )),
         ])
     }
 
@@ -606,14 +618,6 @@ impl PlanExecutor for ProductionSshPlanExecutor {
                     ),
                 };
             }
-            // The closed registry currently has no concrete offline package
-            // mutator. Fail before opening the SSH transport.
-            return ExecutionResult {
-                status: ApplyStatus::Failed,
-                failure_code: Some(
-                    StableId::parse("package_adapter_unavailable").expect("static ID"),
-                ),
-            };
         }
         let result = self
             .lock
@@ -2460,6 +2464,67 @@ fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), DomainFailure> 
     let parent = path.parent().ok_or(DomainFailure::OperationFailed)?;
     fs::create_dir_all(parent).map_err(|_| DomainFailure::OperationFailed)?;
     write_private_atomic_prepared(path, bytes, &sync_directory_io)
+}
+
+#[cfg(test)]
+mod package_registry_tests {
+    use super::*;
+    use commonkit_contracts::{
+        OperationKind, RecoveryCapability, ResourceRef, Risk, Sha256Digest, StableId,
+    };
+    use commonkit_core::{OperationDraft, finalize_operation};
+    use commonkit_reconcile::Adapter;
+
+    fn digest(seed: char) -> Sha256Digest {
+        Sha256Digest::parse(format!("sha256:{}", seed.to_string().repeat(64))).unwrap()
+    }
+
+    fn package_operation(manager: &str) -> commonkit_contracts::Operation {
+        finalize_operation(OperationDraft {
+            adapter_id: StableId::parse("packages").unwrap(),
+            kind: OperationKind::Create,
+            resource: ResourceRef {
+                resource_type: StableId::parse("package").unwrap(),
+                resource_id: StableId::parse(manager).unwrap(),
+                managed_path: None,
+            },
+            risk: Risk::Medium,
+            requires_confirmation: true,
+            recovery_capability: RecoveryCapability::ConvergeForwardOnly,
+            depends_on: Vec::new(),
+            before_digest: None,
+            after_digest: Some(digest('a')),
+            payload_digest: digest('b'),
+            provenance: None,
+            summary: format!("install {manager}"),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn production_local_registry_routes_apt_and_nvm_to_concrete_package_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let executor = super::super::LocalPlanExecutor::open(
+            Arc::new(PlanStore::open(root.path().join("plans")).unwrap()),
+            root.path().join("receipts"),
+            &target,
+            root.path().join("adapter"),
+        )
+        .unwrap();
+
+        let mut adapters = executor.adapters().unwrap();
+        for manager in ["apt", "nvm"] {
+            let failure = adapters
+                .iter_mut()
+                .find(|adapter| adapter.id().as_str() == "packages")
+                .unwrap()
+                .preflight(&package_operation(manager))
+                .unwrap_err();
+            assert_eq!(failure.code, "package_resolution_invalid", "{manager}");
+        }
+    }
 }
 
 fn write_private_atomic_with_sync(
