@@ -2132,9 +2132,70 @@ impl LocalExecutionError {
                 _ => "reconcile_failed",
             },
             Self::Adapter(_) => "adapter_unavailable",
+            Self::PackageArtifact(_) | Self::PackageBackend(_) => "package_adapter_unavailable",
             Self::Relay(_) => "relay_unavailable",
             Self::Contract(_) => "contract_invalid",
         })
+    }
+}
+
+/// Closed fallback for targets whose concrete package transport is not
+/// registered. It never delegates package operations to another adapter.
+struct UnavailablePackageAdapter;
+
+impl Adapter for UnavailablePackageAdapter {
+    fn id(&self) -> &StableId {
+        static ID: std::sync::OnceLock<StableId> = std::sync::OnceLock::new();
+        ID.get_or_init(|| StableId::parse("packages").expect("static adapter ID"))
+    }
+
+    fn supports_operation(&self, operation: &Operation) -> bool {
+        operation.adapter_id.as_str() == "packages"
+            && operation.resource.resource_type.as_str() == "package"
+            && operation.kind == commonkit_contracts::OperationKind::Create
+            && operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
+    }
+
+    fn supports_offline_recovery(&self, operation: &Operation) -> bool {
+        self.supports_operation(operation)
+    }
+
+    fn preflight(
+        &mut self,
+        _operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        Err(commonkit_reconcile::AdapterFailure::new(
+            "package_adapter_unavailable",
+            "no concrete offline package adapter is registered",
+        ))
+    }
+
+    fn prepare(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        self.preflight(operation)
+    }
+
+    fn apply(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        self.preflight(operation)
+    }
+
+    fn verify(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        self.preflight(operation)
+    }
+
+    fn rollback(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+        self.preflight(operation)
     }
 }
 

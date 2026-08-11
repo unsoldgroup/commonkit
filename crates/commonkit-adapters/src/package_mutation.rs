@@ -67,7 +67,7 @@ impl PackageMutationBackendRegistry {
     pub fn new(
         backends: impl IntoIterator<Item = Box<dyn PackageMutationBackend>>,
     ) -> Result<Self, PackageMutationError> {
-        let mut registered = Vec::new();
+        let mut registered: Vec<Box<dyn PackageMutationBackend>> = Vec::new();
         for backend in backends {
             if registered.iter().any(|existing| {
                 [PackageManager::Apt, PackageManager::Nvm]
@@ -102,7 +102,9 @@ impl PackageMutationBackend for PackageMutationBackendRegistry {
     }
 
     fn supports_manager(&self, manager: PackageManager) -> bool {
-        self.backends.contains_key(&manager)
+        self.backends
+            .iter()
+            .any(|backend| backend.supports_manager(manager))
     }
 
     fn observe(

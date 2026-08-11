@@ -5,7 +5,8 @@ use commonkit_contracts::StableId;
 use commonkit_core::{RootAccess, TargetRoot};
 
 use crate::{
-    ArtifactStore, ContentSensitivity, LocalTargetFilesystem, PackageMutationPhase,
+    ArtifactStore, ContentSensitivity, LocalTargetFilesystem, PackageMutationBackend,
+    PackageMutationPhase,
     ProcessOfflinePackageBackend, SshFilesystemRequest,
     SshFilesystemResponse, TargetFilesystem, TargetFilesystemError,
 };
@@ -122,7 +123,7 @@ impl TargetHelper {
                 let mut backend = ProcessOfflinePackageBackend::new(root_path);
                 match phase {
                     PackageMutationPhase::Observe => {
-                        let observed = commonkit_adapters::PackageMutationBackend::observe(
+                        let observed = PackageMutationBackend::observe(
                             &mut backend,
                             &resolution,
                         )
@@ -132,7 +133,7 @@ impl TargetHelper {
                         })
                     }
                     PackageMutationPhase::Prepare => {
-                        commonkit_adapters::PackageMutationBackend::prepare_offline(
+                        PackageMutationBackend::prepare_offline(
                             &mut backend,
                             &resolution,
                             &self.artifacts,
@@ -141,7 +142,7 @@ impl TargetHelper {
                         Ok(SshFilesystemResponse::Applied)
                     }
                     PackageMutationPhase::Apply => {
-                        commonkit_adapters::PackageMutationBackend::apply_offline(
+                        PackageMutationBackend::apply_offline(
                             &mut backend,
                             &resolution,
                             &self.artifacts,
@@ -150,7 +151,7 @@ impl TargetHelper {
                         Ok(SshFilesystemResponse::Applied)
                     }
                     PackageMutationPhase::Verify => {
-                        commonkit_adapters::PackageMutationBackend::verify_offline(
+                        PackageMutationBackend::verify_offline(
                             &mut backend,
                             &resolution,
                             &self.artifacts,
