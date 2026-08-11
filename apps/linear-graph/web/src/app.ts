@@ -2,7 +2,7 @@ import cytoscape from "cytoscape";
 import fcose from "cytoscape-fcose";
 import { demoPayload, normalizePayload, type GraphEdge, type GraphNode, type GraphPayload } from "./protocol.js";
 import type { Campaign, WorkBundle } from "@commonkit/linear-graph-protocol";
-import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, recommendationFor, statusShape, teamColor, teamSummaries, topicColor, uniqueTopics, visibleGraph, zoneMetrics, type Filters, type ViewMode } from "./model.js";
+import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, recommendationFor, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, uniqueTopics, visibleGraph, zoneMetrics, type Filters, type ViewMode } from "./model.js";
 
 cytoscape.use(fcose);
 const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
@@ -68,7 +68,7 @@ function selectNode(id: string, additive = false) {
   if (additive && selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
   selectedId = selectedIds.has(id) ? id : selectedIds.values().next().value ?? null;
   renderRecommendations(); renderList(); renderContext();
-  if (cy) { cy.nodes().unselect(); selectedIds.forEach((selected) => cy.getElementById(selected).select()); if (changedTicket && !additive) cy.fit(undefined, 40); if (selectedId) cy.center(cy.getElementById(selectedId)); }
+  if (cy) { cy.nodes().unselect(); selectedIds.forEach((selected) => cy.getElementById(selected).select()); if (selectionViewportAction(changedTicket, additive) === "fit") cy.fit(undefined, 40); }
 }
 function clearSelection() { selectedIds.clear(); selectedId = null; renderRecommendations(); renderList(); renderContext(); if (cy) cy.nodes().unselect(); }
 async function authorizedFetch(path: string, init: RequestInit) {
