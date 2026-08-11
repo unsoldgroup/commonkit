@@ -459,6 +459,11 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
 }));
 JS
 chmod 0600 "$HOME/.config/commonkit/target-helper.json"
+trap 'rm -f "$HOME/.config/commonkit/.target-helper."*.tmp' EXIT
+if [[ "${COMMONKIT_PACKAGE_SUPPORT:-0}" == "1" && "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" != "1" ]]; then
+  echo 'package support requires an explicit successful native probe' >&2
+  exit 1
+fi
 if [[ "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" == "1" ]]; then
   : "${COMMONKIT_TARGET_IDENTITY_DIGEST:?set a controller-bound target identity digest}"
   : "${COMMONKIT_PACKAGE_MANAGER:?set apt or nvm}"

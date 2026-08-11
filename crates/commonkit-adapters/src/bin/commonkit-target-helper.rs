@@ -1,8 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions as CapOpenOptions};
 use commonkit_adapters::{
     AptRepositoryConfigurationV1, NodeRuntimeHost, ProcessAptResolutionCommandRunner,
     ProcessNodeRuntimeHost, SshFilesystemRequest, TargetHelper, TargetNodeResolutionConfig,
@@ -42,6 +44,7 @@ fn run() -> Result<(), ()> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(());
     }
+    validate_config_parents(config_path.parent().ok_or(())?)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -113,6 +116,7 @@ fn target_probe() -> Result<commonkit_adapters::PackageTargetV1, ()> {
         "aarch64" => "arm64",
         _ => return Err(()),
     };
+    let libc = detect_libc()?;
     Ok(commonkit_adapters::PackageTargetV1 {
         os: "linux".into(),
         os_version: os_version.into(),
@@ -120,9 +124,37 @@ fn target_probe() -> Result<commonkit_adapters::PackageTargetV1, ()> {
         distro_version: Some(os_version.into()),
         codename,
         arch: arch.into(),
-        libc: Some("glibc".into()),
+        libc: Some(libc),
         manager_prefix: None,
     })
+}
+
+fn detect_libc() -> Result<String, ()> {
+    let ldd = Path::new("/usr/bin/ldd");
+    let metadata = fs::symlink_metadata(ldd).map_err(|_| ())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(());
+    }
+    let output = std::process::Command::new(ldd)
+        .arg("--version")
+        .output()
+        .map_err(|_| ())?;
+    if !output.status.success() {
+        return Err(());
+    }
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+    if text.contains("glibc") || text.contains("gnu libc") {
+        Ok("glibc".into())
+    } else if text.contains("musl") {
+        Ok("musl".into())
+    } else {
+        Err(())
+    }
 }
 
 fn canonical_apt_source(source: &StableId) -> Result<&'static str, ()> {
@@ -141,6 +173,105 @@ fn package_policy(source: &StableId) -> SecurityPolicy {
         )]),
         ..SecurityPolicy::default()
     }
+}
+
+fn owner_allowed(uid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let effective = unsafe { libc::geteuid() };
+        uid == effective || uid == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = uid;
+        true
+    }
+}
+
+fn validate_existing_path(path: &Path, executable: bool, writable_root: bool) -> Result<(), ()> {
+    if !path.is_absolute() {
+        return Err(());
+    }
+    let mut current = PathBuf::from(path);
+    let leaf = fs::symlink_metadata(&current).map_err(|_| ())?;
+    if leaf.file_type().is_symlink() || !leaf.is_file() && !leaf.is_dir() {
+        return Err(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if leaf.permissions().mode() & 0o022 != 0 || !owner_allowed(leaf.uid()) {
+            return Err(());
+        }
+        if executable && leaf.permissions().mode() & 0o111 == 0 {
+            return Err(());
+        }
+        if writable_root && leaf.uid() != unsafe { libc::geteuid() } {
+            return Err(());
+        }
+    }
+    while let Some(parent) = current.parent() {
+        if parent == current {
+            break;
+        }
+        let metadata = fs::symlink_metadata(parent).map_err(|_| ())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            let mode = metadata.permissions().mode();
+            let sticky_root = mode & 0o1000 != 0 && metadata.uid() == 0;
+            if (mode & 0o022 != 0 && !sticky_root) || !owner_allowed(metadata.uid()) {
+                return Err(());
+            }
+        }
+        current = parent.to_path_buf();
+    }
+    Ok(())
+}
+
+fn validate_config_parents(parent: &Path) -> Result<(), ()> {
+    let home = PathBuf::from(std::env::var_os("HOME").ok_or(())?);
+    if !home.is_absolute() || !parent.starts_with(&home) {
+        return Err(());
+    }
+    let mut current = Some(parent);
+    while let Some(directory) = current {
+        let metadata = fs::symlink_metadata(directory).map_err(|_| ())?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
+            if metadata.permissions().mode() & 0o022 != 0 || !owner_allowed(metadata.uid()) {
+                return Err(());
+            }
+        }
+        if directory == home {
+            return Ok(());
+        }
+        current = directory.parent();
+    }
+    Err(())
+}
+
+fn validate_roots(config: &HelperConfig) -> Result<(), ()> {
+    if config.state_root.as_os_str().is_empty() || !config.state_root.is_absolute() {
+        return Err(());
+    }
+    validate_existing_path(&config.state_root, false, false)?;
+    for root in &config.roots {
+        let path = Path::new(&root.path);
+        validate_existing_path(
+            path,
+            false,
+            root.access == commonkit_core::RootAccess::ReadWrite,
+        )?;
+    }
+    Ok(())
 }
 
 fn provision(args: &[String]) -> Result<(), ()> {
@@ -168,6 +299,7 @@ fn provision(args: &[String]) -> Result<(), ()> {
                 return Err(());
             }
             let signed_by = PathBuf::from(option(args, "--apt-signed-by")?);
+            validate_existing_path(&signed_by, false, false)?;
             let signing_authority =
                 StableId::parse(option(args, "--apt-signing-authority")?).map_err(|_| ())?;
             let repository = AptRepositoryConfigurationV1 {
@@ -192,6 +324,10 @@ fn provision(args: &[String]) -> Result<(), ()> {
             let shell = PathBuf::from(option(args, "--shell-executable")?);
             let keyring = PathBuf::from(option(args, "--release-keyring")?);
             let gpgv = PathBuf::from(option(args, "--gpgv-executable")?);
+            validate_existing_path(&nvm_dir, false, true)?;
+            validate_existing_path(&shell, true, false)?;
+            validate_existing_path(&keyring, false, false)?;
+            validate_existing_path(&gpgv, true, false)?;
             let mut target = target.clone();
             target.manager_prefix = Some(nvm_dir.to_string_lossy().into_owned());
             let mut host = ProcessNodeRuntimeHost::new_with_gpgv(
@@ -226,6 +362,10 @@ fn provision(args: &[String]) -> Result<(), ()> {
         node,
         target_identity_digest,
     });
+    validate_roots(&config)?;
+    let candidate = config.package_resolution.clone();
+    TargetHelper::open_with_package_resolution(config.roots.clone(), &config.state_root, candidate)
+        .map_err(|_| ())?;
     write_config_atomic(&config_path, &config)
 }
 
@@ -243,6 +383,7 @@ fn read_or_create_config(path: &Path, args: &[String]) -> Result<HelperConfig, (
                 return Err(());
             }
         }
+        validate_config_parents(path.parent().ok_or(())?)?;
         let bytes = fs::read(path).map_err(|_| ())?;
         return serde_json::from_slice(&bytes).map_err(|_| ());
     }
@@ -262,35 +403,39 @@ fn read_or_create_config(path: &Path, args: &[String]) -> Result<HelperConfig, (
 
 fn write_config_atomic(path: &Path, config: &HelperConfig) -> Result<(), ()> {
     let parent = path.parent().ok_or(())?;
-    let mut current = Some(parent);
-    while let Some(directory) = current {
-        let metadata = fs::symlink_metadata(directory).map_err(|_| ())?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(());
-        }
-        current = directory.parent();
-    }
+    validate_config_parents(parent)?;
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(());
         }
     }
-    let temp = parent.join(format!(".target-helper.{}.tmp", std::process::id()));
+    let parent_dir = Dir::open_ambient_dir(parent, ambient_authority()).map_err(|_| ())?;
+    let cleanup_dir = parent_dir.try_clone().map_err(|_| ())?;
+    let temp = format!(".target-helper.{}.tmp", std::process::id());
     let bytes = serde_json::to_vec_pretty(config).map_err(|_| ())?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp)
-        .map_err(|_| ())?;
+    let mut options = CapOpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| ())?;
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
     }
-    file.write_all(&bytes).map_err(|_| ())?;
-    file.sync_all().map_err(|_| ())?;
-    fs::rename(&temp, path).map_err(|_| ())?;
+    let result = (|| -> Result<(), ()> {
+        let mut file = parent_dir.open_with(&temp, &options).map_err(|_| ())?;
+        file.write_all(&bytes).map_err(|_| ())?;
+        file.sync_all().map_err(|_| ())?;
+        drop(file);
+        let leaf = path.file_name().ok_or(())?;
+        parent_dir
+            .rename(&temp, &parent_dir, leaf)
+            .map_err(|_| ())?;
+        parent_dir.into_std_file().sync_all().map_err(|_| ())?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = cleanup_dir.remove_file(&temp);
+    }
+    result?;
     let metadata = fs::symlink_metadata(path).map_err(|_| ())?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(());

@@ -47,6 +47,17 @@ sudo -u "$user" test -r "$runtime_root" -a -x "$runtime_root"
 sudo -u "$user" test -r "$home/.ssh/authorized_keys"
 sudo -u "$user" test -x "$home/commonkit-target-helper"
 sudo -u "$user" test -w "$target" -a -w "$state"
+cleanup() {
+  if [[ -f "$scratch/sshd/pid" ]]; then
+    kill "$(cat "$scratch/sshd/pid")" 2>/dev/null || true
+  fi
+  rm -f "$home/.config/commonkit/.target-helper."*.tmp "$scratch/sshd/pid"
+}
+trap cleanup EXIT INT TERM
+if [[ "${COMMONKIT_PACKAGE_SUPPORT:-0}" == "1" && "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" != "1" ]]; then
+  echo 'package support requires an explicit successful native probe' >&2
+  exit 1
+fi
 if [[ "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" == "1" ]]; then
   : "${COMMONKIT_TARGET_IDENTITY_DIGEST:?set a controller-bound target identity digest}"
   : "${COMMONKIT_PACKAGE_MANAGER:?set apt or nvm}"
