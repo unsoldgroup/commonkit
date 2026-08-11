@@ -170,6 +170,7 @@ struct NodeResolutionConfig {
 impl SyncConfig {
     fn target_package_resolution(&self) -> Option<TargetPackageResolutionConfig> {
         let config = self.package_resolution.as_ref()?;
+        let target = canonical_package_target(config.target.clone()).ok()?;
         let node = config.node.as_ref().and_then(|node| {
             node.gpgv_executable_digest
                 .clone()
@@ -182,7 +183,7 @@ impl SyncConfig {
                 })
         });
         Some(TargetPackageResolutionConfig {
-            target: config.target.clone(),
+            target,
             manager: config.manager.clone(),
             policy: config.policy.clone(),
             apt: config.apt.clone(),
@@ -2352,19 +2353,9 @@ impl ProductionSyncDomain {
         let platform = self.config.provider_platform()?;
         let canonical_arch =
             canonical_package_architecture(&platform.operating_system, &platform.architecture)?;
-        let mut package_target = config.target.clone();
-        package_target.arch =
-            canonical_package_architecture(&package_target.os, &package_target.arch)?;
-        let target_os_matches = matches!(
-            (
-                platform.operating_system.as_str(),
-                config.target.os.as_str()
-            ),
-            ("macos", "macos" | "darwin")
-                | ("darwin", "macos" | "darwin")
-                | ("linux", "linux")
-                | ("windows", "windows")
-        );
+        let package_target = canonical_package_target(config.target.clone())?;
+        let target_os_matches =
+            canonical_package_os(&platform.operating_system) == package_target.os;
         if !target_os_matches || canonical_arch != package_target.arch {
             return Err(DomainFailure::OperationFailed);
         }
@@ -2683,8 +2674,7 @@ impl ProductionSyncDomain {
             .package_resolution
             .as_ref()
             .ok_or(DomainFailure::InvalidRequest)?;
-        let mut target = config.target.clone();
-        target.arch = canonical_package_architecture(&target.os, &target.arch)?;
+        let target = canonical_package_target(config.target.clone())?;
         let platform = self.config.provider_platform()?;
         let platform_arch =
             canonical_package_architecture(&platform.operating_system, &platform.architecture)?;
@@ -2960,6 +2950,12 @@ impl ProductionSyncDomain {
 fn canonical_package_os(os: &str) -> String {
     let os = os.to_ascii_lowercase();
     if os == "darwin" { "macos".into() } else { os }
+}
+
+fn canonical_package_target(mut target: PackageTargetV1) -> Result<PackageTargetV1, DomainFailure> {
+    target.os = canonical_package_os(&target.os);
+    target.arch = canonical_package_architecture(&target.os, &target.arch)?;
+    Ok(target)
 }
 
 fn production_ssh_target(
@@ -6299,6 +6295,73 @@ mod package_resolution_tests {
             "arm64"
         );
         assert!(canonical_package_architecture("linux", "x64").is_err());
+    }
+
+    #[test]
+    fn local_package_resolution_canonicalizes_linux_and_macos_aliases() {
+        fn config(target: PackageTargetV1) -> SyncConfig {
+            SyncConfig {
+                target_id: StableId::parse("alias-target").unwrap(),
+                target_root: std::env::temp_dir().join("commonkit-alias-target"),
+                adapter_state: std::env::temp_dir().join("commonkit-alias-adapter"),
+                provider_artifacts: std::env::temp_dir().join("commonkit-alias-artifacts"),
+                materialized_states: Vec::new(),
+                provider_pipeline: None,
+                styleguide: None,
+                target_transport: Some(SyncTargetTransport::Local),
+                target_platform: None,
+                declared_roots: vec![NormalizedManagedPath::parse("home").unwrap()],
+                relay_client_root: None,
+                protected_roots: Vec::new(),
+                case_sensitive: true,
+                target_identity_digest: digest_domain_json("fixture", &"target").unwrap(),
+                composed_loadout_digest: digest_domain_json("fixture", &"loadout").unwrap(),
+                policy_digest: digest_domain_json("fixture", &"policy").unwrap(),
+                package_resolution: Some(PackageResolutionConfig {
+                    target,
+                    manager: ManagerBindingV1 {
+                        manager: PackageManager::Apt,
+                        version: "1".into(),
+                        executable_digest: digest_domain_json("fixture", &"manager").unwrap(),
+                        config_digest: digest_domain_json("fixture", &"config").unwrap(),
+                    },
+                    policy: SecurityPolicy::default(),
+                    apt: None,
+                    node: None,
+                }),
+                relay_endpoint: None,
+            }
+        }
+
+        let linux = config(PackageTargetV1 {
+            os: "linux".into(),
+            os_version: "24.04".into(),
+            distro_id: Some("ubuntu".into()),
+            distro_version: Some("24.04".into()),
+            codename: Some("noble".into()),
+            arch: "x86_64".into(),
+            libc: Some("glibc".into()),
+            manager_prefix: None,
+        })
+        .target_package_resolution()
+        .unwrap();
+        assert_eq!(linux.target.os, "linux");
+        assert_eq!(linux.target.arch, "amd64");
+
+        let macos = config(PackageTargetV1 {
+            os: "darwin".into(),
+            os_version: "14".into(),
+            distro_id: None,
+            distro_version: None,
+            codename: None,
+            arch: "x86_64".into(),
+            libc: None,
+            manager_prefix: Some("/Users/al/.nvm".into()),
+        })
+        .target_package_resolution()
+        .unwrap();
+        assert_eq!(macos.target.os, "macos");
+        assert_eq!(macos.target.arch, "x86_64");
     }
 
     #[test]

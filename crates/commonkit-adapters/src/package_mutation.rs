@@ -1028,7 +1028,9 @@ impl ProcessOfflinePackageBackend {
             // configuration before they are exposed to a plan executor.
             return Ok(());
         };
-        if config.target != resolution.target || config.manager != resolution.manager {
+        if !package_targets_match(&config.target, &resolution.target)
+            || config.manager != resolution.manager
+        {
             return Err(PackageMutationError::Backend);
         }
         match resolution.manager.manager {
@@ -1587,18 +1589,36 @@ fn package_target_matches_platform(
     operating_system: &str,
     architecture: &str,
 ) -> bool {
+    let target_os = canonical_os(&target.os);
+    let platform_os = canonical_os(operating_system);
     let os_matches = match manager {
-        PackageManager::Apt => operating_system.eq_ignore_ascii_case("linux"),
-        PackageManager::Nvm => {
-            operating_system.eq_ignore_ascii_case("linux")
-                || operating_system.eq_ignore_ascii_case("macos")
-                || operating_system.eq_ignore_ascii_case("darwin")
-        }
+        PackageManager::Apt => platform_os == "linux",
+        PackageManager::Nvm => platform_os == "linux" || platform_os == "macos",
         _ => false,
     };
     os_matches
-        && target.os.eq_ignore_ascii_case(operating_system)
+        && target_os == platform_os
         && canonical_arch(&target.arch) == canonical_arch(architecture)
+}
+
+fn package_targets_match(left: &crate::PackageTargetV1, right: &crate::PackageTargetV1) -> bool {
+    canonical_os(&left.os) == canonical_os(&right.os)
+        && left.os_version == right.os_version
+        && left.distro_id == right.distro_id
+        && left.distro_version == right.distro_version
+        && left.codename == right.codename
+        && canonical_arch(&left.arch) == canonical_arch(&right.arch)
+        && left.libc == right.libc
+        && left.manager_prefix == right.manager_prefix
+}
+
+fn canonical_os(operating_system: &str) -> String {
+    let operating_system = operating_system.to_ascii_lowercase();
+    if operating_system == "darwin" {
+        "macos".into()
+    } else {
+        operating_system
+    }
 }
 
 fn canonical_arch(architecture: &str) -> std::borrow::Cow<'_, str> {
@@ -1646,8 +1666,72 @@ fn failure(code: &'static str) -> AdapterFailure {
 
 #[cfg(test)]
 mod tests {
-    use super::ValidatedNvmScript;
+    use super::{
+        PackageManager, ValidatedNvmScript, package_target_matches_platform, package_targets_match,
+    };
+    use crate::PackageTargetV1;
     use std::fs;
+
+    fn target(os: &str, arch: &str) -> PackageTargetV1 {
+        PackageTargetV1 {
+            os: os.into(),
+            os_version: "1".into(),
+            distro_id: None,
+            distro_version: None,
+            codename: None,
+            arch: arch.into(),
+            libc: None,
+            manager_prefix: None,
+        }
+    }
+
+    #[test]
+    fn local_package_target_matching_accepts_linux_architecture_aliases() {
+        assert!(package_target_matches_platform(
+            &target("linux", "amd64"),
+            PackageManager::Apt,
+            "linux",
+            "x86_64",
+        ));
+        assert!(!package_target_matches_platform(
+            &target("linux", "amd64"),
+            PackageManager::Apt,
+            "linux",
+            "arm64",
+        ));
+    }
+
+    #[test]
+    fn local_package_target_matching_accepts_macos_darwin_aliases() {
+        assert!(package_target_matches_platform(
+            &target("darwin", "x86_64"),
+            PackageManager::Nvm,
+            "macos",
+            "x86_64",
+        ));
+        assert!(!package_target_matches_platform(
+            &target("darwin", "x86_64"),
+            PackageManager::Nvm,
+            "linux",
+            "x86_64",
+        ));
+    }
+
+    #[test]
+    fn local_manager_binding_matching_accepts_aliases_but_rejects_foreign_targets() {
+        assert!(package_targets_match(
+            &target("linux", "x86_64"),
+            &target("linux", "amd64"),
+        ));
+        assert!(package_targets_match(
+            &target("darwin", "x86_64"),
+            &target("macos", "x86_64"),
+        ));
+        assert!(!package_targets_match(
+            &target("linux", "x86_64"),
+            &target("linux", "arm64"),
+        ));
+    }
 
     #[test]
     fn validated_nvm_script_materializes_an_immutable_copy() {
