@@ -134,9 +134,10 @@ async function connectCodex() {
 
 function renderShell() {
   // Shell updates (auth polling, toasts, brief status) should not detach the
-  // Cytoscape canvas. Reattaching the same container preserves its viewport.
-  const existingGraphContainer = cy ? document.querySelector<HTMLElement>("#cy") : null;
-  existingGraphContainer?.remove();
+  // Cytoscape event surface. Preserve the whole wrapper, not only #cy, so
+  // canvas gestures, hover layers, and toolbar hit-testing stay connected.
+  const existingGraphWrap = cy ? document.querySelector<HTMLElement>(".graph-wrap") : null;
+  existingGraphWrap?.remove();
   const teams = teamSummaries(payload.snapshot.nodes, payload.snapshot.teams);
   const topics = uniqueTopics(payload.snapshot.nodes);
   app.innerHTML = `<header class="topbar">
@@ -159,8 +160,8 @@ function renderShell() {
       <section class="list-alternative" aria-label="Accessible issue list"><div class="list-heading"><h2>Accessible list</h2><span>Use this view if the graph is too dense.</span></div><div id="issue-list"></div></section>
     </section>
   </main><div id="toast" role="status" aria-live="polite"></div>`;
-  if (existingGraphContainer && cy) {
-    $("#cy").replaceWith(existingGraphContainer);
+  if (existingGraphWrap && cy) {
+    $(".graph-wrap").replaceWith(existingGraphWrap);
     cy.resize();
   }
   renderRecommendations(); renderZones(); renderList(); renderGraph(); renderContext();
