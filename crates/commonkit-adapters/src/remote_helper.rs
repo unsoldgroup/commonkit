@@ -6,8 +6,7 @@ use commonkit_core::{RootAccess, TargetRoot};
 
 use crate::{
     ArtifactStore, ContentSensitivity, LocalTargetFilesystem, PackageMutationBackend,
-    PackageMutationPhase,
-    ProcessOfflinePackageBackend, SshFilesystemRequest,
+    PackageMutationPhase, ProcessOfflinePackageBackend, SshFilesystemRequest,
     SshFilesystemResponse, TargetFilesystem, TargetFilesystemError,
 };
 
@@ -123,11 +122,8 @@ impl TargetHelper {
                 let mut backend = ProcessOfflinePackageBackend::new(root_path);
                 match phase {
                     PackageMutationPhase::Observe => {
-                        let observed = PackageMutationBackend::observe(
-                            &mut backend,
-                            &resolution,
-                        )
-                        .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
+                        let observed = PackageMutationBackend::observe(&mut backend, &resolution)
+                            .map_err(|_| TargetFilesystemError::PackageCommandFailed)?;
                         Ok(SshFilesystemResponse::PackageObserved {
                             installed_versions: observed.installed_versions,
                         })

@@ -2177,17 +2177,11 @@ impl Adapter for UnavailablePackageAdapter {
         self.preflight(operation)
     }
 
-    fn apply(
-        &mut self,
-        operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+    fn apply(&mut self, operation: &Operation) -> Result<(), commonkit_reconcile::AdapterFailure> {
         self.preflight(operation)
     }
 
-    fn verify(
-        &mut self,
-        operation: &Operation,
-    ) -> Result<(), commonkit_reconcile::AdapterFailure> {
+    fn verify(&mut self, operation: &Operation) -> Result<(), commonkit_reconcile::AdapterFailure> {
         self.preflight(operation)
     }
 
