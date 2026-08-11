@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use commonkit_adapters::{
     FileMode, NodeRuntimeHost, NormalizedManagedPath, PackageArtifactV1, PackageDesiredIntent,
@@ -19,6 +21,54 @@ use sha2::{Digest, Sha256};
 
 fn temp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("commonkit-helper-{name}-{}", std::process::id()))
+}
+
+#[cfg(unix)]
+struct NvmEnvironmentGuard {
+    previous: Vec<(OsString, OsString)>,
+    _lock: MutexGuard<'static, ()>,
+}
+
+#[cfg(unix)]
+impl Drop for NvmEnvironmentGuard {
+    fn drop(&mut self) {
+        for (name, value) in &self.previous {
+            // Environment mutation is synchronized for this test process.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+}
+
+#[cfg(unix)]
+fn clean_nvm_environment() -> NvmEnvironmentGuard {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn prohibited(name: &OsStr) -> bool {
+        let Some(name) = name.to_str() else {
+            return true;
+        };
+        let canonical = name.to_ascii_uppercase();
+        canonical.starts_with("NPM_CONFIG_")
+            || matches!(
+                canonical.as_str(),
+                "PREFIX"
+                    | "NVM_NODEJS_ORG_MIRROR"
+                    | "NVM_IOJS_ORG_MIRROR"
+                    | "NVM_REINSTALL_PACKAGES_FROM"
+                    | "NVM_INSTALL_LATEST_NPM"
+            )
+    }
+    let lock = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let previous = std::env::vars_os()
+        .filter(|(name, _)| prohibited(name))
+        .collect::<Vec<_>>();
+    for (name, _) in &previous {
+        // Environment mutation is synchronized for this test process.
+        unsafe { std::env::remove_var(name) };
+    }
+    NvmEnvironmentGuard {
+        previous,
+        _lock: lock,
+    }
 }
 
 fn invoke(home: &std::path::Path, request: &SshFilesystemRequest) -> std::process::Output {
@@ -82,6 +132,7 @@ fn helper_subprocess_applies_only_typed_requests_inside_configured_roots() {
 #[cfg(unix)]
 #[test]
 fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
+    let _nvm_environment = clean_nvm_environment();
     let root = temp("package-authority-root");
     let state = temp("package-authority-state");
     fs::create_dir_all(&root).unwrap();
