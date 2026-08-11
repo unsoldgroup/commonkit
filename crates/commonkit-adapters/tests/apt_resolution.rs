@@ -291,6 +291,50 @@ fn process_apt_runner_has_a_fixed_private_read_only_command_plan() {
 }
 
 #[test]
+fn live_safety_simulation_pins_the_archived_closure_without_selecting_it() {
+    let registry = apt_registry();
+    let declaration = match desired() {
+        commonkit_adapters::PackageDesiredIntent::Package { declaration } => declaration,
+    };
+    let request = AptResolutionSystemRequestV1 {
+        declaration,
+        target: target(),
+        manager: manager(),
+        source_id: id("ubuntu-main"),
+        canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+        registry_definition_digest: registry
+            .source_definition_digest(&id("ubuntu-main"))
+            .unwrap(),
+        source_authority: source_authority(),
+        repository: repository(),
+    };
+    let closure = vec![
+        AptResolvedPackageV1 {
+            name: "curl".into(),
+            version: "8.5.0-2ubuntu10.6".into(),
+            architecture: "amd64".into(),
+        },
+        AptResolvedPackageV1 {
+            name: "libc6".into(),
+            version: "2.39-0ubuntu8.4".into(),
+            architecture: "amd64".into(),
+        },
+    ];
+
+    let command =
+        ProcessAptResolutionCommandRunner::live_safety_command_snapshot(&request, &closure)
+            .unwrap();
+    let rendered = format!("{} {}", command.executable, command.args.join(" "));
+
+    assert!(rendered.contains("Dir::State::status=<private>/live-status"));
+    assert!(rendered.contains("--simulate --no-remove"));
+    assert!(rendered.contains("curl:amd64=8.5.0-2ubuntu10.6"));
+    assert!(rendered.contains("libc6:amd64=2.39-0ubuntu8.4"));
+    assert!(!rendered.contains("--print-uris"));
+    assert!(!command.network);
+}
+
+#[test]
 fn apt_source_scope_and_key_are_part_of_registry_authority() {
     let base = PackageSourceRegistry::builtin().unwrap();
     let source_id = id("ubuntu-main");

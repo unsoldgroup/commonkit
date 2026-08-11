@@ -109,6 +109,14 @@ impl ProcessAptResolutionCommandRunner {
         Ok(apt_command_plan(request, "<private>"))
     }
 
+    pub fn live_safety_command_snapshot(
+        request: &AptResolutionSystemRequestV1,
+        closure: &[AptResolvedPackageV1],
+    ) -> Result<AptCommandSpecV1, AptResolutionCommandError> {
+        validate_system_request(request)?;
+        apt_live_safety_command(closure, "<private>")
+    }
+
     pub fn probe_manager_binding(
         target: &PackageTargetV1,
         canonical_repository: &str,
@@ -154,7 +162,14 @@ impl ProcessAptResolutionCommandRunner {
             repository,
             &format!("{workspace_text}/archive-keyring.gpg"),
         )?;
-        write_private_apt_workspace(workspace.path(), &source_line, &signing_key)?;
+        let sandbox_identity = current_apt_sandbox_identity()?;
+        write_private_apt_workspace_for_identity(
+            workspace.path(),
+            &source_line,
+            &signing_key,
+            &[],
+            sandbox_identity,
+        )?;
         let commands = [
             AptCommandSpecV1 {
                 executable: "/usr/bin/apt-get".into(),
@@ -183,7 +198,7 @@ impl ProcessAptResolutionCommandRunner {
         ];
         let outputs = commands
             .iter()
-            .map(|command| run_fixed_command(command, workspace_text, false))
+            .map(|command| run_fixed_command(command, workspace_text))
             .collect::<Result<Vec<_>, _>>()?;
         let architecture = outputs[2].trim();
         if architecture != target.arch {
@@ -192,6 +207,9 @@ impl ProcessAptResolutionCommandRunner {
             ));
         }
         validate_effective_apt_config(&outputs[3])?;
+        if sandbox_identity.is_some() {
+            validate_root_apt_sandbox_config(&outputs[3])?;
+        }
         let normalized_config = outputs[3].replace(workspace_text, "<private>");
         let normalized_source_line = apt_source_line_with_key(
             target,
@@ -657,42 +675,7 @@ fn apt_command_plan(
     let architecture = architecture.as_deref().unwrap_or(&request.target.arch);
     let package = format!("{name}:{architecture}");
     let exact = format!("{package}={}", request.declaration.version);
-    let apt_options = vec![
-        "-o".into(),
-        format!("Dir::Etc::sourcelist={workspace}/sources.list"),
-        "-o".into(),
-        "Dir::Etc::sourceparts=-".into(),
-        "-o".into(),
-        format!("Dir::State::lists={workspace}/lists"),
-        "-o".into(),
-        format!("Dir::Cache::archives={workspace}/archives"),
-        "-o".into(),
-        "APT::Get::List-Cleanup=0".into(),
-        "-o".into(),
-        "Acquire::AllowInsecureRepositories=false".into(),
-        "-o".into(),
-        "Acquire::AllowWeakRepositories=false".into(),
-        "-o".into(),
-        "Acquire::AllowDowngradeToInsecureRepositories=false".into(),
-        "-o".into(),
-        "APT::Get::AllowUnauthenticated=false".into(),
-        "-o".into(),
-        "Acquire::Check-Valid-Until=true".into(),
-        "-o".into(),
-        "Acquire::Check-Date=true".into(),
-        "-o".into(),
-        "Acquire::By-Hash=force".into(),
-        "-o".into(),
-        "Acquire::http::AllowRedirect=false".into(),
-        "-o".into(),
-        "Acquire::https::AllowRedirect=false".into(),
-        "-o".into(),
-        "Acquire::http::Proxy=DIRECT".into(),
-        "-o".into(),
-        "Acquire::https::Proxy=DIRECT".into(),
-        "-o".into(),
-        "Acquire::Languages=none".into(),
-    ];
+    let apt_options = apt_options(workspace);
     let apt = |mut args: Vec<String>| {
         let mut all = apt_options.clone();
         all.append(&mut args);
@@ -789,6 +772,94 @@ fn apt_command_plan(
     ]
 }
 
+fn apt_options(workspace: &str) -> Vec<String> {
+    vec![
+        "-o".into(),
+        format!("Dir::Etc::sourcelist={workspace}/sources.list"),
+        "-o".into(),
+        "Dir::Etc::sourceparts=-".into(),
+        "-o".into(),
+        format!("Dir::State::lists={workspace}/lists"),
+        "-o".into(),
+        format!("Dir::Cache::archives={workspace}/archives"),
+        "-o".into(),
+        "APT::Get::List-Cleanup=0".into(),
+        "-o".into(),
+        "Acquire::AllowInsecureRepositories=false".into(),
+        "-o".into(),
+        "Acquire::AllowWeakRepositories=false".into(),
+        "-o".into(),
+        "Acquire::AllowDowngradeToInsecureRepositories=false".into(),
+        "-o".into(),
+        "APT::Get::AllowUnauthenticated=false".into(),
+        "-o".into(),
+        "Acquire::Check-Valid-Until=true".into(),
+        "-o".into(),
+        "Acquire::Check-Date=true".into(),
+        "-o".into(),
+        "Acquire::By-Hash=force".into(),
+        "-o".into(),
+        "Acquire::http::AllowRedirect=false".into(),
+        "-o".into(),
+        "Acquire::https::AllowRedirect=false".into(),
+        "-o".into(),
+        "Acquire::http::Proxy=DIRECT".into(),
+        "-o".into(),
+        "Acquire::https::Proxy=DIRECT".into(),
+        "-o".into(),
+        "Acquire::Languages=none".into(),
+    ]
+}
+
+fn apt_live_safety_command(
+    closure: &[AptResolvedPackageV1],
+    workspace: &str,
+) -> Result<AptCommandSpecV1, AptResolutionCommandError> {
+    let mut pinned = closure.to_vec();
+    pinned.sort_by(|left, right| {
+        (&left.name, &left.architecture, &left.version).cmp(&(
+            &right.name,
+            &right.architecture,
+            &right.version,
+        ))
+    });
+    if pinned.is_empty()
+        || pinned.windows(2).any(|pair| {
+            (&pair[0].name, &pair[0].architecture) == (&pair[1].name, &pair[1].architecture)
+        })
+        || pinned.iter().any(|package| {
+            !safe_apt_token(&package.name)
+                || !safe_apt_token(&package.architecture)
+                || !safe_apt_version(&package.version)
+        })
+    {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "live APT safety closure is empty, duplicate, or malformed".into(),
+        ));
+    }
+    let mut args = apt_options(workspace);
+    args.extend([
+        "-o".into(),
+        format!("Dir::State::status={workspace}/live-status"),
+        "--simulate".into(),
+        "--no-remove".into(),
+        "--no-install-recommends".into(),
+        "install".into(),
+    ]);
+    args.extend(pinned.into_iter().map(|package| {
+        format!(
+            "{}:{}={}",
+            package.name, package.architecture, package.version
+        )
+    }));
+    Ok(AptCommandSpecV1 {
+        executable: "/usr/bin/apt-get".into(),
+        args,
+        environment: apt_command_environment(workspace),
+        network: false,
+    })
+}
+
 fn apt_command_environment(workspace: &str) -> BTreeMap<String, String> {
     BTreeMap::from([("APT_CONFIG".into(), format!("{workspace}/apt.conf"))])
 }
@@ -807,6 +878,7 @@ fn private_apt_config(workspace: &str) -> String {
             "Dir::Bin::dpkg \"/usr/bin/dpkg\";\n",
             "Dir::Bin::apt-helper \"/usr/lib/apt/apt-helper\";\n",
             "Dir::Bin::gpgv \"/usr/bin/gpgv\";\n",
+            "APT::Sandbox::User \"_apt\";\n",
             "#clear DPkg::Pre-Invoke;\n",
             "#clear DPkg::Post-Invoke;\n",
             "#clear APT::Update::Pre-Invoke;\n",
@@ -819,13 +891,14 @@ fn private_apt_config(workspace: &str) -> String {
 }
 
 fn validate_effective_apt_config(config: &str) -> Result<(), AptResolutionCommandError> {
-    const FIXED_HELPERS: [(&str, &str); 6] = [
+    const FIXED_HELPERS: [(&str, &str); 7] = [
         ("dir::bin::methods", "/usr/lib/apt/methods"),
         ("dir::bin::solvers", "/usr/lib/apt/solvers"),
         ("dir::bin::planners", "/usr/lib/apt/planners"),
         ("dir::bin::dpkg", "/usr/bin/dpkg"),
         ("dir::bin::apt-helper", "/usr/lib/apt/apt-helper"),
         ("dir::bin::gpgv", "/usr/bin/gpgv"),
+        ("apt::sandbox::user", "_apt"),
     ];
     for line in config
         .lines()
@@ -851,6 +924,20 @@ fn validate_effective_apt_config(config: &str) -> Result<(), AptResolutionComman
                 ));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_root_apt_sandbox_config(config: &str) -> Result<(), AptResolutionCommandError> {
+    let sandbox = config
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.to_ascii_lowercase().starts_with("apt::sandbox::user"))
+        .collect::<Vec<_>>();
+    if sandbox.len() != 1 || !sandbox[0].contains("\"_apt\"") {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "effective root APT configuration lacks the required _apt sandbox identity".into(),
+        ));
     }
     Ok(())
 }
@@ -902,10 +989,126 @@ fn read_trusted_signing_key(path: &std::path::Path) -> Result<Vec<u8>, AptResolu
     read_trusted_key_for_uid(path, 0)
 }
 
-fn write_private_apt_workspace(
+#[cfg(unix)]
+fn read_trusted_dpkg_status() -> Result<Vec<u8>, AptResolutionCommandError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let path = std::path::Path::new("/var/lib/dpkg/status");
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = options
+        .open(path)
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(AptResolutionCommandError::Unavailable(
+            "dpkg status is not a trusted root-owned regular file".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    if bytes.is_empty() || bytes.len() > 16 * 1024 * 1024 {
+        return Err(AptResolutionCommandError::Unavailable(
+            "dpkg status is empty or exceeds the fixed observation bound".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn read_trusted_dpkg_status() -> Result<Vec<u8>, AptResolutionCommandError> {
+    Err(AptResolutionCommandError::Unavailable(
+        "trusted dpkg status snapshots require Unix no-follow file capabilities".into(),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AptSandboxIdentityV1 {
+    uid: u32,
+    gid: u32,
+}
+
+fn select_apt_sandbox_identity(
+    effective_uid: u32,
+    passwd: &str,
+) -> Result<Option<AptSandboxIdentityV1>, AptResolutionCommandError> {
+    if effective_uid != 0 {
+        return Ok(None);
+    }
+    let matches = passwd
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split(':').collect::<Vec<_>>();
+            (fields.len() >= 7 && fields[0] == "_apt").then_some(fields)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(AptResolutionCommandError::Unavailable(
+            "root APT resolution requires exactly one _apt sandbox identity".into(),
+        ));
+    }
+    let uid = matches[0][2].parse::<u32>().map_err(|_| {
+        AptResolutionCommandError::Unavailable("_apt sandbox uid is invalid".into())
+    })?;
+    let gid = matches[0][3].parse::<u32>().map_err(|_| {
+        AptResolutionCommandError::Unavailable("_apt sandbox gid is invalid".into())
+    })?;
+    if uid == 0 {
+        return Err(AptResolutionCommandError::Unavailable(
+            "_apt sandbox identity must not be root".into(),
+        ));
+    }
+    Ok(Some(AptSandboxIdentityV1 { uid, gid }))
+}
+
+#[cfg(unix)]
+fn current_apt_sandbox_identity() -> Result<Option<AptSandboxIdentityV1>, AptResolutionCommandError>
+{
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let effective_uid = unsafe { libc::geteuid() };
+    if effective_uid != 0 {
+        return Ok(None);
+    }
+    let path = std::path::Path::new("/etc/passwd");
+    let mut options = fs::OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let mut file = options
+        .open(path)
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(AptResolutionCommandError::Unavailable(
+            "APT sandbox identity source is not a trusted root-owned regular file".into(),
+        ));
+    }
+    let mut passwd = String::new();
+    file.read_to_string(&mut passwd)
+        .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    select_apt_sandbox_identity(effective_uid, &passwd)
+}
+
+#[cfg(not(unix))]
+fn current_apt_sandbox_identity() -> Result<Option<AptSandboxIdentityV1>, AptResolutionCommandError>
+{
+    Ok(None)
+}
+
+fn write_private_apt_workspace_for_identity(
     workspace: &std::path::Path,
     source_line: &str,
     signing_key: &[u8],
+    live_status: &[u8],
+    identity: Option<AptSandboxIdentityV1>,
 ) -> Result<(), AptResolutionCommandError> {
     for directory in [
         workspace.join("etc/apt"),
@@ -926,14 +1129,92 @@ fn write_private_apt_workspace(
     .and_then(|_| fs::write(workspace.join("empty-main"), []))
     .and_then(|_| fs::write(workspace.join("sources.list"), source_line))
     .and_then(|_| fs::write(workspace.join("status"), []))
+    .and_then(|_| fs::write(workspace.join("live-status"), live_status))
     .and_then(|_| fs::write(workspace.join("archive-keyring.gpg"), signing_key))
     .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
     #[cfg(unix)]
-    fs::set_permissions(
-        workspace.join("archive-keyring.gpg"),
-        <fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o400),
-    )
-    .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+    configure_private_apt_workspace_permissions(workspace, identity)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn configure_private_apt_workspace_permissions(
+    workspace: &std::path::Path,
+    identity: Option<AptSandboxIdentityV1>,
+) -> Result<(), AptResolutionCommandError> {
+    use std::os::unix::fs::{PermissionsExt, chown};
+
+    let set_mode = |path: &std::path::Path, mode| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))
+    };
+    let files = [
+        "apt.conf",
+        "empty-main",
+        "sources.list",
+        "status",
+        "live-status",
+        "archive-keyring.gpg",
+    ];
+    let Some(identity) = identity else {
+        set_mode(workspace, 0o700)?;
+        for directory in [
+            "etc",
+            "etc/apt",
+            "empty-parts",
+            "lists",
+            "lists/partial",
+            "archives",
+            "archives/partial",
+        ] {
+            set_mode(&workspace.join(directory), 0o700)?;
+        }
+        for file in files {
+            set_mode(
+                &workspace.join(file),
+                if file == "archive-keyring.gpg" {
+                    0o400
+                } else {
+                    0o600
+                },
+            )?;
+        }
+        return Ok(());
+    };
+    for directory in [
+        workspace,
+        &workspace.join("etc"),
+        &workspace.join("etc/apt"),
+        &workspace.join("empty-parts"),
+        &workspace.join("lists"),
+        &workspace.join("archives"),
+    ] {
+        chown(directory, None, Some(identity.gid))
+            .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+        set_mode(directory, 0o750)?;
+    }
+    for partial in [
+        workspace.join("lists/partial"),
+        workspace.join("archives/partial"),
+    ] {
+        chown(&partial, Some(identity.uid), Some(identity.gid))
+            .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+        set_mode(&partial, 0o700)?;
+    }
+    for file in [
+        "apt.conf",
+        "empty-main",
+        "sources.list",
+        "archive-keyring.gpg",
+    ] {
+        let path = workspace.join(file);
+        chown(&path, None, Some(identity.gid))
+            .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
+        set_mode(&path, 0o440)?;
+    }
+    for file in ["status", "live-status"] {
+        set_mode(&workspace.join(file), 0o600)?;
+    }
     Ok(())
 }
 
@@ -953,6 +1234,7 @@ fn resolve_apt_on_linux(
     let dpkg_bytes = fs::read("/usr/bin/dpkg")
         .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
     let key_bytes = read_trusted_signing_key(&request.repository.signed_by)?;
+    let live_status_bytes = read_trusted_dpkg_status()?;
     let apt_digest = content_digest(&apt_bytes)?;
     let dpkg_digest = content_digest(&dpkg_bytes)?;
     let key_digest = content_digest(&key_bytes)?;
@@ -981,7 +1263,14 @@ fn resolve_apt_on_linux(
         &request.repository,
         "<private>/archive-keyring.gpg",
     )?;
-    write_private_apt_workspace(workspace_path, &source_line, &key_bytes)?;
+    let sandbox_identity = current_apt_sandbox_identity()?;
+    write_private_apt_workspace_for_identity(
+        workspace_path,
+        &source_line,
+        &key_bytes,
+        &live_status_bytes,
+        sandbox_identity,
+    )?;
     if key_digest != request.source_authority.signing_key_digest {
         return Err(AptResolutionCommandError::InvalidOutput(
             "APT signing key differs from the source-registry authority".into(),
@@ -990,7 +1279,7 @@ fn resolve_apt_on_linux(
     let commands = apt_command_plan(request, workspace_text);
     let mut outputs = vec![String::new(); commands.len()];
     for (index, command) in commands.iter().enumerate().take(6) {
-        outputs[index] = run_fixed_command(command, workspace_text, index == 4)?;
+        outputs[index] = run_fixed_command(command, workspace_text)?;
     }
 
     let architecture = outputs[2].trim();
@@ -1000,6 +1289,9 @@ fn resolve_apt_on_linux(
         ));
     }
     validate_effective_apt_config(&outputs[3])?;
+    if sandbox_identity.is_some() {
+        validate_root_apt_sandbox_config(&outputs[3])?;
+    }
     let normalized_config = outputs[3].replace(workspace_text, "<private>");
     let manager = manager_binding_from_evidence(
         &outputs[0],
@@ -1018,8 +1310,11 @@ fn resolve_apt_on_linux(
             "local APT manager authority differs from the controller binding".into(),
         ));
     }
+    let live_status = std::str::from_utf8(&live_status_bytes)
+        .map_err(|_| AptResolutionCommandError::InvalidOutput("dpkg status is not UTF-8".into()))?;
+    let installed = parse_complete_installed_state(live_status, &outputs[4])?;
     for (index, command) in commands.iter().enumerate().skip(6) {
-        outputs[index] = run_fixed_command(command, workspace_text, false)?;
+        outputs[index] = run_fixed_command(command, workspace_text)?;
     }
 
     let metadata_bytes = load_single_inrelease(&workspace_path.join("lists"))?;
@@ -1044,7 +1339,6 @@ fn resolve_apt_on_linux(
     risks
         .held
         .retain(|package| closure_names.contains(package.as_str()));
-    let installed = parse_installed_packages(&outputs[4]);
     risks.downgrades = find_downgrades(&archives, &installed, workspace_text)?;
     let closure = archives
         .iter()
@@ -1053,10 +1347,36 @@ fn resolve_apt_on_linux(
             version: archive.version.clone(),
             architecture: archive.architecture.clone(),
         })
-        .collect();
-    let before = PackageObservationV1 {
-        installed_versions: installed.values().cloned().collect(),
-    };
+        .collect::<Vec<_>>();
+    let live_safety_command = apt_live_safety_command(&closure, workspace_text)?;
+    let live_safety_output = run_fixed_command(&live_safety_command, workspace_text)?;
+    validate_live_safety_simulation(&live_safety_output, &closure)?;
+    let live_risks = parse_solver_risks(&live_safety_output, "", "");
+    risks.removals.extend(live_risks.removals);
+    risks.replacements.extend(live_risks.replacements);
+    risks
+        .unresolved_alternatives
+        .extend(live_risks.unresolved_alternatives);
+    let live_status_digest = content_digest(&live_status_bytes)?;
+    let live_safety_digest = digest_domain_json(
+        "commonkit.apt-live-safety-evidence.v1",
+        &(
+            &live_status_digest,
+            &installed,
+            parse_simulated_packages(&live_safety_output)?,
+            &risks,
+        ),
+    )
+    .map_err(|error| AptResolutionCommandError::InvalidOutput(error.to_string()))?;
+    let mut installed_versions = installed
+        .iter()
+        .map(|((name, architecture), version)| format!("{name}:{architecture}={version}"))
+        .collect::<BTreeSet<_>>();
+    installed_versions.insert(format!(
+        "commonkit-apt-live-safety={}",
+        live_safety_digest.as_str()
+    ));
+    let before = PackageObservationV1 { installed_versions };
 
     if content_digest(
         &fs::read("/usr/bin/apt-get")
@@ -1072,6 +1392,7 @@ fn resolve_apt_on_linux(
             std::path::Path::new("/etc/dpkg/dpkg.cfg"),
             std::path::Path::new("/etc/dpkg/dpkg.cfg.d"),
         )? != dpkg_config_digest
+        || content_digest(&read_trusted_dpkg_status()?)? != live_status_digest
     {
         return Err(AptResolutionCommandError::Failed(
             "APT executable or signing key changed during resolution".into(),
@@ -1176,6 +1497,14 @@ fn safe_apt_token(value: &str) -> bool {
         })
 }
 
+fn safe_apt_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '+' | '-' | '_' | ':' | '~')
+        })
+}
+
 fn valid_apt_repository(value: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(value) else {
         return false;
@@ -1191,7 +1520,6 @@ fn valid_apt_repository(value: &str) -> bool {
 fn run_fixed_command(
     command: &AptCommandSpecV1,
     workspace: &str,
-    allow_not_installed: bool,
 ) -> Result<String, AptResolutionCommandError> {
     const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
     let output = Command::new(&command.executable)
@@ -1205,23 +1533,29 @@ fn run_fixed_command(
         .envs(&command.environment)
         .output()
         .map_err(|error| AptResolutionCommandError::Unavailable(error.to_string()))?;
-    let accepted = output.status.success()
-        || (allow_not_installed && output.status.code().is_some_and(|code| code == 1));
-    if !accepted {
-        return Err(AptResolutionCommandError::Failed(
-            String::from_utf8_lossy(&output.stderr)
-                .chars()
-                .take(1_024)
-                .collect(),
-        ));
-    }
     if output.stdout.len() > MAX_OUTPUT_BYTES || output.stderr.len() > MAX_OUTPUT_BYTES {
         return Err(AptResolutionCommandError::Failed(
             "APT command output exceeded the fixed bound".into(),
         ));
     }
+    let diagnostics = String::from_utf8_lossy(&output.stderr);
+    validate_apt_command_diagnostics(&diagnostics)?;
+    if !output.status.success() {
+        return Err(AptResolutionCommandError::Failed(
+            diagnostics.chars().take(1_024).collect(),
+        ));
+    }
     String::from_utf8(output.stdout)
         .map_err(|_| AptResolutionCommandError::InvalidOutput("APT output is not UTF-8".into()))
+}
+
+fn validate_apt_command_diagnostics(stderr: &str) -> Result<(), AptResolutionCommandError> {
+    if stderr.to_ascii_lowercase().contains("unsandboxed as root") {
+        return Err(AptResolutionCommandError::Failed(
+            "APT refused the required _apt download sandbox".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn parse_tool_version(output: &str, preceding: &str) -> Result<String, AptResolutionCommandError> {
@@ -1369,21 +1703,173 @@ fn load_single_inrelease(lists: &std::path::Path) -> Result<Vec<u8>, AptResoluti
     fs::read(&matches[0]).map_err(|error| AptResolutionCommandError::Failed(error.to_string()))
 }
 
-fn parse_installed_packages(output: &str) -> BTreeMap<(String, String), String> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let fields = line.split('\t').collect::<Vec<_>>();
-            if fields.len() != 4 || !fields[1].trim().starts_with("ii") {
-                return None;
+fn parse_complete_installed_state(
+    status: &str,
+    query: &str,
+) -> Result<BTreeMap<(String, String), String>, AptResolutionCommandError> {
+    let status_packages = parse_status_installed_packages(status)?;
+    let query_packages = parse_query_installed_packages(query)?;
+    if status_packages != query_packages {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "dpkg installed-state observations are incomplete or inconsistent".into(),
+        ));
+    }
+    Ok(status_packages)
+}
+
+fn parse_status_installed_packages(
+    status: &str,
+) -> Result<BTreeMap<(String, String), String>, AptResolutionCommandError> {
+    let mut installed = BTreeMap::new();
+    for paragraph in status
+        .split("\n\n")
+        .filter(|value| !value.trim().is_empty())
+    {
+        let mut fields = BTreeMap::new();
+        for line in paragraph.lines() {
+            if line.starts_with([' ', '\t']) {
+                continue;
             }
-            let name = fields[0].trim().split(':').next()?.to_owned();
-            Some((
-                (name, fields[3].trim().to_owned()),
-                fields[2].trim().to_owned(),
-            ))
-        })
-        .collect()
+            let (name, value) = line.split_once(':').ok_or_else(|| {
+                AptResolutionCommandError::InvalidOutput("malformed dpkg status record".into())
+            })?;
+            if fields.insert(name, value.trim()).is_some() {
+                return Err(AptResolutionCommandError::InvalidOutput(
+                    "duplicate dpkg status field".into(),
+                ));
+            }
+        }
+        let package = fields.get("Package").copied().ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput("dpkg status record lacks Package".into())
+        })?;
+        let package_status = fields.get("Status").copied().ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput("dpkg status record lacks Status".into())
+        })?;
+        let status_fields = package_status.split_whitespace().collect::<Vec<_>>();
+        if status_fields.len() != 3 {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "malformed dpkg package status".into(),
+            ));
+        }
+        if !matches!(
+            status_fields[0],
+            "unknown" | "install" | "hold" | "deinstall" | "purge"
+        ) || !matches!(status_fields[1], "ok" | "reinstreq")
+            || !matches!(
+                status_fields[2],
+                "not-installed"
+                    | "config-files"
+                    | "half-installed"
+                    | "unpacked"
+                    | "half-configured"
+                    | "triggers-awaited"
+                    | "triggers-pending"
+                    | "installed"
+            )
+        {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "dpkg status contains an unknown package state".into(),
+            ));
+        }
+        if status_fields[2] != "installed" {
+            continue;
+        }
+        if status_fields[1] != "ok" {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "installed dpkg package is in an error state".into(),
+            ));
+        }
+        let architecture = fields.get("Architecture").copied().ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "installed dpkg status record lacks Architecture".into(),
+            )
+        })?;
+        let version = fields.get("Version").copied().ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput(
+                "installed dpkg status record lacks Version".into(),
+            )
+        })?;
+        insert_installed_package(&mut installed, package, architecture, version)?;
+    }
+    if installed.is_empty() {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "dpkg status contains no installed packages".into(),
+        ));
+    }
+    Ok(installed)
+}
+
+fn parse_query_installed_packages(
+    query: &str,
+) -> Result<BTreeMap<(String, String), String>, AptResolutionCommandError> {
+    let mut installed = BTreeMap::new();
+    for line in query.lines() {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 4 || fields[1].len() != 3 || !fields[1].is_ascii() {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "malformed dpkg-query installed-state record".into(),
+            ));
+        }
+        let status = fields[1].as_bytes();
+        if !b"uihpr".contains(&status[0])
+            || !b"ncHUFWti".contains(&status[1])
+            || !matches!(status[2], b' ' | b'R')
+        {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "dpkg-query returned an unknown package state".into(),
+            ));
+        }
+        if status[1] != b'i' {
+            continue;
+        }
+        if status[2] != b' ' {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "installed dpkg-query package is in an error state".into(),
+            ));
+        }
+        let (name, qualified_architecture) = fields[0]
+            .split_once(':')
+            .map_or((fields[0], None), |(name, architecture)| {
+                (name, Some(architecture))
+            });
+        if qualified_architecture.is_some_and(|architecture| architecture != fields[3]) {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "dpkg-query package and architecture disagree".into(),
+            ));
+        }
+        insert_installed_package(&mut installed, name, fields[3], fields[2])?;
+    }
+    if installed.is_empty() {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "dpkg-query returned no installed packages".into(),
+        ));
+    }
+    Ok(installed)
+}
+
+fn insert_installed_package(
+    installed: &mut BTreeMap<(String, String), String>,
+    name: &str,
+    architecture: &str,
+    version: &str,
+) -> Result<(), AptResolutionCommandError> {
+    if !safe_apt_token(name) || !safe_apt_token(architecture) || !safe_apt_version(version) {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "dpkg installed-state identity is malformed".into(),
+        ));
+    }
+    if installed
+        .insert(
+            (name.to_owned(), architecture.to_owned()),
+            version.to_owned(),
+        )
+        .is_some()
+    {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "duplicate dpkg installed-state package".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn find_downgrades(
@@ -1602,6 +2088,59 @@ fn validate_simulated_archive_closure(
     simulation: &str,
     archives: &[AptResolvedArchiveV1],
 ) -> Result<(), AptResolutionCommandError> {
+    let simulated = parse_simulated_packages(simulation)?;
+    let archived = archives
+        .iter()
+        .map(|archive| {
+            (
+                archive.package_name.clone(),
+                archive.architecture.clone(),
+                archive.version.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if simulated.is_empty() || simulated != archived {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "APT simulation and archive enumeration disagree on the exact closure".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_safety_simulation(
+    simulation: &str,
+    closure: &[AptResolvedPackageV1],
+) -> Result<(), AptResolutionCommandError> {
+    let risks = parse_solver_risks(simulation, "", "");
+    if !risks.removals.is_empty()
+        || !risks.replacements.is_empty()
+        || !risks.unresolved_alternatives.is_empty()
+    {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "live APT safety simulation requires a destructive transaction".into(),
+        ));
+    }
+    let intended = closure
+        .iter()
+        .map(|package| {
+            (
+                package.name.clone(),
+                package.architecture.clone(),
+                package.version.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    if !parse_simulated_packages(simulation)?.is_subset(&intended) {
+        return Err(AptResolutionCommandError::InvalidOutput(
+            "live APT safety simulation selected a package outside the pinned closure".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_simulated_packages(
+    simulation: &str,
+) -> Result<BTreeSet<(String, String, String)>, AptResolutionCommandError> {
     let mut simulated = BTreeSet::new();
     for line in simulation.lines().map(str::trim) {
         let Some(rest) = line.strip_prefix("Inst ") else {
@@ -1639,22 +2178,7 @@ fn validate_simulated_archive_closure(
             ));
         }
     }
-    let archived = archives
-        .iter()
-        .map(|archive| {
-            (
-                archive.package_name.clone(),
-                archive.architecture.clone(),
-                archive.version.clone(),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    if simulated.is_empty() || simulated != archived {
-        return Err(AptResolutionCommandError::InvalidOutput(
-            "APT simulation and archive enumeration disagree on the exact closure".into(),
-        ));
-    }
-    Ok(())
+    Ok(simulated)
 }
 
 #[cfg(test)]
@@ -1718,6 +2242,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn root_apt_configuration_requires_the_bound_sandbox_identity() {
+        validate_root_apt_sandbox_config("APT::Sandbox::User \"_apt\";").unwrap();
+        assert!(validate_root_apt_sandbox_config("Acquire::Languages \"none\";").is_err());
+        assert!(validate_root_apt_sandbox_config("APT::Sandbox::User \"root\";").is_err());
+    }
+
     #[cfg(unix)]
     #[test]
     fn signing_key_snapshot_is_no_follow_owner_bound_and_non_writable() {
@@ -1755,6 +2286,140 @@ mod tests {
                 &archives,
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn installed_state_requires_complete_consistent_dpkg_observation() {
+        let status = concat!(
+            "Package: curl\n",
+            "Status: install ok installed\n",
+            "Architecture: amd64\n",
+            "Version: 8.5.0-2ubuntu10.6\n\n",
+            "Package: old-lib\n",
+            "Status: deinstall ok config-files\n",
+            "Architecture: amd64\n",
+            "Version: 1.0-1\n",
+        );
+        let query = "curl:amd64\tii \t8.5.0-2ubuntu10.6\tamd64\n";
+
+        let observed = parse_complete_installed_state(status, query).unwrap();
+        assert_eq!(
+            observed
+                .get(&("curl".to_owned(), "amd64".to_owned()))
+                .map(String::as_str),
+            Some("8.5.0-2ubuntu10.6")
+        );
+        assert!(parse_complete_installed_state(status, "").is_err());
+        assert!(parse_complete_installed_state(status, "curl\tii \t8.5.0\n").is_err());
+        assert!(parse_complete_installed_state(status, &format!("{query}{query}")).is_err());
+        assert!(
+            parse_complete_installed_state(status, &format!("{query}ghost\t???\t1.0-1\tamd64\n"),)
+                .is_err()
+        );
+        assert!(
+            parse_complete_installed_state(
+                &status.replace("install ok installed", "banana ok installed"),
+                query,
+            )
+            .is_err()
+        );
+        let broken = format!(
+            "{status}\nPackage: broken\nStatus: install reinstreq installed\nArchitecture: amd64\nVersion: 1.0-1\n"
+        );
+        assert!(parse_complete_installed_state(&broken, query).is_err());
+    }
+
+    #[test]
+    fn live_safety_simulation_rejects_reverse_conflict_side_effects() {
+        let closure = vec![AptResolvedPackageV1 {
+            name: "curl".into(),
+            version: "8.5.0-2ubuntu10.6".into(),
+            architecture: "amd64".into(),
+        }];
+
+        validate_live_safety_simulation("", &closure).unwrap();
+        assert!(validate_live_safety_simulation("Remv old-lib [1.0-1]\n", &closure).is_err());
+        assert!(
+            validate_live_safety_simulation(
+                "Inst unrelated (2.0-1 Ubuntu:24.04/noble [amd64])\n",
+                &closure,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn apt_diagnostics_reject_unsandboxed_root_fallback() {
+        validate_apt_command_diagnostics("").unwrap();
+        assert!(
+            validate_apt_command_diagnostics(
+                "W: Download is performed unsandboxed as root because user '_apt' cannot access the file",
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dpkg_observation_requires_a_zero_exit_status() {
+        let workspace = tempfile::tempdir().unwrap();
+        let command = AptCommandSpecV1 {
+            executable: "/usr/bin/false".into(),
+            args: Vec::new(),
+            environment: BTreeMap::new(),
+            network: false,
+        };
+
+        assert!(matches!(
+            run_fixed_command(&command, workspace.path().to_str().unwrap()),
+            Err(AptResolutionCommandError::Failed(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_workspace_grants_only_required_apt_sandbox_access() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        let identity = AptSandboxIdentityV1 { uid, gid };
+        write_private_apt_workspace_for_identity(
+            root.path(),
+            "deb [signed-by=/private/key] https://example.invalid noble main\n",
+            b"key",
+            b"Package: base-files\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1.0-1\n",
+            Some(identity),
+        )
+        .unwrap();
+
+        assert_eq!(fs::metadata(root.path()).unwrap().mode() & 0o777, 0o750);
+        assert_eq!(
+            fs::metadata(root.path().join("archive-keyring.gpg"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o440
+        );
+        for partial in ["lists/partial", "archives/partial"] {
+            let metadata = fs::metadata(root.path().join(partial)).unwrap();
+            assert_eq!(metadata.uid(), uid);
+            assert_eq!(metadata.gid(), gid);
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+        }
+        assert!(select_apt_sandbox_identity(0, "root:x:0:0:root:/root:/bin/sh\n").is_err());
+        assert_eq!(
+            select_apt_sandbox_identity(
+                0,
+                "root:x:0:0:root:/root:/bin/sh\n_apt:x:42:65534::/nonexistent:/usr/sbin/nologin\n",
+            )
+            .unwrap(),
+            Some(AptSandboxIdentityV1 {
+                uid: 42,
+                gid: 65_534,
+            })
         );
     }
 
