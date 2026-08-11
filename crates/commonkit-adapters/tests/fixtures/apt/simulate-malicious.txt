@@ -1,0 +1,2 @@
+Remv old-lib [1.0-1]
+Inst curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])

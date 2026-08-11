@@ -3,12 +3,20 @@ use std::fs;
 use std::path::PathBuf;
 
 use commonkit_adapters::{
-    ArtifactStore, ContentSensitivity, DeclaredSideEffect, ExactProviderVersion, FileAdapter,
-    FilesystemIntent, MaterializedState, NormalizedManagedPath, NormalizedResource, OwnershipRules,
-    ProviderInputs, ProviderPlanError, ProviderPlanRequest, ResourceProvenance,
-    UnsupportedCapability, build_provider_plan,
+    ArtifactEvidence, ArtifactStore, ContentSensitivity, DeclaredSideEffect, ExactProviderVersion,
+    FileAdapter, FilesystemIntent, ManagerBindingV1, MaterializedState, NormalizedManagedPath,
+    NormalizedResource, OfflineInstallRecipeV1, OwnershipRules, PackageArtifactV1,
+    PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1, PackageResourcePlanner,
+    PackageSourceRegistry, PackageTargetV1, ProviderInputs, ProviderPlanError, ProviderPlanRequest,
+    ProviderPlannerRoute, ProviderResourceRouter, ResolvedMaterializedState, ResolvedPackage,
+    ResolvedPackageIntent, ResourceProvenance, ResourceType, SourceBindingV1,
+    UnsupportedCapability, build_provider_plan, build_resolved_provider_plan_with_router,
 };
-use commonkit_contracts::{Sha256Digest, StableId};
+use commonkit_contracts::{
+    Operation, OperationKind, PackageDeclaration, PackageManager, PackageSelector,
+    RecoveryCapability, ResourceRef, Risk, SchemaVersion, SecurityPolicy, Sha256Digest, StableId,
+};
+use commonkit_core::{OperationDraft, finalize_operation};
 use commonkit_reconcile::Adapter;
 use sha2::{Digest, Sha256};
 
@@ -39,7 +47,8 @@ fn state(
                 content,
                 mode: None,
                 expected_before: None,
-            },
+            }
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: version.into(),
@@ -55,6 +64,689 @@ fn state(
 
 fn bytes_digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
+}
+
+fn package_target() -> PackageTargetV1 {
+    PackageTargetV1 {
+        os: "macos".into(),
+        os_version: "15.6".into(),
+        distro_id: None,
+        distro_version: None,
+        codename: None,
+        arch: "aarch64".into(),
+        libc: None,
+        manager_prefix: Some("/opt/homebrew".into()),
+    }
+}
+
+fn package_manager() -> ManagerBindingV1 {
+    ManagerBindingV1 {
+        manager: PackageManager::Homebrew,
+        version: "4.5.0".into(),
+        executable_digest: digest('e'),
+        config_digest: digest('f'),
+    }
+}
+
+fn package_policy() -> SecurityPolicy {
+    SecurityPolicy {
+        allowlists: BTreeMap::from([(
+            StableId::parse("package_sources").unwrap(),
+            BTreeSet::from(["homebrew-core".into()]),
+        )]),
+        ..SecurityPolicy::default()
+    }
+}
+
+fn package_authority() -> PackageResolutionAuthority {
+    PackageResolutionAuthority::new(
+        &package_target(),
+        &package_manager(),
+        &PackageSourceRegistry::builtin().unwrap(),
+        &package_policy(),
+    )
+    .unwrap()
+}
+
+fn mixed_state(artifacts: &ArtifactStore) -> ResolvedMaterializedState {
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "provider.v2".into(),
+        BTreeMap::from([("source".into(), digest('a'))]),
+        vec!["filesystem".into(), "package".into()],
+    )
+    .unwrap();
+    let file_content = artifacts
+        .put(b"config", ContentSensitivity::Portable)
+        .unwrap();
+    let package_artifact = artifacts
+        .put(b"package", ContentSensitivity::Portable)
+        .unwrap();
+    let declaration = PackageDeclaration {
+        id: StableId::parse("ripgrep").unwrap(),
+        version: "14.1.1".into(),
+        manager: PackageManager::Homebrew,
+        source: StableId::parse("homebrew-core").unwrap(),
+        selector: Some(PackageSelector::HomebrewFormula {
+            name: "ripgrep".into(),
+        }),
+    };
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let source = SourceBindingV1 {
+        source_id: declaration.source.clone(),
+        registry_definition_digest: registry
+            .source_definition_digest(&declaration.source)
+            .unwrap(),
+        canonical_repository: "https://github.com/Homebrew/homebrew-core".into(),
+        repository_revision: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        signed_metadata: vec![ArtifactEvidence {
+            authority: StableId::parse("homebrew").unwrap(),
+            metadata_digest: digest('2'),
+            signature_digest: digest('3'),
+        }],
+    };
+    let source_metadata_digest = source.metadata_digest().unwrap();
+    let package_resolution = PackageResolutionV1 {
+        schema_version: SchemaVersion(1),
+        declaration: declaration.clone(),
+        target: package_target(),
+        manager: package_manager(),
+        source: source.clone(),
+        before: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        closure: vec![ResolvedPackage {
+            declaration: declaration.clone(),
+            source: source.clone(),
+        }],
+        artifacts: vec![PackageArtifactV1 {
+            role: StableId::parse("bottle").unwrap(),
+            content: package_artifact.clone(),
+            upstream_checksum: package_artifact.digest.clone(),
+            size: package_artifact.bytes,
+            materialization_key: StableId::parse("ripgrep-bottle").unwrap(),
+            source_metadata_digest,
+        }],
+        recipe: OfflineInstallRecipeV1::HomebrewBottle {
+            artifact_roles: BTreeSet::from([StableId::parse("bottle").unwrap()]),
+        },
+    };
+    let resolution = artifacts
+        .put(
+            &serde_json::to_vec(&package_resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let provenance = |source: &str| ResourceProvenance {
+        provider_id: inputs.provider_id.clone(),
+        provider_version: inputs.provider_version.to_string(),
+        input_digest: inputs.digest().clone(),
+        source: source.into(),
+    };
+    ResolvedMaterializedState::finalize(
+        inputs.clone(),
+        vec![
+            NormalizedResource {
+                intent: FilesystemIntent::File {
+                    path: NormalizedManagedPath::parse("home/config").unwrap(),
+                    content: file_content,
+                    mode: None,
+                    expected_before: None,
+                }
+                .into(),
+                provenance: provenance("file"),
+            },
+            NormalizedResource {
+                intent: ResolvedPackageIntent {
+                    declaration,
+                    resolution,
+                    artifacts: vec![package_artifact],
+                }
+                .into(),
+                provenance: provenance("package"),
+            },
+        ],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .unwrap()
+}
+
+struct NoopPackagePlanner {
+    id: StableId,
+}
+
+#[test]
+fn resolved_planning_rejects_stale_authority_before_registration_and_binds_current_authority() {
+    let root = temporary_directory("provider-plan-package-authority");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let state = mixed_state(&artifacts);
+    let rules = OwnershipRules::new(
+        true,
+        vec![NormalizedManagedPath::parse("home").unwrap()],
+        vec![],
+    )
+    .unwrap();
+    let request = || ProviderPlanRequest {
+        target_id: StableId::parse("local").unwrap(),
+        target_identity_digest: digest('9'),
+        composed_loadout_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: digest('c'),
+        ownership_rules: &rules,
+        mapped_side_effects: BTreeSet::new(),
+    };
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let mut stale_target = package_target();
+    stale_target.arch = "x86_64".into();
+    let stale_authority = PackageResolutionAuthority::new(
+        &stale_target,
+        &package_manager(),
+        &registry,
+        &package_policy(),
+    )
+    .unwrap();
+    let adapter_state = root.join("stale-adapter-state");
+    let mut files = FileAdapter::open(&root.join("stale-target"), &adapter_state).unwrap();
+    let mut packages = NoopPackagePlanner::new("packages");
+    let mut router = ProviderResourceRouter::new(vec![
+        ProviderPlannerRoute::Filesystem(&mut files),
+        ProviderPlannerRoute::Package(&mut packages),
+    ])
+    .unwrap();
+    let error = build_resolved_provider_plan_with_router(
+        request(),
+        std::slice::from_ref(&state),
+        &stale_authority,
+        &artifacts,
+        &mut router,
+    )
+    .expect_err("stale target authority");
+    assert!(matches!(
+        error,
+        ProviderPlanError::PackageResolution(
+            commonkit_adapters::PackageResolutionError::TargetBindingMismatch
+        )
+    ));
+    assert!(
+        !adapter_state.join("operations").exists()
+            || fs::read_dir(adapter_state.join("operations"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+
+    let authority = PackageResolutionAuthority::new(
+        &package_target(),
+        &package_manager(),
+        &registry,
+        &package_policy(),
+    )
+    .unwrap();
+    let mut files = FileAdapter::open(
+        &root.join("current-target"),
+        &root.join("current-adapter-state"),
+    )
+    .unwrap();
+    let mut packages = NoopPackagePlanner::new("packages");
+    let mut router = ProviderResourceRouter::new(vec![
+        ProviderPlannerRoute::Filesystem(&mut files),
+        ProviderPlannerRoute::Package(&mut packages),
+    ])
+    .unwrap();
+    let plan = build_resolved_provider_plan_with_router(
+        request(),
+        &[state],
+        &authority,
+        &artifacts,
+        &mut router,
+    )
+    .unwrap();
+    assert_eq!(
+        plan.bindings.package_resolution_authority_digest,
+        Some(authority.digest().clone())
+    );
+
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resolved_planning_rejects_removed_package_source_policy_before_registration() {
+    let root = temporary_directory("provider-plan-package-policy");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let state = mixed_state(&artifacts);
+    let rules = OwnershipRules::new(
+        true,
+        vec![NormalizedManagedPath::parse("home").unwrap()],
+        vec![],
+    )
+    .unwrap();
+    let request = ProviderPlanRequest {
+        target_id: StableId::parse("local").unwrap(),
+        target_identity_digest: digest('9'),
+        composed_loadout_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: digest('c'),
+        ownership_rules: &rules,
+        mapped_side_effects: BTreeSet::new(),
+    };
+    let authority = PackageResolutionAuthority::new(
+        &package_target(),
+        &package_manager(),
+        &PackageSourceRegistry::builtin().unwrap(),
+        &SecurityPolicy::default(),
+    )
+    .unwrap();
+    let adapter_state = root.join("adapter-state");
+    let mut files = FileAdapter::open(&root.join("target"), &adapter_state).unwrap();
+    let mut packages = NoopPackagePlanner::new("packages");
+    let mut router = ProviderResourceRouter::new(vec![
+        ProviderPlannerRoute::Filesystem(&mut files),
+        ProviderPlannerRoute::Package(&mut packages),
+    ])
+    .unwrap();
+
+    let error = build_resolved_provider_plan_with_router(
+        request,
+        &[state],
+        &authority,
+        &artifacts,
+        &mut router,
+    )
+    .expect_err("removed package source policy must invalidate prior resolution");
+
+    assert!(matches!(
+        error,
+        ProviderPlanError::PackageResolution(
+            commonkit_adapters::PackageResolutionError::PackageSourceNotAllowed { .. }
+        )
+    ));
+    assert!(
+        !adapter_state.join("operations").exists()
+            || fs::read_dir(adapter_state.join("operations"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
+struct SpoofPackagePlanner {
+    declared: StableId,
+    returned: StableId,
+    spoof_resource_binding: bool,
+}
+
+impl PackageResourcePlanner for SpoofPackagePlanner {
+    fn adapter_id(&self) -> &StableId {
+        &self.declared
+    }
+
+    fn register_package_resource(
+        &mut self,
+        id: StableId,
+        intent: &ResolvedPackageIntent,
+        provenance: &ResourceProvenance,
+        _provider_artifacts: &ArtifactStore,
+    ) -> Result<Option<Operation>, ProviderPlanError> {
+        let desired_digest =
+            commonkit_adapters::ResourceIntent::ResolvedPackage(intent.clone()).desired_digest()?;
+        let resource = if self.spoof_resource_binding {
+            ResourceRef {
+                resource_type: StableId::parse("service").unwrap(),
+                resource_id: StableId::parse("provider-chosen-resource").unwrap(),
+                managed_path: Some("home/provider-chosen".into()),
+            }
+        } else {
+            ResourceRef {
+                resource_type: StableId::parse("package").unwrap(),
+                resource_id: id,
+                managed_path: None,
+            }
+        };
+        let operation = finalize_operation(OperationDraft {
+            adapter_id: self.returned.clone(),
+            kind: OperationKind::Create,
+            resource,
+            risk: Risk::Medium,
+            requires_confirmation: true,
+            recovery_capability: if self.spoof_resource_binding {
+                RecoveryCapability::ExactRollback
+            } else {
+                RecoveryCapability::ConvergeForwardOnly
+            },
+            depends_on: vec![],
+            before_digest: None,
+            after_digest: Some(if self.spoof_resource_binding {
+                digest('e')
+            } else {
+                desired_digest.clone()
+            }),
+            payload_digest: if self.spoof_resource_binding {
+                digest('f')
+            } else {
+                desired_digest
+            },
+            provenance: (!self.spoof_resource_binding).then(|| provenance.clone()),
+            summary: "install package".into(),
+        })?;
+        Ok(Some(operation))
+    }
+}
+
+impl NoopPackagePlanner {
+    fn new(id: &str) -> Self {
+        Self {
+            id: StableId::parse(id).unwrap(),
+        }
+    }
+}
+
+impl PackageResourcePlanner for NoopPackagePlanner {
+    fn adapter_id(&self) -> &StableId {
+        &self.id
+    }
+
+    fn register_package_resource(
+        &mut self,
+        _id: StableId,
+        _intent: &ResolvedPackageIntent,
+        _provenance: &ResourceProvenance,
+        _provider_artifacts: &ArtifactStore,
+    ) -> Result<Option<Operation>, ProviderPlanError> {
+        Ok(None)
+    }
+}
+
+#[test]
+fn missing_package_route_fails_before_filesystem_operation_registration() {
+    let root = temporary_directory("provider-plan-missing-package-route");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let state = mixed_state(&artifacts);
+    let rules = OwnershipRules::new(
+        true,
+        vec![NormalizedManagedPath::parse("home").unwrap()],
+        vec![],
+    )
+    .unwrap();
+    let adapter_state = root.join("adapter-state");
+    let mut files = FileAdapter::open(&root.join("target"), &adapter_state).unwrap();
+    let mut router =
+        ProviderResourceRouter::new(vec![ProviderPlannerRoute::Filesystem(&mut files)]).unwrap();
+    let error = build_resolved_provider_plan_with_router(
+        ProviderPlanRequest {
+            target_id: StableId::parse("local").unwrap(),
+            target_identity_digest: digest('9'),
+            composed_loadout_digest: digest('a'),
+            observed_digest: digest('b'),
+            policy_digest: digest('c'),
+            ownership_rules: &rules,
+            mapped_side_effects: BTreeSet::new(),
+        },
+        &[state],
+        &package_authority(),
+        &artifacts,
+        &mut router,
+    )
+    .expect_err("package route is not installed");
+
+    assert!(matches!(
+        error,
+        ProviderPlanError::MissingResourcePlanner(ResourceType::Package)
+    ));
+    assert!(
+        !adapter_state.join("operations").exists()
+            || fs::read_dir(adapter_state.join("operations"))
+                .unwrap()
+                .next()
+                .is_none(),
+        "filesystem operation was registered before router preflight"
+    );
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn duplicate_resource_routes_are_rejected_as_ambiguous() {
+    let mut first = NoopPackagePlanner::new("packages");
+    let mut second = NoopPackagePlanner::new("packages");
+    let error = match ProviderResourceRouter::new(vec![
+        ProviderPlannerRoute::Package(&mut first),
+        ProviderPlannerRoute::Package(&mut second),
+    ]) {
+        Ok(_) => panic!("ambiguous package route"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ProviderPlanError::DuplicateResourcePlanner(ResourceType::Package)
+    ));
+}
+
+#[test]
+fn package_artifact_omission_and_tamper_fail_before_registration() {
+    let root = temporary_directory("provider-plan-package-artifacts");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let rules = OwnershipRules::new(
+        true,
+        vec![NormalizedManagedPath::parse("home").unwrap()],
+        vec![],
+    )
+    .unwrap();
+    let request = || ProviderPlanRequest {
+        target_id: StableId::parse("local").unwrap(),
+        target_identity_digest: digest('9'),
+        composed_loadout_digest: digest('a'),
+        observed_digest: digest('b'),
+        policy_digest: digest('c'),
+        ownership_rules: &rules,
+        mapped_side_effects: BTreeSet::new(),
+    };
+
+    let omitted = mixed_state(&artifacts);
+    let mut omitted_resources = omitted.resources;
+    let package = omitted_resources
+        .iter_mut()
+        .find(|resource| resource.resource_type() == ResourceType::Package)
+        .unwrap();
+    let commonkit_adapters::ResourceIntent::ResolvedPackage(intent) = &mut package.intent else {
+        unreachable!()
+    };
+    intent.artifacts.clear();
+    let omitted = ResolvedMaterializedState::finalize(
+        omitted.inputs,
+        omitted_resources,
+        omitted.declared_side_effects,
+        omitted.unsupported,
+        omitted.capabilities,
+    )
+    .unwrap();
+    let mut omitted_files =
+        FileAdapter::open(&root.join("target-omitted"), &root.join("state-omitted")).unwrap();
+    let mut omitted_packages = NoopPackagePlanner::new("packages");
+    let mut omitted_router = ProviderResourceRouter::new(vec![
+        ProviderPlannerRoute::Filesystem(&mut omitted_files),
+        ProviderPlannerRoute::Package(&mut omitted_packages),
+    ])
+    .unwrap();
+    let omitted_error = build_resolved_provider_plan_with_router(
+        request(),
+        &[omitted],
+        &package_authority(),
+        &artifacts,
+        &mut omitted_router,
+    )
+    .expect_err("package artifact omission");
+    assert!(matches!(
+        omitted_error,
+        ProviderPlanError::PackageResolution(
+            commonkit_adapters::PackageResolutionError::ArtifactSetMismatch
+        )
+    ));
+
+    let tampered = mixed_state(&artifacts);
+    let mut tampered_resources = tampered.resources;
+    let package = tampered_resources
+        .iter_mut()
+        .find(|resource| resource.resource_type() == ResourceType::Package)
+        .unwrap();
+    let commonkit_adapters::ResourceIntent::ResolvedPackage(intent) = &mut package.intent else {
+        unreachable!()
+    };
+    intent.artifacts[0].bytes += 1;
+    let tampered = ResolvedMaterializedState::finalize(
+        tampered.inputs,
+        tampered_resources,
+        tampered.declared_side_effects,
+        tampered.unsupported,
+        tampered.capabilities,
+    )
+    .unwrap();
+    let mut files =
+        FileAdapter::open(&root.join("target-tampered"), &root.join("state-tampered")).unwrap();
+    let mut packages = NoopPackagePlanner::new("packages");
+    let mut router = ProviderResourceRouter::new(vec![
+        ProviderPlannerRoute::Filesystem(&mut files),
+        ProviderPlannerRoute::Package(&mut packages),
+    ])
+    .unwrap();
+    let tampered_error = build_resolved_provider_plan_with_router(
+        request(),
+        &[tampered],
+        &package_authority(),
+        &artifacts,
+        &mut router,
+    )
+    .expect_err("tampered package artifact reference");
+    assert!(matches!(
+        tampered_error,
+        ProviderPlanError::PackageResolution(
+            commonkit_adapters::PackageResolutionError::ArtifactSetMismatch
+        )
+    ));
+
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resource_planner_cannot_choose_an_unregistered_adapter_id() {
+    let root = temporary_directory("provider-plan-adapter-spoof");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let mixed = mixed_state(&artifacts);
+    let package_resources = mixed
+        .resources
+        .into_iter()
+        .filter(|resource| resource.resource_type() == ResourceType::Package)
+        .collect();
+    let state = ResolvedMaterializedState::finalize(
+        mixed.inputs,
+        package_resources,
+        mixed.declared_side_effects,
+        mixed.unsupported,
+        mixed.capabilities,
+    )
+    .unwrap();
+    let rules = OwnershipRules::new(
+        true,
+        vec![NormalizedManagedPath::parse("home").unwrap()],
+        vec![],
+    )
+    .unwrap();
+    let mut planner = SpoofPackagePlanner {
+        declared: StableId::parse("packages").unwrap(),
+        returned: StableId::parse("provider-chosen-adapter").unwrap(),
+        spoof_resource_binding: false,
+    };
+    let mut router =
+        ProviderResourceRouter::new(vec![ProviderPlannerRoute::Package(&mut planner)]).unwrap();
+    let error = build_resolved_provider_plan_with_router(
+        ProviderPlanRequest {
+            target_id: StableId::parse("local").unwrap(),
+            target_identity_digest: digest('9'),
+            composed_loadout_digest: digest('a'),
+            observed_digest: digest('b'),
+            policy_digest: digest('c'),
+            ownership_rules: &rules,
+            mapped_side_effects: BTreeSet::new(),
+        },
+        &[state],
+        &package_authority(),
+        &artifacts,
+        &mut router,
+    )
+    .expect_err("provider-selected adapter ID");
+    assert!(matches!(
+        error,
+        ProviderPlanError::UnexpectedAdapterRoute {
+            resource_type: ResourceType::Package,
+            ..
+        }
+    ));
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn resource_planner_cannot_spoof_the_routed_resource_binding() {
+    let root = temporary_directory("provider-plan-resource-spoof");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let mixed = mixed_state(&artifacts);
+    let package_resources = mixed
+        .resources
+        .into_iter()
+        .filter(|resource| resource.resource_type() == ResourceType::Package)
+        .collect();
+    let state = ResolvedMaterializedState::finalize(
+        mixed.inputs,
+        package_resources,
+        mixed.declared_side_effects,
+        mixed.unsupported,
+        mixed.capabilities,
+    )
+    .unwrap();
+    let rules = OwnershipRules::new(
+        true,
+        vec![NormalizedManagedPath::parse("home").unwrap()],
+        vec![],
+    )
+    .unwrap();
+    let mut planner = SpoofPackagePlanner {
+        declared: StableId::parse("packages").unwrap(),
+        returned: StableId::parse("packages").unwrap(),
+        spoof_resource_binding: true,
+    };
+    let mut router =
+        ProviderResourceRouter::new(vec![ProviderPlannerRoute::Package(&mut planner)]).unwrap();
+    let error = build_resolved_provider_plan_with_router(
+        ProviderPlanRequest {
+            target_id: StableId::parse("local").unwrap(),
+            target_identity_digest: digest('9'),
+            composed_loadout_digest: digest('a'),
+            observed_digest: digest('b'),
+            policy_digest: digest('c'),
+            ownership_rules: &rules,
+            mapped_side_effects: BTreeSet::new(),
+        },
+        &[state],
+        &package_authority(),
+        &artifacts,
+        &mut router,
+    )
+    .expect_err("provider-selected resource binding");
+    assert!(matches!(
+        error,
+        ProviderPlanError::UnexpectedResourceBinding {
+            resource_type: ResourceType::Package,
+            ..
+        }
+    ));
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -245,6 +937,68 @@ fn provider_policy_failures_stop_before_operation_registration() {
     .unwrap_err();
     assert!(matches!(error, ProviderPlanError::UnmappedSideEffect(_)));
     assert!(fs::read_dir(&target).unwrap().next().is_none());
+    drop(artifacts);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn protected_roots_are_deterministically_bound_into_plan_authority() {
+    let root = temporary_directory("provider-plan-protected-roots");
+    let target = root.join("target");
+    let artifacts = ArtifactStore::open(root.join("provider-artifacts")).unwrap();
+    let desired = state(
+        "native",
+        "1.0.0",
+        "native-v1",
+        "home/native.txt",
+        artifacts
+            .put(b"native\n", ContentSensitivity::Portable)
+            .unwrap(),
+    );
+    let roots = |protected: &[&str]| {
+        OwnershipRules::new(
+            true,
+            vec![NormalizedManagedPath::parse("home").unwrap()],
+            protected
+                .iter()
+                .map(|path| NormalizedManagedPath::parse(*path).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    };
+    let build = |rules: &OwnershipRules, state_dir: &str| {
+        build_provider_plan(
+            ProviderPlanRequest {
+                target_id: StableId::parse("local").unwrap(),
+                target_identity_digest: digest('9'),
+                composed_loadout_digest: digest('a'),
+                observed_digest: digest('b'),
+                policy_digest: digest('c'),
+                ownership_rules: rules,
+                mapped_side_effects: BTreeSet::new(),
+            },
+            std::slice::from_ref(&desired),
+            &artifacts,
+            &mut FileAdapter::open(&target, &root.join(state_dir)).unwrap(),
+        )
+        .unwrap()
+    };
+
+    let forward = build(&roots(&["home/.commonkit", "home/.ssh/control"]), "forward");
+    let reverse = build(&roots(&["home/.ssh/control", "home/.commonkit"]), "reverse");
+    assert_eq!(forward.id, reverse.id);
+    assert_eq!(
+        forward.bindings.ownership_map_digest,
+        reverse.bindings.ownership_map_digest
+    );
+
+    let changed = build(&roots(&["home/.commonkit"]), "changed");
+    assert_ne!(forward.id, changed.id);
+    assert_ne!(
+        forward.bindings.ownership_map_digest,
+        changed.bindings.ownership_map_digest
+    );
+
     drop(artifacts);
     fs::remove_dir_all(root).unwrap();
 }

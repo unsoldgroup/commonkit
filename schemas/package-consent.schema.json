@@ -1,0 +1,19 @@
+{
+  "$id": "https://schemas.commonkit.dev/v1/package-consent.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "confirmationId": {
+      "type": "string"
+    },
+    "operationSetDigest": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "confirmationId",
+    "operationSetDigest"
+  ],
+  "title": "PackageConsent",
+  "type": "object"
+}

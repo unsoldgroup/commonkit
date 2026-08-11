@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_adapters::{FileAdapter, FileIntent, ManagedRelativePath};
-use commonkit_contracts::{PlanBindings, ReceiptState, Sha256Digest, StableId};
-use commonkit_core::{PlanDraft, build_plan};
+use commonkit_contracts::{PlanBindings, ReceiptState, RecoveryCapability, Sha256Digest, StableId};
+use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_reconcile::{PlanStore, ReceiptJournal, ReceiptStore};
 use commonkit_relay::{
     RelayAdapter, RelayConfig, RelayLifecycleControl, RelayMutationInputs, RelayPlanError,
@@ -62,6 +62,7 @@ fn fixture(root: &std::path::Path) -> (Arc<PlanStore>, commonkit_contracts::Plan
             provider_inputs_digest: digest(5),
             ownership_map_digest: digest(6),
             artifact_set_digest: digest(7),
+            package_resolution_authority_digest: None,
         },
         operations: vec![operation],
     })
@@ -120,22 +121,63 @@ fn local_execution_is_receipt_idempotent_and_startup_scan_cancels_prepared_runs(
 
     let receipts = ReceiptStore::open(root.join("receipts")).unwrap();
     let pending_id = StableId::parse("pending-run").unwrap();
-    let pending = ReceiptJournal::new(
-        pending_id.clone(),
-        plan.id.clone(),
-        plan.target_id.clone(),
-        plan.desired_digest.clone(),
-        plan.observed_digest.clone(),
-        plan.policy_digest.clone(),
-        plan.bindings.clone(),
-    )
-    .unwrap();
+    let pending = ReceiptJournal::for_plan(pending_id.clone(), &plan).unwrap();
     receipts.persist(&pending).unwrap();
+    let exact = &plan.operations[0];
+    let forward_operation = finalize_operation(OperationDraft {
+        adapter_id: exact.adapter_id.clone(),
+        kind: exact.kind,
+        resource: exact.resource.clone(),
+        risk: exact.risk,
+        requires_confirmation: exact.requires_confirmation,
+        recovery_capability: RecoveryCapability::ConvergeForwardOnly,
+        depends_on: exact.depends_on.clone(),
+        before_digest: exact.before_digest.clone(),
+        after_digest: exact.after_digest.clone(),
+        payload_digest: exact.payload_digest.clone(),
+        provenance: exact.provenance.clone(),
+        summary: exact.summary.clone(),
+    })
+    .unwrap();
+    let forward_plan = build_plan(PlanDraft {
+        target_id: plan.target_id.clone(),
+        desired_digest: plan.desired_digest.clone(),
+        observed_digest: plan.observed_digest.clone(),
+        policy_digest: plan.policy_digest.clone(),
+        bindings: plan.bindings.clone(),
+        operations: vec![forward_operation],
+    })
+    .unwrap();
+    plans.persist(&forward_plan).unwrap();
+    let recovered_id = StableId::parse("already-forward-recovered").unwrap();
+    let mut already_recovered =
+        ReceiptJournal::for_plan(recovered_id.clone(), &forward_plan).unwrap();
+    receipts.persist(&already_recovered).unwrap();
+    already_recovered
+        .transition(ReceiptState::Applying)
+        .unwrap();
+    receipts.persist(&already_recovered).unwrap();
+    already_recovered
+        .transition(ReceiptState::ForwardRecoveryRequired)
+        .unwrap();
+    receipts.persist(&already_recovered).unwrap();
+    already_recovered
+        .transition(ReceiptState::ConvergingForward)
+        .unwrap();
+    receipts.persist(&already_recovered).unwrap();
+    already_recovered
+        .transition(ReceiptState::ForwardRecovered)
+        .unwrap();
+    receipts.persist(&already_recovered).unwrap();
     let recovered = executor.recover_pending().unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(
         receipts.load(pending_id).unwrap().receipt().state,
         ReceiptState::Canceled
+    );
+    assert_eq!(
+        receipts.load(recovered_id).unwrap().receipt().state,
+        ReceiptState::ForwardRecovered
     );
     fs::remove_dir_all(root).unwrap();
 }

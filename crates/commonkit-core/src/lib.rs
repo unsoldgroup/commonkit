@@ -4,7 +4,7 @@ mod context_resolver;
 mod principal;
 mod target;
 
-use std::{collections::BTreeSet, sync::OnceLock};
+use std::{collections::BTreeMap, collections::BTreeSet, sync::OnceLock};
 
 pub use commonkit_contracts::*;
 pub use context_resolver::{
@@ -30,6 +30,7 @@ pub struct OperationDraft {
     pub resource: ResourceRef,
     pub risk: Risk,
     pub requires_confirmation: bool,
+    pub recovery_capability: RecoveryCapability,
     pub depends_on: Vec<Sha256Digest>,
     pub before_digest: Option<Sha256Digest>,
     pub after_digest: Option<Sha256Digest>,
@@ -54,26 +55,63 @@ struct OperationSemantic<'a> {
     provenance: Option<&'a OperationProvenance>,
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForwardOperationSemantic<'a> {
+    adapter_id: &'a StableId,
+    kind: OperationKind,
+    resource: &'a ResourceRef,
+    risk: Risk,
+    requires_confirmation: bool,
+    recovery_capability: RecoveryCapability,
+    depends_on: &'a [Sha256Digest],
+    before_digest: &'a Option<Sha256Digest>,
+    after_digest: &'a Option<Sha256Digest>,
+    payload_digest: &'a Sha256Digest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provenance: Option<&'a OperationProvenance>,
+}
+
 pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, ContractError> {
     draft
         .depends_on
         .sort_by(|left, right| left.as_str().cmp(right.as_str()));
     draft.depends_on.dedup();
-    let id = digest_domain_json(
-        "commonkit.operation.v1",
-        &OperationSemantic {
-            adapter_id: &draft.adapter_id,
-            kind: draft.kind,
-            resource: &draft.resource,
-            risk: draft.risk,
-            requires_confirmation: draft.requires_confirmation,
-            depends_on: &draft.depends_on,
-            before_digest: &draft.before_digest,
-            after_digest: &draft.after_digest,
-            payload_digest: &draft.payload_digest,
-            provenance: draft.provenance.as_ref(),
-        },
-    )?;
+    let semantic = OperationSemantic {
+        adapter_id: &draft.adapter_id,
+        kind: draft.kind,
+        resource: &draft.resource,
+        risk: draft.risk,
+        requires_confirmation: draft.requires_confirmation,
+        depends_on: &draft.depends_on,
+        before_digest: &draft.before_digest,
+        after_digest: &draft.after_digest,
+        payload_digest: &draft.payload_digest,
+        provenance: draft.provenance.as_ref(),
+    };
+    let id = match draft.recovery_capability {
+        RecoveryCapability::ExactRollback => {
+            // Exact rollback is the v1 behavior. Retaining its domain preserves
+            // recovery of unfinished durable v1 plans and receipts.
+            digest_domain_json("commonkit.operation.v1", &semantic)?
+        }
+        RecoveryCapability::ConvergeForwardOnly => digest_domain_json(
+            "commonkit.operation.v2",
+            &ForwardOperationSemantic {
+                adapter_id: semantic.adapter_id,
+                kind: semantic.kind,
+                resource: semantic.resource,
+                risk: semantic.risk,
+                requires_confirmation: semantic.requires_confirmation,
+                recovery_capability: draft.recovery_capability,
+                depends_on: semantic.depends_on,
+                before_digest: semantic.before_digest,
+                after_digest: semantic.after_digest,
+                payload_digest: semantic.payload_digest,
+                provenance: semantic.provenance,
+            },
+        )?,
+    };
     Ok(Operation {
         id,
         adapter_id: draft.adapter_id,
@@ -81,6 +119,7 @@ pub fn finalize_operation(mut draft: OperationDraft) -> Result<Operation, Contra
         resource: draft.resource,
         risk: draft.risk,
         requires_confirmation: draft.requires_confirmation,
+        recovery_capability: draft.recovery_capability,
         depends_on: draft.depends_on,
         before_digest: draft.before_digest,
         after_digest: draft.after_digest,
@@ -125,7 +164,33 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
             }
         }
     }
-
+    let operations_by_id = draft
+        .operations
+        .iter()
+        .map(|operation| (operation.id.as_str(), operation))
+        .collect::<BTreeMap<_, _>>();
+    for operation in draft
+        .operations
+        .iter()
+        .filter(|operation| operation.recovery_capability == RecoveryCapability::ExactRollback)
+    {
+        let mut pending = operation.depends_on.iter().collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(dependency) = pending.pop() {
+            if !visited.insert(dependency.as_str()) {
+                continue;
+            }
+            let dependency_operation = operations_by_id
+                .get(dependency.as_str())
+                .expect("dependencies were validated above");
+            if dependency_operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly {
+                return Err(PlanBuildError::ExactDependsOnForwardOnly(
+                    operation.id.clone(),
+                ));
+            }
+            pending.extend(dependency_operation.depends_on.iter());
+        }
+    }
     let mut emitted = BTreeSet::new();
     let mut ordered = Vec::with_capacity(draft.operations.len());
     while !draft.operations.is_empty() {
@@ -153,6 +218,7 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
             resource: operation.resource.clone(),
             risk: operation.risk,
             requires_confirmation: operation.requires_confirmation,
+            recovery_capability: operation.recovery_capability,
             depends_on: operation.depends_on.clone(),
             before_digest: operation.before_digest.clone(),
             after_digest: operation.after_digest.clone(),
@@ -164,8 +230,15 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
             return Err(PlanBuildError::OperationIdMismatch(operation.id.clone()));
         }
     }
+    let forward_capable = ordered
+        .iter()
+        .any(|operation| operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly);
     let id = digest_domain_json(
-        "commonkit.plan.v1",
+        if forward_capable {
+            "commonkit.plan.v2"
+        } else {
+            "commonkit.plan.v1"
+        },
         &PlanSemantic {
             target_id: &draft.target_id,
             desired_digest: &draft.desired_digest,
@@ -176,8 +249,17 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
         },
     )?;
     Ok(Plan {
-        schema_version: SchemaVersion(SCHEMA_VERSION),
-        contract_version: CONTRACT_VERSION.into(),
+        schema_version: SchemaVersion(if forward_capable {
+            FORWARD_SCHEMA_VERSION
+        } else {
+            SCHEMA_VERSION
+        }),
+        contract_version: if forward_capable {
+            FORWARD_CONTRACT_VERSION
+        } else {
+            CONTRACT_VERSION
+        }
+        .into(),
         id,
         target_id: draft.target_id,
         desired_digest: draft.desired_digest,
@@ -190,6 +272,7 @@ pub fn build_plan(mut draft: PlanDraft) -> Result<Plan, PlanBuildError> {
 
 fn operation_order(left: &Operation, right: &Operation) -> std::cmp::Ordering {
     (
+        left.recovery_capability,
         left.adapter_id.as_str(),
         left.resource.resource_type.as_str(),
         left.resource.resource_id.as_str(),
@@ -197,6 +280,7 @@ fn operation_order(left: &Operation, right: &Operation) -> std::cmp::Ordering {
         left.id.as_str(),
     )
         .cmp(&(
+            right.recovery_capability,
             right.adapter_id.as_str(),
             right.resource.resource_type.as_str(),
             right.resource.resource_id.as_str(),
@@ -217,6 +301,8 @@ pub enum PlanBuildError {
     DependencyCycle,
     #[error("operation semantic ID does not match its content: {0}")]
     OperationIdMismatch(Sha256Digest),
+    #[error("exact-rollback operation depends on forward-only work: {0}")]
+    ExactDependsOnForwardOnly(Sha256Digest),
 }
 
 pub fn is_forbidden_path(candidate: &str) -> bool {

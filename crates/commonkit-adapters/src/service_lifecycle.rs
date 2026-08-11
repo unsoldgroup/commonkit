@@ -210,6 +210,7 @@ impl<B: ServiceBackend> ServiceAdapter<B> {
             },
             risk: Risk::Medium,
             requires_confirmation: true,
+            recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
             depends_on: vec![],
             before_digest: Some(before_digest),
             after_digest: Some(after_digest),
@@ -239,28 +240,8 @@ impl<B: ServiceBackend> ServiceAdapter<B> {
             .execute(&command)
             .map_err(|_| failure("service_backend_failed", "service backend command failed"))
     }
-}
 
-impl<B: ServiceBackend> Adapter for ServiceAdapter<B> {
-    fn id(&self) -> &StableId {
-        &self.id
-    }
-    fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
-        let intent = self.intent(operation)?;
-        let actual = self
-            .backend
-            .inspect(&intent.spec.name)
-            .map_err(|_| failure("service_inspect_failed", "service inspection failed"))?;
-        if actual == intent.before {
-            Ok(())
-        } else {
-            Err(failure(
-                "service_preimage_changed",
-                "service changed after planning",
-            ))
-        }
-    }
-    fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+    fn apply_bound(&self, operation: &Operation) -> Result<(), AdapterFailure> {
         let intent = self.intent(operation)?.clone();
         if intent.desired == ServiceDesiredState::Absent {
             if intent.before.running {
@@ -310,6 +291,66 @@ impl<B: ServiceBackend> Adapter for ServiceAdapter<B> {
             }
             _ => Ok(()),
         }
+    }
+}
+
+impl<B: ServiceBackend> Adapter for ServiceAdapter<B> {
+    fn id(&self) -> &StableId {
+        &self.id
+    }
+    fn supports_recovery(&self, capability: commonkit_contracts::RecoveryCapability) -> bool {
+        capability == commonkit_contracts::RecoveryCapability::ExactRollback
+    }
+    fn supports_offline_recovery(&self, _operation: &Operation) -> bool {
+        false
+    }
+    fn observe_recovery(
+        &mut self,
+        operation: &Operation,
+    ) -> Result<commonkit_reconcile::RecoveryObservation, AdapterFailure> {
+        let intent = self.intent(operation)?;
+        let actual = self
+            .backend
+            .inspect(&intent.spec.name)
+            .map_err(|_| failure("service_inspect_failed", "service inspection failed"))?;
+        let desired = desired_observed(&intent.spec, intent.desired)
+            .map_err(|_| failure("service_digest_failed", "definition digest failed"))?;
+        Ok(if actual == desired {
+            commonkit_reconcile::RecoveryObservation::After
+        } else if actual == intent.before {
+            commonkit_reconcile::RecoveryObservation::Before
+        } else {
+            commonkit_reconcile::RecoveryObservation::Other
+        })
+    }
+    fn prepare_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let intent = self.intent(operation)?;
+        intent
+            .spec
+            .digest()
+            .map(|_| ())
+            .map_err(|_| failure("service_digest_failed", "definition digest failed"))
+    }
+    fn converge_recovery(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.apply_bound(operation)
+    }
+    fn prepare(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        let intent = self.intent(operation)?;
+        let actual = self
+            .backend
+            .inspect(&intent.spec.name)
+            .map_err(|_| failure("service_inspect_failed", "service inspection failed"))?;
+        if actual == intent.before {
+            Ok(())
+        } else {
+            Err(failure(
+                "service_preimage_changed",
+                "service changed after planning",
+            ))
+        }
+    }
+    fn apply(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
+        self.apply_bound(operation)
     }
     fn verify(&mut self, operation: &Operation) -> Result<(), AdapterFailure> {
         let intent = self.intent(operation)?;

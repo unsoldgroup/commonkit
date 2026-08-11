@@ -30,6 +30,7 @@ fn plan() -> commonkit_contracts::Plan {
             provider_inputs_digest: digest('e'),
             ownership_map_digest: digest('f'),
             artifact_set_digest: digest('1'),
+            package_resolution_authority_digest: None,
         },
         operations: Vec::new(),
     })
@@ -75,6 +76,7 @@ fn reloads_a_pre_provenance_v1_operation_without_changing_its_identity() {
         },
         risk: Risk::Low,
         requires_confirmation: true,
+        recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
         depends_on: Vec::new(),
         before_digest: Some(digest('4')),
         after_digest: Some(digest('5')),
@@ -94,6 +96,7 @@ fn reloads_a_pre_provenance_v1_operation_without_changing_its_identity() {
             provider_inputs_digest: digest('e'),
             ownership_map_digest: digest('f'),
             artifact_set_digest: digest('1'),
+            package_resolution_authority_digest: None,
         },
         operations: vec![operation],
     })
@@ -103,6 +106,10 @@ fn reloads_a_pre_provenance_v1_operation_without_changing_its_identity() {
     assert!(
         !serialized.contains("provenance"),
         "the legacy v1 representation must remain byte-shape compatible"
+    );
+    assert!(
+        !serialized.contains("recoveryCapability"),
+        "the default exact rollback capability must preserve v1 plan bytes"
     );
     store.persist(&plan).expect("persist");
     assert_eq!(store.load(&plan.id).expect("reload"), plan);

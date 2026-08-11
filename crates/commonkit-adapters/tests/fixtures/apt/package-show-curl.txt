@@ -1,0 +1,7 @@
+Package: curl
+Version: 8.5.0-2ubuntu10.6
+Architecture: amd64
+Filename: pool/main/c/curl/curl_8.5.0-2ubuntu10.6_amd64.deb
+Size: 14
+SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Description: command line tool for transferring data with URL syntax

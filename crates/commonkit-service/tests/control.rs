@@ -38,6 +38,7 @@ fn bindings() -> PlanBindings {
         provider_inputs_digest: digest('5'),
         ownership_map_digest: digest('6'),
         artifact_set_digest: digest('7'),
+        package_resolution_authority_digest: None,
     }
 }
 
@@ -60,6 +61,7 @@ fn plan() -> commonkit_contracts::Plan {
         },
         risk: Risk::Low,
         requires_confirmation: true,
+        recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
         depends_on: vec![],
         before_digest: None,
         after_digest: Some(digest('d')),
@@ -138,6 +140,7 @@ impl SyncDomain for MutableRelayDomain {
                 provider_inputs_digest: authority.provider_inputs_digest.clone(),
                 ownership_map_digest: authority.ownership_map_digest.clone(),
                 artifact_set_digest: authority.artifact_set_digest.clone(),
+                package_resolution_authority_digest: None,
             },
             plan_digest: approved.id.clone(),
         })
@@ -347,6 +350,7 @@ fn relay_apply_recomputes_authority_and_rejects_change_after_review() {
             provider_inputs_digest: authority.provider_inputs_digest.clone(),
             ownership_map_digest: authority.ownership_map_digest.clone(),
             artifact_set_digest: authority.artifact_set_digest.clone(),
+            package_resolution_authority_digest: None,
         },
         operations: vec![operation],
     })

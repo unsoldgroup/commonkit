@@ -131,7 +131,7 @@ pub fn materialize_mcp_client_state(
     .map(|(relative, bytes, source)| {
         let content = artifacts.put(&bytes, ContentSensitivity::Portable)?;
         Ok(NormalizedResource {
-            intent: FilesystemIntent::File {
+            intent: (FilesystemIntent::File {
                 path: NormalizedManagedPath::parse(format!(
                     "{}/{relative}",
                     managed_root.as_str()
@@ -139,7 +139,8 @@ pub fn materialize_mcp_client_state(
                 content,
                 mode: None,
                 expected_before: None,
-            },
+            })
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),

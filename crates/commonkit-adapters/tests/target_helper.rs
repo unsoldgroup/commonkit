@@ -2,7 +2,10 @@ use std::fs;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use commonkit_adapters::{NormalizedManagedPath, SshFilesystemRequest, SshFilesystemResponse};
+use commonkit_adapters::{
+    FileMode, NormalizedManagedPath, SafeSymlinkTarget, SshFilesystemRequest,
+    SshFilesystemResponse, SymlinkTargetKind, TargetResource,
+};
 use commonkit_core::{Sha256Digest, StableId};
 use sha2::{Digest, Sha256};
 
@@ -65,6 +68,90 @@ fn helper_subprocess_applies_only_typed_requests_inside_configured_roots() {
     );
     fs::remove_dir_all(home).unwrap();
     fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn helper_subprocess_routes_relative_directories_and_symlinks_without_following_ancestors() {
+    use std::os::unix::fs::symlink;
+
+    let home = temp("relative-home");
+    let target = temp("relative-target");
+    let outside = temp("relative-outside");
+    let state = temp("relative-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(
+        home.join(".config/commonkit/target-helper.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state, "roots": [{"id":"home","path":target,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let root_id = StableId::parse("home").unwrap();
+    let source = NormalizedManagedPath::parse(".agents/skills/tool").unwrap();
+    let link = NormalizedManagedPath::parse(".codex/skills/tool").unwrap();
+    let relative = SafeSymlinkTarget::parse(&link, "../../.agents/skills/tool").unwrap();
+
+    for request in [
+        SshFilesystemRequest::WriteDirectory {
+            root_id: root_id.clone(),
+            path: source.clone(),
+            mode: Some(FileMode::parse(0o700).unwrap()),
+        },
+        SshFilesystemRequest::WriteSymlink {
+            root_id: root_id.clone(),
+            path: link.clone(),
+            target: relative,
+            target_kind: SymlinkTargetKind::Directory,
+        },
+    ] {
+        let output = invoke(&home, &request);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            serde_json::from_slice::<SshFilesystemResponse>(&output.stdout).unwrap(),
+            SshFilesystemResponse::Applied
+        );
+    }
+    let inspected = invoke(
+        &home,
+        &SshFilesystemRequest::InspectResource {
+            root_id: root_id.clone(),
+            path: link,
+        },
+    );
+    assert_eq!(
+        serde_json::from_slice::<SshFilesystemResponse>(&inspected.stdout).unwrap(),
+        SshFilesystemResponse::Resource {
+            resource: TargetResource::Symlink {
+                target: "../../.agents/skills/tool".into(),
+                target_kind: SymlinkTargetKind::File,
+            }
+        }
+    );
+
+    symlink(&outside, target.join("escape")).unwrap();
+    let escaped = invoke(
+        &home,
+        &SshFilesystemRequest::WriteDirectory {
+            root_id,
+            path: NormalizedManagedPath::parse("escape/blocked").unwrap(),
+            mode: None,
+        },
+    );
+    assert!(!escaped.status.success());
+    assert!(!outside.join("blocked").exists());
+
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(outside).unwrap();
     fs::remove_dir_all(state).unwrap();
 }
 

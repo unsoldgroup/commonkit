@@ -25,6 +25,16 @@ impl SshFilesystemTransport for Memory {
     ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
         let mut remote = self.0.lock().unwrap();
         match request {
+            SshFilesystemRequest::InspectResource { path, .. } => Ok(remote
+                .files
+                .get(path.as_str())
+                .cloned()
+                .map(|content| SshFilesystemResponse::Resource {
+                    resource: TargetResource::File { content },
+                })
+                .unwrap_or(SshFilesystemResponse::Resource {
+                    resource: TargetResource::Absent,
+                })),
             SshFilesystemRequest::ListDirectory { path, .. } => {
                 let prefix = format!("{}/", path.as_str());
                 let mut entries = remote
@@ -301,7 +311,8 @@ fn setup_with_capabilities(
                     .unwrap(),
                 mode: None,
                 expected_before: None,
-            },
+            }
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: inputs.provider_id.clone(),
                 provider_version: inputs.provider_version.to_string(),

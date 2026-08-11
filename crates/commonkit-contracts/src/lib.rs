@@ -14,6 +14,10 @@ pub mod portable_context;
 
 pub const CONTRACT_VERSION: &str = "1.0";
 pub const SCHEMA_VERSION: u32 = 1;
+pub const FORWARD_CONTRACT_VERSION: &str = "2.0";
+pub const FORWARD_SCHEMA_VERSION: u32 = 2;
+pub const PACKAGE_RECEIPT_CONTRACT_VERSION: &str = "3.0";
+pub const PACKAGE_RECEIPT_SCHEMA_VERSION: u32 = 3;
 
 pub fn canonical_json<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, ContractError> {
     serde_jcs::to_vec(value).map_err(|_| ContractError::Canonicalization)
@@ -842,7 +846,76 @@ pub enum PackageManager {
     Rustup,
 }
 
-/// An exact, observe-only package declaration.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RustToolchainProfile {
+    Minimal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PackageSelector {
+    HomebrewFormula {
+        name: String,
+    },
+    AptBinary {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        architecture: Option<String>,
+    },
+    NodeRuntime {},
+    RustToolchain {
+        profile: RustToolchainProfile,
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        components: BTreeSet<String>,
+        #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+        targets: BTreeSet<String>,
+    },
+}
+
+impl PackageSelector {
+    fn validate_for(&self, manager: PackageManager) -> Result<(), ContractError> {
+        let valid = match (manager, self) {
+            (PackageManager::Homebrew, Self::HomebrewFormula { name }) => safe_selector(name),
+            (PackageManager::Apt, Self::AptBinary { name, architecture }) => {
+                safe_selector(name) && architecture.as_deref().is_none_or(safe_selector)
+            }
+            (PackageManager::Fnm | PackageManager::Nvm, Self::NodeRuntime {}) => true,
+            (
+                PackageManager::Rustup,
+                Self::RustToolchain {
+                    profile: RustToolchainProfile::Minimal,
+                    components,
+                    targets,
+                },
+            ) => {
+                components.iter().all(|value| safe_selector(value))
+                    && targets.iter().all(|value| safe_selector(value))
+            }
+            _ => false,
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ContractError::InvalidPackageDeclaration)
+        }
+    }
+}
+
+fn safe_selector(value: &str) -> bool {
+    !value.is_empty()
+        && value.trim() == value
+        && !value.contains("..")
+        && !value.starts_with(['/', '-', '.'])
+        && !value.ends_with('/')
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._+@/-".contains(character))
+}
+
+/// An exact package declaration resolved only by the trusted controller.
 ///
 /// `id` is the stable merge and report identity, `version` is an exact pin,
 /// `manager` selects the fixed read-only query backend, and `source` is matched
@@ -854,6 +927,8 @@ pub struct PackageDeclaration {
     pub version: String,
     pub manager: PackageManager,
     pub source: StableId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<PackageSelector>,
 }
 
 impl PackageDeclaration {
@@ -864,11 +939,82 @@ impl PackageDeclaration {
                 .version
                 .chars()
                 .any(|character| "*^~<>=,|".contains(character))
+            || is_floating_package_version(&self.version)
         {
             return Err(ContractError::InvalidPackageDeclaration);
         }
+        if let Some(selector) = &self.selector {
+            selector.validate_for(self.manager)?;
+        }
         Ok(())
     }
+
+    /// Stricter controller boundary used before package resolution. Legacy
+    /// declarations without a selector remain decodable, but cannot authorize
+    /// resolver or network access.
+    pub fn validate_for_resolution(&self) -> Result<(), ContractError> {
+        self.validate()?;
+        let selector = self
+            .selector
+            .as_ref()
+            .ok_or(ContractError::InvalidPackageDeclaration)?;
+        selector.validate_for(self.manager)?;
+        if exact_package_version(self.manager, &self.version) {
+            Ok(())
+        } else {
+            Err(ContractError::InvalidPackageDeclaration)
+        }
+    }
+}
+
+fn exact_package_version(manager: PackageManager, version: &str) -> bool {
+    match manager {
+        PackageManager::Fnm | PackageManager::Nvm => numeric_triplet(version, true),
+        PackageManager::Rustup => numeric_triplet(version, false),
+        PackageManager::Homebrew | PackageManager::Apt => {
+            version.chars().any(|character| character.is_ascii_digit())
+                && version.chars().any(|character| ".+-_:".contains(character))
+                && version.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".+-_:".contains(character)
+                })
+                && !version
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|part| {
+                        matches!(
+                            part.to_ascii_lowercase().as_str(),
+                            "x" | "main" | "major" | "nightly"
+                        )
+                    })
+        }
+    }
+}
+
+fn numeric_triplet(version: &str, allow_v_prefix: bool) -> bool {
+    let version = if allow_v_prefix {
+        version.strip_prefix('v').unwrap_or(version)
+    } else {
+        version
+    };
+    let components = version.split('.').collect::<Vec<_>>();
+    components.len() == 3
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+        })
+}
+
+fn is_floating_package_version(version: &str) -> bool {
+    let version = version.to_ascii_lowercase();
+    matches!(
+        version.as_str(),
+        "latest" | "stable" | "default" | "node" | "current"
+    ) || version.starts_with("stable-")
+        || version.starts_with("latest-")
+        || version.starts_with("default-")
+        || version.starts_with("lts-")
+        || version.starts_with("lts/")
 }
 
 /// Closed top-level vocabulary for a CommonKit v1 layer.
@@ -1054,6 +1200,22 @@ pub enum Risk {
     Destructive,
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryCapability {
+    #[default]
+    ExactRollback,
+    ConvergeForwardOnly,
+}
+
+impl RecoveryCapability {
+    pub fn is_exact_rollback(value: &Self) -> bool {
+        *value == Self::ExactRollback
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourceRef {
@@ -1081,6 +1243,8 @@ pub struct Operation {
     pub resource: ResourceRef,
     pub risk: Risk,
     pub requires_confirmation: bool,
+    #[serde(default, skip_serializing_if = "RecoveryCapability::is_exact_rollback")]
+    pub recovery_capability: RecoveryCapability,
     pub depends_on: Vec<Sha256Digest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_digest: Option<Sha256Digest>,
@@ -1100,6 +1264,8 @@ pub struct PlanBindings {
     pub provider_inputs_digest: Sha256Digest,
     pub ownership_map_digest: Sha256Digest,
     pub artifact_set_digest: Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_resolution_authority_digest: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1116,14 +1282,123 @@ pub struct Plan {
     pub operations: Vec<Operation>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageOperationConsentBinding {
+    pub operation_id: Sha256Digest,
+    pub resolution_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageConsent {
+    pub confirmation_id: StableId,
+    pub operation_set_digest: Sha256Digest,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageOperationSetSemantic<'a> {
+    plan_id: &'a Sha256Digest,
+    target_id: &'a StableId,
+    operations: Vec<PackageOperationSemantic<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PackageOperationSemantic<'a> {
+    operation_id: &'a Sha256Digest,
+    after_digest: &'a Sha256Digest,
+    resolution_digest: &'a Sha256Digest,
+}
+
+pub fn package_operation_set_digest(
+    plan: &Plan,
+    bindings: &[PackageOperationConsentBinding],
+) -> Result<Sha256Digest, ContractError> {
+    let mut resolutions = BTreeMap::new();
+    for binding in bindings {
+        if resolutions
+            .insert(&binding.operation_id, &binding.resolution_digest)
+            .is_some()
+        {
+            return Err(ContractError::InvalidPackageConsent);
+        }
+    }
+
+    let mut operations = Vec::new();
+    for operation in &plan.operations {
+        let package_routed = operation.adapter_id.as_str() == "packages"
+            || operation.resource.resource_type.as_str() == "package";
+        if !package_routed {
+            continue;
+        }
+        if operation.adapter_id.as_str() != "packages"
+            || operation.resource.resource_type.as_str() != "package"
+            || operation.kind != OperationKind::Create
+            || !operation.requires_confirmation
+            || operation.recovery_capability != RecoveryCapability::ConvergeForwardOnly
+            || operation.before_digest.is_some()
+        {
+            return Err(ContractError::InvalidPackageConsent);
+        }
+        let after_digest = operation
+            .after_digest
+            .as_ref()
+            .ok_or(ContractError::InvalidPackageConsent)?;
+        let resolution_digest = resolutions
+            .remove(&operation.id)
+            .ok_or(ContractError::InvalidPackageConsent)?;
+        operations.push(PackageOperationSemantic {
+            operation_id: &operation.id,
+            after_digest,
+            resolution_digest,
+        });
+    }
+    if operations.is_empty() || !resolutions.is_empty() {
+        return Err(ContractError::InvalidPackageConsent);
+    }
+    operations.sort_by(|left, right| left.operation_id.cmp(right.operation_id));
+    digest_domain_json(
+        "commonkit.package-operation-set.v1",
+        &PackageOperationSetSemantic {
+            plan_id: &plan.id,
+            target_id: &plan.target_id,
+            operations,
+        },
+    )
+}
+
+impl PackageConsent {
+    pub fn validate(
+        &self,
+        plan: &Plan,
+        bindings: &[PackageOperationConsentBinding],
+    ) -> Result<(), ContractError> {
+        if package_operation_set_digest(plan, bindings)? != self.operation_set_digest {
+            return Err(ContractError::InvalidPackageConsent);
+        }
+        Ok(())
+    }
+
+    pub fn digest(&self) -> Result<Sha256Digest, ContractError> {
+        digest_domain_json("commonkit.package-consent.v1", self)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReceiptState {
     Prepared,
     Applying,
     Verifying,
+    ApplyingForward,
     Succeeded,
     RecoveryRequired,
+    ForwardRecoveryRequired,
+    ConvergingForward,
+    ForwardRecovered,
+    ForwardRecoveryFailed,
     RollingBack,
     RolledBack,
     RollbackFailed,
@@ -1142,6 +1417,8 @@ pub enum OperationPhase {
     VerifyFailed,
     RolledBack,
     RollbackFailed,
+    ForwardRecovered,
+    ForwardRecoveryFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1164,6 +1441,46 @@ pub struct ReceiptTransition {
     pub entry_digest: Sha256Digest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageNoPreimageReason {
+    AdditiveForwardOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PackageExitClassification {
+    NotRun,
+    Succeeded,
+    Failed { code: StableId },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageReceiptEvidence {
+    pub operation_id: Sha256Digest,
+    pub resolution_digest: Sha256Digest,
+    pub target_authority_digest: Sha256Digest,
+    pub manager: PackageManager,
+    pub manager_authority_digest: Sha256Digest,
+    pub source_id: StableId,
+    pub source_authority_digest: Sha256Digest,
+    pub before_installed_versions: BTreeSet<String>,
+    pub no_preimage_reason: PackageNoPreimageReason,
+    pub exit_classification: PackageExitClassification,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_digest: Option<Sha256Digest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PackageReceiptAuthorization {
+    pub consent_digest: Sha256Digest,
+    pub confirmation_id: StableId,
+    pub operation_set_digest: Sha256Digest,
+    pub evidence: Vec<PackageReceiptEvidence>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RunReceipt {
@@ -1177,6 +1494,8 @@ pub struct RunReceipt {
     pub observed_digest: Sha256Digest,
     pub policy_digest: Sha256Digest,
     pub bindings: PlanBindings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_authorization: Option<PackageReceiptAuthorization>,
     pub state: ReceiptState,
     pub operation_progress: Vec<OperationProgress>,
     pub transitions: Vec<ReceiptTransition>,
@@ -1479,7 +1798,10 @@ pub fn layer_schema() -> Result<Value, ContractError> {
     for (field, pattern) in [
         ("id", r"^[a-z][a-z0-9_-]{0,62}$"),
         ("source", r"^[a-z][a-z0-9_-]{0,62}$"),
-        ("version", r"^(?!.*[\s*^~<>=,|]).+$"),
+        (
+            "version",
+            r"^(?!.*[\s*^~<>=,|])(?!latest$)(?!stable(?:-|$))(?!default(?:-|$))(?!node$)(?!current$)(?!lts[-/]).+$",
+        ),
     ] {
         package_schema
             .pointer_mut(&format!("/properties/{field}"))
@@ -1556,17 +1878,126 @@ pub fn lock_schema() -> Result<Value, ContractError> {
 }
 
 pub fn plan_schema() -> Result<Value, ContractError> {
-    schema_with_id(
+    let mut schema = schema_with_id(
         schema_for!(Plan),
         "https://schemas.commonkit.dev/v1/plan.schema.json",
+    )?;
+    let definitions = schema
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    definitions.remove("RecoveryCapability");
+    definitions
+        .get_mut("Operation")
+        .and_then(Value::as_object_mut)
+        .and_then(|operation| operation.get_mut("properties"))
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?
+        .remove("recoveryCapability");
+    Ok(schema)
+}
+
+pub fn plan_v2_schema() -> Result<Value, ContractError> {
+    let mut schema = schema_with_id(
+        schema_for!(Plan),
+        "https://schemas.commonkit.dev/v2/plan.schema.json",
+    )?;
+    constrain_wire_version(
+        &mut schema,
+        FORWARD_SCHEMA_VERSION,
+        FORWARD_CONTRACT_VERSION,
+    )?;
+    Ok(schema)
+}
+
+pub fn package_consent_schema() -> Result<Value, ContractError> {
+    schema_with_id(
+        schema_for!(PackageConsent),
+        "https://schemas.commonkit.dev/v1/package-consent.schema.json",
     )
 }
 
 pub fn receipt_schema() -> Result<Value, ContractError> {
-    schema_with_id(
+    let mut schema = schema_with_id(
         schema_for!(RunReceipt),
         "https://schemas.commonkit.dev/v1/receipt.schema.json",
-    )
+    )?;
+    retain_schema_enum(
+        &mut schema,
+        "OperationPhase",
+        &[
+            "prepared",
+            "prepare_failed",
+            "apply_started",
+            "applied",
+            "apply_failed",
+            "verified",
+            "verify_failed",
+            "rolled_back",
+            "rollback_failed",
+        ],
+    )?;
+    retain_schema_enum(
+        &mut schema,
+        "ReceiptState",
+        &[
+            "prepared",
+            "applying",
+            "verifying",
+            "succeeded",
+            "recovery_required",
+            "rolling_back",
+            "rolled_back",
+            "rollback_failed",
+            "canceled",
+        ],
+    )?;
+    remove_schema_property(&mut schema, "packageAuthorization")?;
+    remove_package_receipt_definitions(&mut schema)?;
+    Ok(schema)
+}
+
+pub fn receipt_v2_schema() -> Result<Value, ContractError> {
+    let mut schema = schema_with_id(
+        schema_for!(RunReceipt),
+        "https://schemas.commonkit.dev/v2/receipt.schema.json",
+    )?;
+    constrain_wire_version(
+        &mut schema,
+        FORWARD_SCHEMA_VERSION,
+        FORWARD_CONTRACT_VERSION,
+    )?;
+    remove_schema_property(&mut schema, "packageAuthorization")?;
+    remove_package_receipt_definitions(&mut schema)?;
+    Ok(schema)
+}
+
+pub fn receipt_v3_schema() -> Result<Value, ContractError> {
+    let mut schema = schema_with_id(
+        schema_for!(RunReceipt),
+        "https://schemas.commonkit.dev/v3/receipt.schema.json",
+    )?;
+    constrain_wire_version(
+        &mut schema,
+        PACKAGE_RECEIPT_SCHEMA_VERSION,
+        PACKAGE_RECEIPT_CONTRACT_VERSION,
+    )?;
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?
+        .insert(
+            "packageAuthorization".into(),
+            serde_json::json!({"$ref": "#/$defs/PackageReceiptAuthorization"}),
+        );
+    let required = schema
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    if !required.iter().any(|value| value == "packageAuthorization") {
+        required.push(Value::String("packageAuthorization".into()));
+    }
+    Ok(schema)
 }
 
 pub fn diagnostics_schema() -> Result<Value, ContractError> {
@@ -1630,6 +2061,72 @@ fn schema_with_id(schema: schemars::Schema, id: &str) -> Result<Value, ContractE
     Ok(schema)
 }
 
+fn retain_schema_enum(
+    schema: &mut Value,
+    definition: &str,
+    allowed: &[&str],
+) -> Result<(), ContractError> {
+    let values = schema
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .and_then(|definitions| definitions.get_mut(definition))
+        .and_then(Value::as_object_mut)
+        .and_then(|definition| definition.get_mut("enum"))
+        .and_then(Value::as_array_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    values.retain(|value| value.as_str().is_some_and(|value| allowed.contains(&value)));
+    Ok(())
+}
+
+fn remove_schema_property(schema: &mut Value, property: &str) -> Result<(), ContractError> {
+    schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?
+        .remove(property);
+    if let Some(required) = schema.get_mut("required").and_then(Value::as_array_mut) {
+        required.retain(|value| value.as_str() != Some(property));
+    }
+    Ok(())
+}
+
+fn remove_package_receipt_definitions(schema: &mut Value) -> Result<(), ContractError> {
+    let definitions = schema
+        .get_mut("$defs")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    for definition in [
+        "PackageExitClassification",
+        "PackageManager",
+        "PackageNoPreimageReason",
+        "PackageReceiptAuthorization",
+        "PackageReceiptEvidence",
+    ] {
+        definitions.remove(definition);
+    }
+    Ok(())
+}
+
+fn constrain_wire_version(
+    schema: &mut Value,
+    schema_version: u32,
+    contract_version: &str,
+) -> Result<(), ContractError> {
+    let properties = schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .ok_or(ContractError::SchemaGeneration)?;
+    properties.insert(
+        "schemaVersion".into(),
+        serde_json::json!({"const": schema_version, "type":"integer"}),
+    );
+    properties.insert(
+        "contractVersion".into(),
+        serde_json::json!({"const": contract_version, "type":"string"}),
+    );
+    Ok(())
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ContractError {
     #[error("principal is not a valid GitHub login")]
@@ -1662,6 +2159,8 @@ pub enum ContractError {
     InvalidStyleguideDescriptor,
     #[error("package versions must be non-empty exact pins without whitespace or range syntax")]
     InvalidPackageDeclaration,
+    #[error("package consent does not bind the exact additive forward-only package operation set")]
+    InvalidPackageConsent,
     #[error("optimization limits must be positive")]
     InvalidOptimizationLimits,
     #[error("unsupported SkillOpt provider version or compatibility contract")]

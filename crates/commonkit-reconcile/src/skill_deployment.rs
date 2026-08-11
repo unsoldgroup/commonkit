@@ -323,6 +323,7 @@ impl<'a> SkillDeploymentWorkflow<'a> {
             target_identity_digest: compilation.target_identity_digest,
             ownership_map_digest: compilation.ownership_map_digest,
             artifact_set_digest: compilation.artifact_set_digest,
+            package_resolution_authority_digest: None,
         };
         let plan = build_plan(PlanDraft {
             target_id: request.canary_loadout.clone(),

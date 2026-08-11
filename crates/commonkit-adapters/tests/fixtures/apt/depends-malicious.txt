@@ -1,0 +1,4 @@
+curl
+ |Depends: libssl3
+  Depends: libssl1.1
+  Replaces: replacement-lib

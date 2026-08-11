@@ -1,9 +1,10 @@
 use commonkit_adapters::{
     ContentReference, ContentSensitivity, FileMode, FilesystemIntent, NormalizedManagedPath,
-    NormalizedResource, OwnershipError, OwnershipRules, ResourceProvenance, SafeSymlinkTarget,
+    NormalizedResource, OwnershipError, OwnershipRules, PackageDesiredIntent, ResourceAddress,
+    ResourceIntent, ResourceProvenance, SafeSymlinkTarget, SymlinkTargetKind,
     materialized_resources_digest, validate_ownership,
 };
-use commonkit_contracts::{Sha256Digest, StableId};
+use commonkit_contracts::{PackageDeclaration, PackageManager, Sha256Digest, StableId};
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).expect("digest")
@@ -20,7 +21,7 @@ fn provenance(provider: &str, source: &str) -> ResourceProvenance {
 
 fn file(provider: &str, path: &str) -> NormalizedResource {
     NormalizedResource {
-        intent: FilesystemIntent::File {
+        intent: (FilesystemIntent::File {
             path: NormalizedManagedPath::parse(path).expect("path"),
             content: ContentReference {
                 digest: digest('f'),
@@ -29,28 +30,46 @@ fn file(provider: &str, path: &str) -> NormalizedResource {
             },
             mode: Some(FileMode::parse(0o600).expect("mode")),
             expected_before: None,
-        },
+        })
+        .into(),
         provenance: provenance(provider, path),
     }
 }
 
 fn directory(provider: &str, path: &str, exact: bool) -> NormalizedResource {
     NormalizedResource {
-        intent: FilesystemIntent::Directory {
+        intent: (FilesystemIntent::Directory {
             path: NormalizedManagedPath::parse(path).expect("path"),
             mode: None,
             exact,
-        },
+        })
+        .into(),
         provenance: provenance(provider, path),
     }
 }
 
+fn directory_with_mode(provider: &str, path: &str, exact: bool, mode: u32) -> NormalizedResource {
+    let mut resource = directory(provider, path, exact);
+    if let FilesystemIntent::Directory {
+        mode: resource_mode,
+        ..
+    } = resource
+        .intent
+        .filesystem_mut()
+        .expect("filesystem resource")
+    {
+        *resource_mode = Some(FileMode::parse(mode).unwrap());
+    }
+    resource
+}
+
 fn removal(provider: &str, path: &str) -> NormalizedResource {
     NormalizedResource {
-        intent: FilesystemIntent::Remove {
+        intent: (FilesystemIntent::Remove {
             path: NormalizedManagedPath::parse(path).expect("path"),
             expected_before: None,
-        },
+        })
+        .into(),
         provenance: provenance(provider, path),
     }
 }
@@ -65,6 +84,21 @@ fn rules(case_sensitive: bool) -> OwnershipRules {
         ],
     )
     .expect("rules")
+}
+
+fn package(provider: &str, id: &str, _artifact: char) -> NormalizedResource {
+    NormalizedResource {
+        intent: PackageDesiredIntent::new(PackageDeclaration {
+            id: StableId::parse(id).unwrap(),
+            version: "1.2.3".into(),
+            manager: PackageManager::Homebrew,
+            source: StableId::parse("homebrew-core").unwrap(),
+            selector: None,
+        })
+        .unwrap()
+        .into(),
+        provenance: provenance(provider, id),
+    }
 }
 
 #[test]
@@ -207,6 +241,229 @@ fn rejects_claims_outside_roots_and_below_protected_state() {
 }
 
 #[test]
+fn destructive_ancestor_claims_cannot_enclose_protected_state() {
+    for resource in [
+        removal("native", "home"),
+        directory("native", "home/.ssh", true),
+        file("native", "home"),
+        NormalizedResource {
+            intent: (FilesystemIntent::Symlink {
+                path: NormalizedManagedPath::parse("home").unwrap(),
+                target: SafeSymlinkTarget::parse(
+                    &NormalizedManagedPath::parse("home").unwrap(),
+                    "managed-home",
+                )
+                .unwrap(),
+                target_kind: SymlinkTargetKind::Directory,
+                expected_before: None,
+            })
+            .into(),
+            provenance: provenance("native", "home-link"),
+        },
+    ] {
+        assert!(matches!(
+            validate_ownership(&[resource], &rules(true)),
+            Err(OwnershipError::ProtectedPath { .. })
+        ));
+    }
+
+    validate_ownership(&[directory("native", "home/.ssh", false)], &rules(true))
+        .expect("a non-exact ancestor cannot delete protected descendants");
+    assert!(matches!(
+        validate_ownership(
+            &[directory_with_mode("native", "home/.ssh", false, 0o700)],
+            &rules(true)
+        ),
+        Err(OwnershipError::ProtectedPath { .. })
+    ));
+}
+
+#[test]
+fn symlink_targets_cannot_resolve_into_protected_state() {
+    let link = NormalizedManagedPath::parse("home/bin/commonkit-state").unwrap();
+    let resource = NormalizedResource {
+        intent: (FilesystemIntent::Symlink {
+            path: link.clone(),
+            target: SafeSymlinkTarget::parse(&link, "../.commonkit").unwrap(),
+            target_kind: SymlinkTargetKind::Directory,
+            expected_before: None,
+        })
+        .into(),
+        provenance: provenance("native", "protected-link"),
+    };
+
+    assert!(matches!(
+        validate_ownership(&[resource], &rules(true)),
+        Err(OwnershipError::ProtectedPath { .. })
+    ));
+}
+
+#[test]
+fn case_insensitive_targets_cannot_alias_declared_or_protected_roots() {
+    assert!(matches!(
+        validate_ownership(
+            &[file("native", "HOME/.COMMONKIT/receipts/1")],
+            &rules(false)
+        ),
+        Err(OwnershipError::ProtectedPath { .. })
+    ));
+    assert!(matches!(
+        validate_ownership(&[file("native", "OTHER/config")], &rules(false)),
+        Err(OwnershipError::OutsideDeclaredRoot { .. })
+    ));
+}
+
+#[test]
+fn legacy_file_symlink_intents_keep_their_wire_shape() {
+    let path = NormalizedManagedPath::parse("home/bin/tool").unwrap();
+    let file_target = FilesystemIntent::Symlink {
+        path: path.clone(),
+        target: SafeSymlinkTarget::parse(&path, "../lib/tool").unwrap(),
+        target_kind: SymlinkTargetKind::File,
+        expected_before: None,
+    };
+    let directory_target = FilesystemIntent::Symlink {
+        path,
+        target: SafeSymlinkTarget::parse(
+            &NormalizedManagedPath::parse("home/bin/tool").unwrap(),
+            "../lib/tool",
+        )
+        .unwrap(),
+        target_kind: SymlinkTargetKind::Directory,
+        expected_before: None,
+    };
+
+    assert!(
+        serde_json::to_value(file_target).unwrap()["target_kind"].is_null(),
+        "the default file kind must not change legacy payload bytes"
+    );
+    assert_eq!(
+        serde_json::to_value(directory_target).unwrap()["target_kind"],
+        "directory"
+    );
+}
+
+#[test]
+fn normalized_filesystem_resources_keep_their_v1_wire_shape() {
+    let legacy = file("native", "home/config");
+    let typed = NormalizedResource {
+        intent: ResourceIntent::Filesystem(FilesystemIntent::File {
+            path: NormalizedManagedPath::parse("home/config").unwrap(),
+            content: ContentReference {
+                digest: digest('f'),
+                bytes: 7,
+                sensitivity: ContentSensitivity::Portable,
+            },
+            mode: Some(FileMode::parse(0o600).unwrap()),
+            expected_before: None,
+        }),
+        provenance: provenance("native", "home/config"),
+    };
+
+    let legacy_bytes = serde_json::to_vec(&legacy).unwrap();
+    assert_eq!(serde_json::to_vec(&typed).unwrap(), legacy_bytes);
+    assert_eq!(
+        serde_json::from_slice::<NormalizedResource>(&legacy_bytes).unwrap(),
+        typed
+    );
+    assert_eq!(
+        materialized_resources_digest(&[legacy]).unwrap(),
+        materialized_resources_digest(&[typed]).unwrap()
+    );
+}
+
+#[test]
+fn filesystem_and_package_claims_share_one_deterministic_ownership_digest() {
+    let filesystem = file("native", "home/brew");
+    let package = package("native", "brew", 'b');
+
+    validate_ownership(&[filesystem.clone(), package.clone()], &rules(true)).unwrap();
+    assert_ne!(
+        filesystem.address(),
+        ResourceAddress::Package {
+            manager: PackageManager::Homebrew,
+            id: StableId::parse("brew").unwrap(),
+        },
+        "resource domains cannot alias even when their textual identities match"
+    );
+    assert_eq!(
+        materialized_resources_digest(&[filesystem.clone(), package.clone()]).unwrap(),
+        materialized_resources_digest(&[package.clone(), filesystem.clone()]).unwrap()
+    );
+    assert_eq!(
+        package.resource_type(),
+        commonkit_adapters::ResourceType::Package
+    );
+    assert!(package.artifact_references().is_empty());
+    assert_eq!(
+        package.recovery_capability(),
+        commonkit_contracts::RecoveryCapability::ConvergeForwardOnly
+    );
+    assert!(package.desired_digest().is_ok());
+
+    let mut changed_declaration = package.clone();
+    let ResourceIntent::Package(PackageDesiredIntent::Package { declaration }) =
+        &mut changed_declaration.intent
+    else {
+        panic!("package intent")
+    };
+    declaration.version = "1.2.4".into();
+    assert_ne!(
+        materialized_resources_digest(&[filesystem, package]).unwrap(),
+        materialized_resources_digest(&[changed_declaration]).unwrap()
+    );
+}
+
+#[test]
+fn duplicate_package_identity_claims_fail_closed() {
+    let error = validate_ownership(
+        &[
+            package("native", "ripgrep", 'a'),
+            package("chezmoi", "ripgrep", 'b'),
+        ],
+        &rules(true),
+    )
+    .expect_err("duplicate manager and package identity");
+    assert!(matches!(error, OwnershipError::DuplicatePackage { .. }));
+}
+
+#[test]
+fn unknown_and_ambiguous_resource_wire_types_are_rejected() {
+    let provenance = serde_json::to_value(provenance("native", "unknown")).unwrap();
+    for intent in [
+        serde_json::json!({"type": "registry", "key": "software/tool"}),
+        serde_json::json!({
+            "type": "package",
+            "path": "home/tool",
+            "declaration": {
+                "id": "tool",
+                "version": "1.0.0",
+                "manager": "homebrew",
+                "source": "homebrew-core"
+            },
+            "resolution": {
+                "digest": digest('d'),
+                "bytes": 1,
+                "sensitivity": "portable"
+            },
+            "artifacts": [{
+                "digest": digest('a'),
+                "bytes": 1,
+                "sensitivity": "portable"
+            }]
+        }),
+    ] {
+        assert!(
+            serde_json::from_value::<NormalizedResource>(serde_json::json!({
+                "intent": intent,
+                "provenance": provenance
+            }))
+            .is_err()
+        );
+    }
+}
+
+#[test]
 fn canonical_materialization_digest_is_order_independent_and_semantic() {
     let first = file("native", "home/a");
     let second = directory("chezmoi", "home/b", true);
@@ -219,7 +476,8 @@ fn canonical_materialization_digest_is_order_independent_and_semantic() {
         path: NormalizedManagedPath::parse("home/b").expect("path"),
         mode: None,
         exact: false,
-    };
+    }
+    .into();
     assert_ne!(
         forward,
         materialized_resources_digest(&[first, changed]).expect("changed digest")

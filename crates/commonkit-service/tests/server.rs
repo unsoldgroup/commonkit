@@ -71,7 +71,8 @@ fn generated_relay_authorization(
         .resources
         .iter()
         .map(|resource| {
-            let FilesystemIntent::File { path, content, .. } = &resource.intent else {
+            let Some(FilesystemIntent::File { path, content, .. }) = resource.intent.filesystem()
+            else {
                 panic!("client resource must be a file")
             };
             (path.as_str(), artifacts.load(content).unwrap())

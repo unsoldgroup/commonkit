@@ -23,11 +23,12 @@ fn native_fallback_materializes_precomposed_resources_deterministically() {
     )
     .unwrap();
     let resource = NormalizedResource {
-        intent: FilesystemIntent::Directory {
+        intent: (FilesystemIntent::Directory {
             path: NormalizedManagedPath::parse("home/.config").unwrap(),
             mode: None,
             exact: false,
-        },
+        })
+        .into(),
         provenance: ResourceProvenance {
             provider_id: StableId::parse("native").unwrap(),
             provider_version: "1".into(),

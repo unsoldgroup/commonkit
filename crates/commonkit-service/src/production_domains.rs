@@ -18,8 +18,9 @@ use commonkit_adapters::{
     ProcessBwsRunner, ProcessEngramCommandRunner, ProcessGitRunner,
     ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
     ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderResourcePlanner,
-    RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, SshTargetFilesystem,
-    TargetFilesystem, build_provider_plan, materialize_mcp_client_state, validate_ownership,
+    RemoteProviderStager, ResourceProvenance, SecretValue, SshFileAdapter, SshTargetCapabilities,
+    SshTargetFilesystem, TargetFilesystem, build_provider_plan, materialize_mcp_client_state,
+    validate_ownership,
 };
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
@@ -202,6 +203,12 @@ impl SyncConfig {
             }),
             SyncTargetTransport::Ssh { .. } => Err(DomainFailure::InvalidRequest),
         }
+    }
+
+    fn ssh_target_capabilities(&self) -> Result<SshTargetCapabilities, DomainFailure> {
+        let platform = self.provider_platform()?;
+        SshTargetCapabilities::for_operating_system(&platform.operating_system)
+            .map_err(|_| DomainFailure::InvalidRequest)
     }
 }
 
@@ -401,6 +408,7 @@ pub struct ProductionSshTarget {
     port: u16,
     known_hosts: PathBuf,
     fingerprint: String,
+    capabilities: SshTargetCapabilities,
 }
 
 struct ProcessSshTransportFactory;
@@ -456,8 +464,13 @@ impl ProductionSshPlanExecutor {
     fn adapter(&self) -> Result<Vec<Box<dyn Adapter>>, DomainFailure> {
         let transport = self.factory.open(&self.target)?;
         Ok(vec![Box::new(
-            SshFileAdapter::open(self.target.root_id.clone(), &self.adapter_state, transport)
-                .map_err(|_| DomainFailure::OperationFailed)?,
+            SshFileAdapter::open_with_capabilities(
+                self.target.root_id.clone(),
+                &self.adapter_state,
+                transport,
+                self.target.capabilities,
+            )
+            .map_err(|_| DomainFailure::OperationFailed)?,
         )])
     }
 
@@ -480,8 +493,19 @@ impl ProductionSshPlanExecutor {
             .map_err(|_| DomainFailure::OperationFailed)?;
         let mut adapters = self.adapter()?;
         match self.receipts.load(run_id.clone()) {
-            Ok(receipt) if matches!(receipt.receipt().state, ReceiptState::Succeeded) => {
-                Ok(ReconcileOutcome::Succeeded)
+            Ok(receipt)
+                if matches!(
+                    receipt.receipt().state,
+                    ReceiptState::Succeeded | ReceiptState::ForwardRecovered
+                ) =>
+            {
+                Ok(
+                    if receipt.receipt().state == ReceiptState::ForwardRecovered {
+                        ReconcileOutcome::ForwardRecovered
+                    } else {
+                        ReconcileOutcome::Succeeded
+                    },
+                )
             }
             Ok(receipt)
                 if matches!(
@@ -515,15 +539,22 @@ impl PlanExecutor for ProductionSshPlanExecutor {
             .map_err(|_| DomainFailure::OperationFailed)
             .and_then(|_| self.execute_inner(plan, confirmation_id));
         match result {
-            Ok(ReconcileOutcome::Succeeded) => ExecutionResult {
-                status: ApplyStatus::Succeeded,
-                failure_code: None,
-            },
+            Ok(ReconcileOutcome::Succeeded | ReconcileOutcome::ForwardRecovered) => {
+                ExecutionResult {
+                    status: ApplyStatus::Succeeded,
+                    failure_code: None,
+                }
+            }
             Ok(ReconcileOutcome::RolledBack | ReconcileOutcome::Canceled) => ExecutionResult {
                 status: ApplyStatus::RolledBack,
                 failure_code: None,
             },
-            Ok(ReconcileOutcome::RollbackFailed) | Err(_) => ExecutionResult {
+            Ok(
+                ReconcileOutcome::RollbackFailed
+                | ReconcileOutcome::ForwardRecoveryRequired
+                | ReconcileOutcome::ForwardRecoveryFailed,
+            )
+            | Err(_) => ExecutionResult {
                 status: ApplyStatus::Failed,
                 failure_code: Some(StableId::parse("remote_execution_failed").expect("static ID")),
             },
@@ -579,17 +610,22 @@ impl ProductionDomainRegistry {
                     )
                     .map_err(|_| ProductionDomainError::UnsafeConfig)?,
                 ),
-                transport @ SyncTargetTransport::Ssh { .. } => Arc::new(
-                    ProductionSshPlanExecutor::with_factory(
-                        plan_store.clone(),
-                        receipt_root.as_ref(),
-                        config.adapter_state.clone(),
-                        production_ssh_target(transport)
-                            .map_err(|_| ProductionDomainError::UnsafeConfig)?,
-                        factory.clone(),
+                transport @ SyncTargetTransport::Ssh { .. } => {
+                    let capabilities = config
+                        .ssh_target_capabilities()
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+                    Arc::new(
+                        ProductionSshPlanExecutor::with_factory(
+                            plan_store.clone(),
+                            receipt_root.as_ref(),
+                            config.adapter_state.clone(),
+                            production_ssh_target(transport, capabilities)
+                                .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                            factory.clone(),
+                        )
+                        .map_err(|_| ProductionDomainError::UnsafeConfig)?,
                     )
-                    .map_err(|_| ProductionDomainError::UnsafeConfig)?,
-                ),
+                }
             };
             executors.insert(id.clone(), executor);
         }
@@ -780,31 +816,33 @@ impl ProductionDomainRegistry {
                 )
             }
         };
-        let ssh_execution =
-            config
-                .sync
-                .as_ref()
-                .and_then(|sync| match sync.target_transport.as_ref() {
-                    Some(SyncTargetTransport::Ssh {
-                        root_id,
-                        host,
-                        user,
-                        port,
-                        known_hosts,
-                        fingerprint,
-                    }) => Some((
-                        sync.adapter_state.clone(),
-                        ProductionSshTarget {
-                            root_id: root_id.clone(),
-                            host: host.clone(),
-                            user: user.clone(),
-                            port: *port,
-                            known_hosts: known_hosts.clone(),
-                            fingerprint: fingerprint.clone(),
-                        },
-                    )),
-                    _ => None,
-                });
+        let ssh_execution = match config.sync.as_ref() {
+            Some(sync) => match sync.target_transport.as_ref() {
+                Some(SyncTargetTransport::Ssh {
+                    root_id,
+                    host,
+                    user,
+                    port,
+                    known_hosts,
+                    fingerprint,
+                }) => Some((
+                    sync.adapter_state.clone(),
+                    ProductionSshTarget {
+                        root_id: root_id.clone(),
+                        host: host.clone(),
+                        user: user.clone(),
+                        port: *port,
+                        known_hosts: known_hosts.clone(),
+                        fingerprint: fingerprint.clone(),
+                        capabilities: sync
+                            .ssh_target_capabilities()
+                            .map_err(|_| ProductionDomainError::UnsafeConfig)?,
+                    },
+                )),
+                _ => None,
+            },
+            None => None,
+        };
         let composition = config
             .composition
             .map(
@@ -1412,7 +1450,10 @@ impl ProductionSyncDomain {
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
                 let filesystem = SshTargetFilesystem::new(
                     root_id.clone(),
-                    self.ssh_factory.open(&production_ssh_target(transport)?)?,
+                    self.ssh_factory.open(&production_ssh_target(
+                        transport,
+                        self.config.ssh_target_capabilities()?,
+                    )?)?,
                 );
                 EngramChunkAdapter::status_target(&filesystem, &declaration)
             }
@@ -1470,7 +1511,10 @@ impl ProductionSyncDomain {
                 Ok(ProductionEngramTarget::Ssh {
                     filesystem: SshTargetFilesystem::new(
                         root_id.clone(),
-                        self.ssh_factory.open(&production_ssh_target(transport)?)?,
+                        self.ssh_factory.open(&production_ssh_target(
+                            transport,
+                            config.ssh_target_capabilities()?,
+                        )?)?,
                     ),
                     project_id: engram.project_id.clone(),
                     project_root: engram.project_root.clone(),
@@ -1674,8 +1718,8 @@ impl ProductionSyncDomain {
                     state.resources.iter().any(|resource| {
                         resource.provenance.source.ends_with(&source_suffix)
                             && matches!(
-                                &resource.intent,
-                                FilesystemIntent::File { path, .. }
+                                resource.intent.filesystem(),
+                                Some(FilesystemIntent::File { path, .. })
                                     if path.as_str().ends_with(&suffix)
                             )
                     })
@@ -1999,7 +2043,8 @@ impl ProductionSyncDomain {
                             content,
                             mode: None,
                             expected_before: None,
-                        },
+                        }
+                        .into(),
                         provenance: ResourceProvenance {
                             provider_id: inputs.provider_id.clone(),
                             provider_version: inputs.provider_version.to_string(),
@@ -2129,9 +2174,12 @@ impl ProductionSyncDomain {
             DomainFailure::OperationFailed
         })?;
         let intents = || {
-            states
-                .iter()
-                .flat_map(|state| state.resources.iter().map(|resource| &resource.intent))
+            states.iter().flat_map(|state| {
+                state
+                    .resources
+                    .iter()
+                    .filter_map(|resource| resource.intent.filesystem())
+            })
         };
         let plan = match self
             .config
@@ -2153,7 +2201,8 @@ impl ProductionSyncDomain {
                 self.finish_plan(&states, &artifacts, &rules, observed, &mut files)?
             }
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
-                let target = production_ssh_target(transport)?;
+                let capabilities = self.config.ssh_target_capabilities()?;
+                let target = production_ssh_target(transport, capabilities)?;
                 let mut ssh = self.ssh_factory.open(&target)?;
                 for state in &states {
                     let suffix = &state.digest.as_str()[7..39];
@@ -2167,9 +2216,13 @@ impl ProductionSyncDomain {
                         )
                         .map_err(|_| DomainFailure::OperationFailed)?;
                 }
-                let mut files =
-                    SshFileAdapter::open(root_id.clone(), &self.config.adapter_state, ssh)
-                        .map_err(|_| DomainFailure::OperationFailed)?;
+                let mut files = SshFileAdapter::open_with_capabilities(
+                    root_id.clone(),
+                    &self.config.adapter_state,
+                    ssh,
+                    capabilities,
+                )
+                .map_err(|_| DomainFailure::OperationFailed)?;
                 let observed = files
                     .observed_state_digest(intents())
                     .map_err(|_| DomainFailure::OperationFailed)?;
@@ -2187,7 +2240,7 @@ impl ProductionSyncDomain {
         Ok(plan)
     }
 
-    fn finish_plan<P: ProviderResourcePlanner + ?Sized>(
+    fn finish_plan<P: ProviderResourcePlanner>(
         &self,
         states: &[MaterializedState],
         artifacts: &ArtifactStore,
@@ -2216,6 +2269,7 @@ impl ProductionSyncDomain {
 
 fn production_ssh_target(
     config: &SyncTargetTransport,
+    capabilities: SshTargetCapabilities,
 ) -> Result<ProductionSshTarget, DomainFailure> {
     let SyncTargetTransport::Ssh {
         root_id,
@@ -2235,6 +2289,7 @@ fn production_ssh_target(
         port: *port,
         known_hosts: known_hosts.clone(),
         fingerprint: fingerprint.clone(),
+        capabilities,
     })
 }
 
@@ -2420,7 +2475,7 @@ fn relay_authority_from_states(
     for state in &states {
         state.verify().map_err(|_| DomainFailure::OperationFailed)?;
         for resource in &state.resources {
-            if let FilesystemIntent::File { content, .. } = &resource.intent {
+            for content in resource.artifact_references() {
                 artifact_store
                     .load(content)
                     .map_err(|_| DomainFailure::OperationFailed)?;
@@ -2506,6 +2561,7 @@ impl VerifyRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RollbackRequest {
     run_id: StableId,
+    plan_id: Sha256Digest,
     confirmed: bool,
     confirmation_id: StableId,
     idempotency_key: Option<String>,
@@ -2709,7 +2765,7 @@ impl SyncDomain for ProductionSyncDomain {
         for state in &record.states {
             state.verify().map_err(|_| DomainFailure::OperationFailed)?;
             for resource in &state.resources {
-                if let FilesystemIntent::File { content, .. } = &resource.intent {
+                for content in resource.artifact_references() {
                     artifacts
                         .load(content)
                         .map_err(|_| DomainFailure::OperationFailed)?;
@@ -2751,7 +2807,7 @@ impl SyncDomain for ProductionSyncDomain {
         for state in &states {
             state.verify().map_err(|_| DomainFailure::OperationFailed)?;
             for resource in &state.resources {
-                if let FilesystemIntent::File { content, .. } = &resource.intent {
+                for content in resource.artifact_references() {
                     artifact_store
                         .load(content)
                         .map_err(|_| DomainFailure::OperationFailed)?;
@@ -2852,10 +2908,13 @@ impl SyncDomain for ProductionSyncDomain {
                 }
             }
             transport @ SyncTargetTransport::Ssh { root_id, .. } => {
-                let mut adapter = SshFileAdapter::open(
+                let capabilities = self.config.ssh_target_capabilities()?;
+                let mut adapter = SshFileAdapter::open_with_capabilities(
                     root_id.clone(),
                     &self.config.adapter_state,
-                    self.ssh_factory.open(&production_ssh_target(transport)?)?,
+                    self.ssh_factory
+                        .open(&production_ssh_target(transport, capabilities)?)?,
+                    capabilities,
                 )
                 .map_err(|_| DomainFailure::OperationFailed)?;
                 for operation in &plan.operations {
@@ -2880,15 +2939,18 @@ impl SyncDomain for ProductionSyncDomain {
             reference.idempotency_key,
         );
         let run_id = reference.run_id;
-        let receipts =
-            ReceiptStore::open(&self.receipt_root).map_err(|_| DomainFailure::OperationFailed)?;
-        let receipt = receipts
-            .load(run_id.clone())
-            .map_err(|_| DomainFailure::InvalidRequest)?;
         let plan = self
             .plan_store
-            .load(&receipt.receipt().plan_id)
-            .map_err(|_| DomainFailure::OperationFailed)?;
+            .load(&reference.plan_id)
+            .map_err(|_| DomainFailure::InvalidRequest)?;
+        if plan.operations.iter().any(|operation| {
+            operation.recovery_capability
+                == commonkit_contracts::RecoveryCapability::ConvergeForwardOnly
+        }) {
+            return Err(DomainFailure::RollbackUnsupported);
+        }
+        let receipts =
+            ReceiptStore::open(&self.receipt_root).map_err(|_| DomainFailure::OperationFailed)?;
         let mut adapters: Vec<Box<dyn Adapter>> = match self
             .config
             .target_transport
@@ -2899,18 +2961,32 @@ impl SyncDomain for ProductionSyncDomain {
                 FileAdapter::open(&self.config.target_root, &self.config.adapter_state)
                     .map_err(|_| DomainFailure::OperationFailed)?,
             )],
-            transport @ SyncTargetTransport::Ssh { root_id, .. } => vec![Box::new(
-                SshFileAdapter::open(
-                    root_id.clone(),
-                    &self.config.adapter_state,
-                    self.ssh_factory.open(&production_ssh_target(transport)?)?,
-                )
-                .map_err(|_| DomainFailure::OperationFailed)?,
-            )],
+            transport @ SyncTargetTransport::Ssh { root_id, .. } => {
+                let capabilities = self.config.ssh_target_capabilities()?;
+                vec![Box::new(
+                    SshFileAdapter::open_with_capabilities(
+                        root_id.clone(),
+                        &self.config.adapter_state,
+                        self.ssh_factory
+                            .open(&production_ssh_target(transport, capabilities)?)?,
+                        capabilities,
+                    )
+                    .map_err(|_| DomainFailure::OperationFailed)?,
+                )]
+            }
         };
         let outcome = Reconciler::with_store(&receipts)
             .rollback_succeeded_run(run_id.clone(), &plan, &mut adapters)
-            .map_err(|_| DomainFailure::OperationFailed)?;
+            .map_err(|error| match error {
+                commonkit_reconcile::ReconcileError::RollbackUnsupported => {
+                    DomainFailure::RollbackUnsupported
+                }
+                commonkit_reconcile::ReconcileError::Receipt(_)
+                | commonkit_reconcile::ReconcileError::ReceiptPlanMismatch => {
+                    DomainFailure::InvalidRequest
+                }
+                _ => DomainFailure::OperationFailed,
+            })?;
         Ok(serde_json::json!({"runId":run_id,"outcome":format!("{outcome:?}").to_lowercase()}))
     }
 }

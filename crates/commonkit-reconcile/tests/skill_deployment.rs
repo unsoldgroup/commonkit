@@ -37,6 +37,7 @@ fn operation() -> Operation {
         },
         risk: Risk::Medium,
         requires_confirmation: true,
+        recovery_capability: commonkit_contracts::RecoveryCapability::ExactRollback,
         depends_on: vec![],
         before_digest: Some(digest('1')),
         after_digest: Some(digest('2')),
@@ -82,6 +83,10 @@ impl Adapter for RecordingAdapter {
         ID.get_or_init(|| id("files"))
     }
 
+    fn supports_recovery(&self, capability: commonkit_contracts::RecoveryCapability) -> bool {
+        capability == commonkit_contracts::RecoveryCapability::ExactRollback
+    }
+
     fn prepare(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
         self.calls.push("prepare");
         Ok(())
@@ -109,6 +114,9 @@ impl Adapter for FailingRollbackAdapter {
         static ID: std::sync::OnceLock<StableId> = std::sync::OnceLock::new();
         ID.get_or_init(|| id("files"))
     }
+    fn supports_recovery(&self, capability: commonkit_contracts::RecoveryCapability) -> bool {
+        capability == commonkit_contracts::RecoveryCapability::ExactRollback
+    }
     fn prepare(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
         Ok(())
     }
@@ -128,6 +136,9 @@ impl Adapter for FailingVerifyAdapter {
     fn id(&self) -> &StableId {
         static ID: std::sync::OnceLock<StableId> = std::sync::OnceLock::new();
         ID.get_or_init(|| id("files"))
+    }
+    fn supports_recovery(&self, capability: commonkit_contracts::RecoveryCapability) -> bool {
+        capability == commonkit_contracts::RecoveryCapability::ExactRollback
     }
     fn prepare(&mut self, _: &Operation) -> Result<(), AdapterFailure> {
         Ok(())

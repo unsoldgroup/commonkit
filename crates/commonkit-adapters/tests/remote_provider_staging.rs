@@ -1,14 +1,30 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
 use commonkit_adapters::{
-    ArtifactStore, ContentSensitivity, DesiredStateProvider, ExactProviderVersion,
-    FilesystemIntent, MaterializedState, NormalizedManagedPath, NormalizedResource,
-    ProviderContext, ProviderFailure, ProviderInputs, ProviderWorkspace, RemoteProviderStager,
-    ResourceProvenance, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
-    TargetFilesystemError,
+    ArtifactEvidence, ArtifactStore, ContentSensitivity, DesiredStateProvider,
+    ExactProviderVersion, FilesystemIntent, ManagerBindingV1, MaterializedState,
+    NormalizedManagedPath, NormalizedResource, OfflineInstallRecipeV1, PackageArtifactV1,
+    PackageDesiredIntent, PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1,
+    PackageSourceRegistry, PackageTargetV1, ProviderContext, ProviderFailure, ProviderInputs,
+    ProviderWorkspace, RemoteProviderStager, ResolvedMaterializedState, ResolvedPackage,
+    ResolvedPackageIntent, ResourceProvenance, SourceBindingV1, SshFilesystemRequest,
+    SshFilesystemResponse, SshFilesystemTransport, TargetFilesystemError,
 };
-use commonkit_contracts::{Sha256Digest, StableId};
+use commonkit_contracts::{
+    PackageDeclaration, PackageManager, PackageSelector, SchemaVersion, SecurityPolicy,
+    Sha256Digest, StableId,
+};
+
+fn package_policy() -> SecurityPolicy {
+    SecurityPolicy {
+        allowlists: BTreeMap::from([(
+            StableId::parse("package_sources").unwrap(),
+            BTreeSet::from(["homebrew-core".into()]),
+        )]),
+        ..SecurityPolicy::default()
+    }
+}
 
 struct FixtureProvider {
     id: StableId,
@@ -44,12 +60,13 @@ impl DesiredStateProvider for FixtureProvider {
             .put(&self.content, self.sensitivity)
             .map_err(|error| ProviderFailure::Materialize(error.to_string()))?;
         let resource = NormalizedResource {
-            intent: FilesystemIntent::File {
+            intent: (FilesystemIntent::File {
                 path: NormalizedManagedPath::parse("home/.config/agent/settings.json").unwrap(),
                 content,
                 mode: None,
                 expected_before: None,
-            },
+            })
+            .into(),
             provenance: ResourceProvenance {
                 provider_id: self.id.clone(),
                 provider_version: "1.2.3".into(),
@@ -124,6 +141,210 @@ fn roots(name: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::Path
     (root, staging, artifacts)
 }
 
+fn resolved_package_state(store: &ArtifactStore) -> ResolvedMaterializedState {
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "provider.v2".into(),
+        BTreeMap::from([("policy".into(), digest('a'))]),
+        vec!["package".into()],
+    )
+    .unwrap();
+    let declaration = PackageDeclaration {
+        id: StableId::parse("ripgrep").unwrap(),
+        version: "14.1.1".into(),
+        manager: PackageManager::Homebrew,
+        source: StableId::parse("homebrew-core").unwrap(),
+        selector: Some(PackageSelector::HomebrewFormula {
+            name: "ripgrep".into(),
+        }),
+    };
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let source = SourceBindingV1 {
+        source_id: declaration.source.clone(),
+        registry_definition_digest: registry
+            .source_definition_digest(&declaration.source)
+            .unwrap(),
+        canonical_repository: "https://github.com/Homebrew/homebrew-core".into(),
+        repository_revision: Some("0123456789abcdef0123456789abcdef01234567".into()),
+        signed_metadata: vec![ArtifactEvidence {
+            authority: StableId::parse("homebrew").unwrap(),
+            metadata_digest: digest('2'),
+            signature_digest: digest('3'),
+        }],
+    };
+    let package_bytes = b"package";
+    let package_artifact = store
+        .put(package_bytes, ContentSensitivity::Portable)
+        .unwrap();
+    let resolution = PackageResolutionV1 {
+        schema_version: SchemaVersion(1),
+        declaration: declaration.clone(),
+        target: PackageTargetV1 {
+            os: "linux".into(),
+            os_version: "24.04".into(),
+            distro_id: Some("ubuntu".into()),
+            distro_version: Some("24.04".into()),
+            codename: Some("noble".into()),
+            arch: "x86_64".into(),
+            libc: Some("glibc".into()),
+            manager_prefix: Some("/home/linuxbrew/.linuxbrew".into()),
+        },
+        manager: ManagerBindingV1 {
+            manager: PackageManager::Homebrew,
+            version: "4.5.0".into(),
+            executable_digest: digest('e'),
+            config_digest: digest('f'),
+        },
+        source: source.clone(),
+        before: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        closure: vec![ResolvedPackage {
+            declaration: declaration.clone(),
+            source: source.clone(),
+        }],
+        artifacts: vec![PackageArtifactV1 {
+            role: StableId::parse("bottle").unwrap(),
+            content: package_artifact.clone(),
+            upstream_checksum: package_artifact.digest.clone(),
+            size: package_artifact.bytes,
+            materialization_key: StableId::parse("ripgrep-bottle").unwrap(),
+            source_metadata_digest: source.metadata_digest().unwrap(),
+        }],
+        recipe: OfflineInstallRecipeV1::HomebrewBottle {
+            artifact_roles: BTreeSet::from([StableId::parse("bottle").unwrap()]),
+        },
+    };
+    let resolution_reference = store
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    ResolvedMaterializedState::finalize(
+        inputs.clone(),
+        vec![NormalizedResource {
+            intent: ResolvedPackageIntent {
+                declaration,
+                resolution: resolution_reference,
+                artifacts: vec![package_artifact],
+            }
+            .into(),
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id,
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest,
+                source: "package:ripgrep".into(),
+            },
+        }],
+        vec![],
+        vec![],
+        vec![],
+    )
+    .unwrap()
+}
+
+#[test]
+fn resolved_remote_staging_rejects_stale_manager_before_remote_contact() {
+    let (root, _staging, artifacts) = roots("resolved-stale-manager");
+    let store = ArtifactStore::open(&artifacts).unwrap();
+    let state = resolved_package_state(&store);
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let target = PackageTargetV1 {
+        os: "linux".into(),
+        os_version: "24.04".into(),
+        distro_id: Some("ubuntu".into()),
+        distro_version: Some("24.04".into()),
+        codename: Some("noble".into()),
+        arch: "x86_64".into(),
+        libc: Some("glibc".into()),
+        manager_prefix: Some("/home/linuxbrew/.linuxbrew".into()),
+    };
+    let stale_manager = ManagerBindingV1 {
+        manager: PackageManager::Homebrew,
+        version: "4.5.1".into(),
+        executable_digest: digest('e'),
+        config_digest: digest('f'),
+    };
+    let authority =
+        PackageResolutionAuthority::new(&target, &stale_manager, &registry, &package_policy())
+            .unwrap();
+    let mut transport = RecordingTransport::default();
+    let error = RemoteProviderStager::new(&mut transport)
+        .stage_resolved_materialized(
+            &state,
+            &authority,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-stale-manager").unwrap(),
+        )
+        .expect_err("stale manager binding");
+
+    assert!(matches!(
+        error,
+        commonkit_adapters::RemoteProviderStagingError::PackageResolution(
+            commonkit_adapters::PackageResolutionError::ManagerBindingMismatch
+        )
+    ));
+    assert!(transport.requests.is_empty());
+
+    let current_manager = ManagerBindingV1 {
+        manager: PackageManager::Homebrew,
+        version: "4.5.0".into(),
+        executable_digest: digest('e'),
+        config_digest: digest('f'),
+    };
+    let removed_policy_authority = PackageResolutionAuthority::new(
+        &target,
+        &current_manager,
+        &registry,
+        &SecurityPolicy::default(),
+    )
+    .unwrap();
+    let mut transport = RecordingTransport::default();
+    let error = RemoteProviderStager::new(&mut transport)
+        .stage_resolved_materialized(
+            &state,
+            &removed_policy_authority,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-removed-policy").unwrap(),
+        )
+        .expect_err("removed source policy must fail before remote contact");
+    assert!(matches!(
+        error,
+        commonkit_adapters::RemoteProviderStagingError::PackageResolution(
+            commonkit_adapters::PackageResolutionError::PackageSourceNotAllowed { .. }
+        )
+    ));
+    assert!(transport.requests.is_empty());
+
+    let current_authority =
+        PackageResolutionAuthority::new(&target, &current_manager, &registry, &package_policy())
+            .unwrap();
+    assert_ne!(
+        removed_policy_authority.digest(),
+        current_authority.digest(),
+        "effective package-source policy must participate in authority binding"
+    );
+    let mut transport = RecordingTransport::default();
+    let receipt = RemoteProviderStager::new(&mut transport)
+        .stage_resolved_materialized(
+            &state,
+            &current_authority,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-current-authority").unwrap(),
+        )
+        .unwrap();
+    assert_eq!(
+        receipt.package_resolution_authority_digest,
+        Some(current_authority.digest().clone())
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn materializes_locally_then_stages_and_verifies_portable_artifacts_over_typed_ssh() {
     let (root, staging, artifacts) = roots("happy");
@@ -184,6 +405,129 @@ fn stages_pipeline_output_without_re_running_the_provider() {
     assert_eq!(receipt.materialized_state_digest, state.digest);
     assert_eq!(receipt.target_id.as_str(), "remote-linux");
     assert_eq!(transport.requests.len(), 2);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn provider_package_desire_cannot_stage_controller_owned_resolution_artifacts() {
+    let (root, _staging, artifacts) = roots("package-output");
+    let store = ArtifactStore::open(&artifacts).unwrap();
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "provider.v2".into(),
+        BTreeMap::from([("policy".into(), digest('a'))]),
+        vec!["package".into()],
+    )
+    .unwrap();
+    let state = MaterializedState::finalize(
+        inputs.clone(),
+        vec![NormalizedResource {
+            intent: PackageDesiredIntent::new(PackageDeclaration {
+                id: StableId::parse("ripgrep").unwrap(),
+                version: "14.1.1".into(),
+                manager: PackageManager::Homebrew,
+                source: StableId::parse("homebrew-core").unwrap(),
+                selector: None,
+            })
+            .unwrap()
+            .into(),
+            provenance: ResourceProvenance {
+                provider_id: inputs.provider_id,
+                provider_version: inputs.provider_version.to_string(),
+                input_digest: inputs.input_set_digest,
+                source: "package:ripgrep".into(),
+            },
+        }],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let mut transport = RecordingTransport::default();
+    let receipt = RemoteProviderStager::new(&mut transport)
+        .stage_materialized(
+            &state,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-package").unwrap(),
+        )
+        .unwrap();
+
+    assert!(receipt.artifact_digests.is_empty());
+    assert!(transport.requests.is_empty());
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn conflicting_metadata_for_one_digest_fails_before_remote_staging() {
+    let (root, _staging, artifacts) = roots("conflicting-reference-metadata");
+    let store = ArtifactStore::open(&artifacts).unwrap();
+    let inputs = ProviderInputs::new(
+        StableId::parse("native").unwrap(),
+        ExactProviderVersion::parse("1.0.0").unwrap(),
+        "provider.v2".into(),
+        BTreeMap::from([("policy".into(), digest('a'))]),
+        vec!["filesystem".into()],
+    )
+    .unwrap();
+    let resolution = store
+        .put(b"same digest", ContentSensitivity::Portable)
+        .unwrap();
+    let mut conflicting = resolution.clone();
+    conflicting.bytes += 1;
+    let state = MaterializedState::finalize(
+        inputs.clone(),
+        vec![
+            NormalizedResource {
+                intent: FilesystemIntent::File {
+                    path: NormalizedManagedPath::parse("home/first").unwrap(),
+                    content: resolution,
+                    mode: None,
+                    expected_before: None,
+                }
+                .into(),
+                provenance: ResourceProvenance {
+                    provider_id: inputs.provider_id.clone(),
+                    provider_version: inputs.provider_version.to_string(),
+                    input_digest: inputs.input_set_digest.clone(),
+                    source: "file:first".into(),
+                },
+            },
+            NormalizedResource {
+                intent: FilesystemIntent::File {
+                    path: NormalizedManagedPath::parse("home/second").unwrap(),
+                    content: conflicting,
+                    mode: None,
+                    expected_before: None,
+                }
+                .into(),
+                provenance: ResourceProvenance {
+                    provider_id: inputs.provider_id,
+                    provider_version: inputs.provider_version.to_string(),
+                    input_digest: inputs.input_set_digest,
+                    source: "file:second".into(),
+                },
+            },
+        ],
+        vec![],
+        vec![],
+    )
+    .unwrap();
+    let mut transport = RecordingTransport::default();
+    let error = RemoteProviderStager::new(&mut transport)
+        .stage_materialized(
+            &state,
+            &store,
+            StableId::parse("remote-linux").unwrap(),
+            StableId::parse("run-conflict").unwrap(),
+        )
+        .expect_err("conflicting metadata for one digest");
+
+    assert!(matches!(
+        error,
+        commonkit_adapters::RemoteProviderStagingError::ConflictingArtifactReference { .. }
+    ));
+    assert!(transport.requests.is_empty());
     fs::remove_dir_all(root).unwrap();
 }
 

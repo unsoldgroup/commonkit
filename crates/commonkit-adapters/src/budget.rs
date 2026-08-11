@@ -121,7 +121,8 @@ impl ContextBudgetLedger {
         limit: Option<u64>,
     ) -> Result<Self, BudgetError> {
         let content = resources.iter().filter_map(|resource| {
-            let FilesystemIntent::File { path, content, .. } = &resource.intent else {
+            let Some(FilesystemIntent::File { path, content, .. }) = resource.intent.filesystem()
+            else {
                 return None;
             };
             Some((path.as_str().to_string(), content.digest.clone()))
