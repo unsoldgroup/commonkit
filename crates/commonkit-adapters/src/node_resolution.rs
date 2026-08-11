@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -526,22 +527,7 @@ impl NodeRuntimeHost for ProcessNodeRuntimeHost {
                 ));
             }
         }
-        let environment = [
-            "NPM_CONFIG_PREFIX",
-            "PREFIX",
-            "NVM_NODEJS_ORG_MIRROR",
-            "NVM_IOJS_ORG_MIRROR",
-            "NVM_REINSTALL_PACKAGES_FROM",
-            "NVM_INSTALL_LATEST_NPM",
-        ]
-        .into_iter()
-        .filter_map(|variable| {
-            std::env::var(variable)
-                .ok()
-                .map(|value| (variable.into(), value))
-        })
-        .collect();
-        validate_nvm_environment(&environment)?;
+        validate_nvm_environment_os(&std::env::vars_os().collect())?;
         let shell = read_executable_no_follow(&self.shell_executable)?;
         let keyring = read_regular_no_follow(&self.release_keyring)?;
         let nvm_script_digest = host_content_digest(&nvm_script)?;
@@ -573,15 +559,39 @@ impl NodeRuntimeHost for ProcessNodeRuntimeHost {
 pub fn validate_nvm_environment(
     environment: &BTreeMap<String, String>,
 ) -> Result<(), NodeRuntimeHostError> {
-    for variable in [
-        "NPM_CONFIG_PREFIX",
-        "PREFIX",
-        "NVM_NODEJS_ORG_MIRROR",
-        "NVM_IOJS_ORG_MIRROR",
-        "NVM_REINSTALL_PACKAGES_FROM",
-        "NVM_INSTALL_LATEST_NPM",
-    ] {
-        if environment.contains_key(variable) {
+    validate_nvm_environment_os(
+        &environment
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)))
+            .collect(),
+    )
+}
+
+pub fn validate_nvm_environment_os(
+    environment: &BTreeMap<OsString, OsString>,
+) -> Result<(), NodeRuntimeHostError> {
+    for (key, value) in environment {
+        let variable = key.to_str().ok_or_else(|| {
+            NodeRuntimeHostError::UnsafeConfiguration(
+                "non-UTF-8 environment variable name is not allowed".into(),
+            )
+        })?;
+        if value.to_str().is_none() {
+            return Err(NodeRuntimeHostError::UnsafeConfiguration(format!(
+                "non-UTF-8 value for {variable} is not allowed"
+            )));
+        }
+        let canonical = variable.to_ascii_uppercase();
+        if canonical.starts_with("NPM_CONFIG_")
+            || matches!(
+                canonical.as_str(),
+                "PREFIX"
+                    | "NVM_NODEJS_ORG_MIRROR"
+                    | "NVM_IOJS_ORG_MIRROR"
+                    | "NVM_REINSTALL_PACKAGES_FROM"
+                    | "NVM_INSTALL_LATEST_NPM"
+            )
+        {
             return Err(NodeRuntimeHostError::UnsafeConfiguration(format!(
                 "{variable} is not allowed"
             )));

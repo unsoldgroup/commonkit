@@ -73,7 +73,7 @@ pub use node_resolution::{
     NodeReleaseSignatureError, NodeReleaseSignatureVerifier, NodeResolutionBackend,
     NodeRuntimeHost, NodeRuntimeHostError, NodeRuntimeHostSnapshotV1, NodeSignatureCommandSpecV1,
     ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, VerifiedNodeReleaseSignatureV1,
-    validate_nvm_environment,
+    validate_nvm_environment, validate_nvm_environment_os,
 };
 pub use package_resolution::{
     AptSourceAuthorityV1, ArtifactEvidence, COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS,
