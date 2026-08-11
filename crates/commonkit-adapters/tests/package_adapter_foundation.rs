@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use commonkit_adapters::{
     ArtifactStore, ContentSensitivity, ManagerBindingV1, OfflineInstallRecipeV1, PackageAdapter,
     PackageMutationBackend, PackageMutationError, PackageObservationV1, PackageResolutionAuthority,
-    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ResolvedPackage, SourceBindingV1,
+    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ProcessOfflinePackageBackend,
+    ResolvedPackage, SourceBindingV1,
 };
 use commonkit_contracts::{
     Operation, OperationKind, PackageDeclaration, PackageManager, PackageSelector,
@@ -348,6 +349,229 @@ fn apt_recovery_does_not_treat_ambiguous_observed_architectures_as_after() {
     assert_eq!(
         adapter.observe_recovery(&operation(resolution_ref.digest)),
         Ok(RecoveryObservation::Other)
+    );
+}
+
+#[test]
+fn apt_recovery_does_not_treat_malformed_before_identity_as_before() {
+    let (mut resolution, authority) = apt_resolution();
+    resolution.before = PackageObservationV1 {
+        installed_versions: BTreeSet::from(["ripgrep=14.1.1-1ubuntu1".into()]),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: resolution.before.clone(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Other)
+    );
+}
+
+#[test]
+fn apt_recovery_does_not_treat_duplicate_version_identities_as_before() {
+    let (mut resolution, authority) = apt_resolution();
+    resolution.before = PackageObservationV1 {
+        installed_versions: BTreeSet::from([
+            "ripgrep:amd64=14.1.1-1ubuntu1".into(),
+            "ripgrep:amd64=14.1.1-1ubuntu2".into(),
+        ]),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: resolution.before.clone(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Other)
+    );
+}
+
+#[test]
+fn apt_recovery_does_not_treat_foreign_before_identity_as_before() {
+    let (mut resolution, authority) = apt_resolution();
+    resolution.before = PackageObservationV1 {
+        installed_versions: BTreeSet::from(["ripgrep:arm64=14.1.1-1ubuntu1".into()]),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: resolution.before.clone(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Other)
+    );
+}
+
+#[test]
+fn apt_recovery_does_not_treat_all_native_ambiguity_as_before() {
+    let (mut resolution, authority) = apt_resolution();
+    resolution.before = PackageObservationV1 {
+        installed_versions: BTreeSet::from([
+            "ripgrep:all=14.1.1-1ubuntu1".into(),
+            "ripgrep:amd64=14.1.1-1ubuntu1".into(),
+        ]),
+    };
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: resolution.before.clone(),
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Other)
+    );
+}
+
+#[test]
+fn apt_recovery_does_not_treat_foreign_identity_as_after() {
+    let (resolution, authority) = apt_resolution();
+    let root = tempfile::tempdir().unwrap();
+    let artifacts = ArtifactStore::open(root.path()).unwrap();
+    let resolution_ref = artifacts
+        .put(
+            &serde_json::to_vec(&resolution).unwrap(),
+            ContentSensitivity::Portable,
+        )
+        .unwrap();
+    let backend = FakeMutationBackend {
+        manager: PackageManager::Apt,
+        target_supported: true,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from([
+                "ripgrep:amd64=14.1.1-1ubuntu1".into(),
+                "ripgrep:arm64=14.1.1-1ubuntu1".into(),
+            ]),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    };
+    let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
+
+    assert_eq!(
+        adapter.observe_recovery(&operation(resolution_ref.digest)),
+        Ok(RecoveryObservation::Other)
+    );
+}
+
+#[test]
+fn process_verify_rejects_missing_desired_state_instead_of_preparing_artifacts() {
+    let target_root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(target_root.path().join(".nvm")).unwrap();
+    std::fs::write(
+        target_root.path().join(".nvm/nvm.sh"),
+        "nvm() { return 0; }\n",
+    )
+    .unwrap();
+    let artifacts = ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    let resolution = PackageResolutionV1 {
+        schema_version: SchemaVersion(1),
+        declaration: PackageDeclaration {
+            id: StableId::parse("node").unwrap(),
+            version: "v22.1.0".into(),
+            manager: PackageManager::Nvm,
+            source: StableId::parse("nodejs").unwrap(),
+            selector: Some(PackageSelector::NodeRuntime {}),
+        },
+        target: PackageTargetV1 {
+            os: "macos".into(),
+            os_version: "14".into(),
+            distro_id: None,
+            distro_version: None,
+            codename: None,
+            arch: "aarch64".into(),
+            libc: None,
+            manager_prefix: None,
+        },
+        manager: ManagerBindingV1 {
+            manager: PackageManager::Nvm,
+            version: "0.39.7".into(),
+            executable_digest: digest('a'),
+            config_digest: digest('b'),
+        },
+        source: SourceBindingV1 {
+            source_id: StableId::parse("nodejs").unwrap(),
+            registry_definition_digest: digest('c'),
+            canonical_repository: "https://nodejs.org/dist".into(),
+            repository_revision: None,
+            signed_metadata: Vec::new(),
+        },
+        before: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        closure: vec![ResolvedPackage {
+            declaration: PackageDeclaration {
+                id: StableId::parse("node").unwrap(),
+                version: "v22.1.0".into(),
+                manager: PackageManager::Nvm,
+                source: StableId::parse("nodejs").unwrap(),
+                selector: Some(PackageSelector::NodeRuntime {}),
+            },
+            source: SourceBindingV1 {
+                source_id: StableId::parse("nodejs").unwrap(),
+                registry_definition_digest: digest('c'),
+                canonical_repository: "https://nodejs.org/dist".into(),
+                repository_revision: None,
+                signed_metadata: Vec::new(),
+            },
+        }],
+        artifacts: Vec::new(),
+        recipe: OfflineInstallRecipeV1::NodeArchive {
+            artifact_roles: BTreeSet::new(),
+            install: None,
+        },
+    };
+
+    let mut backend = ProcessOfflinePackageBackend::new(target_root.path());
+    assert_eq!(
+        backend.verify_offline(&resolution, &artifacts),
+        Err(PackageMutationError::Backend)
     );
 }
 

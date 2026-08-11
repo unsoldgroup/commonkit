@@ -233,7 +233,7 @@ impl PackageAdapter {
 
     fn after_resolution(resolution: &PackageResolutionV1, observed: &PackageObservationV1) -> bool {
         if resolution.manager.manager == PackageManager::Apt
-            && apt_observation_has_ambiguous_identity(observed, &resolution.target.arch)
+            && !valid_apt_observation(observed, &resolution.target.arch)
         {
             return false;
         }
@@ -425,6 +425,11 @@ impl Adapter for PackageAdapter {
         operation: &Operation,
     ) -> Result<RecoveryObservation, AdapterFailure> {
         let (resolution, observed) = self.observe_state(operation)?;
+        if resolution.manager.manager == PackageManager::Apt
+            && !valid_apt_observation(&observed, &resolution.target.arch)
+        {
+            return Ok(RecoveryObservation::Other);
+        }
         Ok(
             if observed.installed_versions == resolution.before.installed_versions {
                 RecoveryObservation::Before
@@ -552,29 +557,48 @@ fn valid_apt_resolution_identity(resolution: &PackageResolutionV1) -> bool {
     })
 }
 
-fn apt_observation_has_ambiguous_identity(
-    observed: &PackageObservationV1,
-    target_architecture: &str,
-) -> bool {
+fn valid_apt_observation(observed: &PackageObservationV1, target_architecture: &str) -> bool {
+    let mut identities = BTreeMap::<(String, String), String>::new();
     let mut name_versions = BTreeMap::<(String, String), BTreeSet<String>>::new();
     for identity in &observed.installed_versions {
-        let Some((name_architecture, version)) = identity.split_once('=') else {
-            continue;
+        let Some((name, architecture, version)) = parse_apt_observation_identity(identity) else {
+            return false;
         };
-        let Some((name, architecture)) = name_architecture.rsplit_once(':') else {
-            continue;
-        };
-        if name.is_empty() || architecture.is_empty() {
-            return true;
+        if architecture != "all" && architecture != target_architecture {
+            return false;
+        }
+        let key = (name.to_owned(), architecture.to_owned());
+        if identities
+            .insert(key, version.to_owned())
+            .is_some_and(|previous| previous != version)
+        {
+            return false;
         }
         name_versions
             .entry((name.to_owned(), version.to_owned()))
             .or_default()
             .insert(architecture.to_owned());
     }
-    name_versions.values().any(|architectures| {
+    !name_versions.values().any(|architectures| {
         architectures.contains("all") && architectures.contains(target_architecture)
     })
+}
+
+fn parse_apt_observation_identity(identity: &str) -> Option<(&str, &str, &str)> {
+    if identity.chars().any(char::is_whitespace) || identity.matches('=').count() != 1 {
+        return None;
+    }
+    let (name_architecture, version) = identity.split_once('=')?;
+    let (name, architecture) = name_architecture.split_once(':')?;
+    if name.is_empty()
+        || architecture.is_empty()
+        || version.is_empty()
+        || name.contains(':')
+        || architecture.contains(':')
+    {
+        return None;
+    }
+    Some((name, architecture, version))
 }
 
 fn runtime_authority(
@@ -762,21 +786,27 @@ impl ProcessOfflinePackageBackend {
         }
     }
 
-    fn observe_apt(&self) -> Result<PackageObservationV1, PackageMutationError> {
+    fn observe_apt(
+        &self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<PackageObservationV1, PackageMutationError> {
         let output = Command::new("/usr/bin/dpkg-query")
-            .args(["-W", "-f=${binary:Package}=${Version}\\n"])
+            .args(["-W", "-f=${Package}:${Architecture}=${Version}\\n"])
             .output()
             .map_err(|_| PackageMutationError::Backend)?;
         if !output.status.success() {
             return Err(PackageMutationError::Backend);
         }
-        Ok(PackageObservationV1 {
+        let observed = PackageObservationV1 {
             installed_versions: String::from_utf8_lossy(&output.stdout)
                 .lines()
                 .filter(|line| !line.is_empty())
                 .map(str::to_owned)
                 .collect(),
-        })
+        };
+        valid_apt_observation(&observed, &resolution.target.arch)
+            .then_some(observed)
+            .ok_or(PackageMutationError::Backend)
     }
 
     fn observe_nvm(&self) -> Result<PackageObservationV1, PackageMutationError> {
@@ -841,7 +871,7 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         resolution: &PackageResolutionV1,
     ) -> Result<PackageObservationV1, PackageMutationError> {
         match resolution.manager.manager {
-            PackageManager::Apt => self.observe_apt(),
+            PackageManager::Apt => self.observe_apt(resolution),
             PackageManager::Nvm => self.observe_nvm(),
             _ => Err(PackageMutationError::UnsupportedRecipe),
         }
@@ -942,13 +972,13 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
     fn verify_offline(
         &mut self,
         resolution: &PackageResolutionV1,
-        artifacts: &ArtifactStore,
+        _artifacts: &ArtifactStore,
     ) -> Result<(), PackageMutationError> {
         let observed = self.observe(resolution)?;
         if PackageAdapter::after_resolution(resolution, &observed) {
             Ok(())
         } else {
-            self.prepare_offline(resolution, artifacts)
+            Err(PackageMutationError::Backend)
         }
     }
 }

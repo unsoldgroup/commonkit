@@ -67,6 +67,7 @@ struct PackageAdapterStub {
     id: StableId,
     mutation_count: usize,
     forbid_observation: bool,
+    verify_failure: bool,
 }
 
 impl Adapter for PackageAdapterStub {
@@ -134,7 +135,14 @@ impl Adapter for PackageAdapterStub {
         Ok(())
     }
     fn verify(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
-        Ok(())
+        if self.verify_failure {
+            Err(AdapterFailure::new(
+                "package_verify_failed",
+                "backend output must not enter receipt evidence",
+            ))
+        } else {
+            Ok(())
+        }
     }
     fn rollback(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
         panic!("package mutation cannot exact rollback")
@@ -197,6 +205,7 @@ fn interrupted_package_recovery_accepts_v2_plan_bound_to_v3_receipt() {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
         forbid_observation: false,
+        verify_failure: false,
     })];
     let outcome = Reconciler::with_store(&store)
         .recover_run(run_id.clone(), &plan, &mut adapters)
@@ -263,6 +272,7 @@ fn package_recovery_repairs_forward_evidence_gap_without_target_or_provider_work
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
         forbid_observation: true,
+        verify_failure: false,
     })];
     let outcome = Reconciler::with_store(&store)
         .recover_run(run_id.clone(), &plan, &mut adapters)
@@ -348,6 +358,7 @@ fn package_recovery_repairs_forward_recovered_failed_evidence_gap_without_target
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
         forbid_observation: true,
+        verify_failure: false,
     })];
     let outcome = Reconciler::with_store(&store)
         .recover_run(run_id.clone(), &plan, &mut adapters)
@@ -386,6 +397,7 @@ fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
         id: StableId::parse("packages").unwrap(),
         mutation_count: 0,
         forbid_observation: false,
+        verify_failure: false,
     })];
     let before = std::fs::read_dir(&root).unwrap().count();
 
@@ -430,4 +442,59 @@ fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
         PackageExitClassification::Succeeded
     );
     assert_eq!(authorization.evidence[0].final_digest, Some(digest('f')));
+}
+
+#[test]
+fn package_verify_failure_records_only_sanitized_failed_evidence() {
+    let root = temporary_directory("package-verify-failure");
+    let store = ReceiptStore::open(&root).unwrap();
+    let plan = package_plan();
+    let operation = &plan.operations[0];
+    let mut authorization = package_authorization(operation);
+    authorization.operation_set_digest = package_operation_set_digest(
+        &plan,
+        &[PackageOperationConsentBinding {
+            operation_id: operation.id.clone(),
+            resolution_digest: operation.payload_digest.clone(),
+        }],
+    )
+    .unwrap();
+    let consent = PackageConsent {
+        confirmation_id: authorization.confirmation_id.clone(),
+        operation_set_digest: authorization.operation_set_digest.clone(),
+    };
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
+        id: StableId::parse("packages").unwrap(),
+        mutation_count: 0,
+        forbid_observation: false,
+        verify_failure: true,
+    })];
+
+    let outcome = Reconciler::with_store(&store)
+        .execute_with_package_consent(
+            &plan,
+            StableId::parse("verify-failure").unwrap(),
+            &consent,
+            &mut adapters,
+        )
+        .unwrap();
+
+    assert_eq!(outcome, ReconcileOutcome::ForwardRecoveryRequired);
+    let receipt = store
+        .load(StableId::parse("verify-failure").unwrap())
+        .unwrap();
+    let evidence = &receipt
+        .receipt()
+        .package_authorization
+        .as_ref()
+        .unwrap()
+        .evidence[0];
+    assert_eq!(
+        evidence.exit_classification,
+        PackageExitClassification::Failed {
+            code: StableId::parse("package_verify_failed").unwrap(),
+        }
+    );
+    assert_eq!(evidence.final_digest, None);
+    std::fs::remove_dir_all(root).unwrap();
 }
