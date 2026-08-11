@@ -54,17 +54,25 @@ fn manager() -> ManagerBindingV1 {
 }
 
 fn desired() -> commonkit_adapters::PackageDesiredIntent {
-    commonkit_adapters::PackageDesiredIntent::new(PackageDeclaration {
-        id: id("curl"),
-        version: "8.5.0-2ubuntu10.6".into(),
+    commonkit_adapters::PackageDesiredIntent::new(apt_declaration(
+        "curl",
+        "8.5.0-2ubuntu10.6",
+        "amd64",
+    ))
+    .unwrap()
+}
+
+fn apt_declaration(name: &str, version: &str, architecture: &str) -> PackageDeclaration {
+    PackageDeclaration {
+        id: id(name),
+        version: version.into(),
         manager: PackageManager::Apt,
         source: id("ubuntu-main"),
         selector: Some(PackageSelector::AptBinary {
-            name: "curl".into(),
-            architecture: Some("amd64".into()),
+            name: name.into(),
+            architecture: Some(architecture.into()),
         }),
-    })
-    .unwrap()
+    }
 }
 
 fn policy() -> SecurityPolicy {
@@ -159,6 +167,27 @@ fn archive(package_name: &str, version: &str, locator: &str, bytes: &[u8]) -> Ap
         immutable_locator: locator.into(),
         upstream_checksum: content_digest(bytes),
         size: bytes.len() as u64,
+    }
+}
+
+fn archive_for_architecture(
+    package_name: &str,
+    version: &str,
+    architecture: &str,
+    locator: &str,
+    bytes: &[u8],
+) -> AptResolvedArchiveV1 {
+    AptResolvedArchiveV1 {
+        architecture: architecture.into(),
+        ..archive(package_name, version, locator, bytes)
+    }
+}
+
+fn resolved_package(name: &str, version: &str, architecture: &str) -> AptResolvedPackageV1 {
+    AptResolvedPackageV1 {
+        name: name.into(),
+        version: version.into(),
+        architecture: architecture.into(),
     }
 }
 
@@ -699,4 +728,156 @@ fn apt_backend_resolves_authenticated_exact_closure_and_fetches_every_archive() 
         intent.load_and_validate(&target(), &manager(), &rekeyed_registry, &store),
         Err(PackageResolutionError::SourceBindingMismatch)
     ));
+}
+
+#[test]
+fn architecture_all_root_resolves_for_the_exact_target_architecture() {
+    let package_bytes = b"exact debian archive keyring deb";
+    let package_url = "https://archive.ubuntu.com/ubuntu/pool/main/d/debian-archive-keyring/debian-archive-keyring_2023.4ubuntu1_all.deb";
+    let declaration = apt_declaration("debian-archive-keyring", "2023.4ubuntu1", "amd64");
+    let desired = commonkit_adapters::PackageDesiredIntent::new(declaration.clone()).unwrap();
+    let all_archive = archive_for_architecture(
+        "debian-archive-keyring",
+        "2023.4ubuntu1",
+        "all",
+        package_url,
+        package_bytes,
+    );
+    let mut snapshot = apt_snapshot(package_bytes, b"unused");
+    snapshot.closure = vec![resolved_package(
+        "debian-archive-keyring",
+        "2023.4ubuntu1",
+        "all",
+    )];
+    snapshot.archives = vec![all_archive];
+    let mut backend = AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::from([(package_url.into(), package_bytes.to_vec())]),
+        calls: 0,
+    };
+    let registry = apt_registry();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+
+    let intent = PackageResolutionCoordinator::new(
+        &policy(),
+        &registry,
+        manager(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve(&desired, &target(), &store)
+    .unwrap();
+    let resolution = persisted(&intent, &store);
+
+    assert_eq!(resolution.declaration, declaration);
+    assert_eq!(resolution.closure[0].declaration, declaration);
+    assert_eq!(resolution.artifacts.len(), 1);
+    assert_eq!(
+        resolution.artifacts[0].role,
+        id("apt-archive-f7f93d44c2b54c00ebfc14ac")
+    );
+    assert_eq!(fetch.calls, 1);
+}
+
+#[test]
+fn foreign_architecture_does_not_satisfy_the_requested_root() {
+    let package_bytes = b"foreign archive";
+    let package_url = "https://archive.ubuntu.com/ubuntu/pool/main/d/debian-archive-keyring/debian-archive-keyring_2023.4ubuntu1_arm64.deb";
+    let declaration = apt_declaration("debian-archive-keyring", "2023.4ubuntu1", "amd64");
+    let desired = commonkit_adapters::PackageDesiredIntent::new(declaration).unwrap();
+    let foreign_archive = archive_for_architecture(
+        "debian-archive-keyring",
+        "2023.4ubuntu1",
+        "arm64",
+        package_url,
+        package_bytes,
+    );
+    let mut snapshot = apt_snapshot(package_bytes, b"unused");
+    snapshot.closure = vec![resolved_package(
+        "debian-archive-keyring",
+        "2023.4ubuntu1",
+        "arm64",
+    )];
+    snapshot.archives = vec![foreign_archive];
+    let mut backend = AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::from([(package_url.into(), package_bytes.to_vec())]),
+        calls: 0,
+    };
+    let registry = apt_registry();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+
+    let error = PackageResolutionCoordinator::new(
+        &policy(),
+        &registry,
+        manager(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve(&desired, &target(), &store)
+    .unwrap_err();
+
+    assert!(matches!(error, PackageResolutionError::MissingRootPackage));
+    assert_eq!(fetch.calls, 0);
+}
+
+#[test]
+fn native_and_all_architectures_for_one_package_version_are_ambiguous() {
+    let native_bytes = b"native archive";
+    let all_bytes = b"architecture all archive";
+    let native_url = "https://archive.ubuntu.com/ubuntu/pool/main/d/debian-archive-keyring/debian-archive-keyring_2023.4ubuntu1_amd64.deb";
+    let all_url = "https://archive.ubuntu.com/ubuntu/pool/main/d/debian-archive-keyring/debian-archive-keyring_2023.4ubuntu1_all.deb";
+    let declaration = apt_declaration("debian-archive-keyring", "2023.4ubuntu1", "amd64");
+    let desired = commonkit_adapters::PackageDesiredIntent::new(declaration).unwrap();
+    let all_archive = archive_for_architecture(
+        "debian-archive-keyring",
+        "2023.4ubuntu1",
+        "all",
+        all_url,
+        all_bytes,
+    );
+    let mut snapshot = apt_snapshot(native_bytes, all_bytes);
+    snapshot.closure = vec![
+        resolved_package("debian-archive-keyring", "2023.4ubuntu1", "amd64"),
+        resolved_package("debian-archive-keyring", "2023.4ubuntu1", "all"),
+    ];
+    snapshot.archives = vec![
+        archive_for_architecture(
+            "debian-archive-keyring",
+            "2023.4ubuntu1",
+            "amd64",
+            native_url,
+            native_bytes,
+        ),
+        all_archive,
+    ];
+    let mut backend = AptResolutionBackend::new(repository(), FixtureRunner { snapshot, calls: 0 });
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::from([
+            (native_url.into(), native_bytes.to_vec()),
+            (all_url.into(), all_bytes.to_vec()),
+        ]),
+        calls: 0,
+    };
+    let registry = apt_registry();
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+
+    let error = PackageResolutionCoordinator::new(
+        &policy(),
+        &registry,
+        manager(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve(&desired, &target(), &store)
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        PackageResolutionError::IncompleteAptClosure
+    ));
+    assert_eq!(fetch.calls, 0);
 }
