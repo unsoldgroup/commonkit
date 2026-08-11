@@ -321,6 +321,26 @@ One edge in the **Grant graph**: an owning scope lending one named capability
 to one grantee scope at one permission.
 _Avoid_: Share, invite, copy
 
+**Zone**:
+One of the small fixed set of wide areas every tracked issue is assigned to,
+owned by the work graph and never re-derived by a consumer (ADR 0023).
+_Avoid_: Theme, area, category, focus zone
+
+**Topic tag**:
+A fine-grained subject label the work graph assigns to an issue alongside its
+**Zone**; an issue carries several, and they are the working grain for grouping.
+_Avoid_: Theme, keyword, bucket, tag
+
+**Cluster**:
+A set of issues connected to each other by tracker relationships — parent,
+blocks, duplicate, related — as opposed to by subject.
+_Avoid_: Theme, group, component, epic
+
+**Bundle**:
+A batch of issues handed to one agent as a single unit of work, assembled from
+a **Cluster** or a **Topic tag** but identical to neither.
+_Avoid_: Theme, wave, batch, campaign
+
 ## Relationships
 
 - A **CommonKit** defines one or more **Loadouts**.
