@@ -1312,10 +1312,13 @@ fn resolve_apt_on_linux(
     }
     let live_status = std::str::from_utf8(&live_status_bytes)
         .map_err(|_| AptResolutionCommandError::InvalidOutput("dpkg status is not UTF-8".into()))?;
-    let installed = parse_complete_installed_state(live_status, &outputs[4])?;
-    for (index, command) in commands.iter().enumerate().skip(6) {
-        outputs[index] = run_fixed_command(command, workspace_text)?;
-    }
+    let query_output = outputs[4].clone();
+    let (installed, ()) = with_complete_installed_state(live_status, &query_output, |_| {
+        for (index, command) in commands.iter().enumerate().skip(6) {
+            outputs[index] = run_fixed_command(command, workspace_text)?;
+        }
+        Ok(())
+    })?;
 
     let metadata_bytes = load_single_inrelease(&workspace_path.join("lists"))?;
     let metadata_digest = content_digest(&metadata_bytes)?;
@@ -1364,6 +1367,7 @@ fn resolve_apt_on_linux(
             &live_status_digest,
             &installed,
             parse_simulated_packages(&live_safety_output)?,
+            parse_configured_packages(&live_safety_output)?,
             &risks,
         ),
     )
@@ -1703,10 +1707,12 @@ fn load_single_inrelease(lists: &std::path::Path) -> Result<Vec<u8>, AptResoluti
     fs::read(&matches[0]).map_err(|error| AptResolutionCommandError::Failed(error.to_string()))
 }
 
+type InstalledPackageState = BTreeMap<(String, String), String>;
+
 fn parse_complete_installed_state(
     status: &str,
     query: &str,
-) -> Result<BTreeMap<(String, String), String>, AptResolutionCommandError> {
+) -> Result<InstalledPackageState, AptResolutionCommandError> {
     let status_packages = parse_status_installed_packages(status)?;
     let query_packages = parse_query_installed_packages(query)?;
     if status_packages != query_packages {
@@ -1715,6 +1721,18 @@ fn parse_complete_installed_state(
         ));
     }
     Ok(status_packages)
+}
+
+fn with_complete_installed_state<T>(
+    status: &str,
+    query: &str,
+    continue_after_observation: impl FnOnce(
+        &InstalledPackageState,
+    ) -> Result<T, AptResolutionCommandError>,
+) -> Result<(InstalledPackageState, T), AptResolutionCommandError> {
+    let installed = parse_complete_installed_state(status, query)?;
+    let result = continue_after_observation(&installed)?;
+    Ok((installed, result))
 }
 
 fn parse_status_installed_packages(
@@ -1771,12 +1789,17 @@ fn parse_status_installed_packages(
                 "dpkg status contains an unknown package state".into(),
             ));
         }
-        if status_fields[2] != "installed" {
-            continue;
-        }
         if status_fields[1] != "ok" {
             return Err(AptResolutionCommandError::InvalidOutput(
-                "installed dpkg package is in an error state".into(),
+                "dpkg package is in an error state".into(),
+            ));
+        }
+        if matches!(status_fields[2], "not-installed" | "config-files") {
+            continue;
+        }
+        if status_fields[2] != "installed" {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "dpkg package is in a nonterminal state".into(),
             ));
         }
         let architecture = fields.get("Architecture").copied().ok_or_else(|| {
@@ -2130,7 +2153,9 @@ fn validate_live_safety_simulation(
             )
         })
         .collect::<BTreeSet<_>>();
-    if !parse_simulated_packages(simulation)?.is_subset(&intended) {
+    if !parse_simulated_packages(simulation)?.is_subset(&intended)
+        || !parse_configured_packages(simulation)?.is_subset(&intended)
+    {
         return Err(AptResolutionCommandError::InvalidOutput(
             "live APT safety simulation selected a package outside the pinned closure".into(),
         ));
@@ -2179,6 +2204,67 @@ fn parse_simulated_packages(
         }
     }
     Ok(simulated)
+}
+
+fn parse_configured_packages(
+    simulation: &str,
+) -> Result<BTreeSet<(String, String, String)>, AptResolutionCommandError> {
+    let mut configured = BTreeSet::new();
+    for line in simulation.lines().map(str::trim) {
+        let rest = match line.strip_prefix("Conf ") {
+            Some(rest) => rest,
+            None if line.split_whitespace().next() == Some("Conf") => {
+                return Err(AptResolutionCommandError::InvalidOutput(
+                    "malformed APT configure action".into(),
+                ));
+            }
+            None => continue,
+        };
+        let (name_with_arch, after_name) = rest.split_once(' ').ok_or_else(|| {
+            AptResolutionCommandError::InvalidOutput("malformed APT configure action".into())
+        })?;
+        let version = after_name
+            .strip_prefix('(')
+            .and_then(|value| value.split_whitespace().next())
+            .ok_or_else(|| {
+                AptResolutionCommandError::InvalidOutput(
+                    "malformed APT configure action version".into(),
+                )
+            })?;
+        let listed_architecture = after_name
+            .rsplit_once('[')
+            .and_then(|(_, value)| value.strip_suffix("])"))
+            .or_else(|| {
+                after_name
+                    .rsplit_once('[')
+                    .and_then(|(_, value)| value.strip_suffix(']'))
+            });
+        let (name, qualified_architecture) = name_with_arch
+            .split_once(':')
+            .map_or((name_with_arch, None), |(name, arch)| (name, Some(arch)));
+        let architecture = listed_architecture
+            .or(qualified_architecture)
+            .ok_or_else(|| {
+                AptResolutionCommandError::InvalidOutput(
+                    "APT configure action did not bind a package architecture".into(),
+                )
+            })?;
+        if qualified_architecture.is_some_and(|qualified| qualified != architecture)
+            || !safe_apt_token(name)
+            || !safe_apt_token(architecture)
+            || !safe_apt_version(version)
+        {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "malformed APT configure action identity".into(),
+            ));
+        }
+        if !configured.insert((name.to_owned(), architecture.to_owned(), version.to_owned())) {
+            return Err(AptResolutionCommandError::InvalidOutput(
+                "APT simulation returned a duplicate configure action".into(),
+            ));
+        }
+    }
+    Ok(configured)
 }
 
 #[cfg(test)]
@@ -2331,6 +2417,33 @@ mod tests {
     }
 
     #[test]
+    fn nonterminal_dpkg_state_stops_before_network_continuation() {
+        let query = "base-files:amd64\tii \t1.0-1\tamd64\n";
+        for package_status in [
+            "install ok unpacked",
+            "install ok half-configured",
+            "install ok triggers-awaited",
+            "install ok triggers-pending",
+            "install reinstreq installed",
+        ] {
+            let status = format!(
+                "Package: base-files\nStatus: install ok installed\nArchitecture: amd64\nVersion: 1.0-1\n\nPackage: broken\nStatus: {package_status}\nArchitecture: amd64\nVersion: 2.0-1\n"
+            );
+            let mut network_calls = 0;
+
+            assert!(
+                with_complete_installed_state(&status, query, |_| {
+                    network_calls += 1;
+                    Ok(())
+                })
+                .is_err(),
+                "{package_status}"
+            );
+            assert_eq!(network_calls, 0, "{package_status}");
+        }
+    }
+
+    #[test]
     fn live_safety_simulation_rejects_reverse_conflict_side_effects() {
         let closure = vec![AptResolvedPackageV1 {
             name: "curl".into(),
@@ -2347,6 +2460,30 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn live_safety_simulation_binds_every_conf_action_to_the_pinned_closure() {
+        let closure = vec![AptResolvedPackageV1 {
+            name: "curl".into(),
+            version: "8.5.0-2ubuntu10.6".into(),
+            architecture: "amd64".into(),
+        }];
+        let exact = "Conf curl (8.5.0-2ubuntu10.6 Ubuntu:24.04/noble [amd64])\n";
+
+        validate_live_safety_simulation(exact, &closure).unwrap();
+        for unsafe_output in [
+            "Conf unrelated (1.0-1 Ubuntu:24.04/noble [amd64])\n",
+            "Conf curl (9.0-1 Ubuntu:24.04/noble [amd64])\n",
+            &format!("{exact}{exact}"),
+            "Conf curl malformed\n",
+            "Conf\n",
+        ] {
+            assert!(
+                validate_live_safety_simulation(unsafe_output, &closure).is_err(),
+                "{unsafe_output}"
+            );
+        }
     }
 
     #[test]
