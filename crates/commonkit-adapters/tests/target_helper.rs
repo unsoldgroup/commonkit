@@ -4,12 +4,12 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use commonkit_adapters::{
-    AptRepositoryConfigurationV1, AptSourceAuthorityV1, FileMode, ManagerBindingV1,
-    NormalizedManagedPath, PackageArtifactV1, PackageDesiredIntent, PackageMutationArtifact,
-    PackageMutationPhase, PackageObservationV1, PackageResolutionV1, PackageSourceRegistry,
-    PackageTargetV1, ResolvedPackage, SafeSymlinkTarget, SourceBindingV1, SshFilesystemRequest,
-    SshFilesystemResponse, SymlinkTargetKind, TargetHelper, TargetPackageResolutionConfig,
-    TargetResource, package_resolution_request_digest,
+    FileMode, NodeRuntimeHost, NormalizedManagedPath, PackageArtifactV1, PackageDesiredIntent,
+    PackageMutationArtifact, PackageMutationPhase, PackageResolutionV1, PackageSourceRegistry,
+    PackageTargetV1, ProcessNodeRuntimeHost, ResolvedPackage, SafeSymlinkTarget, SourceBindingV1,
+    SshFilesystemRequest, SshFilesystemResponse, SymlinkTargetKind, TargetHelper,
+    TargetNodeResolutionConfig, TargetPackageResolutionConfig, TargetResource,
+    package_resolution_request_digest,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, digest_domain_json,
@@ -84,28 +84,45 @@ fn helper_subprocess_applies_only_typed_requests_inside_configured_roots() {
 fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
     let root = temp("package-authority-root");
     let state = temp("package-authority-state");
-    let keyring = temp("package-authority-keyring");
     fs::create_dir_all(&root).unwrap();
     fs::create_dir_all(&state).unwrap();
-    fs::write(&keyring, b"trusted apt signing key").unwrap();
-
+    let root = fs::canonicalize(root).unwrap();
+    let nvm = root.join(".nvm");
+    fs::create_dir_all(&nvm).unwrap();
+    fs::write(
+        nvm.join("nvm.sh"),
+        include_bytes!("fixtures/node/nvm-v0.40.6.sh"),
+    )
+    .unwrap();
+    fs::create_dir_all(nvm.join("versions/node/v20.0.0")).unwrap();
+    let shell = std::path::PathBuf::from("/bin/bash");
+    let keyring = root.join("node-release-keyring.kbx");
+    let gpgv = root.join("gpgv");
+    fs::write(&keyring, b"fixture node release keyring").unwrap();
+    fs::copy(&shell, &gpgv).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gpgv, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let target = PackageTargetV1 {
         os: "linux".into(),
         os_version: "24.04".into(),
         distro_id: Some("ubuntu".into()),
         distro_version: Some("24.04".into()),
         codename: Some("noble".into()),
-        arch: "amd64".into(),
+        arch: "x86_64".into(),
         libc: Some("glibc".into()),
-        manager_prefix: None,
+        manager_prefix: Some(nvm.to_string_lossy().into_owned()),
     };
-    let manager = ManagerBindingV1 {
-        manager: PackageManager::Apt,
-        version: "2.7.14".into(),
-        executable_digest: Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap(),
-        config_digest: Sha256Digest::parse(format!("sha256:{}", "b".repeat(64))).unwrap(),
-    };
-    let source_id = StableId::parse("ubuntu-main").unwrap();
+    let mut host = ProcessNodeRuntimeHost::new_with_gpgv(
+        nvm.clone(),
+        shell.clone(),
+        keyring.clone(),
+        gpgv.clone(),
+    );
+    let snapshot = host.probe(&target).unwrap();
+    let manager = snapshot.manager.clone();
+    let source_id = StableId::parse("nodejs-nvm").unwrap();
     let policy = SecurityPolicy {
         allowlists: [(
             StableId::parse("package_sources").unwrap(),
@@ -119,65 +136,62 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
         target: target.clone(),
         manager: manager.clone(),
         policy: policy.clone(),
-        apt: Some(AptRepositoryConfigurationV1 {
-            source_id: source_id.clone(),
-            suite: "noble".into(),
-            components: ["main".into()].into_iter().collect(),
-            signed_by: keyring.clone(),
-            signing_authority: StableId::parse("ubuntu-archive").unwrap(),
+        apt: None,
+        node: Some(TargetNodeResolutionConfig {
+            nvm_dir: nvm.clone(),
+            shell_executable: shell,
+            release_keyring: keyring.clone(),
+            gpgv_executable: gpgv,
+            gpgv_executable_digest: snapshot.gpgv_executable_digest.clone(),
         }),
-        node: None,
         target_identity_digest: Sha256Digest::parse(format!("sha256:{}", "c".repeat(64))).unwrap(),
     };
     let registry = PackageSourceRegistry::builtin()
         .unwrap()
-        .with_apt_source_authority(
-            &source_id,
-            AptSourceAuthorityV1 {
-                suite: "noble".into(),
-                components: ["main".into()].into_iter().collect(),
-                signing_authority: StableId::parse("ubuntu-archive").unwrap(),
-                signing_key_digest: Sha256Digest::parse(format!(
-                    "sha256:{:x}",
-                    Sha256::digest(b"trusted apt signing key")
-                ))
-                .unwrap(),
-            },
-        )
+        .with_commonkit_node_release_authority(&source_id)
         .unwrap();
     let source = SourceBindingV1 {
         source_id: source_id.clone(),
         registry_definition_digest: registry.source_definition_digest(&source_id).unwrap(),
-        canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+        canonical_repository: "https://nodejs.org/dist".into(),
         repository_revision: Some("0123456789abcdef".repeat(4)),
         signed_metadata: Vec::new(),
     };
     let declaration = PackageDeclaration {
-        id: StableId::parse("ripgrep").unwrap(),
-        version: "14.1.1-1ubuntu1".into(),
-        manager: PackageManager::Apt,
+        id: StableId::parse("node").unwrap(),
+        version: "20.0.0".into(),
+        manager: PackageManager::Nvm,
         source: source_id,
-        selector: Some(PackageSelector::AptBinary {
-            name: "ripgrep".into(),
-            architecture: Some("amd64".into()),
-        }),
+        selector: Some(PackageSelector::NodeRuntime {}),
     };
     let resolution = PackageResolutionV1 {
-        schema_version: commonkit_contracts::SchemaVersion(1),
+        schema_version: commonkit_contracts::SchemaVersion(2),
         declaration: declaration.clone(),
         target,
-        manager,
+        manager: manager.clone(),
         source: source.clone(),
-        before: PackageObservationV1 {
-            installed_versions: BTreeSet::new(),
-        },
+        before: snapshot.before.clone(),
         closure: vec![ResolvedPackage {
             declaration,
             source,
         }],
         artifacts: Vec::new(),
-        recipe: commonkit_adapters::OfflineInstallRecipeV1::AptArchives {
+        recipe: commonkit_adapters::OfflineInstallRecipeV1::NodeArchive {
             artifact_roles: BTreeSet::new(),
+            install: Some(commonkit_adapters::NodeOfflineInstallRecipeV1 {
+                node_version: "20.0.0".into(),
+                archive_file_name: "node-v20.0.0-linux-x64.tar.xz".into(),
+                cache_relative_path:
+                    ".cache/bin/node-v20.0.0-linux-x64/node-v20.0.0-linux-x64.tar.xz".into(),
+                nvm_version: manager.version.clone(),
+                nvm_script_digest: snapshot.nvm_script_digest.clone(),
+                shell_executable_digest: snapshot.shell_executable_digest.clone(),
+                offline: true,
+                no_source_fallback: true,
+                per_version_lock: true,
+                install_latest_npm: false,
+                migrate_packages: false,
+            }),
         },
     };
     let direct_authority = commonkit_adapters::PackageResolutionAuthority::new(
@@ -188,6 +202,7 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
     )
     .unwrap();
     direct_authority.validate_resolution(&resolution).unwrap();
+    let target_identity_digest = config.target_identity_digest.clone();
     let helper = TargetHelper::open_with_package_resolution(
         vec![TargetRoot {
             id: StableId::parse("home").unwrap(),
@@ -198,21 +213,28 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
         Some(config),
     )
     .unwrap();
-    let request =
-        |resolution: PackageResolutionV1, artifacts| SshFilesystemRequest::PackageMutation {
+    let request = |resolution: PackageResolutionV1, artifacts, target_identity_digest| {
+        SshFilesystemRequest::PackageMutation {
             root_id: StableId::parse("home").unwrap(),
             phase: PackageMutationPhase::Observe,
             resolution,
             artifacts,
-        };
-    let accepted = helper.dispatch(request(resolution.clone(), Vec::new()));
+            target_identity_digest,
+        }
+    };
+    let accepted = helper.dispatch(request(
+        resolution.clone(),
+        Vec::new(),
+        Some(target_identity_digest.clone()),
+    ));
     assert!(
-        !matches!(
-            accepted,
-            Err(commonkit_adapters::TargetFilesystemError::PackageResolutionRejected)
-                | Err(commonkit_adapters::TargetFilesystemError::RemoteArtifact)
+        matches!(
+        accepted,
+        Ok(SshFilesystemResponse::PackageObserved {
+            ref installed_versions,
+        }) if *installed_versions == snapshot.before.installed_versions
         ),
-        "valid package mutation was rejected: {accepted:?}"
+        "valid package observation failed: {accepted:?}"
     );
 
     let mut observed_resolution = resolution.clone();
@@ -221,33 +243,65 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
         bytes: 1,
         sensitivity: commonkit_adapters::ContentSensitivity::Portable,
     };
-    let artifact_role = StableId::parse("apt-archive-ripgrep").unwrap();
+    let artifact_role = StableId::parse("node-archive").unwrap();
     observed_resolution.artifacts = vec![PackageArtifactV1 {
         role: artifact_role.clone(),
         content: observed_reference.clone(),
         upstream_checksum: observed_reference.digest.clone(),
         size: observed_reference.bytes,
-        materialization_key: StableId::parse("ripgrep-deb").unwrap(),
+        materialization_key: StableId::parse("node-archive").unwrap(),
         source_metadata_digest: observed_resolution.source.metadata_digest().unwrap(),
     }];
-    observed_resolution.recipe = commonkit_adapters::OfflineInstallRecipeV1::AptArchives {
+    observed_resolution.recipe = commonkit_adapters::OfflineInstallRecipeV1::NodeArchive {
         artifact_roles: [artifact_role].into_iter().collect(),
+        install: Some(commonkit_adapters::NodeOfflineInstallRecipeV1 {
+            node_version: "20.0.0".into(),
+            archive_file_name: "node-v20.0.0-linux-x64.tar.xz".into(),
+            cache_relative_path: ".cache/bin/node-v20.0.0-linux-x64/node-v20.0.0-linux-x64.tar.xz"
+                .into(),
+            nvm_version: manager.version.clone(),
+            nvm_script_digest: snapshot.nvm_script_digest.clone(),
+            shell_executable_digest: snapshot.shell_executable_digest.clone(),
+            offline: true,
+            no_source_fallback: true,
+            per_version_lock: true,
+            install_latest_npm: false,
+            migrate_packages: false,
+        }),
     };
-    let observed = helper.dispatch(request(observed_resolution, Vec::new()));
+    let observed = helper.dispatch(request(
+        observed_resolution,
+        Vec::new(),
+        Some(target_identity_digest.clone()),
+    ));
     assert!(
-        !matches!(
-            observed,
-            Err(commonkit_adapters::TargetFilesystemError::PackageResolutionRejected)
-                | Err(commonkit_adapters::TargetFilesystemError::RemoteArtifact)
+        matches!(
+        observed,
+        Ok(SshFilesystemResponse::PackageObserved {
+            ref installed_versions,
+        }) if *installed_versions == snapshot.before.installed_versions
         ),
-        "observe with persisted artifacts was rejected: {observed:?}"
+        "observe with persisted artifacts failed: {observed:?}"
     );
 
     let mut altered = resolution.clone();
     altered.source.registry_definition_digest =
         Sha256Digest::parse(format!("sha256:{}", "d".repeat(64))).unwrap();
     assert!(matches!(
-        helper.dispatch(request(altered, Vec::new())),
+        helper.dispatch(request(
+            altered,
+            Vec::new(),
+            Some(target_identity_digest.clone()),
+        )),
+        Err(commonkit_adapters::TargetFilesystemError::PackageResolutionRejected)
+    ));
+
+    assert!(matches!(
+        helper.dispatch(request(
+            resolution.clone(),
+            Vec::new(),
+            Some(Sha256Digest::parse(format!("sha256:{}", "f".repeat(64))).unwrap()),
+        )),
         Err(commonkit_adapters::TargetFilesystemError::PackageResolutionRejected)
     ));
 
@@ -259,13 +313,16 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
         },
     };
     assert!(matches!(
-        helper.dispatch(request(resolution, vec![forged_artifact])),
+        helper.dispatch(request(
+            resolution,
+            vec![forged_artifact],
+            Some(target_identity_digest),
+        )),
         Err(commonkit_adapters::TargetFilesystemError::RemoteArtifact)
     ));
 
     let _ = fs::remove_dir_all(root);
     let _ = fs::remove_dir_all(state);
-    let _ = fs::remove_file(keyring);
 }
 
 #[cfg(unix)]
