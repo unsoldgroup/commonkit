@@ -396,6 +396,7 @@ impl PlanStore {
         }
         set_private_directory(&root)?;
         let (root_handle, root_sync) = open_plan_root(&root)?;
+        let root = root.canonicalize()?;
         Ok(Self {
             root,
             root_handle,
@@ -410,7 +411,7 @@ impl PlanStore {
         let destination = self.path(&plan.id);
         match self.root_handle.symlink_metadata(&destination) {
             Ok(_) => {
-                return if read_plan_bytes(&self.root_handle, &destination)? == bytes {
+                return if read_plan_bytes(&self.root_handle, &destination, &self.root)? == bytes {
                     Ok(())
                 } else {
                     Err(PlanStoreError::PlanConflict)
@@ -443,7 +444,7 @@ impl PlanStore {
             {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if read_plan_bytes(&self.root_handle, &destination)? != bytes {
+                    if read_plan_bytes(&self.root_handle, &destination, &self.root)? != bytes {
                         return Err(PlanStoreError::PlanConflict);
                     }
                 }
@@ -462,7 +463,7 @@ impl PlanStore {
 
     pub fn load(&self, id: &Sha256Digest) -> Result<Plan, PlanStoreError> {
         self.ensure_root()?;
-        let bytes = read_plan_bytes(&self.root_handle, &self.path(id))?;
+        let bytes = read_plan_bytes(&self.root_handle, &self.path(id), &self.root)?;
         let plan: Plan = serde_json::from_slice(&bytes)?;
         if &plan.id != id || validate_plan(&plan).is_err() {
             return Err(PlanStoreError::InvalidPlan);
@@ -550,7 +551,7 @@ impl PlanStore {
                 has_invalid_candidate = true;
                 continue;
             }
-            let (bytes, modified) = read_plan_file(&self.root_handle, Path::new(name))?;
+            let (bytes, modified) = read_plan_file(&self.root_handle, Path::new(name), &self.root)?;
             let plan: Plan = match serde_json::from_slice(&bytes) {
                 Ok(plan) => plan,
                 Err(_) => {
@@ -650,10 +651,12 @@ fn open_plan_root(path: &Path) -> Result<(Dir, std::fs::File), PlanStoreError> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
         const FILE_SHARE_READ: u32 = 0x0000_0001;
         const FILE_SHARE_WRITE: u32 = 0x0000_0002;
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.access_mode(GENERIC_READ | GENERIC_WRITE);
         options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
         options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
     }
@@ -672,26 +675,45 @@ fn open_plan_root(path: &Path) -> Result<(Dir, std::fs::File), PlanStoreError> {
     Ok((Dir::from_std_file(file), root_sync))
 }
 
-fn read_plan_bytes(directory: &Dir, name: &Path) -> Result<Vec<u8>, PlanStoreError> {
-    let (bytes, _) = read_plan_file(directory, name)?;
+fn read_plan_bytes(
+    directory: &Dir,
+    name: &Path,
+    root_path: &Path,
+) -> Result<Vec<u8>, PlanStoreError> {
+    let (bytes, _) = read_plan_file(directory, name, root_path)?;
     Ok(bytes)
 }
 
 fn read_plan_file(
     directory: &Dir,
     name: &Path,
+    root_path: &Path,
 ) -> Result<(Vec<u8>, std::time::SystemTime), PlanStoreError> {
-    let (mut file, metadata) = open_plan_file(directory, name)?;
+    let (mut file, metadata) = open_plan_file(directory, name, root_path)?;
     let modified = metadata
         .modified()
         .map(|time| time.into_std())
         .unwrap_or(std::time::UNIX_EPOCH);
+    #[cfg(windows)]
+    let opened_identity = windows_cap_file_identity(&file)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    let current = directory.symlink_metadata(name)?;
-    if current.file_type().is_symlink() || !current.is_file() || !same_cap_file(&metadata, &current)
+    #[cfg(windows)]
     {
-        return Err(PlanStoreError::InvalidPlan);
+        let (current_file, _) = open_plan_file(directory, name, root_path)?;
+        if opened_identity != windows_cap_file_identity(&current_file)? {
+            return Err(PlanStoreError::InvalidPlan);
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let current = directory.symlink_metadata(name)?;
+        if current.file_type().is_symlink()
+            || !current.is_file()
+            || !same_cap_file(&metadata, &current)
+        {
+            return Err(PlanStoreError::InvalidPlan);
+        }
     }
     Ok((bytes, modified))
 }
@@ -730,31 +752,92 @@ fn open_plan_file_from_path(
 fn open_plan_file(
     directory: &Dir,
     name: &Path,
+    root_path: &Path,
 ) -> Result<(cap_std::fs::File, cap_std::fs::Metadata), PlanStoreError> {
-    let mut options = CapOpenOptions::new();
-    options.read(true);
     #[cfg(unix)]
     {
-        use cap_std::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let _ = root_path;
+        let root = directory.try_clone()?.into_std_file();
+        let file = rustix::fs::openat(
+            &root,
+            name,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(std::fs::File::from)
+        .map_err(|error| {
+            let error: std::io::Error = error.into();
+            if no_follow_open_error(&error) {
+                PlanStoreError::UnsafeEntry
+            } else {
+                error.into()
+            }
+        })?;
+        let file = cap_std::fs::File::from_std(file);
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || cap_metadata_is_reparse_point(&metadata) {
+            return Err(PlanStoreError::UnsafeEntry);
+        }
+        Ok((file, metadata))
     }
     #[cfg(windows)]
     {
-        use cap_std::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        open_plan_file_windows(directory, name, root_path)
     }
-    let file = directory.open_with(name, &options).map_err(|error| {
-        if no_follow_open_error(&error) {
-            PlanStoreError::UnsafeEntry
-        } else {
-            error.into()
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut options = CapOpenOptions::new();
+        options.read(true);
+        let file = directory.open_with(name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || cap_metadata_is_reparse_point(&metadata) {
+            return Err(PlanStoreError::UnsafeEntry);
         }
-    })?;
+        Ok((file, metadata))
+    }
+}
+
+#[cfg(windows)]
+fn open_plan_file_windows(
+    directory: &Dir,
+    name: &Path,
+    root_path: &Path,
+) -> Result<(cap_std::fs::File, cap_std::fs::Metadata), PlanStoreError> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+
+    let path = root_path.join(name);
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is NUL-terminated and remains alive for the call. The
+    // returned handle is owned and converted immediately when valid.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: `handle` is a valid owned handle from CreateFileW.
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let file = cap_std::fs::File::from_std(file);
     let metadata = file.metadata()?;
     if !metadata.is_file() || cap_metadata_is_reparse_point(&metadata) {
         return Err(PlanStoreError::UnsafeEntry);
     }
+    let _ = directory;
     Ok((file, metadata))
 }
 
@@ -780,6 +863,12 @@ fn same_cap_file(opened: &cap_std::fs::Metadata, current: &cap_std::fs::Metadata
     {
         opened.len() == current.len() && opened.modified().ok() == current.modified().ok()
     }
+}
+
+#[cfg(windows)]
+fn windows_cap_file_identity(file: &cap_std::fs::File) -> Result<(u32, u64), PlanStoreError> {
+    let file = file.try_clone()?.into_std();
+    Ok(windows_file_identity(&file)?)
 }
 
 fn same_directory(opened: &std::fs::File, current: &std::fs::File) -> Result<bool, std::io::Error> {
@@ -2331,6 +2420,7 @@ mod plan_file_windows_tests {
         fs::create_dir(&path).expect("temporary root");
         let (_directory, handle) = open_plan_root(&path).expect("open root");
         assert!(same_directory(&handle, &handle).expect("identity"));
+        handle.sync_all().expect("directory flush contract");
         fs::remove_dir(path).expect("cleanup");
     }
 }

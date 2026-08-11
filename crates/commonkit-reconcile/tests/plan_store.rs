@@ -229,7 +229,7 @@ fn latest_matching_rejects_a_symlink_plan_entry() {
         )),
     )
     .expect("symlink plan");
-    fs::remove_file(target).expect("remove symlink target");
+    fs::write(&target, vec![b'x'; 1024 * 1024]).expect("write external large file");
 
     assert!(matches!(
         store.load_latest_for_target(&StableId::parse("local-target").expect("target")),

@@ -17,7 +17,11 @@ rand.workspace = true
 thiserror.workspace = true
 libc.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.0", features = ["fs"] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
     "Win32_Storage_FileSystem",
 ] }

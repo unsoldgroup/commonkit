@@ -711,6 +711,7 @@ dependencies = [
  "commonkit-core",
  "libc",
  "rand 0.9.5",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
