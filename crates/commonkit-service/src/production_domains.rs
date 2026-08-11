@@ -161,6 +161,8 @@ struct NodeResolutionConfig {
     shell_executable: PathBuf,
     release_keyring: PathBuf,
     gpgv_executable: PathBuf,
+    #[serde(default)]
+    gpgv_executable_digest: Option<Sha256Digest>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1338,9 +1340,18 @@ struct ProductionSyncDomain {
 
 struct ProductionPackageFetch {
     runtime: tokio::runtime::Runtime,
+    pinned_addresses: BTreeMap<String, SocketAddr>,
 }
 
 const MAX_REMOTE_PACKAGE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_REMOTE_PACKAGE_ARTIFACT_COUNT: usize = 128;
+
+fn fresh_package_resolution_nonce() -> Result<Sha256Digest, DomainFailure> {
+    let mut bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(bytes)))
+        .map_err(|_| DomainFailure::OperationFailed)
+}
 
 impl ProductionPackageFetch {
     fn new() -> Result<Self, PackageResolutionError> {
@@ -1348,7 +1359,10 @@ impl ProductionPackageFetch {
             .enable_all()
             .build()
             .map_err(|_| PackageResolutionError::FetchUnavailable)?;
-        Ok(Self { runtime })
+        Ok(Self {
+            runtime,
+            pinned_addresses: BTreeMap::new(),
+        })
     }
 
     fn fetch_one(
@@ -1408,16 +1422,23 @@ impl ProductionPackageFetch {
     }
 
     fn client_for_url(
-        &self,
+        &mut self,
         url: &reqwest::Url,
     ) -> Result<reqwest::Client, PackageResolutionError> {
-        let addresses = validated_package_fetch_addresses(url)?;
+        validate_package_fetch_url(url)?;
+        let key = url.as_str().to_owned();
+        let address = if let Some(address) = self.pinned_addresses.get(&key) {
+            *address
+        } else {
+            let address = validated_package_fetch_addresses(url)?
+                .into_iter()
+                .next()
+                .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+            self.pinned_addresses.insert(key, address);
+            address
+        };
         let host = url
             .host_str()
-            .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
-        let address = addresses
-            .first()
-            .copied()
             .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
         reqwest::Client::builder()
             .https_only(true)
@@ -1469,7 +1490,6 @@ fn validate_package_fetch_url(url: &reqwest::Url) -> Result<(), PackageResolutio
     {
         return Err(PackageResolutionError::UnapprovedArtifactLocation);
     }
-    let _ = validated_package_fetch_addresses(url)?;
     Ok(())
 }
 
@@ -2235,13 +2255,16 @@ impl ProductionSyncDomain {
             }
             PackageManager::Nvm => {
                 let node = config.node.as_ref().ok_or(DomainFailure::OperationFailed)?;
-                let mut host = ProcessNodeRuntimeHost::new(
+                let mut host = ProcessNodeRuntimeHost::new_with_gpgv(
                     node.nvm_dir.clone(),
                     node.shell_executable.clone(),
                     node.release_keyring.clone(),
+                    node.gpgv_executable.clone(),
                 );
-                let mut verifier =
-                    ProcessNodeReleaseSignatureVerifier::new(node.gpgv_executable.clone());
+                let mut verifier = ProcessNodeReleaseSignatureVerifier::new_with_digest(
+                    node.gpgv_executable.clone(),
+                    node.gpgv_executable_digest.clone(),
+                );
                 let backend = NodeResolutionBackend::new(&mut host, &mut verifier);
                 self.resolve_with_backend(
                     &states,
@@ -2302,6 +2325,7 @@ impl ProductionSyncDomain {
                                 components: apt.components.clone(),
                                 signing_authority: apt.signing_authority.clone(),
                             });
+                        let request_nonce = fresh_package_resolution_nonce()?;
                         let request_digest = package_resolution_request_digest(
                             &ssh_target.root_id,
                             desired,
@@ -2310,6 +2334,7 @@ impl ProductionSyncDomain {
                             &config.policy,
                             &apt_constraints,
                             &self.config.target_identity_digest,
+                            &request_nonce,
                         )
                         .map_err(|_| DomainFailure::OperationFailed)?;
                         let response = remote
@@ -2317,6 +2342,7 @@ impl ProductionSyncDomain {
                                 commonkit_adapters::SshFilesystemRequest::PackageResolution {
                                     root_id: ssh_target.root_id.clone(),
                                     request_id: request_id.clone(),
+                                    request_nonce: request_nonce.clone(),
                                     desired: desired.clone(),
                                     target: target.clone(),
                                     manager_kind,
@@ -2332,6 +2358,7 @@ impl ProductionSyncDomain {
                             .map_err(|_| DomainFailure::OperationFailed)?;
                         let commonkit_adapters::SshFilesystemResponse::PackageResolution {
                             request_id: response_request_id,
+                            request_nonce: response_nonce,
                             request_digest: response_digest,
                             target_identity_digest,
                             response_digest: attestation_digest,
@@ -2342,6 +2369,7 @@ impl ProductionSyncDomain {
                             return Err(DomainFailure::OperationFailed);
                         };
                         if response_request_id != request_id
+                            || response_nonce != request_nonce
                             || response_digest != request_digest
                             || target_identity_digest != self.config.target_identity_digest
                             || resolution.target != *target
@@ -2349,8 +2377,19 @@ impl ProductionSyncDomain {
                         {
                             return Err(DomainFailure::OperationFailed);
                         }
+                        if remote_artifacts.len() > MAX_REMOTE_PACKAGE_ARTIFACT_COUNT
+                            || remote_artifacts
+                                .iter()
+                                .try_fold(0u64, |total, artifact| {
+                                    total.checked_add(artifact.reference.bytes)
+                                })
+                                .is_none_or(|total| total > MAX_REMOTE_PACKAGE_ARTIFACT_BYTES)
+                        {
+                            return Err(DomainFailure::OperationFailed);
+                        }
                         let expected_attestation = package_resolution_response_digest(
                             &request_digest,
+                            &request_nonce,
                             &target_identity_digest,
                             &resolution,
                             &remote_artifacts,
@@ -3452,11 +3491,62 @@ impl SyncDomain for ProductionSyncDomain {
                 || operation.resource.resource_type.as_str() == "package"
         });
         let package_authority = if has_package_operations {
-            let authority = self.configured_package_authority_for_verify()?;
+            let package_artifacts =
+                ArtifactStore::open_existing(self.config.adapter_state.join("packages"))
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+            let first_package = plan
+                .operations
+                .iter()
+                .find(|operation| {
+                    operation.adapter_id.as_str() == "packages"
+                        || operation.resource.resource_type.as_str() == "package"
+                })
+                .ok_or(DomainFailure::InvalidRequest)?;
+            let is_ssh = matches!(
+                self.config
+                    .target_transport
+                    .as_ref()
+                    .unwrap_or(&SyncTargetTransport::Local),
+                SyncTargetTransport::Ssh { .. }
+            );
+            let package_policy = self
+                .config
+                .package_resolution
+                .as_ref()
+                .ok_or(DomainFailure::InvalidRequest)?
+                .policy
+                .clone();
+            let authority = if is_ssh {
+                commonkit_adapters::PackageResolutionAuthority::load_remote_by_resolution_digest(
+                    &first_package.payload_digest,
+                    &package_artifacts,
+                    &package_policy,
+                )
+                .map(|(authority, _, _)| authority)
+                .map_err(|_| DomainFailure::OperationFailed)?
+            } else {
+                self.configured_package_authority_for_verify()?
+            };
             if plan.bindings.package_resolution_authority_digest.as_ref()
                 != Some(authority.digest())
             {
                 return Err(DomainFailure::InvalidRequest);
+            }
+            if is_ssh {
+                for operation in plan.operations.iter().filter(|operation| {
+                    operation.adapter_id.as_str() == "packages"
+                        || operation.resource.resource_type.as_str() == "package"
+                }) {
+                    let (bound, _, _) = commonkit_adapters::PackageResolutionAuthority::load_remote_by_resolution_digest(
+                        &operation.payload_digest,
+                        &package_artifacts,
+                        &package_policy,
+                    )
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+                    if bound.digest() != authority.digest() {
+                        return Err(DomainFailure::InvalidRequest);
+                    }
+                }
             }
             Some(authority)
         } else {
@@ -6070,6 +6160,7 @@ mod package_resolution_tests {
                 signing_authority: StableId::parse("ubuntu-key").unwrap(),
             }),
             target_identity_digest: digest_domain_json("fixture", &"target").unwrap(),
+            request_nonce: digest_domain_json("fixture", &"nonce").unwrap(),
             request_digest: digest_domain_json("fixture", &"request").unwrap(),
         };
         let encoded = serde_json::to_value(request).unwrap();
@@ -6089,6 +6180,7 @@ mod package_resolution_tests {
         > {
             let commonkit_adapters::SshFilesystemRequest::PackageResolution {
                 request_id,
+                request_nonce,
                 request_digest,
                 target_identity_digest,
                 ..
@@ -6099,6 +6191,7 @@ mod package_resolution_tests {
             Ok(
                 commonkit_adapters::SshFilesystemResponse::PackageResolutionRejected {
                     request_id,
+                    request_nonce,
                     request_digest,
                     target_identity_digest,
                 },
@@ -6132,6 +6225,7 @@ mod package_resolution_tests {
         > {
             let commonkit_adapters::SshFilesystemRequest::PackageResolution {
                 request_id,
+                request_nonce,
                 request_digest,
                 target_identity_digest,
                 ..
@@ -6140,19 +6234,18 @@ mod package_resolution_tests {
                 return Err(commonkit_adapters::TargetFilesystemError::InvalidRemoteResponse);
             };
             let artifacts: Vec<commonkit_adapters::PackageMutationArtifact> = Vec::new();
-            let response_digest = digest_domain_json(
-                "commonkit.ssh-package-resolution-response.v1",
-                &(
-                    &request_digest,
-                    &target_identity_digest,
-                    &self.resolution,
-                    &artifacts,
-                ),
+            let response_digest = package_resolution_response_digest(
+                &request_digest,
+                &request_nonce,
+                &target_identity_digest,
+                &self.resolution,
+                &artifacts,
             )
             .map_err(|_| commonkit_adapters::TargetFilesystemError::InvalidRemoteResponse)?;
             Ok(
                 commonkit_adapters::SshFilesystemResponse::PackageResolution {
                     request_id,
+                    request_nonce,
                     request_digest,
                     target_identity_digest,
                     response_digest,

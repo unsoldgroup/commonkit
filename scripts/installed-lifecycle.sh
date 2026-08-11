@@ -458,6 +458,7 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
   roots: [{ id: "home", path: process.argv[4], access: "read_write" }],
 }));
 JS
+chmod 0600 "$HOME/.config/commonkit/target-helper.json"
 printf '%s' '{"operation":"write_file","root_id":"home","path":"portable/helper-proof.txt","content":[104,101,108,112,101,114,10]}' |
   "$target_helper" --stdio-v1 > "$scratch/helper-response.json"
 node -e 'const r=require(process.argv[1]);if(r.result!=="applied")process.exit(1)' "$scratch/helper-response.json"

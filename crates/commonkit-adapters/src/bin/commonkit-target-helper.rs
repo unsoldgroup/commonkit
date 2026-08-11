@@ -39,8 +39,34 @@ fn run() -> Result<(), ()> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(());
     }
-    let config: HelperConfig =
-        serde_json::from_slice(&std::fs::read(config_path).map_err(|_| ())?).map_err(|_| ())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 {
+            return Err(());
+        }
+        let effective_uid = unsafe { libc::geteuid() };
+        let owner_allowed =
+            metadata.uid() == effective_uid || (effective_uid == 0 && metadata.uid() == 0);
+        if !owner_allowed {
+            return Err(());
+        }
+        let mut parent = config_path.clone();
+        parent.pop();
+        for _ in 0..2 {
+            let parent_metadata = std::fs::symlink_metadata(&parent).map_err(|_| ())?;
+            if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+                return Err(());
+            }
+            parent.pop();
+        }
+    }
+    let config_bytes = std::fs::read(&config_path).map_err(|_| ())?;
+    if config_bytes.len() > 1024 * 1024 {
+        return Err(());
+    }
+    let config: HelperConfig = serde_json::from_slice(&config_bytes).map_err(|_| ())?;
     let helper = TargetHelper::open_with_package_resolution(
         config.roots,
         &config.state_root,

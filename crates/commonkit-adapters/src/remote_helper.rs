@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,6 +21,7 @@ use crate::{
 };
 
 const MAX_RESOLUTION_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RESOLUTION_ARTIFACT_COUNT: usize = 128;
 
 pub struct TargetHelper {
     roots: BTreeMap<StableId, (PathBuf, RootAccess)>,
@@ -70,10 +72,12 @@ impl TargetHelper {
         LocalTargetFilesystem::open(path, *access)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn package_resolution(
         &self,
         root_id: StableId,
         request_id: StableId,
+        request_nonce: commonkit_contracts::Sha256Digest,
         desired: crate::PackageDesiredIntent,
         target: crate::PackageTargetV1,
         manager_kind: PackageManager,
@@ -85,6 +89,7 @@ impl TargetHelper {
         let Some(config) = self.package_resolution.clone() else {
             return Ok(package_resolution_rejected(
                 request_id,
+                request_nonce,
                 request_digest,
                 target_identity_digest,
             ));
@@ -98,6 +103,7 @@ impl TargetHelper {
         {
             return Ok(package_resolution_rejected(
                 request_id,
+                request_nonce,
                 request_digest,
                 target_identity_digest,
             ));
@@ -110,11 +116,13 @@ impl TargetHelper {
             &policy,
             &apt,
             &target_identity_digest,
+            &request_nonce,
         )
         .map_err(|_| TargetFilesystemError::PackageResolutionRejected)?;
         if expected_request_digest != request_digest {
             return Ok(package_resolution_rejected(
                 request_id,
+                request_nonce,
                 request_digest,
                 target_identity_digest,
             ));
@@ -145,6 +153,7 @@ impl TargetHelper {
                     &mut backend,
                     root_id,
                     request_id,
+                    request_nonce,
                     desired,
                     target_identity_digest,
                     request_digest,
@@ -155,16 +164,20 @@ impl TargetHelper {
                     .node
                     .clone()
                     .ok_or(TargetFilesystemError::PackageResolutionUnavailable)?;
-                let mut host = ProcessNodeRuntimeHost::new(
+                let mut host = ProcessNodeRuntimeHost::new_with_gpgv(
                     node.nvm_dir,
                     node.shell_executable,
                     node.release_keyring,
+                    node.gpgv_executable.clone(),
                 );
                 let actual = commonkit_adapters_node_probe(&mut host, &config.target)?;
                 if actual.manager != config.manager {
                     return Err(TargetFilesystemError::PackageResolutionRejected);
                 }
-                let mut verifier = ProcessNodeReleaseSignatureVerifier::new(node.gpgv_executable);
+                let mut verifier = ProcessNodeReleaseSignatureVerifier::new_with_digest(
+                    node.gpgv_executable,
+                    Some(node.gpgv_executable_digest),
+                );
                 let mut backend = NodeResolutionBackend::new(&mut host, &mut verifier);
                 self.resolve_package_with_backend(
                     &config,
@@ -172,6 +185,7 @@ impl TargetHelper {
                     &mut backend,
                     root_id,
                     request_id,
+                    request_nonce,
                     desired,
                     target_identity_digest,
                     request_digest,
@@ -181,6 +195,7 @@ impl TargetHelper {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn resolve_package_with_backend(
         &self,
         config: &TargetPackageResolutionConfig,
@@ -188,6 +203,7 @@ impl TargetHelper {
         backend: &mut dyn PackageResolutionBackend,
         _root_id: StableId,
         request_id: StableId,
+        request_nonce: commonkit_contracts::Sha256Digest,
         desired: crate::PackageDesiredIntent,
         target_identity_digest: commonkit_contracts::Sha256Digest,
         request_digest: commonkit_contracts::Sha256Digest,
@@ -220,6 +236,10 @@ impl TargetHelper {
             return Err(TargetFilesystemError::PackageResolutionRejected);
         }
         let mut artifacts = Vec::with_capacity(intent.artifacts.len());
+        if intent.artifacts.len() > MAX_RESOLUTION_ARTIFACT_COUNT {
+            return Err(TargetFilesystemError::RemoteArtifact);
+        }
+        let mut total_artifact_bytes = 0u64;
         for reference in intent.artifacts {
             let bytes = self
                 .artifacts
@@ -230,10 +250,17 @@ impl TargetHelper {
             {
                 return Err(TargetFilesystemError::RemoteArtifact);
             }
+            total_artifact_bytes = total_artifact_bytes
+                .checked_add(reference.bytes)
+                .ok_or(TargetFilesystemError::RemoteArtifact)?;
+            if total_artifact_bytes > MAX_RESOLUTION_ARTIFACT_BYTES {
+                return Err(TargetFilesystemError::RemoteArtifact);
+            }
             artifacts.push(PackageMutationArtifact { reference, bytes });
         }
         let response_digest = package_resolution_response_digest(
             &request_digest,
+            &request_nonce,
             &target_identity_digest,
             &resolution,
             &artifacts,
@@ -241,6 +268,7 @@ impl TargetHelper {
         .map_err(|_| TargetFilesystemError::PackageResolutionFailed)?;
         Ok(SshFilesystemResponse::PackageResolution {
             request_id,
+            request_nonce,
             request_digest,
             target_identity_digest,
             response_digest,
@@ -363,6 +391,7 @@ impl TargetHelper {
             // controller-side resolution against the wrong machine.
             SshFilesystemRequest::PackageResolution {
                 request_id,
+                request_nonce,
                 request_digest,
                 target_identity_digest,
                 root_id,
@@ -374,6 +403,7 @@ impl TargetHelper {
             } => match self.package_resolution(
                 root_id,
                 request_id.clone(),
+                request_nonce.clone(),
                 desired,
                 target,
                 manager_kind,
@@ -385,6 +415,7 @@ impl TargetHelper {
                 Ok(response) => Ok(response),
                 Err(_) => Ok(package_resolution_rejected(
                     request_id,
+                    request_nonce,
                     request_digest,
                     target_identity_digest,
                 )),
@@ -456,11 +487,13 @@ impl TargetHelper {
 
 fn package_resolution_rejected(
     request_id: StableId,
+    request_nonce: commonkit_contracts::Sha256Digest,
     request_digest: commonkit_contracts::Sha256Digest,
     target_identity_digest: commonkit_contracts::Sha256Digest,
 ) -> SshFilesystemResponse {
     SshFilesystemResponse::PackageResolutionRejected {
         request_id,
+        request_nonce,
         request_digest,
         target_identity_digest,
     }
@@ -494,6 +527,11 @@ fn target_package_source_registry(
                 .apt
                 .as_ref()
                 .ok_or(TargetFilesystemError::PackageResolutionUnavailable)?;
+            let key_metadata = std::fs::symlink_metadata(&apt.signed_by)
+                .map_err(|_| TargetFilesystemError::PackageResolutionUnavailable)?;
+            if key_metadata.file_type().is_symlink() || !key_metadata.is_file() {
+                return Err(TargetFilesystemError::PackageResolutionUnavailable);
+            }
             let key = std::fs::read(&apt.signed_by)
                 .map_err(|_| TargetFilesystemError::PackageResolutionUnavailable)?;
             let key_digest = commonkit_contracts::Sha256Digest::parse(format!(
@@ -535,7 +573,7 @@ fn commonkit_adapters_node_probe(
 
 struct TargetPackageFetch {
     runtime: tokio::runtime::Runtime,
-    client: reqwest::Client,
+    pinned_addresses: BTreeMap<String, SocketAddr>,
 }
 
 impl TargetPackageFetch {
@@ -544,14 +582,24 @@ impl TargetPackageFetch {
             .enable_all()
             .build()
             .map_err(|_| PackageResolutionError::FetchUnavailable)?;
-        let client = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(120))
-            .user_agent("commonkit-target-helper/1")
-            .build()
-            .map_err(|_| PackageResolutionError::FetchUnavailable)?;
-        Ok(Self { runtime, client })
+        Ok(Self {
+            runtime,
+            pinned_addresses: BTreeMap::new(),
+        })
+    }
+
+    fn pin_url(&mut self, url: &reqwest::Url) -> Result<SocketAddr, PackageResolutionError> {
+        validate_package_fetch_url(url)?;
+        let key = url.as_str().to_owned();
+        if let Some(address) = self.pinned_addresses.get(&key) {
+            return Ok(*address);
+        }
+        let address = validated_package_fetch_addresses(url)?
+            .into_iter()
+            .next()
+            .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+        self.pinned_addresses.insert(key, address);
+        Ok(address)
     }
 
     fn fetch_one(
@@ -561,15 +609,19 @@ impl TargetPackageFetch {
     ) -> Result<PackageFetchHopV1, PackageResolutionError> {
         let url = reqwest::Url::parse(locator)
             .map_err(|_| PackageResolutionError::UnapprovedArtifactLocation)?;
-        if url.scheme() != "https"
-            || !url.username().is_empty()
-            || url.password().is_some()
-            || url.query().is_some()
-            || url.fragment().is_some()
-        {
-            return Err(PackageResolutionError::UnapprovedArtifactLocation);
-        }
-        let client = self.client.clone();
+        let address = self.pin_url(&url)?;
+        let host = url
+            .host_str()
+            .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(120))
+            .user_agent("commonkit-target-helper/1")
+            .resolve(host, address)
+            .build()
+            .map_err(|_| PackageResolutionError::FetchUnavailable)?;
         let locator = locator.to_owned();
         self.runtime.block_on(async move {
             let url = reqwest::Url::parse(&locator)
@@ -587,6 +639,8 @@ impl TargetPackageFetch {
                     .ok_or(PackageResolutionError::UnvalidatedRedirect)?;
                 let location = url
                     .join(location)
+                    .map_err(|_| PackageResolutionError::UnvalidatedRedirect)?;
+                validate_package_fetch_url(&location)
                     .map_err(|_| PackageResolutionError::UnvalidatedRedirect)?;
                 return Ok(PackageFetchHopV1::Redirect {
                     location: location.into(),
@@ -624,14 +678,7 @@ impl PackageFetch for TargetPackageFetch {
         for locator in locators {
             let url = reqwest::Url::parse(locator)
                 .map_err(|_| PackageResolutionError::UnapprovedArtifactLocation)?;
-            if url.scheme() != "https"
-                || !url.username().is_empty()
-                || url.password().is_some()
-                || url.query().is_some()
-                || url.fragment().is_some()
-            {
-                return Err(PackageResolutionError::UnapprovedArtifactLocation);
-            }
+            self.pin_url(&url)?;
         }
         Ok(())
     }
@@ -656,5 +703,80 @@ impl PackageFetch for TargetPackageFetch {
             return Err(PackageResolutionError::CorruptArtifact);
         }
         self.fetch_one(locator, request.maximum_bytes)
+    }
+}
+
+fn validate_package_fetch_url(url: &reqwest::Url) -> Result<(), PackageResolutionError> {
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(PackageResolutionError::UnapprovedArtifactLocation);
+    }
+    Ok(())
+}
+
+fn validated_package_fetch_addresses(
+    url: &reqwest::Url,
+) -> Result<Vec<SocketAddr>, PackageResolutionError> {
+    let host = url
+        .host_str()
+        .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+    let port = url
+        .port_or_known_default()
+        .ok_or(PackageResolutionError::UnapprovedArtifactLocation)?;
+    let addresses = if let Ok(address) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(address, port)]
+    } else {
+        (host, port)
+            .to_socket_addrs()
+            .map_err(|_| PackageResolutionError::UnapprovedArtifactLocation)?
+            .collect()
+    };
+    if addresses.is_empty()
+        || addresses
+            .iter()
+            .any(|address| unsafe_destination(address.ip()))
+    {
+        return Err(PackageResolutionError::UnapprovedArtifactLocation);
+    }
+    Ok(addresses)
+}
+
+fn unsafe_destination(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || address.is_multicast()
+                || address.octets()[0] >= 240
+                || address.octets()[0] == 0
+                || (address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]))
+                || (address.octets()[0] == 192 && address.octets()[1] == 0)
+                || (address.octets()[0] == 198 && address.octets()[1] == 18)
+                || (address.octets()[0] == 198 && address.octets()[1] == 19)
+                || (address.octets()[0] == 198
+                    && address.octets()[1] == 51
+                    && address.octets()[2] == 100)
+                || (address.octets()[0] == 203
+                    && address.octets()[1] == 0
+                    && address.octets()[2] == 113)
+        }
+        IpAddr::V6(address) => {
+            let segments = address.segments();
+            address
+                .to_ipv4_mapped()
+                .is_some_and(|mapped| unsafe_destination(IpAddr::V4(mapped)))
+                || address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+        }
     }
 }

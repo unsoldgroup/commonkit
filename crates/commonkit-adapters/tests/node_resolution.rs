@@ -82,11 +82,13 @@ fn host_snapshot() -> NodeRuntimeHostSnapshotV1 {
     let nvm_script_digest = Sha256Digest::parse(COMMONKIT_NVM_SCRIPT_RELEASES[0].1).unwrap();
     let shell_executable_digest = content_digest(b"bash fixture");
     let release_keyring_digest = content_digest(b"release keyring fixture");
+    let gpgv_executable_digest = content_digest(b"gpgv fixture");
     let config_digest = digest_domain_json(
         "commonkit.nvm-manager-config.v1",
         &(
             &shell_executable_digest,
             &release_keyring_digest,
+            &gpgv_executable_digest,
             "/home/al/.nvm",
         ),
     )
@@ -105,6 +107,7 @@ fn host_snapshot() -> NodeRuntimeHostSnapshotV1 {
         nvm_script_digest,
         shell_executable_digest,
         release_keyring_digest,
+        gpgv_executable_digest,
         release_keyring: b"release keyring fixture".to_vec(),
     }
 }
@@ -765,6 +768,7 @@ fn process_host_fixture() -> (tempfile::TempDir, ProcessNodeRuntimeHost, Package
     .unwrap();
     let shell = root.path().join("bash");
     let keyring = root.path().join("node-release-keyring.kbx");
+    let gpgv = root.path().join("gpgv");
     std::fs::write(&shell, b"bash fixture").unwrap();
     #[cfg(unix)]
     {
@@ -772,11 +776,17 @@ fn process_host_fixture() -> (tempfile::TempDir, ProcessNodeRuntimeHost, Package
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     std::fs::write(&keyring, b"keyring fixture").unwrap();
+    std::fs::write(&gpgv, b"gpgv fixture").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gpgv, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let mut target = target();
     target.manager_prefix = Some(nvm_dir.to_string_lossy().into_owned());
     (
         root,
-        ProcessNodeRuntimeHost::new(nvm_dir, shell, keyring),
+        ProcessNodeRuntimeHost::new_with_gpgv(nvm_dir, shell, keyring, gpgv),
         target,
     )
 }

@@ -288,6 +288,7 @@ fn helper_without_target_resolver_capability_returns_typed_rejection() {
     })
     .unwrap();
     let identity = digest_domain_json("fixture", &"target").unwrap();
+    let request_nonce = digest_domain_json("fixture", &"nonce").unwrap();
     let request_digest = package_resolution_request_digest(
         &StableId::parse("home").unwrap(),
         &desired,
@@ -296,6 +297,7 @@ fn helper_without_target_resolver_capability_returns_typed_rejection() {
         &SecurityPolicy::default(),
         &None,
         &identity,
+        &request_nonce,
     )
     .unwrap();
     let output = invoke(
@@ -303,6 +305,7 @@ fn helper_without_target_resolver_capability_returns_typed_rejection() {
         &SshFilesystemRequest::PackageResolution {
             root_id: StableId::parse("home").unwrap(),
             request_id: StableId::parse("curl").unwrap(),
+            request_nonce: request_nonce.clone(),
             desired,
             target: target_facts,
             manager_kind: PackageManager::Apt,
@@ -321,6 +324,7 @@ fn helper_without_target_resolver_capability_returns_typed_rejection() {
         serde_json::from_slice::<SshFilesystemResponse>(&output.stdout).unwrap(),
         SshFilesystemResponse::PackageResolutionRejected {
             request_id: StableId::parse("curl").unwrap(),
+            request_nonce,
             request_digest,
             target_identity_digest: identity,
         }
@@ -328,4 +332,76 @@ fn helper_without_target_resolver_capability_returns_typed_rejection() {
     fs::remove_dir_all(home).unwrap();
     fs::remove_dir_all(target).unwrap();
     fs::remove_dir_all(state).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn helper_rejects_group_or_world_writable_configuration() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = temp("config-mode-home");
+    let target = temp("config-mode-target");
+    let state = temp("config-mode-state");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::create_dir_all(&target).unwrap();
+    let config_path = home.join(".config/commonkit/target-helper.json");
+    fs::write(
+        &config_path,
+        serde_json::to_vec(&serde_json::json!({
+            "stateRoot": state,
+            "roots": [{"id":"home","path":target,"access":"read_write"}]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&config_path, fs::Permissions::from_mode(0o666)).unwrap();
+    let output = invoke(
+        &home,
+        &SshFilesystemRequest::ReadFile {
+            root_id: StableId::parse("home").unwrap(),
+            path: NormalizedManagedPath::parse("probe").unwrap(),
+        },
+    );
+    assert!(!output.status.success());
+    fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(target).unwrap();
+    let _ = fs::remove_dir_all(state);
+}
+
+#[test]
+fn package_resolution_request_digest_is_challenge_bound() {
+    let target = commonkit_adapters::PackageTargetV1 {
+        os: "linux".into(),
+        os_version: "24.04".into(),
+        distro_id: Some("ubuntu".into()),
+        distro_version: Some("24.04".into()),
+        codename: Some("noble".into()),
+        arch: "amd64".into(),
+        libc: Some("glibc".into()),
+        manager_prefix: None,
+    };
+    let desired = PackageDesiredIntent::new(PackageDeclaration {
+        id: StableId::parse("curl").unwrap(),
+        version: "1.0.0".into(),
+        manager: PackageManager::Apt,
+        source: StableId::parse("ubuntu-main").unwrap(),
+        selector: None,
+    })
+    .unwrap();
+    let identity = digest_domain_json("fixture", &"target").unwrap();
+    let first = digest_domain_json("fixture", &"nonce-a").unwrap();
+    let second = digest_domain_json("fixture", &"nonce-b").unwrap();
+    let digest = |nonce| {
+        package_resolution_request_digest(
+            &StableId::parse("home").unwrap(),
+            &desired,
+            &target,
+            PackageManager::Apt,
+            &SecurityPolicy::default(),
+            &None,
+            &identity,
+            nonce,
+        )
+        .unwrap()
+    };
+    assert_ne!(digest(&first), digest(&second));
 }

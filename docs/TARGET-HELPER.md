@@ -18,7 +18,9 @@ only the versioned JSON protocol on standard input; it does not expose a command
    `commonkit-target-helper --stdio-v1`, sends typed requests on stdin, pins the configured
    host-and-port key, and fails closed on missing or ambiguous pins.
 
-Example configuration (paths are target-local):
+The installer must write this file from a target probe; do not copy a hand-written
+configuration or fabricate any digest. The following is the shape of an APT
+configuration after probing (values are illustrative names only):
 
 ```json
 {
@@ -38,9 +40,9 @@ Example configuration (paths are target-local):
     },
     "manager": {
       "manager": "apt",
-      "version": "<target-probed-version>",
-      "executableDigest": "sha256:<64-hex>",
-      "configDigest": "sha256:<64-hex>"
+      "version": "<probe output>",
+      "executableDigest": "<probe digest>",
+      "configDigest": "<probe digest>"
     },
     "policy": { "allowlists": {} },
     "apt": {
@@ -60,7 +62,10 @@ manager binding, policy, source authority, and all resolver paths are target
 local; the SSH request supplies only a typed desired package and a challenge.
 The helper probes the configured target before resolving. A Node/NVM target
 uses `node` instead of `apt` and keeps `nvmDir`, `shellExecutable`,
-`releaseKeyring`, and `gpgvExecutable` in this target-only file.
+`releaseKeyring`, `gpgvExecutable`, and the probed
+`gpgvExecutableDigest` in this target-only file. The helper rechecks that
+executable (without following symlinks) immediately before signature
+verification.
 
 The helper must be upgraded atomically with the controlling CommonKit release. Retain the prior
 verified binary until the first post-upgrade target verification succeeds so rollback does not

@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -8,6 +8,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport, TargetFilesystemError,
 };
+
+pub const MAX_SSH_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_SSH_RESPONSE_BYTES: usize = 576 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSshConfig {
@@ -95,14 +98,23 @@ impl RemoteProcessRunner for ProcessRemoteRunner {
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Do not buffer untrusted remote diagnostics; stdout is the only
+            // typed channel and is independently bounded below.
+            .stderr(Stdio::null())
             .spawn()?;
         child.stdin.take().expect("piped stdin").write_all(stdin)?;
-        let output = child.wait_with_output()?;
+        let mut stdout = Vec::new();
+        child
+            .stdout
+            .take()
+            .expect("piped stdout")
+            .take((MAX_SSH_RESPONSE_BYTES + 1) as u64)
+            .read_to_end(&mut stdout)?;
+        let status = child.wait()?.code().unwrap_or(-1);
         Ok(ProcessOutput {
-            status: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            status,
+            stdout,
+            stderr: Vec::new(),
         })
     }
 }
@@ -247,12 +259,18 @@ impl<R: RemoteProcessRunner> SshFilesystemTransport for OpenSshTransport<R> {
         }
         let input = serde_json::to_vec(&request)
             .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?;
+        if input.len() > MAX_SSH_REQUEST_BYTES {
+            return Err(TargetFilesystemError::InvalidRemoteResponse);
+        }
         let out = self.runner.run("ssh", &self.ssh_args(), &input)?;
         if out.status != 0 {
             return Err(TargetFilesystemError::RemoteFailure {
                 status: out.status,
                 message: "remote process reported an error".into(),
             });
+        }
+        if out.stdout.len() > MAX_SSH_RESPONSE_BYTES {
+            return Err(TargetFilesystemError::InvalidRemoteResponse);
         }
         let response: SshFilesystemResponse = serde_json::from_slice(&out.stdout)
             .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?;

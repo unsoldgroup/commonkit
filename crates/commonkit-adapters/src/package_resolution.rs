@@ -74,6 +74,7 @@ pub struct TargetNodeResolutionConfig {
     pub shell_executable: std::path::PathBuf,
     pub release_keyring: std::path::PathBuf,
     pub gpgv_executable: std::path::PathBuf,
+    pub gpgv_executable_digest: Sha256Digest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -649,6 +650,45 @@ impl PackageResolutionAuthority {
         };
         let validated = self.validate(&intent, store)?;
         Ok((intent, validated))
+    }
+
+    /// Rebuilds the authority from an immutable target-attested resolution.
+    /// This is the only safe path for remote-plan verification: it never
+    /// consults controller-local APT keyrings, NVM directories, or argv.
+    pub fn load_remote_by_resolution_digest(
+        resolution_digest: &Sha256Digest,
+        store: &ArtifactStore,
+        policy: &SecurityPolicy,
+    ) -> Result<(Self, ResolvedPackageIntent, PackageResolutionV1), PackageResolutionError> {
+        let bytes = store.load_by_digest(resolution_digest)?;
+        let resolution = serde_json::from_slice::<PackageResolutionV1>(&bytes).or_else(|_| {
+            serde_json::from_slice::<CompatiblePackageResolutionV1>(&bytes)
+                .map(CompatiblePackageResolutionV1::inherit_missing_parent_sources)
+        })?;
+        let registry = PackageSourceRegistry::for_remote_resolution(
+            &resolution.source,
+            resolution.manager.manager,
+        )?;
+        let authority = Self::new(&resolution.target, &resolution.manager, &registry, policy)?;
+        let resolution_reference = ContentReference {
+            digest: resolution_digest.clone(),
+            bytes: bytes
+                .len()
+                .try_into()
+                .map_err(|_| PackageResolutionError::CorruptArtifact)?,
+            sensitivity: ContentSensitivity::Portable,
+        };
+        let intent = ResolvedPackageIntent {
+            declaration: resolution.declaration.clone(),
+            resolution: resolution_reference,
+            artifacts: resolution
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.content.clone())
+                .collect(),
+        };
+        let validated = authority.validate(&intent, store)?;
+        Ok((authority, intent, validated))
     }
 
     pub fn validate(

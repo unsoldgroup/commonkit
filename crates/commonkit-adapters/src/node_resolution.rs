@@ -31,6 +31,7 @@ pub struct NodeRuntimeHostSnapshotV1 {
     pub nvm_script_digest: Sha256Digest,
     pub shell_executable_digest: Sha256Digest,
     pub release_keyring_digest: Sha256Digest,
+    pub gpgv_executable_digest: Sha256Digest,
     pub release_keyring: Vec<u8>,
 }
 
@@ -441,6 +442,7 @@ fn validate_host_snapshot(
         &(
             &host.shell_executable_digest,
             &host.release_keyring_digest,
+            &host.gpgv_executable_digest,
             prefix,
         ),
     )?;
@@ -462,6 +464,7 @@ pub struct ProcessNodeRuntimeHost {
     nvm_dir: PathBuf,
     shell_executable: PathBuf,
     release_keyring: PathBuf,
+    gpgv_executable: PathBuf,
 }
 
 impl ProcessNodeRuntimeHost {
@@ -470,10 +473,20 @@ impl ProcessNodeRuntimeHost {
         shell_executable: impl Into<PathBuf>,
         release_keyring: impl Into<PathBuf>,
     ) -> Self {
+        Self::new_with_gpgv(nvm_dir, shell_executable, release_keyring, "/usr/bin/gpgv")
+    }
+
+    pub fn new_with_gpgv(
+        nvm_dir: impl Into<PathBuf>,
+        shell_executable: impl Into<PathBuf>,
+        release_keyring: impl Into<PathBuf>,
+        gpgv_executable: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             nvm_dir: nvm_dir.into(),
             shell_executable: shell_executable.into(),
             release_keyring: release_keyring.into(),
+            gpgv_executable: gpgv_executable.into(),
         }
     }
 }
@@ -551,11 +564,18 @@ impl NodeRuntimeHost for ProcessNodeRuntimeHost {
         validate_nvm_environment_os(&std::env::vars_os().collect())?;
         let shell = read_executable_no_follow(&self.shell_executable)?;
         let keyring = read_regular_no_follow(&self.release_keyring)?;
+        let gpgv = read_executable_no_follow(&self.gpgv_executable)?;
         let shell_executable_digest = host_content_digest(&shell)?;
         let release_keyring_digest = host_content_digest(&keyring)?;
+        let gpgv_executable_digest = host_content_digest(&gpgv)?;
         let config_digest = digest_domain_json(
             "commonkit.nvm-manager-config.v1",
-            &(&shell_executable_digest, &release_keyring_digest, prefix),
+            &(
+                &shell_executable_digest,
+                &release_keyring_digest,
+                &gpgv_executable_digest,
+                prefix,
+            ),
         )
         .map_err(|error| NodeRuntimeHostError::Unavailable(error.to_string()))?;
         let before = observe_installed_versions(&self.nvm_dir)?;
@@ -571,6 +591,7 @@ impl NodeRuntimeHost for ProcessNodeRuntimeHost {
             nvm_script_digest,
             shell_executable_digest,
             release_keyring_digest,
+            gpgv_executable_digest,
             release_keyring: keyring,
         })
     }
@@ -623,6 +644,7 @@ pub fn validate_nvm_environment_os(
 #[derive(Debug, Clone)]
 pub struct ProcessNodeReleaseSignatureVerifier {
     gpgv_executable: PathBuf,
+    expected_digest: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -634,8 +656,16 @@ pub struct NodeSignatureCommandSpecV1 {
 
 impl ProcessNodeReleaseSignatureVerifier {
     pub fn new(gpgv_executable: impl Into<PathBuf>) -> Self {
+        Self::new_with_digest(gpgv_executable, None)
+    }
+
+    pub fn new_with_digest(
+        gpgv_executable: impl Into<PathBuf>,
+        expected_digest: Option<Sha256Digest>,
+    ) -> Self {
         Self {
             gpgv_executable: gpgv_executable.into(),
+            expected_digest,
         }
     }
 
@@ -661,6 +691,17 @@ impl NodeReleaseSignatureVerifier for ProcessNodeReleaseSignatureVerifier {
         armored_signature: &[u8],
         keyring: &[u8],
     ) -> Result<VerifiedNodeReleaseSignatureV1, NodeReleaseSignatureError> {
+        if let Some(expected) = &self.expected_digest {
+            let executable = read_executable_no_follow(&self.gpgv_executable)
+                .map_err(|error| NodeReleaseSignatureError::Unavailable(error.to_string()))?;
+            let actual = host_content_digest(&executable)
+                .map_err(|error| NodeReleaseSignatureError::Unavailable(error.to_string()))?;
+            if &actual != expected {
+                return Err(NodeReleaseSignatureError::Unavailable(
+                    "gpgv executable changed after target probe".into(),
+                ));
+            }
+        }
         let workspace = tempfile::Builder::new()
             .prefix("commonkit-node-signature-")
             .tempdir()
