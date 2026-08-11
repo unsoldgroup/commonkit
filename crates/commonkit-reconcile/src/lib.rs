@@ -24,6 +24,7 @@ use commonkit_contracts::{
     PackageOperationConsentBinding, PackageReceiptAuthorization, PackageReceiptEvidence, Plan,
     PlanBindings, ReceiptState, ReceiptTransition, RecoveryCapability, RunReceipt, SCHEMA_VERSION,
     SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
+    package_operation_set_digest,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use serde::{Deserialize, Serialize};
@@ -831,17 +832,7 @@ impl<'a> Reconciler<'a> {
         let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
         let mut journal = store.load(run_id)?;
         let receipt = journal.receipt();
-        if receipt.plan_id != plan.id
-            || receipt.schema_version != plan.schema_version
-            || receipt.contract_version != plan.contract_version
-            || receipt.target_id != plan.target_id
-            || receipt.desired_digest != plan.desired_digest
-            || receipt.observed_digest != plan.observed_digest
-            || receipt.policy_digest != plan.policy_digest
-            || receipt.bindings != plan.bindings
-        {
-            return Err(ReconcileError::ReceiptPlanMismatch);
-        }
+        validate_receipt_plan_binding(plan, receipt)?;
 
         let after_forward_barrier = plan.operations.iter().any(|operation| {
             operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
@@ -990,10 +981,15 @@ impl<'a> Reconciler<'a> {
         }
 
         for operation in &plan.operations {
-            if journal.receipt().operation_progress.iter().any(|progress| {
+            let already_recovered = journal.receipt().operation_progress.iter().any(|progress| {
                 progress.operation_id == operation.id
                     && progress.phase == OperationPhase::ForwardRecovered
-            }) {
+            });
+            if already_recovered {
+                if package_evidence_pending(journal, operation) {
+                    record_package_success(journal, operation, adapters)?;
+                    self.persist(journal)?;
+                }
                 continue;
             }
             let observation = adapter_for(adapters, &operation.adapter_id)?
@@ -1032,13 +1028,17 @@ impl<'a> Reconciler<'a> {
             };
             match result {
                 Ok(()) => {
+                    // Package evidence must be durably present before the
+                    // operation can be marked ForwardRecovered. Recovery
+                    // still repairs receipts written by the old ordering.
+                    record_package_success(journal, operation, adapters)?;
+                    self.persist(journal)?;
                     journal.record_operation(
                         operation.id.clone(),
                         OperationPhase::ForwardRecovered,
                         None,
                     )?;
                     self.persist(journal)?;
-                    record_package_success(journal, operation, adapters)?;
                 }
                 Err(code) => {
                     journal.record_operation(
@@ -1138,15 +1138,29 @@ fn record_package_success(
     }
     let digest = adapter_for(adapters, &operation.adapter_id)?
         .package_final_digest(operation)
-        .map_err(ReconcileError::AdapterPreflightFailed)?;
-    if let Some(digest) = digest {
-        journal.record_package_exit(
-            &operation.id,
-            PackageExitClassification::Succeeded,
-            Some(digest),
-        )?;
-    }
+        .map_err(ReconcileError::AdapterPreflightFailed)?
+        .ok_or_else(|| ReconcileError::PackageEvidenceUnavailable {
+            adapter_id: operation.adapter_id.clone(),
+        })?;
+    journal.record_package_exit(
+        &operation.id,
+        PackageExitClassification::Succeeded,
+        Some(digest),
+    )?;
     Ok(())
+}
+
+fn package_evidence_pending(journal: &ReceiptJournal, operation: &Operation) -> bool {
+    journal
+        .receipt()
+        .package_authorization
+        .as_ref()
+        .is_some_and(|authorization| {
+            authorization.evidence.iter().any(|evidence| {
+                evidence.operation_id == operation.id
+                    && evidence.exit_classification == PackageExitClassification::NotRun
+            })
+        })
 }
 
 fn stable_failure_code(failure: &AdapterFailure) -> StableId {
@@ -1238,6 +1252,59 @@ fn validate_plan(plan: &Plan) -> Result<(), ReconcileError> {
     Ok(())
 }
 
+/// Binds a durable receipt to its plan while keeping the package receipt
+/// version upgrade explicit. Forward plans are v2; package authorization adds
+/// v3 receipt evidence without changing the plan identity or its bindings.
+fn validate_receipt_plan_binding(plan: &Plan, receipt: &RunReceipt) -> Result<(), ReconcileError> {
+    if receipt.plan_id != plan.id
+        || receipt.target_id != plan.target_id
+        || receipt.desired_digest != plan.desired_digest
+        || receipt.observed_digest != plan.observed_digest
+        || receipt.policy_digest != plan.policy_digest
+        || receipt.bindings != plan.bindings
+    {
+        return Err(ReconcileError::ReceiptPlanMismatch);
+    }
+
+    let exact_version = receipt.schema_version == plan.schema_version
+        && receipt.contract_version == plan.contract_version;
+    let package_receipt_upgrade = plan.schema_version.0 == FORWARD_SCHEMA_VERSION
+        && plan.contract_version == FORWARD_CONTRACT_VERSION
+        && receipt.schema_version.0 == PACKAGE_RECEIPT_SCHEMA_VERSION
+        && receipt.contract_version == PACKAGE_RECEIPT_CONTRACT_VERSION
+        && receipt.package_authorization.is_some();
+    if !exact_version && !package_receipt_upgrade {
+        return Err(ReconcileError::ReceiptPlanMismatch);
+    }
+
+    if package_receipt_upgrade {
+        let authorization = receipt
+            .package_authorization
+            .as_ref()
+            .ok_or(ReconcileError::ReceiptPlanMismatch)?;
+        let expected_bindings =
+            package_bindings_from_plan(plan).map_err(|_| ReconcileError::ReceiptPlanMismatch)?;
+        let receipt_bindings = authorization
+            .evidence
+            .iter()
+            .map(|evidence| PackageOperationConsentBinding {
+                operation_id: evidence.operation_id.clone(),
+                resolution_digest: evidence.resolution_digest.clone(),
+            })
+            .collect::<Vec<_>>();
+        if receipt_bindings != expected_bindings
+            || authorization.operation_set_digest
+                != package_operation_set_digest(plan, &receipt_bindings)
+                    .map_err(|_| ReconcileError::ReceiptPlanMismatch)?
+        {
+            return Err(ReconcileError::ReceiptPlanMismatch);
+        }
+        validate_package_receipt_authorization(plan, authorization)
+            .map_err(|_| ReconcileError::ReceiptPlanMismatch)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum ReconcileError {
     #[error(transparent)]
@@ -1256,6 +1323,8 @@ pub enum ReconcileError {
     PackageAuthorizationUnavailable { adapter_id: StableId },
     #[error("package adapter changed the consent binding before execution")]
     PackageConsentBindingChanged,
+    #[error("package adapter {adapter_id} did not provide final-state evidence")]
+    PackageEvidenceUnavailable { adapter_id: StableId },
     #[error("adapter preflight failed: {0:?}")]
     AdapterPreflightFailed(AdapterFailure),
     #[error("adapter is not registered: {0}")]
