@@ -59,6 +59,11 @@ export function zoneMetrics(nodes: GraphNode[], zones: TopicZone[]): ZoneMetric[
 export const graphLayoutName = (view: ViewMode): GraphLayoutName => view === "focus" ? "fcose" : "grid";
 export const deterministicGridColumns = (nodeCount: number) => Math.max(1, Math.ceil(Math.sqrt(Math.max(1, nodeCount))));
 
+/** Identifies graph-affecting state so shell-only updates do not rerun layout. */
+export function graphRenderKey(revision: number, view: ViewMode, filters: Filters) {
+  return JSON.stringify([revision, view, filters.query, [...filters.teams].sort(), [...filters.topics].sort(), filters.showSemantic, filters.showCompleted]);
+}
+
 /** Selecting a different ticket fits the graph, but never recenters it afterward. */
 export function selectionViewportAction(changedTicket: boolean, additive: boolean): SelectionViewportAction {
   return changedTicket && !additive ? "fit" : "preserve";
