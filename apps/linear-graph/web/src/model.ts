@@ -3,6 +3,7 @@ import type { GraphEdge, GraphNode, GraphSnapshot, TeamMetadata, TopicZone, Focu
 export type ViewMode = "focus" | "universe";
 export type GraphLayoutName = "fcose" | "grid";
 export type Filters = { query: string; teams: Set<string>; topics: Set<string>; showSemantic: boolean; showCompleted: boolean };
+export type SelectionViewportAction = "fit" | "preserve";
 export type TeamSummary = { id?: string; key?: string; name: string; count: number; activeCount?: number; completedCount?: number; canceledCount?: number; color: string };
 export type ZoneMetric = TopicZone & { issueCount: number; activeCount: number; completedCount: number; canceledCount: number; weightedWorkload: number };
 
@@ -57,6 +58,16 @@ export function zoneMetrics(nodes: GraphNode[], zones: TopicZone[]): ZoneMetric[
 /** Focus benefits from semantic force placement; Universe needs bounded, deterministic placement. */
 export const graphLayoutName = (view: ViewMode): GraphLayoutName => view === "focus" ? "fcose" : "grid";
 export const deterministicGridColumns = (nodeCount: number) => Math.max(1, Math.ceil(Math.sqrt(Math.max(1, nodeCount))));
+
+/** Identifies graph-affecting state so shell-only updates do not rerun layout. */
+export function graphRenderKey(revision: number, view: ViewMode, filters: Filters) {
+  return JSON.stringify([revision, view, filters.query, [...filters.teams].sort(), [...filters.topics].sort(), filters.showSemantic, filters.showCompleted]);
+}
+
+/** Selecting a different ticket fits the graph, but never recenters it afterward. */
+export function selectionViewportAction(changedTicket: boolean, additive: boolean): SelectionViewportAction {
+  return changedTicket && !additive ? "fit" : "preserve";
+}
 
 export const edgeLabel = (edge: Pick<GraphEdge, "kind" | "sourceType">) => {
   if (edge.sourceType === "codex" || edge.kind === "semantic") return "Codex link";

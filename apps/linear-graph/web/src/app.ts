@@ -2,7 +2,7 @@ import cytoscape from "cytoscape";
 import fcose from "cytoscape-fcose";
 import { demoPayload, normalizePayload, type GraphEdge, type GraphNode, type GraphPayload } from "./protocol.js";
 import type { Campaign, WorkBundle } from "@commonkit/linear-graph-protocol";
-import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, issueNeighbors, recommendationFor, statusShape, teamColor, teamSummaries, topicColor, uniqueTopics, visibleGraph, zoneMetrics, type Filters, type ViewMode } from "./model.js";
+import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, recommendationFor, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, uniqueTopics, visibleGraph, zoneMetrics, type Filters, type ViewMode } from "./model.js";
 
 cytoscape.use(fcose);
 const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
@@ -25,6 +25,8 @@ let codexStatusTimer: ReturnType<typeof setInterval> | undefined;
 let toastTimer: ReturnType<typeof setTimeout> | undefined;
 let viewport: { zoom: number; pan: { x: number; y: number } } | null = null;
 let fitNextGraph = true;
+let graphRevision = 0;
+let renderedGraphKey: string | null = null;
 let lastEmptyState = emptyStateKind(payload.snapshot, payload.recommendations, filters, view);
 let graphRequestId = 0;
 let graphAbort: AbortController | undefined;
@@ -68,7 +70,7 @@ function selectNode(id: string, additive = false) {
   if (additive && selectedIds.has(id)) selectedIds.delete(id); else selectedIds.add(id);
   selectedId = selectedIds.has(id) ? id : selectedIds.values().next().value ?? null;
   renderRecommendations(); renderList(); renderContext();
-  if (cy) { cy.nodes().unselect(); selectedIds.forEach((selected) => cy.getElementById(selected).select()); if (changedTicket && !additive) cy.fit(undefined, 40); if (selectedId) cy.center(cy.getElementById(selectedId)); }
+  if (cy) { cy.nodes().unselect(); selectedIds.forEach((selected) => cy.getElementById(selected).select()); if (selectionViewportAction(changedTicket, additive) === "fit") cy.fit(undefined, 40); }
 }
 function clearSelection() { selectedIds.clear(); selectedId = null; renderRecommendations(); renderList(); renderContext(); if (cy) cy.nodes().unselect(); }
 async function authorizedFetch(path: string, init: RequestInit) {
@@ -131,6 +133,11 @@ async function connectCodex() {
 }
 
 function renderShell() {
+  // Shell updates (auth polling, toasts, brief status) should not detach the
+  // Cytoscape event surface. Preserve the whole wrapper, not only #cy, so
+  // canvas gestures, hover layers, and toolbar hit-testing stay connected.
+  const existingGraphWrap = cy ? document.querySelector<HTMLElement>(".graph-wrap") : null;
+  existingGraphWrap?.remove();
   const teams = teamSummaries(payload.snapshot.nodes, payload.snapshot.teams);
   const topics = uniqueTopics(payload.snapshot.nodes);
   app.innerHTML = `<header class="topbar">
@@ -153,6 +160,10 @@ function renderShell() {
       <section class="list-alternative" aria-label="Accessible issue list"><div class="list-heading"><h2>Accessible list</h2><span>Use this view if the graph is too dense.</span></div><div id="issue-list"></div></section>
     </section>
   </main><div id="toast" role="status" aria-live="polite"></div>`;
+  if (existingGraphWrap && cy) {
+    $(".graph-wrap").replaceWith(existingGraphWrap);
+    cy.resize();
+  }
   renderRecommendations(); renderZones(); renderList(); renderGraph(); renderContext();
 }
 
@@ -188,6 +199,9 @@ function renderList() {
 function renderGraph() {
   const root = $("#cy");
   const graph = visibleGraph(payload.snapshot, payload.recommendations, filters, view);
+  const nextGraphKey = graphRenderKey(graphRevision, view, filters);
+  if (cy && renderedGraphKey === nextGraphKey) return;
+  renderedGraphKey = nextGraphKey;
   lastEmptyState = emptyStateKind(payload.snapshot, payload.recommendations, filters, view);
   const empty = $("#graph-empty") as HTMLElement;
   empty.hidden = graph.nodes.length > 0;
@@ -286,7 +300,7 @@ async function saveTopic(issueId: string, zone: string) {
   const response = await authorizedFetch(`/api/issues/${encodeURIComponent(issueId)}/topic`, { method: "PUT", body: JSON.stringify({ zone }) });
   if (!response.ok) throw new Error("Could not save topic");
   const node = nodeById(issueId);
-  if (node) { node.topicId = zone; node.topic = payload.snapshot.zones.find((item) => item.id === zone)?.name ?? zone; }
+  if (node) { node.topicId = zone; node.topic = payload.snapshot.zones.find((item) => item.id === zone)?.name ?? zone; graphRevision += 1; }
   renderShell();
   selectedId = issueId;
   selectedIds.add(issueId);
@@ -308,8 +322,8 @@ async function loadGraph() {
     if (!response.ok) throw new Error("Graph unavailable");
     const body = await response.json() as Record<string, unknown>;
     if (requestId !== graphRequestId || controller.signal.aborted || requestedView !== view) return;
-    if (body.snapshot && typeof body.snapshot === "object" && "nodes" in body.snapshot) { const snapshot = body.snapshot as Parameters<typeof normalizePayload>[0]; payload = normalizePayload(snapshot, body.brief as Parameters<typeof normalizePayload>[1], body.analysis as Parameters<typeof normalizePayload>[2]); }
-    else if ("nodes" in body) payload = normalizePayload(body as Parameters<typeof normalizePayload>[0]);
+    if (body.snapshot && typeof body.snapshot === "object" && "nodes" in body.snapshot) { const snapshot = body.snapshot as Parameters<typeof normalizePayload>[0]; payload = normalizePayload(snapshot, body.brief as Parameters<typeof normalizePayload>[1], body.analysis as Parameters<typeof normalizePayload>[2]); graphRevision += 1; fitNextGraph = true; }
+    else if ("nodes" in body) { payload = normalizePayload(body as Parameters<typeof normalizePayload>[0]); graphRevision += 1; fitNextGraph = true; }
     graphError = null;
     initialLoading = false;
     renderShell();
