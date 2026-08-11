@@ -17,3 +17,4 @@ rand.workspace = true
 zeroize = "1.8"
 rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 tempfile = "3"
+libc.workspace = true
