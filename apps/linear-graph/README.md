@@ -41,6 +41,29 @@ curl -fsS https://graph.unsold.cloud/health
 systemctl --user status linear-graph.service
 ```
 
+### Updating a running VPS hub
+
+Every deploy after the first is one command on the VPS:
+
+```sh
+bash apps/linear-graph/deploy/update-vps.sh
+```
+
+It fetches, resets to the tracked upstream, rebuilds `protocol` and `web` only when those
+changed (the hub runs TypeScript directly under Bun), restarts the service, and polls
+`/health` on the configured port before reporting the deployed commit. It refuses to run if
+the checkout has uncommitted changes to tracked files, or is not on a branch with an upstream.
+
+The deploy checkout must be able to see the branch it deploys. A clone created with a
+single-branch refspec can only fetch `main`, which is how `/root/commonkit` ended up serving
+hand-copied, untracked files until EXP-2820. Fix the refspec, then track the branch:
+
+```sh
+git -C ~/commonkit config remote.origin.fetch "+refs/heads/*:refs/remotes/origin/*"
+git -C ~/commonkit fetch origin
+git -C ~/commonkit checkout -B linear-graph-deploy origin/<deploy-branch>
+```
+
 Codex uses the existing subscription login copied into the graph’s private `CODEX_HOME` by default. Set `LINEAR_GRAPH_CODEX_AUTH=api-key` together with
 `CODEX_API_KEY` only when API-key mode is intended; subscription mode never forwards that variable
 to the Codex child process. The installer copies only the existing `~/.codex/auth.json` once; future
