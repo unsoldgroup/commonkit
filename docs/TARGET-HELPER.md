@@ -67,6 +67,28 @@ uses `node` instead of `apt` and keeps `nvmDir`, `shellExecutable`,
 executable (without following symlinks) immediately before signature
 verification.
 
+Provision the capability on the target with the installed helper, never by
+editing digest fields by hand. The command is read-only except for the final
+atomic config replacement and computes manager, gpgv, keyring, and executable
+digests from the target it is running on:
+
+```sh
+commonkit-target-helper --probe-package-resolution \
+  --config "$HOME/.config/commonkit/target-helper.json" \
+  --manager nvm \
+  --target-identity-digest 'sha256:<controller-bound identity>' \
+  --nvm-dir "$HOME/.nvm" \
+  --shell-executable /bin/bash \
+  --release-keyring /etc/commonkit/node-release-keyring.kbx \
+  --gpgv-executable /usr/bin/gpgv
+```
+
+APT provisioning takes `--apt-source-id`, `--apt-suite`,
+`--apt-components`, `--apt-signed-by`, and `--apt-signing-authority`; these
+are source policy inputs, not digest values. The command rejects symlinked or
+group/world-writable config paths, writes mode `0600`, fsyncs, and validates
+the resulting helper config before returning.
+
 The helper must be upgraded atomically with the controlling CommonKit release. Retain the prior
 verified binary until the first post-upgrade target verification succeeds so rollback does not
 depend on the network.

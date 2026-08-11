@@ -459,6 +459,33 @@ fs.writeFileSync(process.argv[2], JSON.stringify({
 }));
 JS
 chmod 0600 "$HOME/.config/commonkit/target-helper.json"
+if [[ "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" == "1" ]]; then
+  : "${COMMONKIT_TARGET_IDENTITY_DIGEST:?set a controller-bound target identity digest}"
+  : "${COMMONKIT_PACKAGE_MANAGER:?set apt or nvm}"
+  probe_args=(
+    --probe-package-resolution
+    --config "$HOME/.config/commonkit/target-helper.json"
+    --manager "$COMMONKIT_PACKAGE_MANAGER"
+    --target-identity-digest "$COMMONKIT_TARGET_IDENTITY_DIGEST"
+  )
+  if [[ "$COMMONKIT_PACKAGE_MANAGER" == apt ]]; then
+    probe_args+=(
+      --apt-source-id "${COMMONKIT_APT_SOURCE_ID:?}"
+      --apt-suite "${COMMONKIT_APT_SUITE:?}"
+      --apt-components "${COMMONKIT_APT_COMPONENTS:?}"
+      --apt-signed-by "${COMMONKIT_APT_SIGNED_BY:?}"
+      --apt-signing-authority "${COMMONKIT_APT_SIGNING_AUTHORITY:?}"
+    )
+  else
+    probe_args+=(
+      --nvm-dir "${COMMONKIT_NVM_DIR:?}"
+      --shell-executable "${COMMONKIT_SHELL_EXECUTABLE:?}"
+      --release-keyring "${COMMONKIT_RELEASE_KEYRING:?}"
+      --gpgv-executable "${COMMONKIT_GPGV_EXECUTABLE:?}"
+    )
+  fi
+  "$target_helper" "${probe_args[@]}"
+fi
 printf '%s' '{"operation":"write_file","root_id":"home","path":"portable/helper-proof.txt","content":[104,101,108,112,101,114,10]}' |
   "$target_helper" --stdio-v1 > "$scratch/helper-response.json"
 node -e 'const r=require(process.argv[1]);if(r.result!=="applied")process.exit(1)' "$scratch/helper-response.json"

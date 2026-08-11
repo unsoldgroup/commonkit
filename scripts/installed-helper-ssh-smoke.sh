@@ -47,6 +47,33 @@ sudo -u "$user" test -r "$runtime_root" -a -x "$runtime_root"
 sudo -u "$user" test -r "$home/.ssh/authorized_keys"
 sudo -u "$user" test -x "$home/commonkit-target-helper"
 sudo -u "$user" test -w "$target" -a -w "$state"
+if [[ "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" == "1" ]]; then
+  : "${COMMONKIT_TARGET_IDENTITY_DIGEST:?set a controller-bound target identity digest}"
+  : "${COMMONKIT_PACKAGE_MANAGER:?set apt or nvm}"
+  probe_args=(
+    --probe-package-resolution
+    --config "$home/.config/commonkit/target-helper.json"
+    --manager "$COMMONKIT_PACKAGE_MANAGER"
+    --target-identity-digest "$COMMONKIT_TARGET_IDENTITY_DIGEST"
+  )
+  if [[ "$COMMONKIT_PACKAGE_MANAGER" == apt ]]; then
+    probe_args+=(
+      --apt-source-id "${COMMONKIT_APT_SOURCE_ID:?}"
+      --apt-suite "${COMMONKIT_APT_SUITE:?}"
+      --apt-components "${COMMONKIT_APT_COMPONENTS:?}"
+      --apt-signed-by "${COMMONKIT_APT_SIGNED_BY:?}"
+      --apt-signing-authority "${COMMONKIT_APT_SIGNING_AUTHORITY:?}"
+    )
+  else
+    probe_args+=(
+      --nvm-dir "${COMMONKIT_NVM_DIR:?}"
+      --shell-executable "${COMMONKIT_SHELL_EXECUTABLE:?}"
+      --release-keyring "${COMMONKIT_RELEASE_KEYRING:?}"
+      --gpgv-executable "${COMMONKIT_GPGV_EXECUTABLE:?}"
+    )
+  fi
+  sudo -u "$user" "$home/commonkit-target-helper" "${probe_args[@]}"
+fi
 host_key="$scratch/sshd/host_key"
 ssh-keygen -q -t ed25519 -N '' -f "$host_key"
 cat > "$scratch/sshd/config" <<CFG

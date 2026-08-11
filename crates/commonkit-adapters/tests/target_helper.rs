@@ -405,3 +405,107 @@ fn package_resolution_request_digest_is_challenge_bound() {
     };
     assert_ne!(digest(&first), digest(&second));
 }
+
+#[cfg(all(unix, target_os = "linux"))]
+#[test]
+fn installed_probe_writes_a_real_nvm_package_capability_atomically() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp("probe-home");
+    let root = temp("probe-root");
+    let state = temp("probe-state");
+    let nvm = home.join(".nvm");
+    let config = home.join(".config/commonkit/target-helper.json");
+    fs::create_dir_all(&nvm).unwrap();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        nvm.join("nvm.sh"),
+        include_bytes!("fixtures/node/nvm-v0.40.6.sh"),
+    )
+    .unwrap();
+    let shell = home.join("bash");
+    let keyring = home.join("node-release-keyring.kbx");
+    let gpgv = home.join("gpgv");
+    fs::write(&shell, b"shell fixture").unwrap();
+    fs::write(&keyring, b"keyring fixture").unwrap();
+    fs::write(&gpgv, b"gpgv fixture").unwrap();
+    fs::set_permissions(&shell, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&gpgv, fs::Permissions::from_mode(0o700)).unwrap();
+    let identity = digest_domain_json("fixture", "probe-target").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit-target-helper"))
+        .args([
+            "--probe-package-resolution",
+            "--config",
+            config.to_str().unwrap(),
+            "--manager",
+            "nvm",
+            "--target-identity-digest",
+            identity.as_str(),
+            "--state-root",
+            state.to_str().unwrap(),
+            "--root-id",
+            "home",
+            "--root-path",
+            root.to_str().unwrap(),
+            "--nvm-dir",
+            nvm.to_str().unwrap(),
+            "--shell-executable",
+            shell.to_str().unwrap(),
+            "--release-keyring",
+            keyring.to_str().unwrap(),
+            "--gpgv-executable",
+            gpgv.to_str().unwrap(),
+        ])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata = fs::symlink_metadata(&config).unwrap();
+    assert!(!metadata.file_type().is_symlink());
+    assert_eq!(metadata.permissions().mode() & 0o022, 0);
+    let document: serde_json::Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(
+        document["packageResolution"]["manager"]["version"],
+        "0.40.6"
+    );
+    assert_eq!(
+        document["packageResolution"]["targetIdentityDigest"],
+        identity.as_str()
+    );
+    assert_eq!(
+        document["packageResolution"]["node"]["gpgvExecutable"],
+        gpgv.to_str().unwrap()
+    );
+    assert!(
+        document["packageResolution"]["node"]["gpgvExecutableDigest"]
+            .as_str()
+            .is_some_and(|digest| digest.starts_with("sha256:"))
+    );
+    let _ = fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(state);
+}
+
+#[cfg(unix)]
+#[test]
+fn installed_probe_rejects_a_symlinked_config_path() {
+    use std::os::unix::fs::symlink;
+    let home = temp("probe-symlink-home");
+    let outside = temp("probe-symlink-outside");
+    fs::create_dir_all(home.join(".config/commonkit")).unwrap();
+    fs::write(&outside, b"{}").unwrap();
+    symlink(&outside, home.join(".config/commonkit/target-helper.json")).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit-target-helper"))
+        .args(["--probe-package-resolution", "--manager", "nvm"])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let _ = fs::remove_dir_all(home);
+    let _ = fs::remove_file(outside);
+}
