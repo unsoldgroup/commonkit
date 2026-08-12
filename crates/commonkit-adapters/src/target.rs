@@ -442,7 +442,7 @@ impl TargetFilesystem for LocalTargetFilesystem {
 
 #[cfg(unix)]
 fn sync_directory(directory: &Dir) -> Result<(), std::io::Error> {
-    directory.try_clone()?.into_std_file().sync_all()
+    directory.open(".")?.sync_all()
 }
 
 #[cfg(not(unix))]
