@@ -155,6 +155,21 @@ impl LocalTargetFilesystem {
         Ok(self.root.try_clone()?.into_std_file())
     }
 
+    pub fn open_directory_handle(
+        &self,
+        path: &NormalizedManagedPath,
+    ) -> Result<std::fs::File, TargetFilesystemError> {
+        self.ensure_safe_ancestors(path, false)?;
+        let metadata = self.root.symlink_metadata(path.as_str())?;
+        if metadata_is_reparse_or_symlink(&metadata) {
+            return Err(TargetFilesystemError::SymlinkEncountered(path.to_string()));
+        }
+        if !metadata.is_dir() {
+            return Err(TargetFilesystemError::NotDirectory(path.to_string()));
+        }
+        Ok(self.root.open_dir(path.as_str())?.into_std_file())
+    }
+
     fn ensure_safe_ancestors(
         &self,
         path: &NormalizedManagedPath,

@@ -14,10 +14,10 @@ use commonkit_adapters::{
     ARTIFACT_CHUNK_SIZE, ApmProvider, ApmProviderConfig, AptRepositoryConfigurationV1,
     AptResolutionBackend, AptResolutionConstraints, AptSourceAuthorityV1, ArtifactStore,
     BwsCredentialResolver, ChezmoiProvider, ContentSensitivity, CredentialReference,
-    CredentialResolver, DesiredStateProvider, EngramChunkAdapter, EngramCommandRunner,
-    EngramOwnerId, EngramProjectId, EngramScope, EngramTargetChunkSetDeclaration,
-    EngramTargetRuntime, EngramTargetSyncMode, ExactProviderVersion, FileAdapter, FilesystemIntent,
-    GitRepository, GitSyncDisposition, LocalSensitiveFileStore, MAX_ARTIFACT_TRANSFER_BYTES,
+    CredentialResolver, DesiredStateProvider, EngramChunkAdapter, EngramError, EngramOwnerId,
+    EngramProjectId, EngramScope, EngramTargetChunkSetDeclaration, EngramTargetRuntime,
+    EngramTargetSyncMode, ExactProviderVersion, FileAdapter, FilesystemIntent, GitRepository,
+    GitSyncDisposition, LocalSensitiveFileStore, MAX_ARTIFACT_TRANSFER_BYTES,
     MAX_ARTIFACT_TRANSFER_COUNT, ManagerBindingV1, MaterializedState, NativeProvider,
     NodeResolutionBackend, NormalizedManagedPath, NormalizedResource, OpenSshConfig,
     OpenSshTransport, OwnershipRules, PackageAdapter, PackageDiscoveryFetchRequestV1, PackageFetch,
@@ -33,8 +33,8 @@ use commonkit_adapters::{
     ResolvedMaterializedState, ResolvedPackageIntent, ResourceIntent, ResourceProvenance,
     SecretValue, SshFileAdapter, SshFilesystemRequest, SshFilesystemResponse,
     SshOfflinePackageBackend, SshTargetCapabilities, SshTargetFilesystem, TargetFilesystem,
-    TargetNodeResolutionConfig, TargetPackageResolutionConfig, build_provider_plan,
-    build_resolved_provider_plan_with_router, materialize_mcp_client_state,
+    TargetFilesystemError, TargetNodeResolutionConfig, TargetPackageResolutionConfig,
+    build_provider_plan, build_resolved_provider_plan_with_router, materialize_mcp_client_state,
     package_resolution_request_digest, package_resolution_response_digest, validate_ownership,
 };
 use commonkit_config::{
@@ -1299,25 +1299,6 @@ fn validate_sync_config(config: &SyncConfig) -> Result<(), ProductionDomainError
     Ok(())
 }
 
-fn open_local_engram_project(
-    target_root: &Path,
-    project_root: &NormalizedManagedPath,
-) -> Result<PathBuf, DomainFailure> {
-    let mut project = target_root.to_path_buf();
-    for component in project_root.as_str().split('/') {
-        project.push(component);
-        let metadata =
-            fs::symlink_metadata(&project).map_err(|_| DomainFailure::OperationFailed)?;
-        if metadata.file_type().is_symlink() {
-            return Err(DomainFailure::OperationFailed);
-        }
-        if !metadata.is_dir() {
-            return Err(DomainFailure::OperationFailed);
-        }
-    }
-    Ok(project)
-}
-
 fn unique_destinations(
     values: Vec<CredentialDestination>,
 ) -> Result<BTreeMap<StableId, CredentialDestination>, ProductionDomainError> {
@@ -1491,11 +1472,51 @@ struct ProductionEngramReceipt {
     reconciliation: commonkit_adapters::EngramTargetReconciliationReceipt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionEngramSyncError {
+    Unreachable,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProductionEngramOpenError {
+    Unreachable,
+    Failed,
+}
+
+fn is_local_open_unreachable(error: &TargetFilesystemError) -> bool {
+    matches!(
+        error,
+        TargetFilesystemError::Io(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+fn is_local_unreachable(error: &EngramError) -> bool {
+    matches!(
+        error,
+        EngramError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NetworkUnreachable
+            )
+    )
+}
+
+fn is_remote_unreachable(error: &TargetFilesystemError) -> bool {
+    matches!(
+        error,
+        TargetFilesystemError::RemoteFailure { status: 255, .. }
+    )
+}
+
 enum ProductionEngramTarget {
     Local {
         filesystem: commonkit_adapters::LocalTargetFilesystem,
-        executable: PathBuf,
-        project: PathBuf,
+        executable: ProcessEngramCommandRunner,
+        project: std::fs::File,
         project_id: EngramProjectId,
     },
     Ssh {
@@ -1513,7 +1534,7 @@ impl ProductionEngramTarget {
         }
     }
 
-    fn sync(&self, mode: EngramTargetSyncMode) -> Result<(), DomainFailure> {
+    fn sync(&self, mode: EngramTargetSyncMode) -> Result<(), ProductionEngramSyncError> {
         match self {
             Self::Local {
                 executable,
@@ -1521,20 +1542,26 @@ impl ProductionEngramTarget {
                 project_id,
                 ..
             } => {
-                let runner = ProcessEngramCommandRunner::from_path(executable);
                 let args = match mode {
                     EngramTargetSyncMode::Export => vec!["sync", "--project", project_id.as_str()],
                     EngramTargetSyncMode::Import => {
                         vec!["sync", "--import", "--project", project_id.as_str()]
                     }
                 };
-                let output = runner
-                    .run(project, &args)
-                    .map_err(|_| DomainFailure::OperationFailed)?;
+                let output =
+                    executable
+                        .run_in_directory_handle(project, &args)
+                        .map_err(|error| {
+                            if is_local_unreachable(&error) {
+                                ProductionEngramSyncError::Unreachable
+                            } else {
+                                ProductionEngramSyncError::Failed
+                            }
+                        })?;
                 output
                     .success
                     .then_some(())
-                    .ok_or(DomainFailure::OperationFailed)
+                    .ok_or(ProductionEngramSyncError::Failed)
             }
             Self::Ssh {
                 filesystem,
@@ -1542,7 +1569,13 @@ impl ProductionEngramTarget {
                 project_root,
             } => filesystem
                 .sync_engram(project_id, project_root, mode)
-                .map_err(|_| DomainFailure::OperationFailed),
+                .map_err(|error| {
+                    if is_remote_unreachable(&error) {
+                        ProductionEngramSyncError::Unreachable
+                    } else {
+                        ProductionEngramSyncError::Failed
+                    }
+                }),
         }
     }
 }
@@ -1878,6 +1911,29 @@ struct AuthenticatedProviderAuthority {
 }
 
 impl ProductionSyncDomain {
+    fn persist_engram_receipt(
+        &self,
+        run_id: StableId,
+        confirmation_id: StableId,
+        reconciliation: commonkit_adapters::EngramTargetReconciliationReceipt,
+    ) -> Result<Value, DomainFailure> {
+        let receipt = ProductionEngramReceipt {
+            run_id: run_id.clone(),
+            confirmation_id,
+            reconciliation,
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&receipt).map_err(|_| DomainFailure::OperationFailed)?;
+        write_private_atomic(
+            &self
+                .receipt_root
+                .join("engram")
+                .join(format!("{run_id}.json")),
+            &bytes,
+        )?;
+        serde_json::to_value(receipt).map_err(|_| DomainFailure::OperationFailed)
+    }
+
     fn resolved_engram_owner() -> Result<EngramOwnerId, DomainFailure> {
         resolve_principal()
             .map(|principal| EngramOwnerId::from_principal(&principal))
@@ -1906,43 +1962,77 @@ impl ProductionSyncDomain {
         config: &SyncConfig,
         access: RootAccess,
     ) -> Result<ProductionEngramTarget, DomainFailure> {
+        self.open_engram_target_inner(config, access)
+            .map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn open_engram_target_inner(
+        &self,
+        config: &SyncConfig,
+        access: RootAccess,
+    ) -> Result<ProductionEngramTarget, ProductionEngramOpenError> {
         let engram = config
             .engram
             .as_ref()
-            .ok_or(DomainFailure::OperationFailed)?;
+            .ok_or(ProductionEngramOpenError::Failed)?;
         match config
             .target_transport
             .as_ref()
             .unwrap_or(&SyncTargetTransport::Local)
         {
-            SyncTargetTransport::Local => Ok(ProductionEngramTarget::Local {
-                filesystem: commonkit_adapters::LocalTargetFilesystem::open(
-                    &config.target_root,
-                    access,
+            SyncTargetTransport::Local => {
+                let filesystem =
+                    commonkit_adapters::LocalTargetFilesystem::open(&config.target_root, access)
+                        .map_err(|error| {
+                            if is_local_open_unreachable(&error) {
+                                ProductionEngramOpenError::Unreachable
+                            } else {
+                                ProductionEngramOpenError::Failed
+                            }
+                        })?;
+                let project = filesystem
+                    .open_directory_handle(&engram.project_root)
+                    .map_err(|error| {
+                        if is_local_open_unreachable(&error) {
+                            ProductionEngramOpenError::Unreachable
+                        } else {
+                            ProductionEngramOpenError::Failed
+                        }
+                    })?;
+                let executable = ProcessEngramCommandRunner::try_from_path(
+                    engram
+                        .executable
+                        .clone()
+                        .ok_or(ProductionEngramOpenError::Failed)?,
                 )
-                .map_err(|_| DomainFailure::OperationFailed)?,
-                executable: engram
-                    .executable
-                    .clone()
-                    .ok_or(DomainFailure::OperationFailed)?,
-                project: open_local_engram_project(&config.target_root, &engram.project_root)?,
-                project_id: engram.project_id.clone(),
-            }),
+                .map_err(|_| ProductionEngramOpenError::Failed)?;
+                Ok(ProductionEngramTarget::Local {
+                    filesystem,
+                    executable,
+                    project,
+                    project_id: engram.project_id.clone(),
+                })
+            }
             SyncTargetTransport::Ssh { root_id, .. } => Ok(ProductionEngramTarget::Ssh {
                 filesystem: SshTargetFilesystem::new(
                     root_id.clone(),
-                    self.ssh_factory.open(&production_ssh_target(
-                        config.target_transport.as_ref().unwrap(),
-                        config
-                            .ssh_target_capabilities()
-                            .map_err(|_| DomainFailure::OperationFailed)?,
-                        config
-                            .provider_platform()
-                            .map_err(|_| DomainFailure::OperationFailed)?,
-                        config.target_id.clone(),
-                        config.target_identity_digest.clone(),
-                        config.target_package_resolution(),
-                    )?)?,
+                    self.ssh_factory
+                        .open(
+                            &production_ssh_target(
+                                config.target_transport.as_ref().unwrap(),
+                                config
+                                    .ssh_target_capabilities()
+                                    .map_err(|_| ProductionEngramOpenError::Failed)?,
+                                config
+                                    .provider_platform()
+                                    .map_err(|_| ProductionEngramOpenError::Failed)?,
+                                config.target_id.clone(),
+                                config.target_identity_digest.clone(),
+                                config.target_package_resolution(),
+                            )
+                            .map_err(|_| ProductionEngramOpenError::Failed)?,
+                        )
+                        .map_err(|_| ProductionEngramOpenError::Failed)?,
                 ),
                 project_id: engram.project_id.clone(),
                 project_root: engram.project_root.clone(),
@@ -3667,36 +3757,118 @@ impl SyncDomain for ProductionSyncDomain {
         if left.project_id != right.project_id || left.owner_id != right.owner_id {
             return Err(DomainFailure::OperationFailed);
         }
-        let left_target = self.open_engram_target(&self.config, RootAccess::ReadWrite)?;
-        let right_target = self.open_engram_target(peer, RootAccess::ReadWrite)?;
-        left_target.sync(EngramTargetSyncMode::Export)?;
-        right_target.sync(EngramTargetSyncMode::Export)?;
-        let reconciliation = EngramChunkAdapter::reconcile_targets(
-            left_target.filesystem(),
-            &left,
-            right_target.filesystem(),
-            &right,
-        )
-        .map_err(|_| DomainFailure::OperationFailed)?;
-        left_target.sync(EngramTargetSyncMode::Import)?;
-        right_target.sync(EngramTargetSyncMode::Import)?;
         let run_id = StableId::parse(format!("engram-{:032x}", rand::random::<u128>()))
             .map_err(|_| DomainFailure::OperationFailed)?;
-        let receipt = ProductionEngramReceipt {
-            run_id: run_id.clone(),
-            confirmation_id: request.confirmation_id,
-            reconciliation,
+        let left_target = match self.open_engram_target_inner(&self.config, RootAccess::ReadWrite) {
+            Ok(target) => target,
+            Err(ProductionEngramOpenError::Unreachable) => {
+                return self.persist_engram_receipt(
+                    run_id,
+                    request.confirmation_id,
+                    commonkit_adapters::EngramTargetReconciliationReceipt {
+                        project_id: left.project_id.clone(),
+                        moved: Vec::new(),
+                        unresolved: Some("target is unreachable".to_owned()),
+                    },
+                );
+            }
+            Err(ProductionEngramOpenError::Failed) => {
+                return Err(DomainFailure::OperationFailed);
+            }
         };
-        let bytes =
-            serde_json::to_vec_pretty(&receipt).map_err(|_| DomainFailure::OperationFailed)?;
-        write_private_atomic(
-            &self
-                .receipt_root
-                .join("engram")
-                .join(format!("{run_id}.json")),
-            &bytes,
-        )?;
-        serde_json::to_value(receipt).map_err(|_| DomainFailure::OperationFailed)
+        let right_target = match self.open_engram_target_inner(peer, RootAccess::ReadWrite) {
+            Ok(target) => target,
+            Err(ProductionEngramOpenError::Unreachable) => {
+                return self.persist_engram_receipt(
+                    run_id,
+                    request.confirmation_id,
+                    commonkit_adapters::EngramTargetReconciliationReceipt {
+                        project_id: left.project_id.clone(),
+                        moved: Vec::new(),
+                        unresolved: Some("target is unreachable".to_owned()),
+                    },
+                );
+            }
+            Err(ProductionEngramOpenError::Failed) => {
+                return Err(DomainFailure::OperationFailed);
+            }
+        };
+        let unresolved = match left_target.sync(EngramTargetSyncMode::Export) {
+            Ok(()) => match right_target.sync(EngramTargetSyncMode::Export) {
+                Ok(()) => None,
+                Err(ProductionEngramSyncError::Unreachable) => {
+                    Some("target is unreachable".to_owned())
+                }
+                Err(ProductionEngramSyncError::Failed) => {
+                    return Err(DomainFailure::OperationFailed);
+                }
+            },
+            Err(ProductionEngramSyncError::Unreachable) => Some("target is unreachable".to_owned()),
+            Err(ProductionEngramSyncError::Failed) => {
+                return Err(DomainFailure::OperationFailed);
+            }
+        };
+        let reconciliation = if let Some(reason) = unresolved {
+            commonkit_adapters::EngramTargetReconciliationReceipt {
+                project_id: left.project_id.clone(),
+                moved: Vec::new(),
+                unresolved: Some(reason),
+            }
+        } else {
+            match EngramChunkAdapter::reconcile_targets(
+                left_target.filesystem(),
+                &left,
+                right_target.filesystem(),
+                &right,
+            ) {
+                Ok(reconciliation) => reconciliation,
+                Err(EngramError::Target(error)) if is_remote_unreachable(&error) => {
+                    commonkit_adapters::EngramTargetReconciliationReceipt {
+                        project_id: left.project_id.clone(),
+                        moved: Vec::new(),
+                        unresolved: Some("target is unreachable".to_owned()),
+                    }
+                }
+                Err(_) => return Err(DomainFailure::OperationFailed),
+            }
+        };
+        if reconciliation.unresolved.is_none() {
+            match left_target.sync(EngramTargetSyncMode::Import) {
+                Ok(()) => {}
+                Err(ProductionEngramSyncError::Unreachable) => {
+                    return self.persist_engram_receipt(
+                        run_id,
+                        request.confirmation_id,
+                        commonkit_adapters::EngramTargetReconciliationReceipt {
+                            project_id: left.project_id.clone(),
+                            moved: Vec::new(),
+                            unresolved: Some("target is unreachable".to_owned()),
+                        },
+                    );
+                }
+                Err(ProductionEngramSyncError::Failed) => {
+                    return Err(DomainFailure::OperationFailed);
+                }
+            }
+            match right_target.sync(EngramTargetSyncMode::Import) {
+                Ok(()) => {}
+                Err(ProductionEngramSyncError::Unreachable) => {
+                    return self.persist_engram_receipt(
+                        run_id,
+                        request.confirmation_id,
+                        commonkit_adapters::EngramTargetReconciliationReceipt {
+                            project_id: left.project_id.clone(),
+                            moved: Vec::new(),
+                            unresolved: Some("target is unreachable".to_owned()),
+                        },
+                    );
+                }
+                Err(ProductionEngramSyncError::Failed) => {
+                    return Err(DomainFailure::OperationFailed);
+                }
+            }
+        }
+        self.persist_engram_receipt(run_id, request.confirmation_id, reconciliation)
     }
 
     fn git_sync(&self, fetch: bool) -> Result<Value, DomainFailure> {
@@ -5961,6 +6133,22 @@ mod engram_project_containment_tests {
     use std::os::unix::fs::symlink;
 
     #[test]
+    fn only_an_unreachable_ssh_process_becomes_a_receipted_no_op() {
+        assert!(is_remote_unreachable(
+            &TargetFilesystemError::RemoteFailure {
+                status: 255,
+                message: "connection refused".into(),
+            }
+        ));
+        assert!(!is_remote_unreachable(
+            &TargetFilesystemError::RemoteFailure {
+                status: 1,
+                message: "authorization rejected".into(),
+            }
+        ));
+    }
+
+    #[test]
     fn local_engram_project_rejects_symlinked_project_root() {
         let temporary = tempfile::tempdir().unwrap();
         let target_root = temporary.path().join("target");
@@ -5970,10 +6158,10 @@ mod engram_project_containment_tests {
         symlink(&outside, target_root.join("project")).unwrap();
 
         let project_root = NormalizedManagedPath::parse("project").unwrap();
-        assert_eq!(
-            open_local_engram_project(&target_root, &project_root),
-            Err(DomainFailure::OperationFailed)
-        );
+        let filesystem =
+            commonkit_adapters::LocalTargetFilesystem::open(&target_root, RootAccess::ReadWrite)
+                .unwrap();
+        assert!(filesystem.open_directory_handle(&project_root).is_err());
     }
 }
 

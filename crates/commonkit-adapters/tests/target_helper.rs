@@ -7,12 +7,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use commonkit_adapters::{
-    ArtifactEvidence, FileMode, NodeRuntimeHost, NormalizedManagedPath, PackageArtifactV1,
-    PackageDesiredIntent, PackageMutationArtifact, PackageMutationPhase, PackageResolutionV1,
-    PackageSourceRegistry, PackageTargetV1, ProcessNodeRuntimeHost, ResolvedPackage,
-    SafeSymlinkTarget, SourceBindingV1, SshFilesystemRequest, SshFilesystemResponse,
-    SymlinkTargetKind, TargetHelper, TargetNodeResolutionConfig, TargetPackageResolutionConfig,
-    TargetResource, package_resolution_request_digest,
+    ArtifactEvidence, EngramTargetSyncMode, FileMode, NodeRuntimeHost, NormalizedManagedPath,
+    PackageArtifactV1, PackageDesiredIntent, PackageMutationArtifact, PackageMutationPhase,
+    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ProcessNodeRuntimeHost,
+    ResolvedPackage, SafeSymlinkTarget, SourceBindingV1, SshFilesystemRequest,
+    SshFilesystemResponse, SymlinkTargetKind, TargetHelper, TargetNodeResolutionConfig,
+    TargetPackageResolutionConfig, TargetResource, package_resolution_request_digest,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, digest_domain_json,
@@ -975,6 +975,53 @@ fn helper_rejects_staging_symlinks_during_cleanup() {
     fs::remove_dir_all(home).unwrap();
     fs::remove_dir_all(target).unwrap();
     fs::remove_dir_all(outside).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn helper_executes_the_validated_engram_file_after_its_path_is_swapped() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let target = temp("engram-executable-race-target");
+    let state = temp("engram-executable-race-state");
+    fs::create_dir_all(target.join("repo/.engram")).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let executable = target.join("engram");
+    let original = target.join("engram.original");
+    let swapped = target.join("engram.swapped");
+    fs::copy("/usr/bin/true", &executable).unwrap();
+    fs::copy("/usr/bin/false", &swapped).unwrap();
+    let mut permissions = fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&executable, permissions).unwrap();
+
+    let helper = TargetHelper::open_with_package_resolution_and_protected_paths(
+        vec![TargetRoot {
+            id: StableId::parse("home").unwrap(),
+            path: target.to_string_lossy().into_owned(),
+            access: RootAccess::ReadWrite,
+        }],
+        &state,
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .with_engram_executable(Some(executable.clone()))
+    .unwrap();
+    fs::rename(&executable, &original).unwrap();
+    symlink(&swapped, &executable).unwrap();
+
+    helper
+        .dispatch(SshFilesystemRequest::EngramSync {
+            root_id: StableId::parse("home").unwrap(),
+            project_id: "github.com/unsoldgroup/commonkit".try_into().unwrap(),
+            project_path: NormalizedManagedPath::parse("repo").unwrap(),
+            mode: EngramTargetSyncMode::Export,
+        })
+        .unwrap();
+
+    fs::remove_dir_all(target).unwrap();
     fs::remove_dir_all(state).unwrap();
 }
 

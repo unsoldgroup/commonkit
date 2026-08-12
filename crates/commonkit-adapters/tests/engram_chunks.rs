@@ -470,6 +470,10 @@ impl SshFilesystemTransport for MemorySsh {
                 files.insert(path.to_string(), content);
                 Ok(SshFilesystemResponse::Applied)
             }
+            SshFilesystemRequest::Remove { path, .. } => {
+                files.remove(path.as_str());
+                Ok(SshFilesystemResponse::Applied)
+            }
             SshFilesystemRequest::EngramSync { mode, .. } => {
                 self.syncs.push(mode);
                 Ok(SshFilesystemResponse::EngramSynced { mode })
@@ -532,6 +536,51 @@ fn target_reconcile_uses_the_closed_ssh_filesystem_protocol() {
             .len(),
         2
     );
+}
+
+#[test]
+fn target_status_ignores_crash_left_stage_files_before_manifest_enumeration() {
+    let manifest = serde_json::to_vec(&json!({"version":1,"chunks":[{
+        "id":"11111111","created_by":"test","created_at":"2026-08-06T00:00:00Z",
+        "sessions":0,"memories":1,"prompts":0
+    }]}))
+    .unwrap();
+    let remote = SshTargetFilesystem::new(
+        StableId::parse("repo-root").unwrap(),
+        MemorySsh {
+            files: [
+                ("repo/.engram/manifest.json".to_owned(), manifest),
+                (
+                    "repo/.engram/.manifest.json.commonkit-tmp".to_owned(),
+                    b"partial".to_vec(),
+                ),
+                (
+                    "repo/.engram/chunks/11111111.jsonl.gz".to_owned(),
+                    b"left".to_vec(),
+                ),
+                (
+                    "repo/.engram/chunks/.22222222.jsonl.gz.commonkit-tmp".to_owned(),
+                    b"partial".to_vec(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            syncs: Vec::new(),
+        },
+    );
+    let declaration = EngramTargetChunkSetDeclaration {
+        target_id: StableId::parse("macbook").unwrap(),
+        project_id: "github.com/unsoldgroup/commonkit".try_into().unwrap(),
+        owner_id: EngramOwnerId::try_from("github:astemarie").unwrap(),
+        project_root: NormalizedManagedPath::parse("repo").unwrap(),
+        root: NormalizedManagedPath::parse("repo/.engram").unwrap(),
+        scope: EngramScope::Project,
+    };
+
+    let status = EngramChunkAdapter::status_target(&remote, &declaration).unwrap();
+
+    assert_eq!(status.state, EngramChunkSetState::InSync);
+    assert_eq!(status.present.len(), 1);
 }
 
 #[test]

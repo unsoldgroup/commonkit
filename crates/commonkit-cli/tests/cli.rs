@@ -86,6 +86,7 @@ fn engram_status_reports_a_declared_project_chunk_set() {
             "--root",
             root.path().to_str().unwrap(),
         ])
+        .env("GH_CONFIG_DIR", root.path().join("empty-gh-config"))
         .output()
         .unwrap();
     assert!(!output.status.success());

@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use commonkit_contracts::{Sha256Digest, StableId};
 use serde::{Deserialize, Serialize};
@@ -237,13 +238,70 @@ pub trait EngramCommandRunner: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct ProcessEngramCommandRunner {
     executable: PathBuf,
+    stable_directory: Option<Arc<tempfile::TempDir>>,
 }
 
 impl ProcessEngramCommandRunner {
     pub fn from_path(executable: impl Into<PathBuf>) -> Self {
-        Self {
-            executable: executable.into(),
+        let executable = executable.into();
+        let resolved = resolve_executable_path(&executable).unwrap_or_else(|| executable.clone());
+        match stable_executable(&resolved) {
+            Ok((executable, stable_directory)) => Self {
+                executable,
+                stable_directory: Some(Arc::new(stable_directory)),
+            },
+            Err(_) => Self {
+                executable: resolved,
+                stable_directory: None,
+            },
         }
+    }
+
+    pub fn try_from_path(executable: impl Into<PathBuf>) -> Result<Self, std::io::Error> {
+        let executable = executable.into();
+        let resolved = resolve_executable_path(&executable).unwrap_or(executable);
+        let (executable, stable_directory) = stable_executable(&resolved)?;
+        Ok(Self {
+            executable,
+            stable_directory: Some(Arc::new(stable_directory)),
+        })
+    }
+
+    #[cfg(unix)]
+    pub fn run_in_directory_handle(
+        &self,
+        directory: &std::fs::File,
+        arguments: &[&str],
+    ) -> Result<EngramCommandOutput, EngramError> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        if self.stable_directory.is_none() {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::NotFound, "Engram executable").into(),
+            );
+        }
+        let directory = directory.try_clone()?;
+        let directory_fd = directory.as_raw_fd();
+        clear_close_on_exec(directory_fd)?;
+        let mut command = Command::new(&self.executable);
+        command
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(directory_fd) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let status = command.status()?;
+        Ok(EngramCommandOutput {
+            success: status.success(),
+        })
     }
 }
 
@@ -259,14 +317,113 @@ impl EngramCommandRunner for ProcessEngramCommandRunner {
         working_directory: &Path,
         arguments: &[&str],
     ) -> Result<EngramCommandOutput, EngramError> {
-        let status = Command::new(&self.executable)
-            .args(arguments)
-            .current_dir(working_directory)
-            .status()?;
-        Ok(EngramCommandOutput {
-            success: status.success(),
-        })
+        #[cfg(unix)]
+        {
+            let directory = open_directory_handle(working_directory)?;
+            self.run_in_directory_handle(&directory, arguments)
+        }
+        #[cfg(not(unix))]
+        {
+            if self.stable_directory.is_none() {
+                return Err(
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "Engram executable").into(),
+                );
+            }
+            let status = Command::new(&self.executable)
+                .args(arguments)
+                .current_dir(working_directory)
+                .status()?;
+            Ok(EngramCommandOutput {
+                success: status.success(),
+            })
+        }
     }
+}
+
+fn resolve_executable_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|directory| directory.join(path))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(not(unix))]
+fn stable_executable(path: &Path) -> Result<(PathBuf, tempfile::TempDir), std::io::Error> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "Engram executable is not a regular file",
+        ));
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("commonkit-engram-exec-")
+        .tempdir()?;
+    let executable = directory.path().join("engram");
+    std::fs::copy(path, &executable)?;
+    Ok((executable, directory))
+}
+
+#[cfg(unix)]
+fn stable_executable(path: &Path) -> Result<(PathBuf, tempfile::TempDir), std::io::Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "Engram executable is not a regular file",
+        ));
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("commonkit-engram-exec-")
+        .tempdir()?;
+    let executable = directory.path().join("engram");
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&executable)?;
+    let mut source = file;
+    std::io::copy(&mut source, &mut output)?;
+    output.sync_all()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            &executable,
+            std::fs::Permissions::from_mode(metadata.permissions().mode()),
+        )?;
+    }
+    Ok((executable, directory))
+}
+
+#[cfg(unix)]
+fn clear_close_on_exec(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_directory_handle(path: &Path) -> Result<std::fs::File, std::io::Error> {
+    use cap_std::ambient_authority;
+    use cap_std::fs::Dir;
+    let mut current = Dir::open_ambient_dir(Path::new("/"), ambient_authority())?;
+    for component in path.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        current = current.open_dir(name)?;
+    }
+    Ok(current.into_std_file())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -418,6 +575,7 @@ impl EngramChunkAdapter {
         filesystem: &dyn TargetFilesystem,
         declaration: &EngramTargetChunkSetDeclaration,
     ) -> Result<EngramChunkSetStatus, EngramError> {
+        recover_target_stage_files(filesystem, &declaration.root)?;
         let manifest = match read_target_manifest(filesystem, &declaration.root) {
             Ok(manifest) => manifest,
             Err(EngramError::TargetUnreachable) => {
@@ -466,6 +624,8 @@ impl EngramChunkAdapter {
         right: &EngramTargetChunkSetDeclaration,
     ) -> Result<EngramTargetReconciliationReceipt, EngramError> {
         validate_target_pair(left, right)?;
+        recover_target_stage_files(left_filesystem, &left.root)?;
+        recover_target_stage_files(right_filesystem, &right.root)?;
         let left_manifest = read_target_manifest(left_filesystem, &left.root)?;
         let right_manifest = read_target_manifest(right_filesystem, &right.root)?;
         let left_chunks = manifest_map(&left_manifest)?;
@@ -776,6 +936,9 @@ fn observed_target_chunk_ids(
     let names = filesystem.list_directory(&target_path(root, "chunks")?)?;
     let mut ids = BTreeSet::new();
     for name in names {
+        if name.ends_with(".jsonl.gz.commonkit-tmp") {
+            continue;
+        }
         let id = name
             .strip_suffix(".jsonl.gz")
             .ok_or_else(|| EngramError::InvalidChunkId(name.clone()))?;
@@ -783,6 +946,29 @@ fn observed_target_chunk_ids(
         ids.insert(id.to_owned());
     }
     Ok(ids)
+}
+
+fn recover_target_stage_files(
+    filesystem: &dyn TargetFilesystem,
+    root: &NormalizedManagedPath,
+) -> Result<(), EngramError> {
+    let manifest_temporary = target_path(root, ".manifest.json.commonkit-tmp")?;
+    match filesystem.remove(&manifest_temporary) {
+        Ok(()) | Err(TargetFilesystemError::ReadOnly) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let chunks = target_path(root, "chunks")?;
+    for name in filesystem.list_directory(&chunks)? {
+        if !name.starts_with('.') || !name.ends_with(".jsonl.gz.commonkit-tmp") {
+            continue;
+        }
+        let temporary = target_path(root, &format!("chunks/{name}"))?;
+        match filesystem.remove(&temporary) {
+            Ok(()) | Err(TargetFilesystemError::ReadOnly) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn read_target_chunk(

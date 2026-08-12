@@ -27,9 +27,10 @@ use crate::{
     PackageFetch, PackageFetchHopV1, PackageFetchRequestV1, PackageMutationArtifact,
     PackageMutationBackend, PackageMutationPhase, PackageResolutionBackend,
     PackageResolutionCoordinator, PackageResolutionError, PackageSourceRegistry,
-    ProcessAptResolutionCommandRunner, ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost,
-    ProcessOfflinePackageBackend, SshFilesystemRequest, SshFilesystemResponse, TargetFilesystem,
-    TargetFilesystemError, TargetPackageResolutionConfig, package_resolution_request_digest,
+    ProcessAptResolutionCommandRunner, ProcessEngramCommandRunner,
+    ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, ProcessOfflinePackageBackend,
+    SshFilesystemRequest, SshFilesystemResponse, TargetFilesystem, TargetFilesystemError,
+    TargetPackageResolutionConfig, package_resolution_request_digest,
     package_resolution_response_digest,
 };
 
@@ -44,7 +45,7 @@ pub struct TargetHelper {
     staging: std::sync::Mutex<Dir>,
     package_resolution: Option<TargetPackageResolutionConfig>,
     protected_paths: Vec<PathBuf>,
-    engram_executable: Option<PathBuf>,
+    engram_executable: Option<ProcessEngramCommandRunner>,
 }
 
 struct ValidatedRoot {
@@ -59,13 +60,10 @@ impl TargetHelper {
         mut self,
         executable: Option<PathBuf>,
     ) -> Result<Self, TargetFilesystemError> {
-        if let Some(path) = &executable {
-            let metadata = std::fs::symlink_metadata(path)?;
-            if !path.is_absolute() || metadata.file_type().is_symlink() || !metadata.is_file() {
-                return Err(TargetFilesystemError::InvalidEngramExecutable);
-            }
-        }
-        self.engram_executable = executable;
+        self.engram_executable = executable
+            .map(ProcessEngramCommandRunner::try_from_path)
+            .transpose()
+            .map_err(|_| TargetFilesystemError::InvalidEngramExecutable)?;
         Ok(self)
     }
 
@@ -866,37 +864,20 @@ impl TargetHelper {
                     .engram_executable
                     .as_ref()
                     .ok_or(TargetFilesystemError::EngramExecutableUnavailable)?;
-                let (_, root_path, _) = self
+                let (filesystem, _, _) = self
                     .roots
                     .get(&root_id)
                     .ok_or_else(|| TargetFilesystemError::UnknownRoot(root_id.clone()))?;
-                let mut project = root_path.clone();
-                for component in project_path.as_str().split('/') {
-                    project.push(component);
-                    let metadata = std::fs::symlink_metadata(&project)?;
-                    if metadata.file_type().is_symlink() {
-                        return Err(TargetFilesystemError::SymlinkEncountered(
-                            project_path.to_string(),
-                        ));
-                    }
-                    if !metadata.is_dir() {
-                        return Err(TargetFilesystemError::NotDirectory(
-                            project_path.to_string(),
-                        ));
-                    }
-                }
-                let mut command = std::process::Command::new(executable);
-                command
-                    .arg("sync")
-                    .arg("--project")
-                    .arg(project_id.as_str())
-                    .current_dir(project)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
+                let project = filesystem.open_directory_handle(&project_path)?;
+                let mut arguments = vec!["sync"];
                 if mode == crate::EngramTargetSyncMode::Import {
-                    command.arg("--import");
+                    arguments.push("--import");
                 }
-                if !command.status()?.success() {
+                arguments.extend(["--project", project_id.as_str()]);
+                let output = executable
+                    .run_in_directory_handle(&project, &arguments)
+                    .map_err(|_| TargetFilesystemError::EngramCommandFailed)?;
+                if !output.success {
                     return Err(TargetFilesystemError::EngramCommandFailed);
                 }
                 Ok(SshFilesystemResponse::EngramSynced { mode })
