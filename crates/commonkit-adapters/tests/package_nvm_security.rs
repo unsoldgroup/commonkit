@@ -369,6 +369,49 @@ fn nvm_observe_accepts_real_alias_rows_and_rejects_junk_only_output() {
 }
 
 #[test]
+fn nvm_observe_accepts_padded_current_and_system_rows() {
+    let output = "->     v20.19.0 *\n->       system * (-> v20.19.0)\n";
+    let root = tempfile::tempdir().unwrap();
+    let script = format!("nvm() {{ printf '%s' '{}'; }}\n", output);
+    let script_bytes = script.as_bytes();
+    fs::create_dir(root.path().join(".nvm")).unwrap();
+    fs::write(root.path().join(".nvm/nvm.sh"), script_bytes).unwrap();
+    let mut backend = ProcessOfflinePackageBackend::new(root.path());
+
+    let observed = backend
+        .observe(&resolution(root.path(), digest(script_bytes)))
+        .unwrap();
+    assert_eq!(
+        observed.installed_versions,
+        BTreeSet::from(["20.19.0".into()])
+    );
+}
+
+#[test]
+fn nvm_observe_rejects_unresolved_or_malformed_current_rows() {
+    let outputs = [
+        "->       system *\n",
+        "->       system * (-> N/A)\n",
+        "->     v20.19.0 unexpected\n",
+    ];
+    for output in outputs {
+        let root = tempfile::tempdir().unwrap();
+        let script = format!("nvm() {{ printf '%s' '{}'; }}\n", output);
+        let script_bytes = script.as_bytes();
+        fs::create_dir(root.path().join(".nvm")).unwrap();
+        fs::write(root.path().join(".nvm/nvm.sh"), script_bytes).unwrap();
+        let mut backend = ProcessOfflinePackageBackend::new(root.path());
+
+        assert!(
+            backend
+                .observe(&resolution(root.path(), digest(script_bytes)))
+                .is_err(),
+            "malformed or unresolved current row must fail closed: {output}"
+        );
+    }
+}
+
+#[test]
 fn nvm_observe_accepts_legitimate_no_installed_state() {
     let output = "N/A *\niojs -> N/A (default)\nnode -> stable (-> N/A) (default)\nunstable -> N/A (default)\n";
     let root = tempfile::tempdir().unwrap();

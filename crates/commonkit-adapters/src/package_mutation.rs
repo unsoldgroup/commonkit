@@ -1555,6 +1555,11 @@ fn parse_nvm_observation(output: &[u8]) -> Result<(BTreeSet<String>, bool), Pack
             recognized_line = true;
             continue;
         }
+        if let Some(version) = parse_nvm_system_row(line) {
+            installed_versions.insert(version);
+            recognized_line = true;
+            continue;
+        }
         if let Some(version) = parse_nvm_version_row(line) {
             installed_versions.insert(version);
             recognized_line = true;
@@ -1603,10 +1608,18 @@ fn parse_nvm_observation(output: &[u8]) -> Result<(BTreeSet<String>, bool), Pack
 }
 
 fn parse_nvm_version_row(line: &str) -> Option<String> {
-    let version = line
-        .strip_prefix("-> v")
-        .or_else(|| line.strip_prefix('v'))?;
+    let version = if let Some(row) = line.strip_prefix("->") {
+        row.trim_start().strip_prefix('v')?
+    } else {
+        line.strip_prefix('v')?
+    };
     let version = version.trim_end_matches(" *");
+    valid_nvm_observation_version(version).then(|| version.to_owned())
+}
+
+fn parse_nvm_system_row(line: &str) -> Option<String> {
+    let row = line.strip_prefix("->")?.trim_start();
+    let version = row.strip_prefix("system * (-> v")?.strip_suffix(')')?;
     valid_nvm_observation_version(version).then(|| version.to_owned())
 }
 
