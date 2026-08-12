@@ -300,6 +300,110 @@ fn persist_crash_after_forward_barrier(
     store.persist(&journal).unwrap();
 }
 
+fn persist_crash_after_applying_forward(
+    store: &ReceiptStore,
+    plan: &commonkit_contracts::Plan,
+    run_id: &StableId,
+) {
+    let mut journal = ReceiptJournal::for_plan(run_id.clone(), plan).unwrap();
+    store.persist(&journal).unwrap();
+    for operation in &plan.operations {
+        journal
+            .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+            .unwrap();
+        store.persist(&journal).unwrap();
+    }
+    journal.transition(ReceiptState::Applying).unwrap();
+    store.persist(&journal).unwrap();
+    let exact = plan
+        .operations
+        .iter()
+        .find(|operation| operation.recovery_capability == RecoveryCapability::ExactRollback)
+        .unwrap();
+    for phase in [
+        OperationPhase::ApplyStarted,
+        OperationPhase::Applied,
+        OperationPhase::Verified,
+    ] {
+        journal
+            .record_operation(exact.id.clone(), phase, None)
+            .unwrap();
+        store.persist(&journal).unwrap();
+    }
+    journal.transition(ReceiptState::Verifying).unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::ApplyingForward).unwrap();
+    store.persist(&journal).unwrap();
+}
+
+fn persist_legacy_exact_forward_recovery(
+    store: &ReceiptStore,
+    plan: &commonkit_contracts::Plan,
+    run_id: &StableId,
+    exact_phase: OperationPhase,
+    final_state: ReceiptState,
+) {
+    let mut journal = ReceiptJournal::for_plan(run_id.clone(), plan).unwrap();
+    store.persist(&journal).unwrap();
+    for operation in &plan.operations {
+        journal
+            .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+            .unwrap();
+        store.persist(&journal).unwrap();
+    }
+    journal.transition(ReceiptState::Applying).unwrap();
+    store.persist(&journal).unwrap();
+    let exact = plan
+        .operations
+        .iter()
+        .find(|operation| operation.recovery_capability == RecoveryCapability::ExactRollback)
+        .unwrap();
+    let forward = plan
+        .operations
+        .iter()
+        .find(|operation| operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly)
+        .unwrap();
+    for phase in [
+        OperationPhase::ApplyStarted,
+        OperationPhase::Applied,
+        OperationPhase::Verified,
+    ] {
+        journal
+            .record_operation(exact.id.clone(), phase, None)
+            .unwrap();
+        store.persist(&journal).unwrap();
+        journal
+            .record_operation(forward.id.clone(), phase, None)
+            .unwrap();
+        store.persist(&journal).unwrap();
+    }
+    journal.transition(ReceiptState::Verifying).unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::ApplyingForward).unwrap();
+    store.persist(&journal).unwrap();
+    let failure_code = StableId::parse("legacy_exact_forward_recovery").unwrap();
+    journal
+        .record_operation(
+            exact.id.clone(),
+            exact_phase,
+            (exact_phase == OperationPhase::ForwardRecoveryFailed).then_some(failure_code),
+        )
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(forward.id.clone(), OperationPhase::ForwardRecovered, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .transition(ReceiptState::ForwardRecoveryRequired)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::ConvergingForward).unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(final_state).unwrap();
+    store.persist(&journal).unwrap();
+}
+
 #[test]
 fn prepares_every_operation_before_mutation_then_applies_and_verifies_in_plan_order() {
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -567,6 +671,108 @@ fn forward_barrier_never_rolls_back_and_records_forward_recovery_required() {
         ]
     );
     fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn applying_forward_checkpoint_is_already_a_recovery_barrier() {
+    let directory = temporary_directory("forward-applying-crash");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let mixed = plan_with(vec![
+        operation_with_capability("files", "exact", RecoveryCapability::ExactRollback),
+        operation_with_capability("files", "forward", RecoveryCapability::ConvergeForwardOnly),
+    ]);
+    let run_id = StableId::parse("forward-applying-crashed").unwrap();
+    persist_crash_after_applying_forward(&store, &mixed, &run_id);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut recovering = adapter(events.clone());
+    recovering.supports_forward = true;
+    recovering
+        .observations
+        .lock()
+        .unwrap()
+        .insert("forward".into(), RecoveryObservation::Before);
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(recovering)];
+
+    assert_eq!(
+        Reconciler::with_store(&store)
+            .recover_run(run_id.clone(), &mixed, &mut adapters)
+            .unwrap(),
+        ReconcileOutcome::ForwardRecovered
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "observe:forward",
+            "recovery_prepare:forward",
+            "converge:forward",
+            "observe:forward",
+        ]
+    );
+    let receipt = store.load(run_id).unwrap();
+    assert_eq!(receipt.receipt().state, ReceiptState::ForwardRecovered);
+    assert_eq!(
+        receipt
+            .receipt()
+            .operation_progress
+            .iter()
+            .find(|progress| progress.operation_id == mixed.operations[0].id)
+            .unwrap()
+            .phase,
+        OperationPhase::Verified
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn legacy_exact_forward_recovery_is_failed_closed_and_retryable() {
+    for (suffix, exact_phase, final_state) in [
+        (
+            "failed",
+            OperationPhase::ForwardRecoveryFailed,
+            ReceiptState::ForwardRecoveryFailed,
+        ),
+        (
+            "recovered",
+            OperationPhase::ForwardRecovered,
+            ReceiptState::ForwardRecovered,
+        ),
+    ] {
+        let directory = temporary_directory(&format!("legacy-exact-{suffix}"));
+        let store = ReceiptStore::open(&directory).unwrap();
+        let mixed = plan_with(vec![
+            operation_with_capability("files", "exact", RecoveryCapability::ExactRollback),
+            operation_with_capability("files", "forward", RecoveryCapability::ConvergeForwardOnly),
+        ]);
+        let run_id = StableId::parse(format!("legacy-exact-{suffix}")).unwrap();
+        persist_legacy_exact_forward_recovery(&store, &mixed, &run_id, exact_phase, final_state);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut recovering = adapter(events.clone());
+        recovering.supports_forward = true;
+        let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(recovering)];
+
+        assert_eq!(
+            Reconciler::with_store(&store)
+                .recover_run(run_id.clone(), &mixed, &mut adapters)
+                .unwrap(),
+            ReconcileOutcome::ForwardRecoveryFailed
+        );
+        assert!(events.lock().unwrap().is_empty());
+        let receipt = store.load(run_id).unwrap();
+        assert_eq!(receipt.receipt().state, ReceiptState::ForwardRecoveryFailed);
+        assert_eq!(
+            receipt
+                .receipt()
+                .operation_progress
+                .iter()
+                .find(|progress| progress.operation_id == mixed.operations[0].id)
+                .unwrap()
+                .phase,
+            OperationPhase::ForwardRecoveryFailed
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[test]

@@ -1353,6 +1353,7 @@ impl<'a> Reconciler<'a> {
         let mut journal = store.load(run_id)?;
         let receipt = journal.receipt();
         validate_receipt_plan_binding(plan, receipt)?;
+        let legacy_exact_forward_progress = legacy_exact_forward_progress(plan, receipt);
 
         let after_forward_barrier = plan.operations.iter().any(|operation| {
             operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
@@ -1373,12 +1374,14 @@ impl<'a> Reconciler<'a> {
             receipt.state,
             ReceiptState::ForwardRecoveryRequired
                 | ReceiptState::ConvergingForward
+                | ReceiptState::ApplyingForward
                 | ReceiptState::ForwardRecoveryFailed
-        ) || (receipt.state == ReceiptState::ForwardRecovered
-            && plan
-                .operations
-                .iter()
-                .any(|operation| package_evidence_pending(&journal, operation)));
+        ) || (!legacy_exact_forward_progress.is_empty())
+            || (receipt.state == ReceiptState::ForwardRecovered
+                && plan
+                    .operations
+                    .iter()
+                    .any(|operation| package_evidence_pending(&journal, operation)));
         if after_forward_barrier {
             return self.converge_forward(&mut journal, plan, adapters);
         }
@@ -1505,6 +1508,27 @@ impl<'a> Reconciler<'a> {
         ) {
             journal.transition(ReceiptState::ConvergingForward)?;
             self.persist(journal)?;
+        }
+
+        let legacy_exact_forward_progress = legacy_exact_forward_progress(plan, journal.receipt());
+        if !legacy_exact_forward_progress.is_empty() {
+            let failure_code =
+                StableId::parse("legacy_exact_forward_recovery").expect("static stable ID");
+            for (operation_id, phase) in legacy_exact_forward_progress {
+                if phase == OperationPhase::ForwardRecovered {
+                    journal.record_operation(
+                        operation_id,
+                        OperationPhase::ForwardRecoveryFailed,
+                        Some(failure_code.clone()),
+                    )?;
+                    self.persist(journal)?;
+                }
+            }
+            if journal.receipt().state != ReceiptState::ForwardRecoveryFailed {
+                journal.transition(ReceiptState::ForwardRecoveryFailed)?;
+                self.persist(journal)?;
+            }
+            return Ok(ReconcileOutcome::ForwardRecoveryFailed);
         }
 
         for operation in plan.operations.iter().filter(|operation| {
@@ -1814,6 +1838,30 @@ fn validate_plan(plan: &Plan) -> Result<(), ReconcileError> {
         return Err(ReconcileError::PlanMismatch);
     }
     Ok(())
+}
+
+fn legacy_exact_forward_progress(
+    plan: &Plan,
+    receipt: &RunReceipt,
+) -> Vec<(Sha256Digest, OperationPhase)> {
+    plan.operations
+        .iter()
+        .filter(|operation| operation.recovery_capability == RecoveryCapability::ExactRollback)
+        .filter_map(|operation| {
+            receipt
+                .operation_progress
+                .iter()
+                .find(|progress| {
+                    progress.operation_id == operation.id
+                        && matches!(
+                            progress.phase,
+                            OperationPhase::ForwardRecoveryFailed
+                                | OperationPhase::ForwardRecovered
+                        )
+                })
+                .map(|progress| (progress.operation_id.clone(), progress.phase))
+        })
+        .collect()
 }
 
 /// Binds a durable receipt to its plan while keeping the package receipt
