@@ -28,7 +28,7 @@ provided from the existing secrets manager (do not put them in the repository):
 
 ```sh
 LINEAR_API_TOKEN='…' LINEAR_GRAPH_ACTION_TOKEN='…' \
-CF_Token='…' LINEAR_GRAPH_TAILSCALE_IP='100.71.109.66' \
+CF_Token='…' LINEAR_GRAPH_TAILSCALE_IP='<tailnet-ip>' \
   bash apps/linear-graph/deploy/install-vps.sh
 ```
 

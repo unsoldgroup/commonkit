@@ -3,7 +3,7 @@ set -euo pipefail
 
 readonly DOMAIN="${LINEAR_GRAPH_DOMAIN:-graph.unsold.cloud}"
 readonly HUB_PORT="${LINEAR_GRAPH_PORT:-8790}"
-readonly TAILSCALE_IP="${LINEAR_GRAPH_TAILSCALE_IP:-100.71.109.66}"
+readonly TAILSCALE_IP="${LINEAR_GRAPH_TAILSCALE_IP:?Set LINEAR_GRAPH_TAILSCALE_IP to the VPS tailnet IP}"
 readonly REPO_DIR="${LINEAR_GRAPH_REPO_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 readonly TEMPLATE_DIR="$REPO_DIR/apps/linear-graph/deploy/templates"
 readonly CONFIG_DIR="$HOME/.config/commonkit/linear-graph"
