@@ -14,7 +14,9 @@ use commonkit_adapters::{
     ARTIFACT_CHUNK_SIZE, ApmProvider, ApmProviderConfig, AptRepositoryConfigurationV1,
     AptResolutionBackend, AptResolutionConstraints, AptSourceAuthorityV1, ArtifactStore,
     BwsCredentialResolver, ChezmoiProvider, ContentSensitivity, CredentialReference,
-    CredentialResolver, DesiredStateProvider, ExactProviderVersion, FileAdapter, FilesystemIntent,
+    CredentialResolver, DesiredStateProvider, EngramChunkAdapter, EngramCommandRunner,
+    EngramOwnerId, EngramProjectId, EngramScope, EngramTargetChunkSetDeclaration,
+    EngramTargetRuntime, EngramTargetSyncMode, ExactProviderVersion, FileAdapter, FilesystemIntent,
     GitRepository, GitSyncDisposition, LocalSensitiveFileStore, MAX_ARTIFACT_TRANSFER_BYTES,
     MAX_ARTIFACT_TRANSFER_COUNT, ManagerBindingV1, MaterializedState, NativeProvider,
     NodeResolutionBackend, NormalizedManagedPath, NormalizedResource, OpenSshConfig,
@@ -23,16 +25,17 @@ use commonkit_adapters::{
     PackageResolutionAuthority, PackageResolutionBackend, PackageResolutionCoordinator,
     PackageResolutionError, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
     PlatformKeychain, PlatformKeychainCredentialResolver, ProcessAptResolutionCommandRunner,
-    ProcessBwsRunner, ProcessGitRunner, ProcessNodeReleaseSignatureVerifier,
-    ProcessNodeRuntimeHost, ProcessOfflinePackageBackend, ProcessPlatformSecretCommandRunner,
-    ProcessRemoteRunner, ProviderCapability, ProviderContext, ProviderInputs, ProviderPipeline,
-    ProviderPlanRequest, ProviderPlannerRoute, ProviderResourcePlanner, ProviderResourceRouter,
-    RemoteProviderStager, ResolvedMaterializedState, ResolvedPackageIntent, ResourceIntent,
-    ResourceProvenance, SecretValue, SshFileAdapter, SshFilesystemRequest, SshFilesystemResponse,
-    SshOfflinePackageBackend, SshTargetCapabilities, TargetNodeResolutionConfig,
-    TargetPackageResolutionConfig, build_provider_plan, build_resolved_provider_plan_with_router,
-    materialize_mcp_client_state, package_resolution_request_digest,
-    package_resolution_response_digest, validate_ownership,
+    ProcessBwsRunner, ProcessEngramCommandRunner, ProcessGitRunner,
+    ProcessNodeReleaseSignatureVerifier, ProcessNodeRuntimeHost, ProcessOfflinePackageBackend,
+    ProcessPlatformSecretCommandRunner, ProcessRemoteRunner, ProviderCapability, ProviderContext,
+    ProviderInputs, ProviderPipeline, ProviderPlanRequest, ProviderPlannerRoute,
+    ProviderResourcePlanner, ProviderResourceRouter, RemoteProviderStager,
+    ResolvedMaterializedState, ResolvedPackageIntent, ResourceIntent, ResourceProvenance,
+    SecretValue, SshFileAdapter, SshFilesystemRequest, SshFilesystemResponse,
+    SshOfflinePackageBackend, SshTargetCapabilities, SshTargetFilesystem, TargetFilesystem,
+    TargetNodeResolutionConfig, TargetPackageResolutionConfig, build_provider_plan,
+    build_resolved_provider_plan_with_router, materialize_mcp_client_state,
+    package_resolution_request_digest, package_resolution_response_digest, validate_ownership,
 };
 use commonkit_config::{
     LayerSet, StyleguidePolicy, compose_layers, resolve_styleguide_selection, v1_merge_rules,
@@ -43,7 +46,7 @@ use commonkit_contracts::{
     StableId, StyleguideDescriptor, StyleguideSelection, assert_no_embedded_secrets,
     digest_domain_json,
 };
-use commonkit_core::{PlanDraft, build_plan, enforce_policy_floor};
+use commonkit_core::{PlanDraft, RootAccess, build_plan, enforce_policy_floor};
 use commonkit_reconcile::{
     Adapter, PlanStore, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
 };
@@ -138,10 +141,24 @@ struct SyncConfig {
     policy_digest: Sha256Digest,
     #[serde(default)]
     package_resolution: Option<PackageResolutionConfig>,
+    #[serde(default)]
+    engram: Option<EngramConfig>,
     /// Runtime-derived, target-local endpoint. It is deliberately absent from
     /// portable configuration so clients cannot drift from daemon discovery.
     #[serde(skip)]
     relay_endpoint: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EngramConfig {
+    project_id: EngramProjectId,
+    owner_id: EngramOwnerId,
+    project_root: NormalizedManagedPath,
+    root: NormalizedManagedPath,
+    scope: EngramScope,
+    #[serde(default)]
+    executable: Option<PathBuf>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1064,6 +1081,7 @@ impl ProductionDomainRegistry {
             )
             .transpose()?;
         let mut target_sync_domains = BTreeMap::new();
+        let shared_sync_configs = Arc::new(sync_configs.clone());
         for (id, sync_config) in &sync_configs {
             validate_sync_config(sync_config)?;
             target_sync_domains.insert(
@@ -1073,6 +1091,7 @@ impl ProductionDomainRegistry {
                     plan_store: plan_store.clone(),
                     receipt_root: receipt_root.clone(),
                     ssh_factory: ssh_factory.clone(),
+                    sync_configs: shared_sync_configs.clone(),
                 }) as Arc<dyn SyncDomain>,
             );
         }
@@ -1247,6 +1266,37 @@ fn validate_sync_config(config: &SyncConfig) -> Result<(), ProductionDomainError
     config
         .provider_platform()
         .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+    if let Some(engram) = &config.engram {
+        let project_root = engram.project_root.as_str();
+        let chunk_root = engram.root.as_str();
+        if chunk_root != project_root
+            && !chunk_root
+                .strip_prefix(project_root)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(ProductionDomainError::UnsafeConfig);
+        }
+        if matches!(
+            config
+                .target_transport
+                .as_ref()
+                .unwrap_or(&SyncTargetTransport::Local),
+            SyncTargetTransport::Local
+        ) {
+            let executable = engram
+                .executable
+                .as_ref()
+                .ok_or(ProductionDomainError::UnsafeConfig)?;
+            let metadata = fs::symlink_metadata(executable)
+                .map_err(|_| ProductionDomainError::UnsafeConfig)?;
+            if !executable.is_absolute() || metadata.file_type().is_symlink() || !metadata.is_file()
+            {
+                return Err(ProductionDomainError::UnsafeConfig);
+            }
+        } else if engram.executable.is_some() {
+            return Err(ProductionDomainError::UnsafeConfig);
+        }
+    }
     Ok(())
 }
 
@@ -1412,6 +1462,71 @@ struct ProductionSyncDomain {
     plan_store: Arc<PlanStore>,
     receipt_root: PathBuf,
     ssh_factory: Arc<dyn ProductionSshTransportFactory>,
+    sync_configs: Arc<BTreeMap<StableId, SyncConfig>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProductionEngramReceipt {
+    run_id: StableId,
+    confirmation_id: StableId,
+    reconciliation: commonkit_adapters::EngramTargetReconciliationReceipt,
+}
+
+enum ProductionEngramTarget {
+    Local {
+        filesystem: commonkit_adapters::LocalTargetFilesystem,
+        executable: PathBuf,
+        project: PathBuf,
+        project_id: EngramProjectId,
+    },
+    Ssh {
+        filesystem: SshTargetFilesystem<Box<dyn commonkit_adapters::SshFilesystemTransport + Send>>,
+        project_id: EngramProjectId,
+        project_root: NormalizedManagedPath,
+    },
+}
+
+impl ProductionEngramTarget {
+    fn filesystem(&self) -> &dyn TargetFilesystem {
+        match self {
+            Self::Local { filesystem, .. } => filesystem,
+            Self::Ssh { filesystem, .. } => filesystem,
+        }
+    }
+
+    fn sync(&self, mode: EngramTargetSyncMode) -> Result<(), DomainFailure> {
+        match self {
+            Self::Local {
+                executable,
+                project,
+                project_id,
+                ..
+            } => {
+                let runner = ProcessEngramCommandRunner::from_path(executable);
+                let args = match mode {
+                    EngramTargetSyncMode::Export => vec!["sync", "--project", project_id.as_str()],
+                    EngramTargetSyncMode::Import => {
+                        vec!["sync", "--import", "--project", project_id.as_str()]
+                    }
+                };
+                let output = runner
+                    .run(project, &args)
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+                output
+                    .success
+                    .then_some(())
+                    .ok_or(DomainFailure::OperationFailed)
+            }
+            Self::Ssh {
+                filesystem,
+                project_id,
+                project_root,
+            } => filesystem
+                .sync_engram(project_id, project_root, mode)
+                .map_err(|_| DomainFailure::OperationFailed),
+        }
+    }
 }
 
 struct ProductionPackageFetch {
@@ -1745,6 +1860,72 @@ struct AuthenticatedProviderAuthority {
 }
 
 impl ProductionSyncDomain {
+    fn engram_declaration(
+        config: &SyncConfig,
+    ) -> Result<EngramTargetChunkSetDeclaration, DomainFailure> {
+        let engram = config
+            .engram
+            .as_ref()
+            .ok_or(DomainFailure::OperationFailed)?;
+        Ok(EngramTargetChunkSetDeclaration {
+            target_id: config.target_id.clone(),
+            project_id: engram.project_id.clone(),
+            owner_id: engram.owner_id.clone(),
+            project_root: engram.project_root.clone(),
+            root: engram.root.clone(),
+            scope: engram.scope,
+        })
+    }
+
+    fn open_engram_target(
+        &self,
+        config: &SyncConfig,
+        access: RootAccess,
+    ) -> Result<ProductionEngramTarget, DomainFailure> {
+        let engram = config
+            .engram
+            .as_ref()
+            .ok_or(DomainFailure::OperationFailed)?;
+        match config
+            .target_transport
+            .as_ref()
+            .unwrap_or(&SyncTargetTransport::Local)
+        {
+            SyncTargetTransport::Local => Ok(ProductionEngramTarget::Local {
+                filesystem: commonkit_adapters::LocalTargetFilesystem::open(
+                    &config.target_root,
+                    access,
+                )
+                .map_err(|_| DomainFailure::OperationFailed)?,
+                executable: engram
+                    .executable
+                    .clone()
+                    .ok_or(DomainFailure::OperationFailed)?,
+                project: config.target_root.join(engram.project_root.as_str()),
+                project_id: engram.project_id.clone(),
+            }),
+            SyncTargetTransport::Ssh { root_id, .. } => Ok(ProductionEngramTarget::Ssh {
+                filesystem: SshTargetFilesystem::new(
+                    root_id.clone(),
+                    self.ssh_factory.open(&production_ssh_target(
+                        config.target_transport.as_ref().unwrap(),
+                        config
+                            .ssh_target_capabilities()
+                            .map_err(|_| DomainFailure::OperationFailed)?,
+                        config
+                            .provider_platform()
+                            .map_err(|_| DomainFailure::OperationFailed)?,
+                        config.target_id.clone(),
+                        config.target_identity_digest.clone(),
+                        config.target_package_resolution(),
+                    )?)?,
+                ),
+                project_id: engram.project_id.clone(),
+                project_root: engram.project_root.clone(),
+            }),
+        }
+    }
+
     fn authority_path(&self, plan: &Plan) -> PathBuf {
         self.config
             .adapter_state
@@ -3420,6 +3601,80 @@ struct RollbackRequest {
     idempotency_key: Option<String>,
 }
 impl SyncDomain for ProductionSyncDomain {
+    fn engram_status(&self) -> Result<Value, DomainFailure> {
+        let engram = self
+            .config
+            .engram
+            .as_ref()
+            .ok_or(DomainFailure::OperationFailed)?;
+        let declaration = EngramTargetChunkSetDeclaration {
+            target_id: self.config.target_id.clone(),
+            project_id: engram.project_id.clone(),
+            owner_id: engram.owner_id.clone(),
+            project_root: engram.project_root.clone(),
+            root: engram.root.clone(),
+            scope: engram.scope,
+        };
+        let target = self.open_engram_target(&self.config, RootAccess::ReadOnly)?;
+        let status = EngramChunkAdapter::status_target(target.filesystem(), &declaration)
+            .map_err(|_| DomainFailure::VerificationFailed)?;
+        serde_json::to_value(status).map_err(|_| DomainFailure::OperationFailed)
+    }
+
+    fn engram_reconcile(&self, request: Value) -> Result<Value, DomainFailure> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase", deny_unknown_fields)]
+        struct Request {
+            confirmed: bool,
+            confirmation_id: StableId,
+            peer_target_id: StableId,
+        }
+        let request: Request =
+            serde_json::from_value(request).map_err(|_| DomainFailure::InvalidRequest)?;
+        if !request.confirmed || request.peer_target_id == self.config.target_id {
+            return Err(DomainFailure::InvalidRequest);
+        }
+        let peer = self
+            .sync_configs
+            .get(&request.peer_target_id)
+            .ok_or(DomainFailure::InvalidRequest)?;
+        let left = Self::engram_declaration(&self.config)?;
+        let right = Self::engram_declaration(peer)?;
+        if left.project_id != right.project_id || left.owner_id != right.owner_id {
+            return Err(DomainFailure::OperationFailed);
+        }
+        let left_target = self.open_engram_target(&self.config, RootAccess::ReadWrite)?;
+        let right_target = self.open_engram_target(peer, RootAccess::ReadWrite)?;
+        left_target.sync(EngramTargetSyncMode::Export)?;
+        right_target.sync(EngramTargetSyncMode::Export)?;
+        let reconciliation = EngramChunkAdapter::reconcile_targets(
+            left_target.filesystem(),
+            &left,
+            right_target.filesystem(),
+            &right,
+        )
+        .map_err(|_| DomainFailure::OperationFailed)?;
+        left_target.sync(EngramTargetSyncMode::Import)?;
+        right_target.sync(EngramTargetSyncMode::Import)?;
+        let run_id = StableId::parse(format!("engram-{:032x}", rand::random::<u128>()))
+            .map_err(|_| DomainFailure::OperationFailed)?;
+        let receipt = ProductionEngramReceipt {
+            run_id: run_id.clone(),
+            confirmation_id: request.confirmation_id,
+            reconciliation,
+        };
+        let bytes =
+            serde_json::to_vec_pretty(&receipt).map_err(|_| DomainFailure::OperationFailed)?;
+        write_private_atomic(
+            &self
+                .receipt_root
+                .join("engram")
+                .join(format!("{run_id}.json")),
+            &bytes,
+        )?;
+        serde_json::to_value(receipt).map_err(|_| DomainFailure::OperationFailed)
+    }
+
     fn git_sync(&self, fetch: bool) -> Result<Value, DomainFailure> {
         let source = self
             .config
@@ -6272,6 +6527,7 @@ mod package_resolution_tests {
                 apt: None,
                 node: None,
             }),
+            engram: None,
             relay_endpoint: None,
         };
         std::fs::create_dir_all(&config.target_root).unwrap();
@@ -6280,6 +6536,7 @@ mod package_resolution_tests {
             plan_store: Arc::new(PlanStore::open(root.join("plans")).unwrap()),
             receipt_root: root.join("receipts"),
             ssh_factory: Arc::new(ProcessSshTransportFactory),
+            sync_configs: Arc::new(BTreeMap::new()),
         };
         let declaration = PackageDeclaration {
             id: StableId::parse("ripgrep").unwrap(),
@@ -6398,6 +6655,7 @@ mod package_resolution_tests {
                     apt: None,
                     node: None,
                 }),
+                engram: None,
                 relay_endpoint: None,
             }
         }
@@ -6481,6 +6739,7 @@ mod package_resolution_tests {
                 apt: None,
                 node: None,
             }),
+            engram: None,
             relay_endpoint: None,
         };
         let mut domain = ProductionSyncDomain {
@@ -6488,6 +6747,7 @@ mod package_resolution_tests {
             plan_store: Arc::new(PlanStore::open(root.join("plans")).unwrap()),
             receipt_root: root.join("receipts"),
             ssh_factory: Arc::new(ProcessSshTransportFactory),
+            sync_configs: Arc::new(BTreeMap::new()),
         };
         let registry =
             package_source_registry(domain.config.package_resolution.as_ref().unwrap()).unwrap();
@@ -6726,6 +6986,7 @@ mod package_resolution_tests {
                 apt: None,
                 node: None,
             }),
+            engram: None,
             relay_endpoint: None,
         };
         let domain = ProductionSyncDomain {
@@ -6733,6 +6994,7 @@ mod package_resolution_tests {
             plan_store: Arc::new(PlanStore::open(root.join("plans")).unwrap()),
             receipt_root: root.join("receipts"),
             ssh_factory: Arc::new(RejectingPackageResolutionFactory),
+            sync_configs: Arc::new(BTreeMap::new()),
         };
         let declaration = PackageDeclaration {
             id: StableId::parse("curl").unwrap(),
@@ -6878,6 +7140,7 @@ mod package_resolution_tests {
                 apt: Some(apt),
                 node: None,
             }),
+            engram: None,
             relay_endpoint: None,
         };
         let domain = ProductionSyncDomain {
@@ -6885,6 +7148,7 @@ mod package_resolution_tests {
             plan_store: Arc::new(PlanStore::open(root.join("plans")).unwrap()),
             receipt_root: root.join("receipts"),
             ssh_factory: Arc::new(AcceptingPackageResolutionFactory { resolution }),
+            sync_configs: Arc::new(BTreeMap::new()),
         };
         let resolved = domain
             .resolve_package_states(&[package_state(declaration)], &artifacts)
@@ -6948,6 +7212,7 @@ mod production_verify_binding_tests {
             composed_loadout_digest: digest_domain_json("fixture", &loadout).expect("loadout"),
             policy_digest: digest_domain_json("fixture", &policy).expect("policy"),
             package_resolution: None,
+            engram: None,
             relay_endpoint: None,
         }
     }
@@ -6988,6 +7253,7 @@ mod production_verify_binding_tests {
             plan_store: Arc::new(PlanStore::open(plan_root).expect("plan store")),
             receipt_root: root.join("receipts"),
             ssh_factory: Arc::new(ProcessSshTransportFactory),
+            sync_configs: Arc::new(BTreeMap::new()),
         }
     }
 

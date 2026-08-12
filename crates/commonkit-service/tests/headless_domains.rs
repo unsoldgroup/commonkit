@@ -107,6 +107,12 @@ impl SyncDomain for EchoDomains {
     fn rollback(&self, _: Value) -> Result<Value, DomainFailure> {
         Ok(serde_json::json!({"domain":"sync","action":"rollback"}))
     }
+    fn engram_status(&self) -> Result<Value, DomainFailure> {
+        Ok(serde_json::json!({"domain":"engram","action":"status"}))
+    }
+    fn engram_reconcile(&self, _: Value) -> Result<Value, DomainFailure> {
+        Ok(serde_json::json!({"domain":"engram","action":"reconcile"}))
+    }
 }
 impl CredentialDomain for EchoDomains {
     fn plan(&self, _: Value) -> Result<Value, DomainFailure> {
@@ -164,6 +170,28 @@ async fn configured_domains_receive_authenticated_consent_checked_requests() {
         )
         .await["action"],
         "plan"
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            &token,
+            "GET",
+            "/control/v1/engram",
+            serde_json::json!({})
+        )
+        .await["action"],
+        "status"
+    );
+    assert_eq!(
+        call(
+            app.clone(),
+            &token,
+            "POST",
+            "/control/v1/engram/reconcile",
+            serde_json::json!({"confirmed":true,"confirmationId":"engram-test","peerTargetId":"peer"}),
+        )
+        .await["action"],
+        "reconcile"
     );
     for (method, path, expected) in [
         ("POST", "/control/v1/sync/plan", "sync"),

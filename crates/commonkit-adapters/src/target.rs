@@ -14,6 +14,11 @@ use crate::{FileMode, NormalizedManagedPath, SafeSymlinkTarget, SymlinkTargetKin
 
 /// Filesystem operations available to target adapters after a root capability is granted.
 pub trait TargetFilesystem {
+    fn list_directory(
+        &self,
+        path: &NormalizedManagedPath,
+    ) -> Result<Vec<String>, TargetFilesystemError>;
+
     fn read_file(
         &self,
         path: &NormalizedManagedPath,
@@ -63,6 +68,22 @@ pub enum TargetResource {
         #[serde(default, skip_serializing_if = "SymlinkTargetKind::is_file")]
         target_kind: SymlinkTargetKind,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngramTargetSyncMode {
+    Export,
+    Import,
+}
+
+pub trait EngramTargetRuntime {
+    fn sync_engram(
+        &self,
+        project_id: &crate::EngramProjectId,
+        project_path: &NormalizedManagedPath,
+        mode: EngramTargetSyncMode,
+    ) -> Result<(), TargetFilesystemError>;
 }
 
 pub struct LocalTargetFilesystem {
@@ -206,6 +227,37 @@ fn open_absolute_directory_nofollow(path: &Path) -> Result<Dir, std::io::Error> 
 }
 
 impl TargetFilesystem for LocalTargetFilesystem {
+    fn list_directory(
+        &self,
+        path: &NormalizedManagedPath,
+    ) -> Result<Vec<String>, TargetFilesystemError> {
+        self.ensure_safe_ancestors(path, false)?;
+        let metadata = self.root.symlink_metadata(path.as_str())?;
+        if metadata_is_reparse_or_symlink(&metadata) {
+            return Err(TargetFilesystemError::SymlinkEncountered(path.to_string()));
+        }
+        if !metadata.is_dir() {
+            return Err(TargetFilesystemError::NotDirectory(path.to_string()));
+        }
+        let directory = self.root.open_dir(path.as_str())?;
+        let mut entries = Vec::new();
+        for entry in directory.entries()? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata_is_reparse_or_symlink(&metadata) || !metadata.is_file() {
+                return Err(TargetFilesystemError::InvalidDirectoryEntry);
+            }
+            entries.push(
+                entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| TargetFilesystemError::InvalidDirectoryEntry)?,
+            );
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
     fn read_file(
         &self,
         path: &NormalizedManagedPath,
@@ -354,6 +406,10 @@ impl TargetFilesystem for LocalTargetFilesystem {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum SshFilesystemRequest {
+    ListDirectory {
+        root_id: StableId,
+        path: NormalizedManagedPath,
+    },
     ReadFile {
         root_id: StableId,
         path: NormalizedManagedPath,
@@ -382,6 +438,12 @@ pub enum SshFilesystemRequest {
     Remove {
         root_id: StableId,
         path: NormalizedManagedPath,
+    },
+    EngramSync {
+        root_id: StableId,
+        project_id: crate::EngramProjectId,
+        project_path: NormalizedManagedPath,
+        mode: EngramTargetSyncMode,
     },
     PackageMutation {
         root_id: StableId,
@@ -524,6 +586,9 @@ pub fn package_resolution_response_digest(
 #[allow(clippy::large_enum_variant)]
 pub enum SshFilesystemResponse {
     Absent,
+    Directory {
+        entries: Vec<String>,
+    },
     File {
         content: Vec<u8>,
     },
@@ -531,6 +596,9 @@ pub enum SshFilesystemResponse {
         resource: TargetResource,
     },
     Applied,
+    EngramSynced {
+        mode: EngramTargetSyncMode,
+    },
     PackageObserved {
         installed_versions: std::collections::BTreeSet<String>,
     },
@@ -680,6 +748,23 @@ impl<T> SshTargetFilesystem<T> {
 }
 
 impl<T: SshFilesystemTransport + Send> TargetFilesystem for SshTargetFilesystem<T> {
+    fn list_directory(
+        &self,
+        path: &NormalizedManagedPath,
+    ) -> Result<Vec<String>, TargetFilesystemError> {
+        match self
+            .transport
+            .lock()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?
+            .perform(SshFilesystemRequest::ListDirectory {
+                root_id: self.root_id.clone(),
+                path: path.clone(),
+            })? {
+            SshFilesystemResponse::Directory { entries } => Ok(entries),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+
     fn read_file(
         &self,
         path: &NormalizedManagedPath,
@@ -792,6 +877,29 @@ impl<T: SshFilesystemTransport + Send> TargetFilesystem for SshTargetFilesystem<
         self.remove(path)
     }
 }
+
+impl<T: SshFilesystemTransport + Send> EngramTargetRuntime for SshTargetFilesystem<T> {
+    fn sync_engram(
+        &self,
+        project_id: &crate::EngramProjectId,
+        project_path: &NormalizedManagedPath,
+        mode: EngramTargetSyncMode,
+    ) -> Result<(), TargetFilesystemError> {
+        match self
+            .transport
+            .lock()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?
+            .perform(SshFilesystemRequest::EngramSync {
+                root_id: self.root_id.clone(),
+                project_id: project_id.clone(),
+                project_path: project_path.clone(),
+                mode,
+            })? {
+            SshFilesystemResponse::EngramSynced { mode: actual } if actual == mode => Ok(()),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+}
 #[derive(Debug, Error)]
 pub enum TargetFilesystemError {
     #[error("target capability root must be an absolute, real directory")]
@@ -834,6 +942,12 @@ pub enum TargetFilesystemError {
     PackageResolutionRejected,
     #[error("target-local package resolution failed")]
     PackageResolutionFailed,
+    #[error("target Engram executable is unavailable")]
+    EngramExecutableUnavailable,
+    #[error("target Engram command failed")]
+    EngramCommandFailed,
+    #[error("target Engram executable is not a safe regular file")]
+    InvalidEngramExecutable,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

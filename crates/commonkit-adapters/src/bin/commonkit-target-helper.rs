@@ -23,6 +23,8 @@ struct HelperConfig {
     state_root: PathBuf,
     roots: Vec<TargetRoot>,
     #[serde(default)]
+    engram_executable: Option<PathBuf>,
+    #[serde(default)]
     package_resolution: Option<TargetPackageResolutionConfig>,
 }
 
@@ -81,6 +83,8 @@ fn run() -> Result<(), ()> {
         config.package_resolution,
         protected,
     )
+    .map_err(|_| ())?
+    .with_engram_executable(config.engram_executable)
     .map_err(|_| ())?;
     let mut input = Vec::new();
     std::io::stdin()
@@ -483,6 +487,7 @@ fn read_or_create_config(path: &Path, args: &[String]) -> Result<HelperConfig, (
             access: commonkit_core::RootAccess::ReadWrite,
         }],
         package_resolution: None,
+        engram_executable: None,
     })
 }
 

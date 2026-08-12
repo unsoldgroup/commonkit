@@ -44,6 +44,7 @@ pub struct TargetHelper {
     staging: std::sync::Mutex<Dir>,
     package_resolution: Option<TargetPackageResolutionConfig>,
     protected_paths: Vec<PathBuf>,
+    engram_executable: Option<PathBuf>,
 }
 
 struct ValidatedRoot {
@@ -54,6 +55,20 @@ struct ValidatedRoot {
 }
 
 impl TargetHelper {
+    pub fn with_engram_executable(
+        mut self,
+        executable: Option<PathBuf>,
+    ) -> Result<Self, TargetFilesystemError> {
+        if let Some(path) = &executable {
+            let metadata = std::fs::symlink_metadata(path)?;
+            if !path.is_absolute() || metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(TargetFilesystemError::InvalidEngramExecutable);
+            }
+        }
+        self.engram_executable = executable;
+        Ok(self)
+    }
+
     pub fn open(roots: Vec<TargetRoot>, state_root: &Path) -> Result<Self, TargetFilesystemError> {
         Self::open_with_package_resolution(roots, state_root, None)
     }
@@ -116,6 +131,7 @@ impl TargetHelper {
             staging: std::sync::Mutex::new(staging),
             package_resolution,
             protected_paths,
+            engram_executable: None,
         })
     }
 
@@ -768,7 +784,8 @@ impl TargetHelper {
         request: SshFilesystemRequest,
     ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
         match &request {
-            SshFilesystemRequest::ReadFile { root_id, path }
+            SshFilesystemRequest::ListDirectory { root_id, path }
+            | SshFilesystemRequest::ReadFile { root_id, path }
             | SshFilesystemRequest::InspectResource { root_id, path }
             | SshFilesystemRequest::WriteFile { root_id, path, .. }
             | SshFilesystemRequest::WriteDirectory { root_id, path, .. }
@@ -779,6 +796,11 @@ impl TargetHelper {
             _ => {}
         }
         match request {
+            SshFilesystemRequest::ListDirectory { root_id, path } => {
+                Ok(SshFilesystemResponse::Directory {
+                    entries: self.root(&root_id)?.list_directory(&path)?,
+                })
+            }
             SshFilesystemRequest::ReadFile { root_id, path } => {
                 Ok(match self.root(&root_id)?.read_file(&path)? {
                     Some(content) => SshFilesystemResponse::File { content },
@@ -819,6 +841,51 @@ impl TargetHelper {
             SshFilesystemRequest::Remove { root_id, path } => {
                 self.root(&root_id)?.remove_resource(&path)?;
                 Ok(SshFilesystemResponse::Applied)
+            }
+            SshFilesystemRequest::EngramSync {
+                root_id,
+                project_id,
+                project_path,
+                mode,
+            } => {
+                let executable = self
+                    .engram_executable
+                    .as_ref()
+                    .ok_or(TargetFilesystemError::EngramExecutableUnavailable)?;
+                let (_, root_path, _) = self
+                    .roots
+                    .get(&root_id)
+                    .ok_or_else(|| TargetFilesystemError::UnknownRoot(root_id.clone()))?;
+                let mut project = root_path.clone();
+                for component in project_path.as_str().split('/') {
+                    project.push(component);
+                    let metadata = std::fs::symlink_metadata(&project)?;
+                    if metadata.file_type().is_symlink() {
+                        return Err(TargetFilesystemError::SymlinkEncountered(
+                            project_path.to_string(),
+                        ));
+                    }
+                    if !metadata.is_dir() {
+                        return Err(TargetFilesystemError::NotDirectory(
+                            project_path.to_string(),
+                        ));
+                    }
+                }
+                let mut command = std::process::Command::new(executable);
+                command
+                    .arg("sync")
+                    .arg("--project")
+                    .arg(project_id.as_str())
+                    .current_dir(project)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if mode == crate::EngramTargetSyncMode::Import {
+                    command.arg("--import");
+                }
+                if !command.status()?.success() {
+                    return Err(TargetFilesystemError::EngramCommandFailed);
+                }
+                Ok(SshFilesystemResponse::EngramSynced { mode })
             }
             SshFilesystemRequest::PackageMutation {
                 root_id,

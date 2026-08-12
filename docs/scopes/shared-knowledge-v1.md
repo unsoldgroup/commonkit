@@ -266,3 +266,33 @@ editing. No cross-organization sharing.
 Is `session_summary` shared or personal? It is 16 % of observations and carries
 most of the confidentiality risk. Everything else in the type table is
 project-factual and comparatively safe to share.
+
+## Implemented owner-device disposition
+
+Engram remains a target-local SQLite store. CommonKit carries only its opaque,
+compressed JSONL chunks and manifest, identified by an explicit portable project
+identity. It inventories metadata, hashes compressed bytes, exchanges missing
+chunks, invokes Engram export/import, and records redacted receipts; it never
+decompresses or interprets payloads.
+
+Owner-device transport accepts the current mixed-scope export because both
+targets belong to one principal. Personal transport is rejected explicitly.
+Cross-principal transport is fail-closed until Engram emits
+`engram.scope-export.v1`: project identity, project scope, exporter version,
+exact manifest digest, and every chunk's ID, compressed size, and digest. A
+matching active Grant is required; withdrawal is prospective and retains
+already-imported observations.
+
+The implemented resource is append-only and content-addressed. Same-ID,
+different-byte chunks are collisions; missing peers are unresolved no-ops.
+Local and SSH targets use typed directory/read/write operations and fixed
+Engram export/import requests; no arbitrary remote command or payload decoding
+is exposed. Every cycle exports both targets, exchanges and verifies chunks,
+atomically updates manifests, then imports both sides. Receipts record only
+movement IDs, compressed-byte digests/sizes, confirmation identity, and any
+unresolved outcome.
+
+`session_summary` remains personal-only by default. Team sharing is not claimed
+until Engram supplies scope-separated attestation and the receiving-side gate
+verifies it. This is the honest v1 boundary: owner-device sync is implemented;
+team sync remains intentionally unavailable.

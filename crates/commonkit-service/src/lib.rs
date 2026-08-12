@@ -1086,6 +1086,8 @@ fn router_with_control_and_relay(
             post(target_apply_plan),
         )
         .route("/control/v1/verify", post(verify_target))
+        .route("/control/v1/engram", get(engram_status))
+        .route("/control/v1/engram/reconcile", post(engram_reconcile))
         .route(
             "/control/v1/credentials/readiness",
             post(credentials_readiness),
@@ -2219,6 +2221,12 @@ pub trait SyncDomain: Send + Sync + 'static {
     fn plan(&self, request: Value) -> Result<Value, DomainFailure>;
     fn verify(&self, request: Value) -> Result<Value, DomainFailure>;
     fn rollback(&self, request: Value) -> Result<Value, DomainFailure>;
+    fn engram_status(&self) -> Result<Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
+    fn engram_reconcile(&self, _request: Value) -> Result<Value, DomainFailure> {
+        Err(DomainFailure::OperationFailed)
+    }
     /// Inspects the configured, trusted provider repository. When `fetch` is true,
     /// only remote refs may be updated; managed content is never merged or applied.
     fn git_sync(&self, _fetch: bool) -> Result<Value, DomainFailure> {
@@ -4001,6 +4009,39 @@ async fn verify_target(
     let Json(mut report) = safe_domain_result(domain.verify(request))?;
     attach_package_report(&state, &mut report)?;
     Ok(Json(report))
+}
+
+async fn engram_status(State(state): State<ApiState>) -> Result<Json<Value>, ApiError> {
+    let domain = state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .sync
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
+    safe_domain_result(domain.engram_status())
+}
+
+async fn engram_reconcile(
+    State(state): State<ApiState>,
+    Json(request): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    assert_domain_request_safe(&request)?;
+    require_consent(&request)?;
+    let domain = state
+        .control
+        .inner
+        .runtime
+        .read()
+        .expect("control runtime lock")
+        .domains
+        .sync
+        .clone()
+        .ok_or_else(|| ApiError::unavailable_code("sync_domain_unconfigured"))?;
+    safe_domain_result(domain.engram_reconcile(request))
 }
 
 async fn rollback_run(

@@ -69,6 +69,51 @@ fn sync_help_exposes_explicit_fetch_before_plan() {
 }
 
 #[test]
+fn engram_status_reports_a_declared_project_chunk_set() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("chunks")).unwrap();
+    fs::write(
+        root.path().join("manifest.json"),
+        r#"{"version":1,"chunks":[]}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args([
+            "engram",
+            "status",
+            "--project-id",
+            "github.com/unsoldgroup/commonkit",
+            "--owner-id",
+            "github:astemarie",
+            "--root",
+            root.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["state"], "in_sync");
+    assert_eq!(status["projectId"], "github.com/unsoldgroup/commonkit");
+}
+
+#[test]
+fn engram_watch_requires_confirmation_and_has_a_one_minute_default() {
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["engram", "watch", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(help.contains("--interval-seconds <INTERVAL_SECONDS>"));
+    assert!(help.contains("[default: 60]"));
+    assert!(help.contains("--confirmed"));
+}
+
+#[test]
 fn sync_fetch_sends_one_fetch_bound_plan_request_and_never_applies() {
     let root = tempfile::tempdir().unwrap();
     let mut status = Command::new(env!("CARGO_BIN_EXE_commonkit"));
