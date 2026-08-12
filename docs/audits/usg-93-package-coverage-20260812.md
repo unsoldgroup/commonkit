@@ -1,7 +1,7 @@
 # USG-93 package behavior coverage audit
 
-Date: 2026-08-12  
-Target: `origin/main` (`08a2d2b272e8fd28413cdab10e3cfbde13325db1`)  
+Date: 2026-08-12
+Target: `origin/main` (`08a2d2b272e8fd28413cdab10e3cfbde13325db1`)
 Sources: `recovery/package-local-20260812` (`283d1df`),
 `archive/main-local-36068de-20260812` (`36068de`), and their relevant
 USG-128/129/130 package predecessors.
