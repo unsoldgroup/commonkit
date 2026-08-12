@@ -641,7 +641,6 @@ fn restart_after_forward_barrier_converges_bound_before_and_after_states_without
     assert_eq!(
         *events.lock().unwrap(),
         [
-            "observe:exact",
             "observe:forward",
             "recovery_prepare:forward",
             "converge:forward",
@@ -650,12 +649,91 @@ fn restart_after_forward_barrier_converges_bound_before_and_after_states_without
     );
     let receipt = store.load(run_id).unwrap();
     assert_eq!(receipt.receipt().state, ReceiptState::ForwardRecovered);
-    assert!(
+    assert_eq!(
         receipt
             .receipt()
             .operation_progress
             .iter()
-            .all(|progress| { progress.phase == OperationPhase::ForwardRecovered })
+            .find(|progress| progress.operation_id == mixed.operations[0].id)
+            .unwrap()
+            .phase,
+        OperationPhase::Verified
+    );
+    assert_eq!(
+        receipt
+            .receipt()
+            .operation_progress
+            .iter()
+            .find(|progress| progress.operation_id == mixed.operations[1].id)
+            .unwrap()
+            .phase,
+        OperationPhase::ForwardRecovered
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn restart_after_forward_barrier_never_forward_converges_exact_before_state() {
+    let directory = temporary_directory("forward-restart-exact-before");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let mixed = plan_with(vec![
+        operation_with_capability("files", "exact", RecoveryCapability::ExactRollback),
+        operation_with_capability("files", "forward", RecoveryCapability::ConvergeForwardOnly),
+    ]);
+    let run_id = StableId::parse("forward-exact-before").unwrap();
+    persist_crash_after_forward_barrier(&store, &mixed, &run_id);
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let mut recovering = adapter(events.clone());
+    recovering.supports_forward = true;
+    recovering
+        .observations
+        .lock()
+        .unwrap()
+        .insert("exact".into(), RecoveryObservation::Before);
+    recovering
+        .observations
+        .lock()
+        .unwrap()
+        .insert("forward".into(), RecoveryObservation::Before);
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(recovering)];
+
+    assert_eq!(
+        Reconciler::with_store(&store)
+            .recover_run(run_id.clone(), &mixed, &mut adapters)
+            .unwrap(),
+        ReconcileOutcome::ForwardRecovered
+    );
+    assert_eq!(
+        *events.lock().unwrap(),
+        [
+            "observe:forward",
+            "recovery_prepare:forward",
+            "converge:forward",
+            "observe:forward",
+        ]
+    );
+    let receipt = store.load(run_id).unwrap();
+    assert_eq!(receipt.receipt().state, ReceiptState::ForwardRecovered);
+    assert_eq!(
+        receipt
+            .receipt()
+            .operation_progress
+            .iter()
+            .find(|progress| progress.operation_id == mixed.operations[0].id)
+            .unwrap()
+            .phase,
+        OperationPhase::Verified
+    );
+    assert_eq!(
+        receipt
+            .receipt()
+            .operation_progress
+            .iter()
+            .find(|progress| progress.operation_id == mixed.operations[1].id)
+            .unwrap()
+            .phase,
+        OperationPhase::ForwardRecovered
     );
     fs::remove_dir_all(directory).unwrap();
 }
@@ -692,10 +770,7 @@ fn ambiguous_forward_recovery_fails_without_apply_or_rollback() {
             .unwrap(),
         ReconcileOutcome::ForwardRecoveryFailed
     );
-    assert_eq!(
-        *events.lock().unwrap(),
-        ["observe:exact", "observe:forward"]
-    );
+    assert_eq!(*events.lock().unwrap(), ["observe:forward"]);
     assert_eq!(
         store.load(run_id.clone()).unwrap().receipt().state,
         ReceiptState::ForwardRecoveryFailed

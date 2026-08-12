@@ -1507,7 +1507,9 @@ impl<'a> Reconciler<'a> {
             self.persist(journal)?;
         }
 
-        for operation in &plan.operations {
+        for operation in plan.operations.iter().filter(|operation| {
+            operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
+        }) {
             let already_recovered = journal.receipt().operation_progress.iter().any(|progress| {
                 progress.operation_id == operation.id
                     && progress.phase == OperationPhase::ForwardRecovered
