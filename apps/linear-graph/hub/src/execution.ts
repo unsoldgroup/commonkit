@@ -86,6 +86,7 @@ export interface ExecutionRunnerOptions {
   executable?: string;
   model?: string;
   apiKey?: string;
+  authMode?: "subscription" | "api-key";
   home?: string;
   codexHome?: string;
   timeoutMs?: number;
@@ -196,6 +197,9 @@ export async function executeApprovedBundle(
 
   if (request.bundle.status !== "approved" || !request.bundle.approvedAt) {
     return failureResult(result, new Error("Bundle must be explicitly approved before execution"), now().toISOString());
+  }
+  if (options.authMode === "api-key") {
+    return failureResult(result, new Error("Autonomous workspace-write execution requires subscription authentication"), now().toISOString());
   }
   const configuredRoot = options.repositoryAllowlist[request.repository];
   if (!configuredRoot || !resolve(configuredRoot).startsWith("/")) {

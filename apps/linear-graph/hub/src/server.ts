@@ -62,6 +62,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
   const store = options.store ?? new GraphStore(options.dataPath ?? ":memory:");
   const webDistPath = options.webDistPath ?? join(import.meta.dir, "../../web/dist");
   const codexAuth = createCodexAuthManager(options.codexAuth);
+  const codexAuthMode = options.codexAuth?.mode ?? "subscription";
   const persisted = store.loadSnapshot();
   const grouped = persisted ? graphSnapshotSchema.parse({
     ...persisted,
@@ -233,6 +234,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         } catch { return error("Invalid resolution approval", 400); }
       }
       if (executionMatch && request.method === "POST") {
+        if (codexAuthMode === "api-key") return error("Autonomous workspace-write execution requires subscription authentication; API-key mode is analysis-only", 409);
         if (!options.execution) return error("Headless execution is not configured on this VPS", 503);
         try {
           if (!current) return error("No snapshot available", 503);

@@ -37,6 +37,25 @@ describe("linear graph hub", () => {
     expect(summarizeTeams(issues)).toEqual([{ id: "team", key: "USG", name: "Unsold", issueCount: 2, activeIssueCount: 2, completedIssueCount: 0, canceledIssueCount: 0 }]);
   });
 
+  test("normalizes inverse blocks and duplicate relations canonically and deduplicates both Linear shapes", () => {
+    const canonicalRaw = raw("canonical");
+    const duplicateRaw = {
+      ...raw("duplicate"),
+      relations: { nodes: [{ type: "duplicate", issue: { id: "canonical" } }, { type: "blocks", issue: { id: "blocked" } }] },
+      inverseRelations: { nodes: [{ type: "duplicate", issue: { id: "canonical" } }, { type: "blocks", issue: { id: "blocker" } }] },
+    };
+    const canonicalWithInverse = { ...canonicalRaw, inverseRelations: { nodes: [{ type: "duplicate", issue: { id: "duplicate" } }] } };
+    const blockedRaw = { ...raw("blocked"), inverseRelations: { nodes: [{ type: "blocks", issue: { id: "duplicate" } }] } };
+    const blockerRaw = { ...raw("blocker") };
+    const issues = [canonicalRaw, duplicateRaw, blockedRaw, blockerRaw].map((item) => normalizeLinearIssue(item));
+    const edges = normalizeLinearEdges([canonicalWithInverse, duplicateRaw, blockedRaw, blockerRaw], issues);
+    expect(edges.map((edge) => [edge.kind, edge.sourceId, edge.targetId])).toEqual([
+      ["blocks", "blocker", "duplicate"],
+      ["blocks", "duplicate", "blocked"],
+      ["duplicate", "canonical", "duplicate"],
+    ]);
+  });
+
   test("keeps complete team counts for every synced issue state", () => {
     const issues = [
       normalizeLinearIssue(raw("active")),
@@ -76,6 +95,21 @@ describe("linear graph hub", () => {
     const input = JSON.parse(prompt.split("\n").at(-1)!);
     expect(input.issues).toHaveLength(701);
     expect(input.edges).toHaveLength(3001);
+  });
+
+  test("authenticates analysis with API-key mode without exposing the key to output", async () => {
+    const secret = "sk-analysis-12345678901234567890";
+    let env: Record<string, string> | undefined;
+    const stream = (text: string) => new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(text)); controller.close(); } });
+    const result = await runCodexAnalysis({ issues: [], edges: [] }, {
+      apiKey: secret,
+      spawn: (_command, options) => {
+        env = options.env;
+        return { stdin: { write() {}, end() {} }, stdout: stream(JSON.stringify({ brief: "Analysis complete", assignments: [], semanticEdges: [], recommendations: [], triageDecisions: [] })), stderr: stream(""), exited: Promise.resolve(0), kill() {} } as never;
+      },
+    });
+    expect(env?.CODEX_API_KEY).toBe(secret);
+    expect(JSON.stringify(result)).not.toContain(secret);
   });
 
   test("keeps a Codex run alive when individual rows are malformed", () => {
@@ -130,6 +164,13 @@ describe("linear graph hub", () => {
     expect(body.snapshot.zones.length).toBeGreaterThan(0);
     const topic = await fetch(`${hub.url}/api/issues/one/topic`, { method: "PUT", headers: { Authorization: "Bearer secret", "Content-Type": "application/json" }, body: JSON.stringify({ zone: "platform" }) });
     expect(topic.status).toBe(200);
+  });
+
+  test("refuses API-key mode workspace-write execution at the hub boundary", async () => {
+    hub = startGraphHub({ actionToken: "secret", port: 0, codexAuth: { mode: "api-key", apiKeyConfigured: true }, execution: { repositoryAllowlist: { commonkit: process.cwd() } } });
+    const response = await fetch(`${hub.url}/api/bundles/bundle-1/executions`, { method: "POST", headers: { Authorization: "Bearer secret", "Content-Type": "application/json" }, body: JSON.stringify({ repository: "commonkit" }) });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: expect.stringContaining("analysis-only") });
   });
 
   test("accepts only validated Codex JSONL output and drops unknown suggestions", () => {

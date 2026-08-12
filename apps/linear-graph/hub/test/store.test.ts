@@ -38,6 +38,22 @@ describe("graph store compatibility", () => {
     store.close();
   });
 
+  test("redacts persisted untrusted brief and execution output", () => {
+    const store = new GraphStore(":memory:");
+    const timestamp = "2026-08-02T00:00:00.000Z";
+    const secret = "sk-persisted-12345678901234567890";
+    store.saveBrief({ text: `Review ${secret}`, updatedAt: timestamp, status: "ready", source: "manual", error: null });
+    store.saveExecutionRun({
+      id: "execution:redaction", bundleId: "bundle:1", repository: "commonkit", branch: null, worktreePath: null,
+      status: "failed", startedAt: timestamp, completedAt: timestamp, exitCode: 1,
+      stdout: `Bearer ${secret}`, stderr: `x${secret}`, evidence: [{ kind: "runner", text: secret }], error: secret,
+      instruction: secret, issueIds: ["issue-1"], createdAt: timestamp,
+    });
+    expect(JSON.stringify(store.loadBrief())).not.toContain(secret);
+    expect(JSON.stringify(store.loadExecutionRun("execution:redaction"))).not.toContain(secret);
+    store.close();
+  });
+
   test("persists queued execution intent and detailed evidence across reload", () => {
     const store = new GraphStore(":memory:");
     store.saveExecutionRun({

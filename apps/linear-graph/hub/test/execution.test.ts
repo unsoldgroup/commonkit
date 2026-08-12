@@ -132,4 +132,16 @@ describe("approved bundle execution", () => {
     expect(result.stdout).toContain("[redacted]");
     expect(result.stdout.length).toBeLessThanOrEqual(120 + 40);
   });
+
+  test("refuses autonomous workspace-write execution when API-key mode is selected", async () => {
+    let spawned = false;
+    const result = await executeApprovedBundle({ bundle: bundle(), repository: "commonkit" }, options({
+      authMode: "api-key",
+      worktree: { async create() { throw new Error("worktree must not be created"); }, async remove() {} },
+      spawn() { spawned = true; return fakeProcess("", "", 0); },
+    }));
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("subscription authentication");
+    expect(spawned).toBe(false);
+  });
 });

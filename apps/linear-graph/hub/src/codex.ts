@@ -134,7 +134,13 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
   ].join("\n");
   const command = [options.executable ?? "codex", "exec", "--ephemeral", "--sandbox", "read-only", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--json", "--output-schema", schemaPath, "--model", options.model ?? "gpt-5.6-terra", "-"];
   const spawn = options.spawn ?? ((cmd, spawnOptions) => Bun.spawn(cmd, spawnOptions));
-  const processEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", ...(options.codexHome ? { HOME: options.codexHome, CODEX_HOME: options.codexHome } : {}) };
+  const processEnv = {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    ...(options.codexHome ? { HOME: options.codexHome, CODEX_HOME: options.codexHome } : {}),
+    // API-key mode is analysis-only. The key is scoped to this read-only
+    // process and is never included in the prompt or persisted output.
+    ...(options.apiKey ? { CODEX_API_KEY: options.apiKey } : {}),
+  };
   const child = spawn(command, { cwd: options.cwd, env: processEnv, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   // A killed child still reports exitCode 0, so without this flag a timeout
   // surfaces as "Codex returned no structured analysis" from the truncated stream.
@@ -162,10 +168,10 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
     ]);
     if (timedOut) throw new Error(`Codex timed out after ${timeoutMs}ms with ${input.issues.length} issues; raise LINEAR_GRAPH_CODEX_TIMEOUT_MS or reduce the candidate set`);
     if (exitCode !== 0) {
-      const diagnostic = redactSensitiveText((stderr.trim() || stdout.trim()).slice(-1200));
+      const diagnostic = redactSensitiveText((stderr.trim() || stdout.trim()).slice(-1200), options.apiKey ? [options.apiKey] : []);
       throw new Error(`Codex exited with ${exitCode}${diagnostic ? `: ${diagnostic}` : ""}`);
     }
-    return sanitizeAnalysis(parseCodexEvents(stdout));
+    return sanitizeAnalysis(parseCodexEvents(redactSensitiveText(stdout, options.apiKey ? [options.apiKey] : [])));
   } finally {
     clearTimeout(timer);
     await rm(workdir, { recursive: true, force: true });

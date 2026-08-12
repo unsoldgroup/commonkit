@@ -88,6 +88,7 @@ export function normalizeLinearEdges(rawIssues: LinearIssueInput[], issues: Issu
   const valid = new Set(issues.map((issue) => issue.id));
   const byId = new Map(rawIssues.map((raw) => [text(raw.id), raw]));
   const output = new Map<string, GraphEdge>();
+  const duplicatePairs = new Set<string>();
   const add = (sourceId: string, targetId: string, kind: GraphEdge["kind"], source: GraphEdge["source"] = "linear") => {
     if (!valid.has(sourceId) || !valid.has(targetId) || sourceId === targetId) return;
     const id = `${kind}:${sourceId}:${targetId}`;
@@ -96,13 +97,37 @@ export function normalizeLinearEdges(rawIssues: LinearIssueInput[], issues: Issu
   for (const issue of issues) {
     if (issue.parentId) add(issue.parentId, issue.id, "parent");
     const raw = byId.get(issue.id);
-    for (const relation of [...relationNodes(raw?.relations), ...relationNodes(raw?.inverseRelations)]) {
-      const relationRecord = asRecord(relation);
-      const relatedId = idOf(relationRecord.issue ?? relationRecord.relatedIssue);
-      const type = text(relationRecord.type, "related").toLowerCase();
-      const kind: GraphEdge["kind"] = type === "blocks" ? "blocks" : type === "duplicate" ? "duplicate" : "related";
-      add(issue.id, relatedId, kind);
+    const relationSets: Array<readonly [boolean, unknown[]]> = [[false, relationNodes(raw?.relations)], [true, relationNodes(raw?.inverseRelations)]];
+    for (const [inverse, relations] of relationSets) {
+      for (const relation of relations) {
+        const relationRecord = asRecord(relation);
+        const relatedId = idOf(relationRecord.issue ?? relationRecord.relatedIssue);
+        const type = text(relationRecord.type, "related").toLowerCase().replace(/[_\s]+/g, "-");
+        const kind: GraphEdge["kind"] = type === "blocks" || type === "blocked-by" || type === "blockedby" ? "blocks" : type === "duplicate" ? "duplicate" : "related";
+        if (kind === "duplicate") {
+          if (valid.has(relatedId)) duplicatePairs.add([issue.id, relatedId].sort((left, right) => left.localeCompare(right)).join("\u0000"));
+          continue;
+        }
+        if (kind === "related") {
+          const [sourceId, targetId] = [issue.id, relatedId].sort((left, right) => left.localeCompare(right));
+          add(sourceId, targetId, kind);
+          continue;
+        }
+        // Linear exposes blocking relations from both endpoints. The inverse
+        // collection points back to the opposite endpoint, so preserve the
+        // blocker -> blocked direction while deduplicating the edge.
+        const blockedBy = type === "blocked-by" || type === "blockedby";
+        const currentIsSource = inverse === blockedBy;
+        add(currentIsSource ? issue.id : relatedId, currentIsSource ? relatedId : issue.id, kind);
+      }
     }
+  }
+  for (const pair of duplicatePairs) {
+    const [left, right] = pair.split("\u0000");
+    const leftIssue = issues.find((issue) => issue.id === left)!;
+    const rightIssue = issues.find((issue) => issue.id === right)!;
+    const leftCanonical = leftIssue.createdAt < rightIssue.createdAt || (leftIssue.createdAt === rightIssue.createdAt && left < right);
+    add(leftCanonical ? left : right, leftCanonical ? right : left, "duplicate");
   }
   return [...output.values()].sort((a, b) => a.id.localeCompare(b.id));
 }

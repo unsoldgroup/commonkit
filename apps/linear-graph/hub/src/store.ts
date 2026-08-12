@@ -7,6 +7,9 @@ import {
   type WorkBundle,
 } from "@commonkit/linear-graph-protocol";
 import { summarizeTeams } from "./normalizer.js";
+import { redactSensitiveText } from "./redaction.js";
+
+const safeText = (value: string, max: number) => redactSensitiveText(value).slice(0, max);
 
 export class GraphStore {
   readonly db: Database;
@@ -25,7 +28,18 @@ export class GraphStore {
   }
 
   saveSnapshot(snapshot: GraphSnapshot) {
-    const value = graphSnapshotSchema.parse(snapshot);
+    const value = graphSnapshotSchema.parse({
+      ...snapshot,
+      nodes: snapshot.nodes.map((node) => ({
+        ...node, title: safeText(node.title, 500), description: node.description == null ? null : safeText(node.description, 5_000),
+        team: { ...node.team, key: safeText(node.team.key, 100), name: safeText(node.team.name, 200) },
+        project: node.project ? { ...node.project, name: safeText(node.project.name, 200) } : null,
+        labels: node.labels.map((label) => safeText(label, 160)), repo: node.repo == null ? null : safeText(node.repo, 200),
+        topicTags: node.topicTags.map((tag) => safeText(tag, 160)),
+      })),
+      edges: snapshot.edges.map((edge) => edge.rationale == null ? edge : { ...edge, rationale: safeText(edge.rationale, 500) }),
+      recommendations: snapshot.recommendations.map((recommendation) => ({ ...recommendation, whyNow: safeText(recommendation.whyNow, 1_000), nextAction: safeText(recommendation.nextAction, 500) })),
+    });
     this.db.query("INSERT INTO snapshots (id, payload) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(JSON.stringify(value));
   }
 
@@ -52,7 +66,7 @@ export class GraphStore {
   }
 
   saveBrief(brief: FocusBrief) {
-    const value = focusBriefSchema.parse(brief);
+    const value = focusBriefSchema.parse({ ...brief, text: safeText(brief.text, 5_000), error: brief.error == null ? null : safeText(brief.error, 1_000) });
     this.db.query("INSERT INTO focus_brief(id, payload) VALUES(1, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(JSON.stringify(value));
   }
 
@@ -62,7 +76,7 @@ export class GraphStore {
   }
 
   saveAnalysisRun(run: AnalysisRun) {
-    const value = analysisRunSchema.parse(run);
+    const value = analysisRunSchema.parse({ ...run, error: run.error == null ? null : safeText(run.error, 1_000) });
     this.db.query("INSERT OR REPLACE INTO analysis_runs(id, payload) VALUES(?, ?)").run(value.id, JSON.stringify(value));
   }
 
@@ -72,7 +86,7 @@ export class GraphStore {
   }
 
   saveTriageDecision(decision: TriageDecision) {
-    const value = triageDecisionSchema.parse(decision);
+    const value = triageDecisionSchema.parse({ ...decision, rationale: safeText(decision.rationale, 2_000), nextAction: decision.nextAction == null ? null : safeText(decision.nextAction, 500) });
     this.db.query("INSERT INTO triage_decisions(issue_id, payload) VALUES(?, ?) ON CONFLICT(issue_id) DO UPDATE SET payload=excluded.payload").run(value.issueId, JSON.stringify(value));
   }
 
@@ -87,7 +101,11 @@ export class GraphStore {
   }
 
   saveCampaign(campaign: Campaign) {
-    const value = campaignSchema.parse(campaign);
+    const value = campaignSchema.parse({
+      ...campaign, title: safeText(campaign.title, 240), prompt: safeText(campaign.prompt, 1_000), error: campaign.error == null ? null : safeText(campaign.error, 1_000),
+      bundles: campaign.bundles.map((bundle) => ({ ...bundle, title: safeText(bundle.title, 240), summary: safeText(bundle.summary, 2_000), approvalNote: bundle.approvalNote == null ? null : safeText(bundle.approvalNote, 1_000), issues: bundle.issues.map((item) => ({ ...item, rationale: item.rationale == null ? undefined : safeText(item.rationale, 1_000) })) })),
+      resolutionSet: campaign.resolutionSet ? { ...campaign.resolutionSet, rationale: safeText(campaign.resolutionSet.rationale, 2_000) } : null,
+    });
     this.db.query("INSERT INTO campaigns(id, payload) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(value.id, JSON.stringify(value));
   }
 
@@ -167,7 +185,12 @@ export class GraphStore {
   }
 
   saveExecutionRun(run: ExecutionRun) {
-    const value = executionRunSchema.parse(run);
+    const value = executionRunSchema.parse({
+      ...run,
+      stdout: run.stdout == null ? run.stdout : safeText(run.stdout, 100_000), stderr: run.stderr == null ? run.stderr : safeText(run.stderr, 100_000),
+      evidence: run.evidence.map((item) => ({ ...item, text: safeText(item.text, 100_000) })), error: run.error == null ? null : safeText(run.error, 2_000),
+      instruction: run.instruction == null ? run.instruction : safeText(run.instruction, 2_000),
+    });
     this.db.query("INSERT INTO execution_runs(id, payload) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(value.id, JSON.stringify(value));
   }
 

@@ -37,6 +37,19 @@ describe("work drain proposals", () => {
     expect(result.resolutionSet?.status).toBe("proposed");
   });
 
+  test("uses canonical duplicate direction and blocker direction when building campaign outcomes", () => {
+    const nodes = [issue("canonical", "Canonical"), issue("duplicate", "Duplicate"), issue("blocker", "Blocker"), issue("blocked", "Blocked")];
+    const edges = [
+      { id: "duplicate:canonical:duplicate", sourceId: "canonical", targetId: "duplicate", kind: "duplicate" as const, source: "linear" as const },
+      { id: "blocks:blocker:blocked", sourceId: "blocker", targetId: "blocked", kind: "blocks" as const, source: "linear" as const },
+    ];
+    const canonicalCampaign = proposeCampaign(snapshot(nodes, edges), { prompt: "unmatched", seedIssueIds: ["canonical"] });
+    expect(canonicalCampaign.resolutionSet?.issueIds).toEqual(["duplicate"]);
+    expect(canonicalCampaign.resolutionSet?.issueIds).not.toContain("canonical");
+    const blockerCampaign = proposeCampaign(snapshot(nodes, edges), { prompt: "unmatched", seedIssueIds: ["blocker"] });
+    expect(blockerCampaign.bundles[0]?.dependencyIssueIds).toEqual(["blocked"]);
+  });
+
   test("computes untriaged and approval metrics without claiming Linear changes", () => {
     const nodes = [issue("one", "One"), issue("two", "Two"), issue("done", "Done", { status: { id: "done", name: "Done", type: "completed" as const } })];
     const campaign = proposeCampaign(snapshot(nodes), { prompt: "One" });

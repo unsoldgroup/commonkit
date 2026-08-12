@@ -56,7 +56,7 @@ const hub = startGraphHub({
     ...(process.env.LINEAR_GRAPH_CODEX_TIMEOUT_MS ? { timeoutMs: Number(process.env.LINEAR_GRAPH_CODEX_TIMEOUT_MS) } : {}),
   },
   codexAuth: { mode: codexAuthMode, codexHome: process.env.CODEX_HOME, apiKeyConfigured: Boolean(codexApiKey) },
-  execution: executionRepoMap ? { repositoryAllowlist: executionRepoMap, apiKey: codexApiKey, home: process.env.CODEX_HOME, codexHome: process.env.CODEX_HOME, model: process.env.LINEAR_GRAPH_CODEX_MODEL } : undefined,
+  execution: executionRepoMap && codexAuthMode === "subscription" ? { repositoryAllowlist: executionRepoMap, home: process.env.CODEX_HOME, codexHome: process.env.CODEX_HOME, model: process.env.LINEAR_GRAPH_CODEX_MODEL, authMode: codexAuthMode } : undefined,
 });
 console.log(`Linear graph hub listening on ${hub.url}`);
 
