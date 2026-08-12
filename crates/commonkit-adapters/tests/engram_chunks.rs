@@ -4,8 +4,8 @@ use commonkit_adapters::{
     EngramChunkAdapter, EngramChunkSetDeclaration, EngramChunkSetState, EngramCommandOutput,
     EngramCommandRunner, EngramGrant, EngramGrantState, EngramOwnerId, EngramScope,
     EngramTargetChunkSetDeclaration, EngramTargetSyncMode, LocalTargetFilesystem,
-    NormalizedManagedPath, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
-    SshTargetFilesystem, TargetFilesystemError,
+    NormalizedManagedPath, ProcessEngramCommandRunner, SshFilesystemRequest, SshFilesystemResponse,
+    SshFilesystemTransport, SshTargetFilesystem, TargetFilesystemError,
 };
 use commonkit_contracts::Principal;
 use commonkit_core::{RootAccess, StableId};
@@ -156,6 +156,37 @@ fn reconcile_recovers_stale_stage_files_after_restart() {
     assert!(!left.join("chunks/33333333.jsonl.gz.commonkit-tmp").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn standalone_engram_runner_rejects_a_symlinked_working_directory() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let real = directory.path().join("real");
+    let link = directory.path().join("working");
+    fs::create_dir(&real).unwrap();
+    symlink(&real, &link).unwrap();
+    let runner = ProcessEngramCommandRunner::try_from_path("/usr/bin/true").unwrap();
+
+    assert!(runner.run(&link, &[]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn standalone_engram_runner_rejects_a_symlinked_working_directory_ancestor() {
+    use std::os::unix::fs::symlink;
+
+    let directory = tempfile::tempdir().unwrap();
+    let outside = directory.path().join("outside");
+    let real = outside.join("real");
+    let link = directory.path().join("working");
+    fs::create_dir_all(&real).unwrap();
+    symlink(&outside, &link).unwrap();
+    let runner = ProcessEngramCommandRunner::try_from_path("/usr/bin/true").unwrap();
+
+    assert!(runner.run(&link.join("real"), &[]).is_err());
+}
+
 #[test]
 fn oversized_chunks_fail_before_unbounded_digest_work() {
     let directory = tempfile::tempdir().unwrap();
@@ -218,7 +249,7 @@ fn cross_principal_transport_fails_closed_without_scope_attestation() {
 }
 
 #[test]
-fn active_grant_carries_only_scope_attested_project_chunks_between_principals() {
+fn unsigned_cross_principal_attestation_is_rejected_even_when_metadata_matches() {
     let directory = tempfile::tempdir().unwrap();
     let left_root = directory.path().join("left-target");
     let right_root = directory.path().join("right-target");
@@ -249,16 +280,14 @@ fn active_grant_carries_only_scope_attested_project_chunks_between_principals() 
         state: EngramGrantState::Active,
     };
 
-    let receipt =
+    let error =
         EngramChunkAdapter::reconcile_granted_targets(&left_fs, &left, &right_fs, &right, &grant)
-            .unwrap();
-    let repeated =
-        EngramChunkAdapter::reconcile_granted_targets(&left_fs, &left, &right_fs, &right, &grant)
-            .unwrap();
+            .unwrap_err();
 
-    assert_eq!(receipt.moved.len(), 2);
-    assert!(receipt.unresolved.is_none());
-    assert!(repeated.moved.is_empty());
+    assert_eq!(
+        error.to_string(),
+        "cross-principal Engram transport requires project-scope attestation"
+    );
 }
 
 #[test]
@@ -441,6 +470,7 @@ fn target_reconcile_carries_opaque_chunks_across_capability_roots() {
 struct MemorySsh {
     files: std::collections::BTreeMap<String, Vec<u8>>,
     syncs: Vec<EngramTargetSyncMode>,
+    principal: Option<Principal>,
 }
 
 impl SshFilesystemTransport for MemorySsh {
@@ -450,6 +480,11 @@ impl SshFilesystemTransport for MemorySsh {
     ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
         let files = &mut self.files;
         match request {
+            SshFilesystemRequest::ResolvePrincipal { .. } => self
+                .principal
+                .clone()
+                .map(|principal| SshFilesystemResponse::Principal { principal })
+                .ok_or(TargetFilesystemError::PrincipalUnavailable),
             SshFilesystemRequest::ListDirectory { path, .. } => {
                 let prefix = format!("{}/", path.as_str());
                 let mut entries = files
@@ -506,6 +541,7 @@ fn target_reconcile_uses_the_closed_ssh_filesystem_protocol() {
                 .into_iter()
                 .collect(),
                 syncs: Vec::new(),
+                principal: Some(Principal::parse("astemarie").unwrap()),
             },
         )
     };
@@ -566,6 +602,7 @@ fn target_status_ignores_crash_left_stage_files_before_manifest_enumeration() {
             .into_iter()
             .collect(),
             syncs: Vec::new(),
+            principal: Some(Principal::parse("astemarie").unwrap()),
         },
     );
     let declaration = EngramTargetChunkSetDeclaration {
@@ -606,6 +643,7 @@ fn active_target_reconcile_drives_remote_export_and_import() {
                 .into_iter()
                 .collect(),
                 syncs: Vec::new(),
+                principal: Some(Principal::parse("astemarie").unwrap()),
             },
         )
     };
@@ -675,4 +713,111 @@ fn unreachable_ssh_sync_is_an_explicit_unresolved_no_op() {
 
     assert_eq!(receipt.moved.len(), 0);
     assert_eq!(receipt.unresolved.as_deref(), Some("target is unreachable"));
+}
+
+#[test]
+fn active_target_reconcile_does_not_hide_non_unreachable_failures() {
+    #[derive(Clone, Copy)]
+    enum Failure {
+        ReadOnly,
+        Malformed,
+        Command,
+    }
+    struct Failing {
+        failure: Failure,
+    }
+    impl SshFilesystemTransport for Failing {
+        fn perform(
+            &mut self,
+            request: SshFilesystemRequest,
+        ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+            match request {
+                SshFilesystemRequest::ResolvePrincipal { .. } => {
+                    Ok(SshFilesystemResponse::Principal {
+                        principal: Principal::parse("astemarie").unwrap(),
+                    })
+                }
+                SshFilesystemRequest::EngramSync { .. } => match self.failure {
+                    Failure::ReadOnly => Err(TargetFilesystemError::ReadOnly),
+                    Failure::Malformed => Ok(SshFilesystemResponse::Absent),
+                    Failure::Command => Err(TargetFilesystemError::EngramCommandFailed),
+                },
+                _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+            }
+        }
+    }
+
+    let declaration = |target: &str| EngramTargetChunkSetDeclaration {
+        target_id: StableId::parse(target).unwrap(),
+        project_id: "github.com/unsoldgroup/commonkit".try_into().unwrap(),
+        owner_id: EngramOwnerId::try_from("github:astemarie").unwrap(),
+        project_root: NormalizedManagedPath::parse("repo").unwrap(),
+        root: NormalizedManagedPath::parse("repo/.engram").unwrap(),
+        scope: EngramScope::Project,
+    };
+
+    for (failure, expected) in [
+        (Failure::ReadOnly, "target root is read-only"),
+        (
+            Failure::Malformed,
+            "remote helper returned an invalid or unexpected response",
+        ),
+        (Failure::Command, "target Engram command failed"),
+    ] {
+        let left = SshTargetFilesystem::new(StableId::parse("left").unwrap(), Failing { failure });
+        let right =
+            SshTargetFilesystem::new(StableId::parse("right").unwrap(), Failing { failure });
+        let error = EngramChunkAdapter::reconcile_active_targets(
+            &left,
+            &declaration("left"),
+            &right,
+            &declaration("right"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+    }
+}
+
+#[test]
+fn active_target_reconcile_requires_an_attested_remote_owner_binding() {
+    let declaration = |target: &str| EngramTargetChunkSetDeclaration {
+        target_id: StableId::parse(target).unwrap(),
+        project_id: "github.com/unsoldgroup/commonkit".try_into().unwrap(),
+        owner_id: EngramOwnerId::try_from("github:astemarie").unwrap(),
+        project_root: NormalizedManagedPath::parse("repo").unwrap(),
+        root: NormalizedManagedPath::parse("repo/.engram").unwrap(),
+        scope: EngramScope::Project,
+    };
+    for principal in [None, Some(Principal::parse("attacker").unwrap())] {
+        let left = SshTargetFilesystem::new(
+            StableId::parse("left").unwrap(),
+            MemorySsh {
+                files: Default::default(),
+                syncs: Vec::new(),
+                principal: principal.clone(),
+            },
+        );
+        let right = SshTargetFilesystem::new(
+            StableId::parse("right").unwrap(),
+            MemorySsh {
+                files: Default::default(),
+                syncs: Vec::new(),
+                principal: Some(Principal::parse("astemarie").unwrap()),
+            },
+        );
+        let error = EngramChunkAdapter::reconcile_active_targets(
+            &left,
+            &declaration("left"),
+            &right,
+            &declaration("right"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            commonkit_adapters::EngramError::OwnerBindingMismatch
+                | commonkit_adapters::EngramError::Target(
+                    TargetFilesystemError::PrincipalUnavailable
+                )
+        ));
+    }
 }

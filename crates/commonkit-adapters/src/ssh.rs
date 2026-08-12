@@ -381,6 +381,10 @@ impl<R: RemoteProcessRunner> SshFilesystemTransport for OpenSshTransport<R> {
             .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?;
         let matching = match (&request, &response) {
             (
+                SshFilesystemRequest::ResolvePrincipal { .. },
+                SshFilesystemResponse::Principal { .. },
+            ) => true,
+            (
                 SshFilesystemRequest::EngramSync { mode: a, .. },
                 SshFilesystemResponse::EngramSynced { mode: b },
             ) => a == b,

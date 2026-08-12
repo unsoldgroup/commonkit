@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -414,16 +414,28 @@ fn clear_close_on_exec(fd: std::os::fd::RawFd) -> Result<(), std::io::Error> {
 
 #[cfg(unix)]
 fn open_directory_handle(path: &Path) -> Result<std::fs::File, std::io::Error> {
-    use cap_std::ambient_authority;
-    use cap_std::fs::Dir;
-    let mut current = Dir::open_ambient_dir(Path::new("/"), ambient_authority())?;
-    for component in path.components() {
-        let std::path::Component::Normal(name) = component else {
-            continue;
-        };
-        current = current.open_dir(name)?;
-    }
+    let current = open_engram_root(path)?;
     Ok(current.into_std_file())
+}
+
+fn open_engram_root(path: &Path) -> Result<cap_std::fs::Dir, std::io::Error> {
+    match crate::target::open_absolute_directory_nofollow(path) {
+        Ok(directory) => Ok(directory),
+        Err(error) if cfg!(target_os = "macos") => {
+            let translated = ["/var", "/tmp"].iter().find_map(|prefix| {
+                path.strip_prefix(prefix).ok().map(|suffix| {
+                    Path::new("/private")
+                        .join(prefix.strip_prefix('/').unwrap())
+                        .join(suffix)
+                })
+            });
+            match translated {
+                Some(path) => crate::target::open_absolute_directory_nofollow(&path),
+                None => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -678,9 +690,9 @@ impl EngramChunkAdapter {
     }
 
     pub fn reconcile_granted_targets(
-        left_filesystem: &dyn TargetFilesystem,
+        _left_filesystem: &dyn TargetFilesystem,
         left: &EngramTargetChunkSetDeclaration,
-        right_filesystem: &dyn TargetFilesystem,
+        _right_filesystem: &dyn TargetFilesystem,
         right: &EngramTargetChunkSetDeclaration,
         grant: &EngramGrant,
     ) -> Result<EngramTargetReconciliationReceipt, EngramError> {
@@ -703,19 +715,10 @@ impl EngramChunkAdapter {
         if left.scope != EngramScope::Project || right.scope != EngramScope::Project {
             return Err(EngramError::PersonalTransport);
         }
-        let left_attestation = verify_target_attestation(left_filesystem, left)?;
-        let right_attestation = verify_target_attestation(right_filesystem, right)?;
-        let mut same_owner_right = right.clone();
-        same_owner_right.owner_id = left.owner_id.clone();
-        let receipt =
-            Self::reconcile_targets(left_filesystem, left, right_filesystem, &same_owner_right)?;
-        let merged_manifest = left_filesystem
-            .read_file(&target_path(&left.root, "manifest.json")?)?
-            .ok_or(EngramError::TargetUnreachable)?;
-        let merged = merge_attestations(left_attestation, right_attestation, &merged_manifest)?;
-        write_target_attestation(left_filesystem, &left.root, &merged)?;
-        write_target_attestation(right_filesystem, &right.root, &merged)?;
-        Ok(receipt)
+        // The v1 JSON file is metadata only. Until Engram provides an
+        // authenticated upstream attestation, accepting it would let a peer
+        // self-classify arbitrary mixed-scope chunks as project data.
+        Err(EngramError::MissingScopeAttestation)
     }
 
     pub fn reconcile_active_targets<L, R>(
@@ -728,76 +731,126 @@ impl EngramChunkAdapter {
         L: TargetFilesystem + EngramTargetRuntime,
         R: TargetFilesystem + EngramTargetRuntime,
     {
-        if left_filesystem
-            .sync_engram(
-                &left.project_id,
-                &left.project_root,
-                EngramTargetSyncMode::Export,
-            )
-            .is_err()
-        {
-            return Ok(EngramTargetReconciliationReceipt {
-                project_id: left.project_id.clone(),
-                moved: Vec::new(),
-                unresolved: Some("target is unreachable".to_owned()),
-            });
+        for result in [
+            verify_runtime_owner(left_filesystem, left),
+            verify_runtime_owner(right_filesystem, right),
+        ] {
+            if let Err(error) = result {
+                if let EngramError::Target(target) = &error
+                    && target_error_is_unreachable(target)
+                {
+                    return Ok(EngramTargetReconciliationReceipt {
+                        project_id: left.project_id.clone(),
+                        moved: Vec::new(),
+                        unresolved: Some("target is unreachable".to_owned()),
+                    });
+                }
+                return Err(error);
+            }
         }
-        if right_filesystem
-            .sync_engram(
-                &right.project_id,
-                &right.project_root,
-                EngramTargetSyncMode::Export,
-            )
-            .is_err()
-        {
-            return Ok(EngramTargetReconciliationReceipt {
-                project_id: left.project_id.clone(),
-                moved: Vec::new(),
-                unresolved: Some("target is unreachable".to_owned()),
-            });
+        for result in [
+            left_filesystem
+                .sync_engram(
+                    &left.project_id,
+                    &left.project_root,
+                    EngramTargetSyncMode::Export,
+                )
+                .map_err(EngramError::Target),
+            right_filesystem
+                .sync_engram(
+                    &right.project_id,
+                    &right.project_root,
+                    EngramTargetSyncMode::Export,
+                )
+                .map_err(EngramError::Target),
+        ] {
+            if let Err(error) = result {
+                if let EngramError::Target(target) = &error
+                    && target_error_is_unreachable(target)
+                {
+                    return Ok(EngramTargetReconciliationReceipt {
+                        project_id: left.project_id.clone(),
+                        moved: Vec::new(),
+                        unresolved: Some("target is unreachable".to_owned()),
+                    });
+                }
+                return Err(error);
+            }
         }
         let receipt = match Self::reconcile_targets(left_filesystem, left, right_filesystem, right)
         {
             Ok(receipt) => receipt,
-            Err(EngramError::Target(_)) => EngramTargetReconciliationReceipt {
-                project_id: left.project_id.clone(),
-                moved: Vec::new(),
-                unresolved: Some("target is unreachable".to_owned()),
-            },
+            Err(EngramError::Target(target)) if target_error_is_unreachable(&target) => {
+                EngramTargetReconciliationReceipt {
+                    project_id: left.project_id.clone(),
+                    moved: Vec::new(),
+                    unresolved: Some("target is unreachable".to_owned()),
+                }
+            }
             Err(error) => return Err(error),
         };
         if receipt.unresolved.is_some() {
             return Ok(receipt);
         }
-        if left_filesystem
-            .sync_engram(
-                &left.project_id,
-                &left.project_root,
-                EngramTargetSyncMode::Import,
-            )
-            .is_err()
-        {
-            return Ok(EngramTargetReconciliationReceipt {
-                project_id: left.project_id.clone(),
-                moved: Vec::new(),
-                unresolved: Some("target is unreachable".to_owned()),
-            });
-        }
-        if right_filesystem
-            .sync_engram(
-                &right.project_id,
-                &right.project_root,
-                EngramTargetSyncMode::Import,
-            )
-            .is_err()
-        {
-            return Ok(EngramTargetReconciliationReceipt {
-                project_id: left.project_id.clone(),
-                moved: Vec::new(),
-                unresolved: Some("target is unreachable".to_owned()),
-            });
+        for result in [
+            left_filesystem
+                .sync_engram(
+                    &left.project_id,
+                    &left.project_root,
+                    EngramTargetSyncMode::Import,
+                )
+                .map_err(EngramError::Target),
+            right_filesystem
+                .sync_engram(
+                    &right.project_id,
+                    &right.project_root,
+                    EngramTargetSyncMode::Import,
+                )
+                .map_err(EngramError::Target),
+        ] {
+            if let Err(error) = result {
+                if let EngramError::Target(target) = &error
+                    && target_error_is_unreachable(target)
+                {
+                    return Ok(EngramTargetReconciliationReceipt {
+                        project_id: left.project_id.clone(),
+                        moved: Vec::new(),
+                        unresolved: Some("target is unreachable".to_owned()),
+                    });
+                }
+                return Err(error);
+            }
         }
         Ok(receipt)
+    }
+}
+
+fn verify_runtime_owner<T: EngramTargetRuntime>(
+    runtime: &T,
+    declaration: &EngramTargetChunkSetDeclaration,
+) -> Result<(), EngramError> {
+    let principal = runtime.resolve_principal()?;
+    let owner = EngramOwnerId::from_principal(&principal);
+    if owner != declaration.owner_id {
+        return Err(EngramError::OwnerBindingMismatch);
+    }
+    Ok(())
+}
+
+fn target_error_is_unreachable(error: &TargetFilesystemError) -> bool {
+    match error {
+        TargetFilesystemError::RemoteFailure { status: 255, .. } => true,
+        TargetFilesystemError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::NetworkUnreachable
+                | std::io::ErrorKind::HostUnreachable
+        ),
+        _ => false,
     }
 }
 
@@ -814,95 +867,6 @@ fn validate_target_pair(
     if left.owner_id != right.owner_id {
         return Err(EngramError::MissingScopeAttestation);
     }
-    Ok(())
-}
-
-fn verify_target_attestation(
-    filesystem: &dyn TargetFilesystem,
-    declaration: &EngramTargetChunkSetDeclaration,
-) -> Result<EngramScopeAttestation, EngramError> {
-    let bytes = filesystem
-        .read_file(&target_path(&declaration.root, "scope-attestation.json")?)?
-        .ok_or(EngramError::MissingScopeAttestation)?;
-    let attestation: EngramScopeAttestation = serde_json::from_slice(&bytes)?;
-    let manifest_bytes = filesystem
-        .read_file(&target_path(&declaration.root, "manifest.json")?)?
-        .ok_or(EngramError::TargetUnreachable)?;
-    let manifest_digest =
-        Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&manifest_bytes)))?;
-    if attestation.schema != "engram.scope-export.v1"
-        || attestation.exporter_version.trim().is_empty()
-        || attestation.project_id != declaration.project_id
-        || attestation.scope != EngramScope::Project
-        || attestation.manifest_digest != manifest_digest
-    {
-        return Err(EngramError::InvalidScopeAttestation);
-    }
-    let manifest = read_target_manifest(filesystem, &declaration.root)?;
-    let manifest_ids = manifest_map(&manifest)?
-        .into_keys()
-        .collect::<BTreeSet<_>>();
-    let mut attested = BTreeMap::new();
-    for chunk in &attestation.chunks {
-        validate_chunk_id(&chunk.id)?;
-        if attested.insert(chunk.id.clone(), chunk.clone()).is_some() {
-            return Err(EngramError::InvalidScopeAttestation);
-        }
-    }
-    if manifest_ids != attested.keys().cloned().collect() {
-        return Err(EngramError::InvalidScopeAttestation);
-    }
-    for id in manifest_ids {
-        let observed =
-            digest_chunk_bytes(&id, &read_target_chunk(filesystem, &declaration.root, &id)?)?;
-        if attested.get(&id) != Some(&observed) {
-            return Err(EngramError::InvalidScopeAttestation);
-        }
-    }
-    Ok(attestation)
-}
-
-fn merge_attestations(
-    left: EngramScopeAttestation,
-    right: EngramScopeAttestation,
-    merged_manifest: &[u8],
-) -> Result<EngramScopeAttestation, EngramError> {
-    if left.schema != right.schema
-        || left.exporter_version != right.exporter_version
-        || left.project_id != right.project_id
-        || left.scope != right.scope
-    {
-        return Err(EngramError::InvalidScopeAttestation);
-    }
-    let mut chunks = BTreeMap::new();
-    for chunk in left.chunks.into_iter().chain(right.chunks) {
-        if let Some(existing) = chunks.insert(chunk.id.clone(), chunk.clone())
-            && existing != chunk
-        {
-            return Err(EngramError::InvalidScopeAttestation);
-        }
-    }
-    Ok(EngramScopeAttestation {
-        schema: left.schema,
-        exporter_version: left.exporter_version,
-        project_id: left.project_id,
-        scope: left.scope,
-        manifest_digest: Sha256Digest::parse(format!(
-            "sha256:{:x}",
-            Sha256::digest(merged_manifest)
-        ))?,
-        chunks: chunks.into_values().collect(),
-    })
-}
-
-fn write_target_attestation(
-    filesystem: &dyn TargetFilesystem,
-    root: &NormalizedManagedPath,
-    attestation: &EngramScopeAttestation,
-) -> Result<(), EngramError> {
-    let mut bytes = serde_json::to_vec_pretty(attestation)?;
-    bytes.push(b'\n');
-    filesystem.write_file(&target_path(root, "scope-attestation.json")?, &bytes)?;
     Ok(())
 }
 
@@ -1079,11 +1043,11 @@ fn merge_manifests(
 }
 
 fn read_manifest(root: &Path) -> Result<EngramManifest, EngramError> {
-    let metadata = fs::symlink_metadata(root.join("manifest.json"))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(EngramError::UnsafePath(root.join("manifest.json")));
-    }
-    let manifest: EngramManifest = serde_json::from_slice(&fs::read(root.join("manifest.json"))?)?;
+    let root_dir = open_engram_root(root)?;
+    let mut file = crate::target::open_target_file_nofollow(&root_dir, Path::new("manifest.json"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    let manifest: EngramManifest = serde_json::from_slice(&bytes)?;
     if manifest.version != 1 {
         return Err(EngramError::UnsupportedManifestVersion);
     }
@@ -1092,25 +1056,24 @@ fn read_manifest(root: &Path) -> Result<EngramManifest, EngramError> {
 }
 
 fn observed_chunk_ids(root: &Path) -> Result<BTreeSet<String>, EngramError> {
-    let chunks = root.join("chunks");
-    let metadata = fs::symlink_metadata(&chunks)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(EngramError::UnsafePath(chunks));
-    }
+    let root_dir = open_engram_root(root)?;
+    let chunks = crate::target::open_target_dir_nofollow(&root_dir, Path::new("chunks"))?;
     let mut ids = BTreeSet::new();
-    for entry in fs::read_dir(chunks)? {
+    for entry in chunks.entries()? {
         let entry = entry?;
-        let metadata = entry.file_type()?;
-        if !metadata.is_file() || metadata.is_symlink() {
-            return Err(EngramError::UnsafePath(entry.path()));
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(EngramError::UnsafePath(
+                root.join("chunks").join(entry.file_name()),
+            ));
         }
         let name = entry.file_name();
         let name = name
             .to_str()
-            .ok_or_else(|| EngramError::UnsafePath(entry.path()))?;
+            .ok_or_else(|| EngramError::UnsafePath(root.join("chunks").join(entry.file_name())))?;
         let id = name
             .strip_suffix(".jsonl.gz")
-            .ok_or_else(|| EngramError::UnsafePath(entry.path()))?;
+            .ok_or_else(|| EngramError::UnsafePath(root.join("chunks").join(entry.file_name())))?;
         validate_chunk_id(id)?;
         ids.insert(id.to_owned());
     }
@@ -1135,15 +1098,21 @@ fn chunk_path(root: &Path, id: &str) -> PathBuf {
 
 fn chunk_digest(root: &Path, id: &str) -> Result<EngramChunkDigest, EngramError> {
     validate_chunk_id(id)?;
-    let path = chunk_path(root, id);
-    let metadata = fs::symlink_metadata(&path)?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(EngramError::UnsafePath(path));
-    }
-    if metadata.len() > MAX_ENGRAM_CHUNK_BYTES {
+    let root_dir = open_engram_root(root)?;
+    let chunks = crate::target::open_target_dir_nofollow(&root_dir, Path::new("chunks"))?;
+    let file =
+        crate::target::open_target_file_nofollow(&chunks, Path::new(&format!("{id}.jsonl.gz")))?;
+    digest_open_chunk(id, file)
+}
+
+fn digest_open_chunk(
+    id: &str,
+    mut file: cap_std::fs::File,
+) -> Result<EngramChunkDigest, EngramError> {
+    let bytes = file.metadata()?.len();
+    if bytes > MAX_ENGRAM_CHUNK_BYTES {
         return Err(EngramError::ChunkTooLarge);
     }
-    let mut file = OpenOptions::new().read(true).open(&path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -1157,20 +1126,25 @@ fn chunk_digest(root: &Path, id: &str) -> Result<EngramChunkDigest, EngramError>
     Ok(EngramChunkDigest {
         id: id.to_owned(),
         digest,
-        bytes: metadata.len(),
+        bytes,
     })
 }
 
 fn copy_chunk(from: &Path, to: &Path, id: &str) -> Result<EngramChunkMovement, EngramError> {
-    let source = chunk_path(from, id);
-    let destination = chunk_path(to, id);
     let digest = chunk_digest(from, id)?;
-    let temporary = destination.with_extension("jsonl.gz.commonkit-tmp");
-    if let Ok(metadata) = fs::symlink_metadata(&destination) {
+    let from_root = open_engram_root(from)?;
+    let to_root = open_engram_root(to)?;
+    let from_chunks = crate::target::open_target_dir_nofollow(&from_root, Path::new("chunks"))?;
+    let to_chunks = crate::target::open_target_dir_nofollow(&to_root, Path::new("chunks"))?;
+    let name = PathBuf::from(format!("{id}.jsonl.gz"));
+    if let Ok(metadata) = to_chunks.symlink_metadata(&name) {
         if !metadata.is_file() || metadata.file_type().is_symlink() {
-            return Err(EngramError::UnsafePath(destination));
+            return Err(EngramError::UnsafePath(chunk_path(to, id)));
         }
-        let copied = chunk_digest(to, id)?;
+        let copied = digest_open_chunk(
+            id,
+            crate::target::open_target_file_nofollow(&to_chunks, &name)?,
+        )?;
         if copied.digest != digest.digest || copied.bytes != digest.bytes {
             return Err(EngramError::ChunkDigestMismatch(id.to_owned()));
         }
@@ -1182,16 +1156,19 @@ fn copy_chunk(from: &Path, to: &Path, id: &str) -> Result<EngramChunkMovement, E
             to: to.to_path_buf(),
         });
     }
-    let mut input = OpenOptions::new().read(true).open(&source)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    let mut input = crate::target::open_target_file_nofollow(&from_chunks, &name)?;
+    let temporary = PathBuf::from(format!(".{id}.jsonl.gz.commonkit-tmp"));
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut output = to_chunks.open_with(&temporary, &options)?;
     std::io::copy(&mut input, &mut output)?;
     output.sync_all()?;
-    fs::rename(&temporary, &destination)?;
+    to_chunks.rename(&temporary, &to_chunks, &name)?;
     sync_directory(to)?;
-    let copied = chunk_digest(to, id)?;
+    let copied = digest_open_chunk(
+        id,
+        crate::target::open_target_file_nofollow(&to_chunks, &name)?,
+    )?;
     if copied.digest != digest.digest || copied.bytes != digest.bytes {
         return Err(EngramError::ChunkDigestMismatch(id.to_owned()));
     }
@@ -1205,57 +1182,47 @@ fn copy_chunk(from: &Path, to: &Path, id: &str) -> Result<EngramChunkMovement, E
 }
 
 fn write_manifest(root: &Path, manifest: &EngramManifest) -> Result<(), EngramError> {
-    let path = root.join("manifest.json");
-    let temporary = root.join("manifest.json.commonkit-tmp");
-    remove_stale_file(&temporary)?;
+    let root_dir = open_engram_root(root)?;
+    let path = PathBuf::from("manifest.json");
+    let temporary = PathBuf::from(".manifest.json.commonkit-tmp");
+    let _ = root_dir.remove_file(&temporary);
     let bytes = serde_json::to_vec_pretty(manifest)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut output = root_dir.open_with(&temporary, &options)?;
     output.write_all(&bytes)?;
     output.write_all(b"\n")?;
     output.sync_all()?;
-    fs::rename(temporary, path)?;
+    root_dir.rename(&temporary, &root_dir, &path)?;
     sync_directory(root)?;
     Ok(())
 }
 
 fn recover_local_stage_files(root: &Path) -> Result<(), EngramError> {
-    remove_stale_file(&root.join("manifest.json.commonkit-tmp"))?;
-    let chunks = root.join("chunks");
-    let metadata = fs::symlink_metadata(&chunks)?;
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(EngramError::UnsafePath(chunks));
-    }
-    for entry in fs::read_dir(&chunks)? {
+    let root_dir = open_engram_root(root)?;
+    let _ = root_dir.remove_file(Path::new(".manifest.json.commonkit-tmp"));
+    let _ = root_dir.remove_file(Path::new("manifest.json.commonkit-tmp"));
+    let chunks = crate::target::open_target_dir_nofollow(&root_dir, Path::new("chunks"))?;
+    for entry in chunks.entries()? {
         let entry = entry?;
-        let path = entry.path();
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
-            return Err(EngramError::UnsafePath(path));
+            return Err(EngramError::UnsafePath(
+                root.join("chunks").join(entry.file_name()),
+            ));
         };
         if name.ends_with(".jsonl.gz.commonkit-tmp") {
-            remove_stale_file(&path)?;
+            chunks.remove_file(Path::new(name))?;
         }
-    }
-    Ok(())
-}
-
-fn remove_stale_file(path: &Path) -> Result<(), EngramError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
-            fs::remove_file(path)?;
-        }
-        Ok(_) => return Err(EngramError::UnsafePath(path.to_path_buf())),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
 
 fn sync_directory(path: &Path) -> Result<(), EngramError> {
-    fs::File::open(path)?.sync_all()?;
+    open_engram_root(path)?
+        .try_clone()?
+        .into_std_file()
+        .sync_all()?;
     Ok(())
 }
 
@@ -1277,6 +1244,8 @@ pub enum EngramError {
     ProjectIdentityMismatch,
     #[error("cross-principal Engram transport requires project-scope attestation")]
     MissingScopeAttestation,
+    #[error("Engram target principal does not match the declared owner")]
+    OwnerBindingMismatch,
     #[error("Engram project-scope attestation does not match the exported chunks")]
     InvalidScopeAttestation,
     #[error("Engram Grant does not authorize these principals and project")]

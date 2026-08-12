@@ -78,6 +78,8 @@ pub enum EngramTargetSyncMode {
 }
 
 pub trait EngramTargetRuntime {
+    fn resolve_principal(&self) -> Result<commonkit_contracts::Principal, TargetFilesystemError>;
+
     fn sync_engram(
         &self,
         project_id: &crate::EngramProjectId,
@@ -159,15 +161,14 @@ impl LocalTargetFilesystem {
         &self,
         path: &NormalizedManagedPath,
     ) -> Result<std::fs::File, TargetFilesystemError> {
-        self.ensure_safe_ancestors(path, false)?;
-        let metadata = self.root.symlink_metadata(path.as_str())?;
-        if metadata_is_reparse_or_symlink(&metadata) {
-            return Err(TargetFilesystemError::SymlinkEncountered(path.to_string()));
+        let mut current = self.root.try_clone()?;
+        for component in Path::new(path.as_str()).components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(TargetFilesystemError::InvalidRoot);
+            };
+            current = open_target_dir_nofollow(&current, Path::new(name))?;
         }
-        if !metadata.is_dir() {
-            return Err(TargetFilesystemError::NotDirectory(path.to_string()));
-        }
-        Ok(self.root.open_dir(path.as_str())?.into_std_file())
+        Ok(current.into_std_file())
     }
 
     fn ensure_safe_ancestors(
@@ -218,7 +219,7 @@ impl LocalTargetFilesystem {
     }
 }
 
-fn open_absolute_directory_nofollow(path: &Path) -> Result<Dir, std::io::Error> {
+pub(crate) fn open_absolute_directory_nofollow(path: &Path) -> Result<Dir, std::io::Error> {
     #[cfg(unix)]
     {
         let mut current = Dir::open_ambient_dir(Path::new("/"), ambient_authority())?;
@@ -442,6 +443,9 @@ fn sync_directory(_directory: &Dir) -> Result<(), std::io::Error> {
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum SshFilesystemRequest {
+    ResolvePrincipal {
+        root_id: StableId,
+    },
     ListDirectory {
         root_id: StableId,
         path: NormalizedManagedPath,
@@ -621,6 +625,9 @@ pub fn package_resolution_response_digest(
 #[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(clippy::large_enum_variant)]
 pub enum SshFilesystemResponse {
+    Principal {
+        principal: commonkit_contracts::Principal,
+    },
     Absent,
     Directory {
         entries: Vec<String>,
@@ -915,6 +922,19 @@ impl<T: SshFilesystemTransport + Send> TargetFilesystem for SshTargetFilesystem<
 }
 
 impl<T: SshFilesystemTransport + Send> EngramTargetRuntime for SshTargetFilesystem<T> {
+    fn resolve_principal(&self) -> Result<commonkit_contracts::Principal, TargetFilesystemError> {
+        match self
+            .transport
+            .lock()
+            .map_err(|_| TargetFilesystemError::InvalidRemoteResponse)?
+            .perform(SshFilesystemRequest::ResolvePrincipal {
+                root_id: self.root_id.clone(),
+            })? {
+            SshFilesystemResponse::Principal { principal } => Ok(principal),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+
     fn sync_engram(
         &self,
         project_id: &crate::EngramProjectId,
@@ -984,6 +1004,8 @@ pub enum TargetFilesystemError {
     EngramCommandFailed,
     #[error("target Engram executable is not a safe regular file")]
     InvalidEngramExecutable,
+    #[error("target CommonKit principal is unavailable")]
+    PrincipalUnavailable,
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]

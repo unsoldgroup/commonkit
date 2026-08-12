@@ -782,6 +782,9 @@ impl TargetHelper {
         request: SshFilesystemRequest,
     ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
         match &request {
+            SshFilesystemRequest::ResolvePrincipal { root_id } => {
+                let _ = self.root(root_id)?;
+            }
             SshFilesystemRequest::ListDirectory { root_id, path }
             | SshFilesystemRequest::ReadFile { root_id, path }
             | SshFilesystemRequest::InspectResource { root_id, path }
@@ -808,6 +811,11 @@ impl TargetHelper {
             _ => {}
         }
         match request {
+            SshFilesystemRequest::ResolvePrincipal { .. } => {
+                let principal = commonkit_core::resolve_principal()
+                    .ok_or(TargetFilesystemError::PrincipalUnavailable)?;
+                Ok(SshFilesystemResponse::Principal { principal })
+            }
             SshFilesystemRequest::ListDirectory { root_id, path } => {
                 Ok(SshFilesystemResponse::Directory {
                     entries: self.root(&root_id)?.list_directory(&path)?,

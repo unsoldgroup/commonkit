@@ -266,6 +266,39 @@ fn helper_rejects_engram_sync_without_write_capability_or_over_protected_paths()
     fs::remove_dir_all(state).unwrap();
 }
 
+#[test]
+fn helper_resolves_the_commonkit_principal_over_the_typed_request() {
+    let target = temp("principal-target");
+    let state = temp("principal-state");
+    fs::create_dir_all(&target).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let helper = TargetHelper::open_with_package_resolution_and_protected_paths(
+        vec![TargetRoot {
+            id: StableId::parse("home").unwrap(),
+            path: target.to_string_lossy().into_owned(),
+            access: RootAccess::ReadOnly,
+        }],
+        &state,
+        None,
+        Vec::new(),
+    )
+    .unwrap();
+
+    let result = helper.dispatch(SshFilesystemRequest::ResolvePrincipal {
+        root_id: StableId::parse("home").unwrap(),
+    });
+    match (commonkit_core::resolve_principal(), result) {
+        (Some(expected), Ok(SshFilesystemResponse::Principal { principal })) => {
+            assert_eq!(principal, expected);
+        }
+        (None, Err(commonkit_adapters::TargetFilesystemError::PrincipalUnavailable)) => {}
+        (expected, actual) => panic!("principal request mismatch: {expected:?} / {actual:?}"),
+    }
+
+    fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn package_mutation_revalidates_target_authority_and_exact_artifacts() {

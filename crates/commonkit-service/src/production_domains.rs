@@ -1534,6 +1534,19 @@ impl ProductionEngramTarget {
         }
     }
 
+    fn verify_owner(&self, expected: &EngramOwnerId) -> Result<(), DomainFailure> {
+        let principal = match self {
+            Self::Local { .. } => return Ok(()),
+            Self::Ssh { filesystem, .. } => filesystem
+                .resolve_principal()
+                .map_err(|_| DomainFailure::OperationFailed)?,
+        };
+        if EngramOwnerId::from_principal(&principal) != *expected {
+            return Err(DomainFailure::OperationFailed);
+        }
+        Ok(())
+    }
+
     fn sync(&self, mode: EngramTargetSyncMode) -> Result<(), ProductionEngramSyncError> {
         match self {
             Self::Local {
@@ -3793,6 +3806,8 @@ impl SyncDomain for ProductionSyncDomain {
                 return Err(DomainFailure::OperationFailed);
             }
         };
+        left_target.verify_owner(&left.owner_id)?;
+        right_target.verify_owner(&right.owner_id)?;
         let unresolved = match left_target.sync(EngramTargetSyncMode::Export) {
             Ok(()) => match right_target.sync(EngramTargetSyncMode::Export) {
                 Ok(()) => None,
