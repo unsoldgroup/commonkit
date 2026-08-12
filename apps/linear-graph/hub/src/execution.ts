@@ -48,6 +48,7 @@ export interface ExecutionIssueContext {
 }
 
 export interface WorkBundleExecutionRequest {
+  executionId?: string;
   bundle: WorkBundle;
   /** Key in `repositoryAllowlist`; never accept a path supplied by the browser. */
   repository: string;
@@ -189,7 +190,7 @@ export async function executeApprovedBundle(
   options: ExecutionRunnerOptions,
 ): Promise<WorkBundleExecution> {
   const now = options.now ?? (() => new Date());
-  const id = `execution:${randomUUID()}`;
+  const id = request.executionId ?? `execution:${randomUUID()}`;
   const startedAt = now().toISOString();
   let result = emptyResult(request, id, startedAt, startedAt);
 

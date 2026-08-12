@@ -37,4 +37,18 @@ describe("graph store compatibility", () => {
     expect(store.loadDrainMetrics()?.drained).toBe(true);
     store.close();
   });
+
+  test("persists queued execution intent and detailed evidence across reload", () => {
+    const store = new GraphStore(":memory:");
+    store.saveExecutionRun({
+      id: "execution:intent", bundleId: "bundle:1", repository: "commonkit", branch: null, worktreePath: null,
+      status: "queued", startedAt: "2026-08-02T00:00:00.000Z", completedAt: null, exitCode: null,
+      stdout: "", stderr: "", evidence: [{ kind: "runner", text: "Intent persisted before Codex start" }], error: null,
+      instruction: "Implement the approved bundle", issueIds: ["issue-1"], createdAt: "2026-08-02T00:00:00.000Z",
+    });
+    const reloaded = store.loadExecutionRun("execution:intent");
+    expect(reloaded).toMatchObject({ status: "queued", instruction: "Implement the approved bundle", issueIds: ["issue-1"] });
+    expect(reloaded?.evidence[0]?.text).toContain("Intent persisted");
+    store.close();
+  });
 });

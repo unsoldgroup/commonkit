@@ -46,4 +46,24 @@ describe("work drain proposals", () => {
     expect(metrics.completedIssueCount).toBe(1);
     expect(metrics.drained).toBe(false);
   });
+
+  test("campaigns only include triage-approved work and exclude blocked or unclear issues", () => {
+    const nodes = [issue("ready", "Pricing ready"), issue("blocked", "Pricing blocked"), issue("unclear", "Pricing unclear"), issue("untouched", "Pricing untouched")];
+    const decisions = [
+      { issueId: "ready", disposition: "ready" as const, rationale: "Concrete next step", confidence: 1, evidenceIssueIds: [], nextAction: "Implement", source: "codex" as const, createdAt: "2026-08-02T00:00:00.000Z", updatedAt: "2026-08-02T00:00:00.000Z" },
+      { issueId: "blocked", disposition: "blocked" as const, rationale: "Waiting on API", confidence: 1, evidenceIssueIds: [], nextAction: null, source: "codex" as const, createdAt: "2026-08-02T00:00:00.000Z", updatedAt: "2026-08-02T00:00:00.000Z" },
+      { issueId: "unclear", disposition: "needs_clarification" as const, rationale: "Missing acceptance criteria", confidence: 1, evidenceIssueIds: [], nextAction: null, source: "codex" as const, createdAt: "2026-08-02T00:00:00.000Z", updatedAt: "2026-08-02T00:00:00.000Z" },
+    ];
+    const result = proposeCampaign(snapshot(nodes), { prompt: "pricing" }, new Date("2026-08-02T00:00:00.000Z"), decisions);
+    expect(result.issueIds).toEqual(["ready"]);
+  });
+
+  test("actual reduction is limited to closed issues in approved campaign outcomes", () => {
+    const planningNodes = [issue("outside", "Closed elsewhere"), issue("inside", "Closed in campaign"), issue("open", "Still open")];
+    const campaign = proposeCampaign(snapshot(planningNodes), { prompt: "campaign" });
+    const approved = { ...campaign, bundles: campaign.bundles.map((bundle) => ({ ...bundle, status: "verified" as const, approvedAt: "2026-08-02T00:00:00.000Z", issueIds: ["inside"], issues: [{ issueId: "inside", order: 1 }] })) };
+    const nodes = planningNodes.map((node) => node.id === "outside" || node.id === "inside" ? { ...node, status: { id: "done", name: "Done", type: "completed" as const } } : node);
+    const metrics = computeDrainMetrics(snapshot(nodes), [], [approved]);
+    expect(metrics.actualReduction).toBe(1);
+  });
 });

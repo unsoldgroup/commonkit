@@ -122,9 +122,18 @@ export const semanticEdgeSuggestionSchema = z.object({
 export type SemanticEdgeSuggestion = z.infer<typeof semanticEdgeSuggestionSchema>;
 
 export const codexAnalysisSchema = z.object({
+  brief: z.string().min(1).max(5000).optional(),
   assignments: z.array(topicAssignmentSchema),
   semanticEdges: z.array(semanticEdgeSuggestionSchema).max(1000),
   recommendations: z.array(focusRecommendationSchema).max(50),
+  triageDecisions: z.array(z.object({
+    issueId: id,
+    disposition: z.enum(["ready", "blocked", "needs_clarification", "duplicate_stale", "bundle_candidate"]),
+    rationale: z.string().min(1).max(2000),
+    confidence: z.number().min(0).max(1),
+    evidenceIssueIds: z.array(id).max(50),
+    nextAction: z.string().max(500).nullable(),
+  }).strict()).optional(),
 }).strict();
 export type CodexAnalysis = z.infer<typeof codexAnalysisSchema>;
 
@@ -323,6 +332,8 @@ export const executionRunSchema = z.object({
   stderr: z.string().max(100000).optional(),
   evidence: z.array(z.object({ kind: z.string().min(1).max(80), text: z.string().max(100000) }).strict()).max(50),
   error: z.string().max(2000).nullable(),
+  instruction: z.string().max(2000).optional(),
+  issueIds: z.array(id).optional(),
   createdAt: date,
 }).strict();
 export type ExecutionRun = z.infer<typeof executionRunSchema>;

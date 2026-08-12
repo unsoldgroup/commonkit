@@ -5,7 +5,7 @@ import { z } from "zod";
 import {
   DEFAULT_ZONES, bundleApprovalRequestSchema, campaignRequestSchema, focusBriefSchema, graphSnapshotSchema,
   executionRequestSchema, triageDecisionRequestSchema, updateFocusBriefRequestSchema, updateTopicRequestSchema,
-  type AnalysisRun, type Campaign, type ExecutionRun, type GraphSnapshot, type TriageDecision,
+  type AnalysisRun, type Campaign, type ExecutionRun, type GraphSnapshot, type TriageDecision, type WorkBundle,
 } from "@commonkit/linear-graph-protocol";
 import { applyCodexAnalysis, defaultRecommendations, focusSnapshot } from "./analysis.js";
 import { createCodexAuthManager, type CodexAuthOptions } from "./codex-auth.js";
@@ -101,12 +101,21 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         const sync = await syncLinear(options.linear, store.topicOverrides());
         const baseline: GraphSnapshot = graphSnapshotSchema.parse({ generatedAt: now().toISOString(), syncedAt: sync.syncedAt, stale: false, nodes: sync.issues, edges: sync.edges, teams: sync.teams, zones: DEFAULT_ZONES, recommendations: defaultRecommendations(sync.issues), latestAnalysisRunId: id });
         fallback = baseline;
-        const result = options.codex ? await runCodexAnalysis({ issues: sync.issues, edges: sync.edges, focusBrief: store.loadBrief()?.text }, options.codex) : { assignments: [], semanticEdges: [], recommendations: baseline.recommendations };
+        const result = options.codex ? await runCodexAnalysis({ issues: sync.issues, edges: sync.edges, focusBrief: store.loadBrief()?.text }, options.codex) : { assignments: [], semanticEdges: [], recommendations: baseline.recommendations, triageDecisions: [] };
+        if (options.codex && !result.brief) throw new Error("Codex returned no daily brief");
         const applied = applyCodexAnalysis(sync.issues, sync.edges, result, sync.syncedAt, id);
         const snapshot = { ...applied.snapshot, zones: baseline.zones, recommendations: applied.snapshot.recommendations.length ? applied.snapshot.recommendations : baseline.recommendations };
         store.saveSnapshot(snapshot);
         current = snapshot;
-        if (!existingBrief) {
+        const codexTriage = result.triageDecisions ?? [];
+        if (options.codex && result.brief) {
+          const timestamp = now().toISOString();
+          store.saveBrief({ text: result.brief, updatedAt: timestamp, generatedAt: timestamp, snapshotAt: snapshot.syncedAt, status: "ready", source: "codex", error: null });
+          for (const decision of codexTriage) {
+            const previous = store.loadTriageDecision(decision.issueId);
+            store.saveTriageDecision({ ...decision, createdAt: previous?.createdAt ?? timestamp, updatedAt: timestamp, source: "codex" });
+          }
+        } else if (!existingBrief) {
           const activeCount = snapshot.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
           store.saveBrief({ text: `Universe synced: ${activeCount} active issues are ready for triage and bundle planning.`, updatedAt: now().toISOString(), generatedAt: now().toISOString(), snapshotAt: snapshot.syncedAt, status: "ready", source: "fallback", error: null });
         } else {
@@ -182,7 +191,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         try {
           if (!current) return error("No snapshot available", 503);
           const body = await parseBody(request, campaignRequestSchema);
-          const campaign = proposeCampaign(current, body, now());
+          const campaign = proposeCampaign(current, body, now(), store.loadTriageDecisions());
           store.saveCampaign(campaign);
           updateDrainMetrics();
           return json(campaign, 201);
@@ -207,20 +216,9 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
           const target = store.loadCampaigns().find((campaign) => campaign.bundles.some((bundle) => bundle.id === bundleMatch[1]));
           if (!target) return error("Bundle not found", 404);
           const timestamp = now().toISOString();
-          let bundles = target.bundles.map((bundle) => bundle.id === bundleMatch[1]
+          const bundles = target.bundles.map((bundle) => bundle.id === bundleMatch[1]
             ? { ...bundle, status: body.decision === "approve" ? "approved" as const : "rejected" as const, approvedAt: body.decision === "approve" ? timestamp : null, approvalNote: body.note ?? null, updatedAt: timestamp }
             : bundle);
-          if (body.decision === "approve" && options.linear?.mutate && current) {
-            const approved = bundles.find((bundle) => bundle.id === bundleMatch[1])!;
-            try {
-              const teamIds = [...new Set(current.nodes.filter((issue) => approved.issueIds.includes(issue.id)).map((issue) => issue.team.id))];
-              const project = await options.linear.mutate.createProject({ name: approved.title, description: approved.summary, teamIds, issueIds: approved.issueIds });
-              bundles = bundles.map((bundle) => bundle.id === approved.id ? { ...bundle, linearProjectId: project.id, linearProjectUrl: project.url ?? null, linearSyncError: null } : bundle);
-            } catch (caught) {
-              const message = caught instanceof Error ? caught.message : "Linear project sync failed";
-              bundles = bundles.map((bundle) => bundle.id === approved.id ? { ...bundle, linearSyncError: message.slice(0, 1000), approvalNote: `${body.note ? `${body.note} · ` : ""}Linear project sync failed; review before execution.` } : bundle);
-            }
-          }
           const campaign: Campaign = { ...target, bundles, status: bundles.some((bundle) => bundle.status === "approved") ? "approved" : target.status, updatedAt: timestamp };
           store.saveCampaign(campaign);
           updateDrainMetrics();
@@ -251,19 +249,23 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
           if (!campaign || !bundle) return error("Bundle not found", 404);
           if (bundle.status !== "approved" || !bundle.approvedAt) return error("Bundle must be approved before execution", 409);
           if (!options.execution.repositoryAllowlist[body.repository]) return error("Repository is not in the execution allowlist", 400);
+          const executionId = `execution:${crypto.randomUUID()}`;
           const timestamp = now().toISOString();
           const runningCampaign: Campaign = { ...campaign, bundles: campaign.bundles.map((candidate) => candidate.id === bundle.id ? { ...candidate, status: "running" as const, updatedAt: timestamp } : candidate), updatedAt: timestamp };
           store.saveCampaign(runningCampaign);
+          store.saveExecutionRun({ id: executionId, bundleId: bundle.id, repository: body.repository, branch: null, worktreePath: null, status: "queued", startedAt: timestamp, completedAt: null, exitCode: null, stdout: "", stderr: "", evidence: [{ kind: "runner", text: "Execution intent persisted before Codex start." }], error: null, instruction: body.instruction, issueIds: bundle.issueIds, createdAt: timestamp });
           const issueContext = current.nodes.filter((issue) => bundle.issueIds.includes(issue.id)).map((issue) => ({ identifier: issue.identifier, title: issue.title, description: issue.description }));
-          const result = await executeApprovedBundle({ bundle: { ...bundle, status: "approved" }, repository: body.repository, issueContext, instruction: body.instruction }, options.execution);
+          const result = await executeApprovedBundle({ executionId, bundle: { ...bundle, status: "approved" }, repository: body.repository, issueContext, instruction: body.instruction }, options.execution);
           const execution: ExecutionRun = {
             id: result.id, bundleId: result.bundleId, repository: result.repository, branch: result.branch, worktreePath: result.worktreePath,
             status: result.status, startedAt: result.startedAt, completedAt: result.completedAt, exitCode: result.exitCode,
-            stdout: result.stdout, stderr: result.stderr, evidence: result.evidence, error: result.error, createdAt: timestamp,
+            stdout: result.stdout, stderr: result.stderr, evidence: [{ kind: "runner", text: "Execution intent persisted before Codex start." }, ...result.evidence], error: result.error, instruction: body.instruction, issueIds: bundle.issueIds, createdAt: timestamp,
           };
           store.saveExecutionRun(execution);
-          const finalStatus = result.status === "completed" ? "verified" : result.status === "timed_out" ? "blocked" : "failed";
-          store.saveCampaign({ ...runningCampaign, bundles: runningCampaign.bundles.map((candidate) => candidate.id === bundle.id ? { ...candidate, status: finalStatus, updatedAt: now().toISOString(), approvalNote: result.status === "completed" ? "Codex completed; merge and deploy remain human-approved." : result.error } : candidate), updatedAt: now().toISOString() });
+          const finalStatus: WorkBundle["status"] = result.status === "completed" ? "verified" : result.status === "timed_out" ? "blocked" : "failed";
+          const finalBundles: WorkBundle[] = runningCampaign.bundles.map((candidate) => candidate.id === bundle.id ? { ...candidate, status: finalStatus, updatedAt: now().toISOString(), approvalNote: result.status === "completed" ? "Codex completed; merge and deploy remain human-approved." : result.error } : candidate);
+          const campaignStatus = result.status === "completed" && finalBundles.every((candidate) => ["verified", "rejected"].includes(candidate.status)) ? "completed" as const : result.status === "failed" ? "failed" as const : "running" as const;
+          store.saveCampaign({ ...runningCampaign, status: campaignStatus, bundles: finalBundles, updatedAt: now().toISOString() });
           updateDrainMetrics();
           return json({ execution, campaignId: campaign.id }, result.status === "completed" ? 202 : 502);
         } catch (caught) { return error(caught instanceof Error ? caught.message : "Execution failed", 502); }

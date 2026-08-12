@@ -73,16 +73,22 @@ function makeResolutionSet(campaignId: string, issueIds: string[], snapshot: Gra
   };
 }
 
-export function proposeCampaign(snapshot: GraphSnapshot, request: CampaignRequest, now = new Date()): Campaign {
+export function proposeCampaign(snapshot: GraphSnapshot, request: CampaignRequest, now = new Date(), decisions: TriageDecision[] = []): Campaign {
   const createdAt = now.toISOString();
   const active = snapshot.nodes.filter((node) => !CLOSED.has(node.status.type));
   const activeById = new Map(active.map((issue) => [issue.id, issue]));
+  const decisionByIssue = new Map(decisions.map((decision) => [decision.issueId, decision]));
+  const eligible = (issueId: string) => {
+    if (!decisions.length) return true;
+    const decision = decisionByIssue.get(issueId);
+    return decision?.disposition === "ready" || decision?.disposition === "bundle_candidate";
+  };
   const seedIds = new Set((request.seedIssueIds ?? []).filter((id) => activeById.has(id)));
-  const matches = active.filter((issue) => issueMatches(issue, request));
+  const matches = active.filter((issue) => eligible(issue.id) && issueMatches(issue, request));
   const selected = new Set(matches.map((issue) => issue.id));
-  for (const id of relatedIds(snapshot, seedIds)) if (activeById.has(id)) selected.add(id);
-  // Explicit seeds are always included, even if the prompt does not mention them.
-  for (const id of seedIds) selected.add(id);
+  for (const id of relatedIds(snapshot, seedIds)) if (activeById.has(id) && eligible(id)) selected.add(id);
+  // Explicit seeds are included only when triage says they are executable.
+  for (const id of seedIds) if (eligible(id)) selected.add(id);
   const issueIds = active.filter((issue) => selected.has(issue.id)).sort((a, b) => a.priority - b.priority || b.updatedAt.localeCompare(a.updatedAt)).map((issue) => issue.id);
   const campaignId = `campaign:${randomUUID()}`;
   const bundles: WorkBundle[] = [];
@@ -112,13 +118,16 @@ export function computeDrainMetrics(snapshot: GraphSnapshot, decisions: TriageDe
     return !decision || (!decision.nextAction && decision.disposition !== "duplicate_stale");
   }).length;
   const uniqueApprovedIds = new Set(approvedBundles.flatMap((bundle) => bundle.issueIds));
+  const approvedResolutionIds = new Set(campaigns.flatMap((campaign) => campaign.resolutionSet && ["approved", "applied"].includes(campaign.resolutionSet.status) ? campaign.resolutionSet.issueIds : []));
+  const approvedOutcomeIds = new Set([...uniqueApprovedIds, ...approvedResolutionIds]);
   return drainMetricsSchema.parse({
     snapshotAt: snapshot.syncedAt, activeIssueCount: active.length, completedIssueCount: completed, canceledIssueCount: canceled,
     untriagedIssueCount: untriaged, readyIssueCount: count("ready"), blockedIssueCount: count("blocked"),
     needsClarificationIssueCount: count("needs_clarification"), duplicateStaleIssueCount: count("duplicate_stale"),
     bundleCandidateIssueCount: count("bundle_candidate"), approvedBundleIssueCount: uniqueApprovedIds.size,
     expectedReduction: uniqueApprovedIds.size,
-    actualReduction: completed + canceled, activeCampaignCount: campaigns.filter((campaign) => ["processing", "ready", "approved", "running"].includes(campaign.status)).length,
+    actualReduction: snapshot.nodes.filter((node) => approvedOutcomeIds.has(node.id) && ["completed", "canceled"].includes(node.status.type)).length,
+    activeCampaignCount: campaigns.filter((campaign) => ["processing", "ready", "approved", "running"].includes(campaign.status)).length,
     proposedBundleCount: campaigns.flatMap((campaign) => campaign.bundles).filter((bundle) => bundle.status === "proposed").length,
     approvedBundleCount: approvedBundles.length, drained: untriaged === 0, computedAt: now.toISOString(),
   });

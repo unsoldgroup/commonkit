@@ -61,6 +61,23 @@ describe("linear graph hub", () => {
     ).rejects.toThrow(/timed out after 10ms/);
   });
 
+  test("sends the complete active universe and all connected edges to Codex", async () => {
+    const issues = Array.from({ length: 701 }, (_, index) => normalizeLinearIssue(raw(`full-${index}`)));
+    const edges = Array.from({ length: 3001 }, (_, index) => ({ id: `edge-${index}`, sourceId: issues[0]!.id, targetId: issues[1]!.id, kind: "related", source: "linear" }));
+    let prompt = "";
+    const stream = (text: string) => new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(text)); controller.close(); } });
+    await runCodexAnalysis({ issues, edges }, {
+      spawn: (_command, options) => ({
+        stdin: { write(value: string) { prompt = value; }, end() {} },
+        stdout: stream(JSON.stringify({ brief: "Full universe reviewed.", assignments: [], semanticEdges: [], recommendations: [], triageDecisions: [] })),
+        stderr: stream(""), exited: Promise.resolve(0), kill() {},
+      } as never),
+    });
+    const input = JSON.parse(prompt.split("\n").at(-1)!);
+    expect(input.issues).toHaveLength(701);
+    expect(input.edges).toHaveLength(3001);
+  });
+
   test("keeps a Codex run alive when individual rows are malformed", () => {
     const assignment = (issueId: string, zone: string) => ({ issueId, zone, topicTags: ["quote"], confidence: 0.8, rationale: "why" });
     const result = sanitizeAnalysis({
@@ -123,6 +140,16 @@ describe("linear graph hub", () => {
     expect(result.snapshot.teams).toEqual([{ id: "team", key: "USG", name: "Unsold", issueCount: 1, activeIssueCount: 1, completedIssueCount: 0, canceledIssueCount: 0 }]);
     const overridden = applyCodexAnalysis([{ ...issue, zone: "platform" }], [], { assignments: [{ issueId: "one", zone: "product", topicTags: [], confidence: 1, rationale: "different" }], semanticEdges: [], recommendations: [] }, issue.updatedAt, "run");
     expect(overridden.snapshot.nodes[0].zone).toBe("platform");
+  });
+
+  test("retains a Codex-produced brief and triage decisions", () => {
+    const result = sanitizeAnalysis({
+      brief: "Codex says to ship the ready recovery path first.",
+      assignments: [], semanticEdges: [], recommendations: [],
+      triageDecisions: [{ issueId: "one", disposition: "ready", rationale: "Concrete next step", confidence: 0.9, evidenceIssueIds: [], nextAction: "Implement" }],
+    });
+    expect(result.brief).toBe("Codex says to ship the ready recovery path first.");
+    expect(result.triageDecisions?.[0]?.disposition).toBe("ready");
   });
 
   test("keeps Universe complete while Focus projects recommended neighborhoods", () => {
