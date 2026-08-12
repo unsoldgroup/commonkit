@@ -30,6 +30,16 @@ struct NvmEnvironmentGuard {
 }
 
 #[cfg(unix)]
+impl NvmEnvironmentGuard {
+    fn original_value(&self, name: &OsStr) -> Option<OsString> {
+        self.previous
+            .iter()
+            .find(|(previous_name, _)| previous_name == name)
+            .map(|(_, value)| value.clone())
+    }
+}
+
+#[cfg(unix)]
 impl Drop for NvmEnvironmentGuard {
     fn drop(&mut self) {
         for name in std::env::vars_os()
@@ -84,22 +94,53 @@ fn clean_nvm_environment() -> NvmEnvironmentGuard {
 fn nvm_environment_guard_removes_created_prohibited_variants() {
     use std::os::unix::ffi::OsStringExt;
 
-    let prefix_before = std::env::var_os("PREFIX");
-    let lowercase_before = std::env::var_os("npm_config_registry");
     let non_utf8_name = OsString::from_vec(b"NPM_CONFIG_\xff".to_vec());
-    let non_utf8_before = std::env::var_os(&non_utf8_name);
     {
-        let _guard = clean_nvm_environment();
+        let guard = clean_nvm_environment();
+        let prefix_before = guard.original_value(OsStr::new("PREFIX"));
+        let lowercase_before = guard.original_value(OsStr::new("npm_config_registry"));
+        let non_utf8_before = guard.original_value(&non_utf8_name);
         // Environment mutation is synchronized by the guard.
         unsafe {
             std::env::set_var("PREFIX", "created-by-guard-regression");
             std::env::set_var("npm_config_registry", "created-by-guard-regression");
             std::env::set_var(&non_utf8_name, "created-by-guard-regression");
         }
+        drop(guard);
+        let verify = clean_nvm_environment();
+        assert_eq!(verify.original_value(OsStr::new("PREFIX")), prefix_before);
+        assert_eq!(
+            verify.original_value(OsStr::new("npm_config_registry")),
+            lowercase_before
+        );
+        assert_eq!(verify.original_value(&non_utf8_name), non_utf8_before);
+        drop(verify);
     }
-    assert_eq!(std::env::var_os("PREFIX"), prefix_before);
-    assert_eq!(std::env::var_os("npm_config_registry"), lowercase_before);
-    assert_eq!(std::env::var_os(&non_utf8_name), non_utf8_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn nvm_environment_guard_serializes_concurrent_snapshots() {
+    let workers = (0..2)
+        .map(|worker| {
+            std::thread::spawn(move || {
+                let guard = clean_nvm_environment();
+                let prefix_before = guard.original_value(OsStr::new("PREFIX"));
+                // Environment mutation is synchronized by the guard.
+                unsafe {
+                    std::env::set_var("PREFIX", format!("created-by-worker-{worker}"));
+                }
+                drop(guard);
+
+                let verify = clean_nvm_environment();
+                assert_eq!(verify.original_value(OsStr::new("PREFIX")), prefix_before);
+                drop(verify);
+            })
+        })
+        .collect::<Vec<_>>();
+    for worker in workers {
+        worker.join().unwrap();
+    }
 }
 
 fn invoke(home: &std::path::Path, request: &SshFilesystemRequest) -> std::process::Output {
