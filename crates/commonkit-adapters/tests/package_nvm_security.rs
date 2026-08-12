@@ -369,6 +369,39 @@ fn nvm_observe_accepts_real_alias_rows_and_rejects_junk_only_output() {
 }
 
 #[test]
+fn nvm_observe_accepts_legitimate_no_installed_state() {
+    let output = "N/A *\niojs -> N/A (default)\nnode -> stable (-> N/A) (default)\nunstable -> N/A (default)\n";
+    let root = tempfile::tempdir().unwrap();
+    let script = format!("nvm() {{ printf '%s' '{}'; return 3; }}\n", output);
+    let script_bytes = script.as_bytes();
+    fs::create_dir(root.path().join(".nvm")).unwrap();
+    fs::write(root.path().join(".nvm/nvm.sh"), script_bytes).unwrap();
+    let mut backend = ProcessOfflinePackageBackend::new(root.path());
+
+    let observed = backend
+        .observe(&resolution(root.path(), digest(script_bytes)))
+        .unwrap();
+    assert!(observed.installed_versions.is_empty());
+}
+
+#[test]
+fn nvm_observe_rejects_fake_version_in_malformed_alias_row() {
+    let output = "N/A *\njunk -> nonsense v20.0.0 (-> N/A)\n";
+    let root = tempfile::tempdir().unwrap();
+    let script = format!("nvm() {{ printf '%s' '{}'; return 3; }}\n", output);
+    let script_bytes = script.as_bytes();
+    fs::create_dir(root.path().join(".nvm")).unwrap();
+    fs::write(root.path().join(".nvm/nvm.sh"), script_bytes).unwrap();
+    let mut backend = ProcessOfflinePackageBackend::new(root.path());
+
+    assert!(
+        backend
+            .observe(&resolution(root.path(), digest(script_bytes)))
+            .is_err()
+    );
+}
+
+#[test]
 fn nvm_observe_rejects_manager_prefix_that_does_not_match_backend_target() {
     let root = tempfile::tempdir().unwrap();
     let nvm = root.path().join(".nvm");

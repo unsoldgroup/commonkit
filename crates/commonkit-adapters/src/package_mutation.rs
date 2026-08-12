@@ -1468,32 +1468,16 @@ impl ProcessOfflinePackageBackend {
         let output = command
             .output()
             .map_err(|_| PackageMutationError::Backend)?;
-        if !output.status.success() {
+        let status_code = output.status.code();
+        if !output.status.success() && status_code != Some(3) {
             return Err(PackageMutationError::Backend);
         }
-        let mut installed_versions = BTreeSet::new();
-        let mut recognized_listing_line = false;
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let trimmed = line.trim();
-            let listing_line = trimmed.starts_with('v') || trimmed.contains("->");
-            if !listing_line {
-                continue;
+        let (installed_versions, no_installed_marker) = parse_nvm_observation(&output.stdout)?;
+        if installed_versions.is_empty() {
+            if status_code != Some(3) || !no_installed_marker {
+                return Err(PackageMutationError::Backend);
             }
-            recognized_listing_line = true;
-            for field in trimmed.split_whitespace() {
-                let Some(version) = field.strip_prefix('v') else {
-                    continue;
-                };
-                let version = version.trim_end_matches([')', '*', ',']);
-                if !valid_nvm_observation_version(version) {
-                    return Err(PackageMutationError::Backend);
-                }
-                // `nvm ls` repeats the active version in its alias rows. The
-                // canonical set deliberately collapses those identical rows.
-                installed_versions.insert(version.to_owned());
-            }
-        }
-        if !recognized_listing_line || installed_versions.is_empty() {
+        } else if !output.status.success() {
             return Err(PackageMutationError::Backend);
         }
         canonical_final_observation(resolution, &PackageObservationV1 { installed_versions })
@@ -1555,6 +1539,82 @@ impl ProcessOfflinePackageBackend {
             .load(&artifact.content)
             .map_err(|_| PackageMutationError::Backend)
     }
+}
+
+fn parse_nvm_observation(output: &[u8]) -> Result<(BTreeSet<String>, bool), PackageMutationError> {
+    let mut installed_versions = BTreeSet::new();
+    let mut no_installed_marker = false;
+    let mut recognized_line = false;
+    for line in String::from_utf8_lossy(output).lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "N/A *" {
+            no_installed_marker = true;
+            recognized_line = true;
+            continue;
+        }
+        if let Some(version) = parse_nvm_version_row(line) {
+            installed_versions.insert(version);
+            recognized_line = true;
+            continue;
+        }
+        let Some((alias, target)) = line.split_once(" -> ") else {
+            return Err(PackageMutationError::Backend);
+        };
+        if !valid_nvm_alias_name(alias) {
+            return Err(PackageMutationError::Backend);
+        }
+        if target == "N/A (default)" || target == "N/A" {
+            recognized_line = true;
+            continue;
+        }
+        if let Some((resolved_target, suffix)) = target.split_once(" (-> N/A)") {
+            if !valid_nvm_alias_name(resolved_target)
+                || (!suffix.is_empty() && suffix != " (default)")
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            recognized_line = true;
+            continue;
+        }
+        let Some((resolved_target, version_tail)) = target.split_once(" (-> v") else {
+            return Err(PackageMutationError::Backend);
+        };
+        if !valid_nvm_alias_name(resolved_target) {
+            return Err(PackageMutationError::Backend);
+        }
+        let Some((version, suffix)) = version_tail.split_once(')') else {
+            return Err(PackageMutationError::Backend);
+        };
+        let version = version.trim_end_matches(" *");
+        if !valid_nvm_observation_version(version) || (!suffix.is_empty() && suffix != " (default)")
+        {
+            return Err(PackageMutationError::Backend);
+        }
+        installed_versions.insert(version.to_owned());
+        recognized_line = true;
+    }
+    if !recognized_line {
+        return Err(PackageMutationError::Backend);
+    }
+    Ok((installed_versions, no_installed_marker))
+}
+
+fn parse_nvm_version_row(line: &str) -> Option<String> {
+    let version = line
+        .strip_prefix("-> v")
+        .or_else(|| line.strip_prefix('v'))?;
+    let version = version.trim_end_matches(" *");
+    valid_nvm_observation_version(version).then(|| version.to_owned())
+}
+
+fn valid_nvm_alias_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'*' | b'-' | b'_' | b'.')
+        })
 }
 
 impl PackageMutationBackend for ProcessOfflinePackageBackend {
