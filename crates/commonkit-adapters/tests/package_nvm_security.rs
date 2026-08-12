@@ -334,6 +334,41 @@ fn nvm_observe_rejects_malformed_final_versions() {
 }
 
 #[test]
+fn nvm_observe_accepts_real_alias_rows_and_rejects_junk_only_output() {
+    let outputs = [
+        (
+            "v22.17.0 *\niojs -> N/A (default)\nnode -> stable (-> v22.17.0 *) (default)\nstable -> 22.17 (-> v22.17.0 *)\nunstable -> N/A (default)\n",
+            true,
+        ),
+        (
+            "node -> stable (default)\nnot an nvm listing v20.0.0\n",
+            false,
+        ),
+    ];
+    for (output, valid) in outputs {
+        let root = tempfile::tempdir().unwrap();
+        let script = format!("nvm() {{ printf '%s' '{}'; }}\n", output);
+        let script_bytes = script.as_bytes();
+        fs::create_dir(root.path().join(".nvm")).unwrap();
+        fs::write(root.path().join(".nvm/nvm.sh"), script_bytes).unwrap();
+        let mut backend = ProcessOfflinePackageBackend::new(root.path());
+
+        let result = backend.observe(&resolution(root.path(), digest(script_bytes)));
+        assert_eq!(
+            result.is_ok(),
+            valid,
+            "unexpected NVM output result: {output}"
+        );
+        if valid {
+            assert_eq!(
+                result.unwrap().installed_versions,
+                BTreeSet::from(["22.17.0".into()])
+            );
+        }
+    }
+}
+
+#[test]
 fn nvm_observe_rejects_manager_prefix_that_does_not_match_backend_target() {
     let root = tempfile::tempdir().unwrap();
     let nvm = root.path().join(".nvm");
@@ -368,8 +403,8 @@ fn bound_nvm_mutation_survives_a_post_start_root_swap() {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(root.path())
         .unwrap();
-    let mut backend = ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle)
-        .unwrap();
+    let mut backend =
+        ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle).unwrap();
     let resolution = resolution(root.path(), digest(script));
     let replacement = tempfile::tempdir().unwrap();
     fs::rename(root.path(), replacement.path().join("original")).unwrap();
@@ -436,7 +471,9 @@ fn bound_nvm_observe_keeps_the_nvm_directory_bound_after_a_path_swap() {
     let mut backend =
         ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle).unwrap();
 
-    let observed = backend.observe(&resolution(root.path(), digest(script))).unwrap();
+    let observed = backend
+        .observe(&resolution(root.path(), digest(script)))
+        .unwrap();
 
     assert!(observed.installed_versions.contains("20.0.0"));
     assert!(root.path().join(".nvm").is_symlink());

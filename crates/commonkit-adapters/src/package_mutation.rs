@@ -1472,23 +1472,29 @@ impl ProcessOfflinePackageBackend {
             return Err(PackageMutationError::Backend);
         }
         let mut installed_versions = BTreeSet::new();
-        for field in String::from_utf8_lossy(&output.stdout).split_whitespace() {
-            let Some(version) = field.strip_prefix('v') else {
-                continue;
-            };
-            if !version
-                .chars()
-                .next()
-                .is_some_and(|character| character.is_ascii_digit())
-            {
+        let mut recognized_listing_line = false;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let trimmed = line.trim();
+            let listing_line = trimmed.starts_with('v') || trimmed.contains("->");
+            if !listing_line {
                 continue;
             }
-            if !valid_nvm_observation_version(version) {
-                return Err(PackageMutationError::Backend);
+            recognized_listing_line = true;
+            for field in trimmed.split_whitespace() {
+                let Some(version) = field.strip_prefix('v') else {
+                    continue;
+                };
+                let version = version.trim_end_matches([')', '*', ',']);
+                if !valid_nvm_observation_version(version) {
+                    return Err(PackageMutationError::Backend);
+                }
+                // `nvm ls` repeats the active version in its alias rows. The
+                // canonical set deliberately collapses those identical rows.
+                installed_versions.insert(version.to_owned());
             }
-            // `nvm ls` repeats the active version in its alias rows. The
-            // canonical set deliberately collapses those identical rows.
-            installed_versions.insert(version.to_owned());
+        }
+        if !recognized_listing_line || installed_versions.is_empty() {
+            return Err(PackageMutationError::Backend);
         }
         canonical_final_observation(resolution, &PackageObservationV1 { installed_versions })
     }
