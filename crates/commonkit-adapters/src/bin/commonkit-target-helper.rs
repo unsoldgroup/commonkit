@@ -349,8 +349,7 @@ fn provision(args: &[String]) -> Result<(), ()> {
         Sha256Digest::parse(option(args, "--target-identity-digest")?).map_err(|_| ())?;
     let manager = option(args, "--manager")?;
     let base = read_or_create_config(&config_path, args)?;
-    let target = target_probe()?;
-    let (binding, apt, node, source) = match manager.as_str() {
+    let (binding, apt, node, source, target) = match manager.as_str() {
         "apt" => {
             let source_id = StableId::parse(option(args, "--apt-source-id")?).map_err(|_| ())?;
             let suite = option(args, "--apt-suite")?;
@@ -363,14 +362,20 @@ fn provision(args: &[String]) -> Result<(), ()> {
             if components.is_empty() {
                 return Err(());
             }
+            let trusted_metadata_digest = match option(args, "--apt-metadata-digest") {
+                Ok(value) => Sha256Digest::parse(value).map_err(|_| ())?,
+                Err(()) => {
+                    eprintln!(
+                        "APT provisioning requires --apt-metadata-digest from the trusted signed metadata resolution"
+                    );
+                    return Err(());
+                }
+            };
             let signed_by = PathBuf::from(option(args, "--apt-signed-by")?);
             validate_existing_path(&signed_by, false, false)?;
             let signing_authority =
                 StableId::parse(option(args, "--apt-signing-authority")?).map_err(|_| ())?;
-            let trusted_metadata_digest = option(args, "--apt-metadata-digest")
-                .ok()
-                .map(|value| Sha256Digest::parse(value).map_err(|_| ()))
-                .transpose()?;
+            let target = target_probe()?;
             let key = fs::read(&signed_by).map_err(|_| ())?;
             let repository = AptRepositoryConfigurationV1 {
                 source_id: source_id.clone(),
@@ -382,9 +387,8 @@ fn provision(args: &[String]) -> Result<(), ()> {
                     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(key)))
                         .map_err(|_| ())?,
                 ),
-                trusted_metadata_digest,
+                trusted_metadata_digest: Some(trusted_metadata_digest),
             };
-            let target = target.clone();
             let canonical = canonical_apt_source(&source_id)?;
             let binding = ProcessAptResolutionCommandRunner::probe_manager_binding(
                 &target,
@@ -392,13 +396,14 @@ fn provision(args: &[String]) -> Result<(), ()> {
                 &repository,
             )
             .map_err(|_| ())?;
-            (binding, Some(repository), None, source_id)
+            (binding, Some(repository), None, source_id, target)
         }
         "nvm" => {
             let nvm_dir = PathBuf::from(option(args, "--nvm-dir")?);
             let shell = PathBuf::from(option(args, "--shell-executable")?);
             let keyring = PathBuf::from(option(args, "--release-keyring")?);
             let gpgv = PathBuf::from(option(args, "--gpgv-executable")?);
+            let target = target_probe()?;
             validate_existing_path(&nvm_dir, false, true)?;
             validate_existing_path(&shell, true, false)?;
             validate_existing_path(&keyring, false, false)?;
@@ -425,6 +430,7 @@ fn provision(args: &[String]) -> Result<(), ()> {
                 None,
                 Some(node),
                 StableId::parse("nodejs-nvm").unwrap(),
+                target,
             )
         }
         _ => return Err(()),

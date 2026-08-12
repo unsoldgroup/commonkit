@@ -79,6 +79,7 @@ if [[ "${COMMONKIT_ENABLE_PACKAGE_PROBE:-0}" == "1" ]]; then
       --apt-components "${COMMONKIT_APT_COMPONENTS:?}"
       --apt-signed-by "${COMMONKIT_APT_SIGNED_BY:?}"
       --apt-signing-authority "${COMMONKIT_APT_SIGNING_AUTHORITY:?}"
+      --apt-metadata-digest "${COMMONKIT_APT_METADATA_DIGEST:?set the trusted signed-metadata sha256 digest}"
     )
   else
     probe_args+=(

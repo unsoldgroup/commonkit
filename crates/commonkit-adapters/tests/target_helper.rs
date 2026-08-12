@@ -1092,6 +1092,60 @@ fn package_resolution_request_digest_is_challenge_bound() {
     assert_ne!(digest(&first), digest(&second));
 }
 
+#[cfg(unix)]
+#[test]
+fn installed_apt_probe_requires_trusted_metadata_anchor_before_probe() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = temp("apt-anchor-home");
+    let root = temp("apt-anchor-root");
+    let state = temp("apt-anchor-state");
+    let config = home.join(".config/commonkit/target-helper.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        &config,
+        serde_json::json!({
+            "stateRoot": state,
+            "roots": [{"id": "home", "path": root, "access": "read_write"}]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit-target-helper"))
+        .args([
+            "--probe-package-resolution",
+            "--config",
+            config.to_str().unwrap(),
+            "--manager",
+            "apt",
+            "--target-identity-digest",
+            digest('a').as_str(),
+            "--apt-source-id",
+            "ubuntu-main",
+            "--apt-suite",
+            "noble",
+            "--apt-components",
+            "main",
+            "--apt-signed-by",
+            "/etc/apt/trusted.gpg",
+            "--apt-signing-authority",
+            "ubuntu-archive",
+        ])
+        .env("HOME", &home)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("APT provisioning requires --apt-metadata-digest")
+    );
+    let _ = fs::remove_dir_all(home);
+    let _ = fs::remove_dir_all(root);
+    let _ = fs::remove_dir_all(state);
+}
+
 #[cfg(all(unix, target_os = "linux"))]
 #[test]
 fn installed_probe_writes_a_real_nvm_package_capability_atomically() {

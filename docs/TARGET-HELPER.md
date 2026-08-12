@@ -50,7 +50,8 @@ configuration after probing (values are illustrative names only):
       "suite": "noble",
       "components": ["main"],
       "signedBy": "/etc/commonkit/apt/archive-keyring.gpg",
-      "signingAuthority": "ubuntu-key"
+      "signingAuthority": "ubuntu-key",
+      "trustedMetadataDigest": "sha256:<trusted signed InRelease digest>"
     },
     "targetIdentityDigest": "sha256:<64-hex>"
   }
@@ -84,8 +85,11 @@ commonkit-target-helper --probe-package-resolution \
 ```
 
 APT provisioning takes `--apt-source-id`, `--apt-suite`,
-`--apt-components`, `--apt-signed-by`, and `--apt-signing-authority`; these
-are source policy inputs, not digest values. The command rejects symlinked or
+`--apt-components`, `--apt-signed-by`, `--apt-signing-authority`, and the
+required `--apt-metadata-digest`. The metadata digest must be copied from the
+trusted signed-metadata resolution for this repository; it is an offline
+anchor, not a request to fetch metadata during apply. The command rejects
+symlinked or
 group/world-writable config paths, writes mode `0600`, fsyncs, and validates
 the resulting helper config before returning.
 
