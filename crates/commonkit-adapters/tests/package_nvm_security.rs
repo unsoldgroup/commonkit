@@ -412,6 +412,34 @@ fn nvm_observe_rejects_unresolved_or_malformed_current_rows() {
 }
 
 #[test]
+fn nvm_observe_rejects_missing_arrow_spaces_and_repeated_markers() {
+    let outputs = [
+        "->v20.19.0\n",
+        "->system * (-> v20.19.0)\n",
+        "node -> stable (->v20.19.0)\n",
+        "v20.19.0 * *\n",
+        "-> v20.19.0 * *\n",
+        "-> system * * (-> v20.19.0)\n",
+        "node -> stable (-> v20.19.0 * *)\n",
+    ];
+    for output in outputs {
+        let root = tempfile::tempdir().unwrap();
+        let script = format!("nvm() {{ printf '%s' '{}'; }}\n", output);
+        let script_bytes = script.as_bytes();
+        fs::create_dir(root.path().join(".nvm")).unwrap();
+        fs::write(root.path().join(".nvm/nvm.sh"), script_bytes).unwrap();
+        let mut backend = ProcessOfflinePackageBackend::new(root.path());
+
+        assert!(
+            backend
+                .observe(&resolution(root.path(), digest(script_bytes)))
+                .is_err(),
+            "NVM must reject non-canonical observation: {output}"
+        );
+    }
+}
+
+#[test]
 fn nvm_observe_accepts_legitimate_no_installed_state() {
     let output = "N/A *\niojs -> N/A (default)\nnode -> stable (-> N/A) (default)\nunstable -> N/A (default)\n";
     let root = tempfile::tempdir().unwrap();

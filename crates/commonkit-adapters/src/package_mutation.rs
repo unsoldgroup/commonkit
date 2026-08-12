@@ -1593,12 +1593,13 @@ fn parse_nvm_observation(output: &[u8]) -> Result<(BTreeSet<String>, bool), Pack
         let Some((version, suffix)) = version_tail.split_once(')') else {
             return Err(PackageMutationError::Backend);
         };
-        let version = version.trim_end_matches(" *");
-        if !valid_nvm_observation_version(version) || (!suffix.is_empty() && suffix != " (default)")
-        {
+        let Some(version) = parse_nvm_version_token(version) else {
+            return Err(PackageMutationError::Backend);
+        };
+        if !suffix.is_empty() && suffix != " (default)" {
             return Err(PackageMutationError::Backend);
         }
-        installed_versions.insert(version.to_owned());
+        installed_versions.insert(version);
         recognized_line = true;
     }
     if !recognized_line {
@@ -1608,18 +1609,22 @@ fn parse_nvm_observation(output: &[u8]) -> Result<(BTreeSet<String>, bool), Pack
 }
 
 fn parse_nvm_version_row(line: &str) -> Option<String> {
-    let version = if let Some(row) = line.strip_prefix("->") {
-        row.trim_start().strip_prefix('v')?
+    let version = if let Some(row) = line.strip_prefix("-> ") {
+        row.trim_start_matches(' ').strip_prefix('v')?
     } else {
         line.strip_prefix('v')?
     };
-    let version = version.trim_end_matches(" *");
-    valid_nvm_observation_version(version).then(|| version.to_owned())
+    parse_nvm_version_token(version)
 }
 
 fn parse_nvm_system_row(line: &str) -> Option<String> {
-    let row = line.strip_prefix("->")?.trim_start();
+    let row = line.strip_prefix("-> ")?.trim_start_matches(' ');
     let version = row.strip_prefix("system * (-> v")?.strip_suffix(')')?;
+    valid_nvm_observation_version(version).then(|| version.to_owned())
+}
+
+fn parse_nvm_version_token(value: &str) -> Option<String> {
+    let version = value.strip_suffix(" *").unwrap_or(value);
     valid_nvm_observation_version(version).then(|| version.to_owned())
 }
 
