@@ -673,6 +673,7 @@ fn validate_target_source_evidence(
     artifacts: &ArtifactStore,
     config: &crate::TargetPackageResolutionConfig,
 ) -> Result<(), PackageMutationError> {
+    validate_target_source_anchor(resolution, config)?;
     // Only legacy APT v1 resolutions may omit signed evidence. NVM v2 always
     // carries the checksum/signature pair that the target verifies offline.
     if resolution.source.signed_metadata.is_empty() {
@@ -689,11 +690,7 @@ fn validate_target_source_evidence(
             let actual_key_digest =
                 Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&key)))
                     .map_err(|_| PackageMutationError::Backend)?;
-            if repository
-                .signing_key_digest
-                .as_ref()
-                .is_some_and(|expected| expected != &actual_key_digest)
-            {
+            if repository.signing_key_digest.as_ref() != Some(&actual_key_digest) {
                 return Err(PackageMutationError::Backend);
             }
             if resolution.source.signed_metadata.iter().any(|evidence| {
@@ -703,21 +700,17 @@ fn validate_target_source_evidence(
                 return Err(PackageMutationError::Backend);
             }
             let metadata_digest = resolution.source.signed_metadata[0].metadata_digest.clone();
-            if resolution.source.signed_metadata.iter().any(|evidence| {
-                evidence.metadata_digest != metadata_digest
-            }) || resolution
+            if resolution
                 .source
-                .repository_revision
-                .as_deref()
-                != metadata_digest.as_str().strip_prefix("sha256:")
+                .signed_metadata
+                .iter()
+                .any(|evidence| evidence.metadata_digest != metadata_digest)
+                || resolution.source.repository_revision.as_deref()
+                    != metadata_digest.as_str().strip_prefix("sha256:")
             {
                 return Err(PackageMutationError::Backend);
             }
-            if repository
-                .trusted_metadata_digest
-                .as_ref()
-                .is_some_and(|expected| expected != &metadata_digest)
-            {
+            if repository.trusted_metadata_digest.as_ref() != Some(&metadata_digest) {
                 return Err(PackageMutationError::Backend);
             }
             Ok(())
@@ -781,6 +774,58 @@ fn validate_target_source_evidence(
     }
 }
 
+/// Validate the portion of source evidence that can be checked from the
+/// target-bound configuration alone. SSH uses this before it stages any
+/// artifact chunks; the helper repeats the complete check after receipt.
+fn validate_target_source_anchor(
+    resolution: &PackageResolutionV1,
+    config: &crate::TargetPackageResolutionConfig,
+) -> Result<(), PackageMutationError> {
+    if resolution.source.signed_metadata.is_empty() {
+        return (resolution.manager.manager == PackageManager::Apt
+            && resolution.schema_version == commonkit_contracts::SchemaVersion(1)
+            && resolution.source.repository_revision.is_some())
+        .then_some(())
+        .ok_or(PackageMutationError::Backend);
+    }
+    match resolution.manager.manager {
+        PackageManager::Apt => {
+            let repository = config.apt.as_ref().ok_or(PackageMutationError::Backend)?;
+            let expected_key = repository
+                .signing_key_digest
+                .as_ref()
+                .ok_or(PackageMutationError::Backend)?;
+            let expected_metadata = repository
+                .trusted_metadata_digest
+                .as_ref()
+                .ok_or(PackageMutationError::Backend)?;
+            if resolution.source.source_id != repository.source_id
+                || resolution.source.signed_metadata.iter().any(|evidence| {
+                    evidence.authority != repository.signing_authority
+                        || &evidence.signature_digest != expected_key
+                        || &evidence.metadata_digest != expected_metadata
+                })
+                || resolution.source.repository_revision.as_deref()
+                    != expected_metadata.as_str().strip_prefix("sha256:")
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            Ok(())
+        }
+        PackageManager::Nvm => {
+            if resolution.schema_version == commonkit_contracts::SchemaVersion(2)
+                && (resolution.source.signed_metadata.len() != 1
+                    || resolution.source.signed_metadata[0].authority
+                        != StableId::parse("node-release-key").unwrap())
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            Ok(())
+        }
+        _ => Err(PackageMutationError::UnsupportedRecipe),
+    }
+}
+
 fn validate_nvm_evidence_artifacts(
     evidence: &crate::ArtifactEvidence,
     checksums: &[u8],
@@ -817,6 +862,8 @@ pub struct SshOfflinePackageBackend<T> {
     transport: T,
     target_platform: Option<(String, String)>,
     target_identity_digest: Option<Sha256Digest>,
+    package_resolution: Option<crate::TargetPackageResolutionConfig>,
+    require_package_resolution: bool,
 }
 
 impl<T> SshOfflinePackageBackend<T> {
@@ -826,6 +873,8 @@ impl<T> SshOfflinePackageBackend<T> {
             transport,
             target_platform: None,
             target_identity_digest: None,
+            package_resolution: None,
+            require_package_resolution: false,
         }
     }
 
@@ -841,7 +890,22 @@ impl<T> SshOfflinePackageBackend<T> {
             transport,
             target_platform: Some((operating_system.into(), architecture.into())),
             target_identity_digest: Some(target_identity_digest),
+            package_resolution: None,
+            require_package_resolution: false,
         }
+    }
+
+    pub fn with_target_package_resolution(
+        mut self,
+        package_resolution: crate::TargetPackageResolutionConfig,
+    ) -> Self {
+        self.package_resolution = Some(package_resolution);
+        self
+    }
+
+    pub fn require_target_package_resolution(mut self) -> Self {
+        self.require_package_resolution = true;
+        self
     }
 
     fn request(
@@ -853,6 +917,11 @@ impl<T> SshOfflinePackageBackend<T> {
     where
         T: crate::SshFilesystemTransport,
     {
+        match &self.package_resolution {
+            Some(config) => validate_target_source_anchor(resolution, config)?,
+            None if self.require_package_resolution => return Err(PackageMutationError::Backend),
+            None => {}
+        }
         if resolution.manager.manager == PackageManager::Nvm
             && resolution.schema_version == commonkit_contracts::SchemaVersion(2)
             && resolution.source.signed_metadata.is_empty()
@@ -1210,6 +1279,7 @@ impl ProcessOfflinePackageBackend {
         }
         match resolution.manager.manager {
             PackageManager::Apt => {
+                validate_target_source_anchor(resolution, config)?;
                 let repository = config.apt.as_ref().ok_or(PackageMutationError::Backend)?;
                 if repository.source_id != resolution.source.source_id {
                     return Err(PackageMutationError::Backend);

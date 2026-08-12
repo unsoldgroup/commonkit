@@ -1,13 +1,15 @@
 use std::collections::BTreeSet;
+use std::fs;
 use std::sync::{Arc, Mutex};
 
 use commonkit_adapters::{
-    ARTIFACT_CHUNK_SIZE, AptSourceAuthorityV1, ArtifactStore, ContentSensitivity, ManagerBindingV1,
-    OfflineInstallRecipeV1, PackageAdapter, PackageArtifactV1, PackageMutationBackend,
-    PackageMutationError, PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1,
-    PackageSourceRegistry, PackageTargetV1, ProcessOfflinePackageBackend, ResolvedPackage,
-    SourceBindingV1, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
-    SshOfflinePackageBackend, TargetFilesystemError, artifact_chunk_response_digest,
+    ARTIFACT_CHUNK_SIZE, AptRepositoryConfigurationV1, AptSourceAuthorityV1, ArtifactEvidence,
+    ArtifactStore, ContentSensitivity, ManagerBindingV1, OfflineInstallRecipeV1, PackageAdapter,
+    PackageArtifactV1, PackageMutationBackend, PackageMutationError, PackageObservationV1,
+    PackageResolutionAuthority, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
+    ProcessOfflinePackageBackend, ResolvedPackage, SourceBindingV1, SshFilesystemRequest,
+    SshFilesystemResponse, SshFilesystemTransport, SshOfflinePackageBackend, TargetFilesystemError,
+    TargetPackageResolutionConfig, artifact_chunk_response_digest,
 };
 use commonkit_contracts::{
     Operation, OperationKind, PackageDeclaration, PackageManager, PackageSelector,
@@ -15,6 +17,7 @@ use commonkit_contracts::{
 };
 use commonkit_core::OperationDraft;
 use commonkit_reconcile::{Adapter, RecoveryObservation};
+use sha2::{Digest, Sha256};
 
 #[test]
 fn package_adapter_api_exposes_only_the_typed_offline_backend_seam() {
@@ -426,7 +429,83 @@ fn ssh_package_backend_rejects_forged_node_evidence_before_transport() {
 
     let mut missing_evidence = resolution;
     missing_evidence.source.signed_metadata.clear();
-    assert!(backend.prepare_offline(&missing_evidence, &artifacts).is_err());
+    assert!(
+        backend
+            .prepare_offline(&missing_evidence, &artifacts)
+            .is_err()
+    );
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn ssh_package_backend_rejects_forged_apt_metadata_before_transport() {
+    let (mut resolution, _) = apt_resolution();
+    let root = tempfile::tempdir().unwrap();
+    let key_path = root.path().join("archive-keyring.gpg");
+    fs::write(&key_path, b"trusted apt key").unwrap();
+    let key_digest =
+        Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(b"trusted apt key"))).unwrap();
+    let trusted_metadata = digest('a');
+    let forged_metadata = digest('b');
+    let source = SourceBindingV1 {
+        source_id: StableId::parse("ubuntu-main").unwrap(),
+        registry_definition_digest: digest('c'),
+        canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+        repository_revision: Some(forged_metadata.as_str()[7..].into()),
+        signed_metadata: vec![ArtifactEvidence {
+            authority: StableId::parse("ubuntu-archive").unwrap(),
+            metadata_digest: forged_metadata.clone(),
+            signature_digest: key_digest.clone(),
+        }],
+    };
+    resolution.source = source.clone();
+    resolution.closure[0].source = source;
+    let role = StableId::parse("apt-archive-ripgrep").unwrap();
+    let artifacts = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let archive = artifacts
+        .put(b"forged archive", ContentSensitivity::Portable)
+        .unwrap();
+    resolution.artifacts = vec![PackageArtifactV1 {
+        role: role.clone(),
+        content: archive.clone(),
+        upstream_checksum: archive.digest.clone(),
+        size: archive.bytes,
+        materialization_key: StableId::parse("ripgrep-deb").unwrap(),
+        source_metadata_digest: forged_metadata,
+    }];
+    resolution.recipe = OfflineInstallRecipeV1::AptArchives {
+        artifact_roles: BTreeSet::from([role]),
+    };
+    let config = TargetPackageResolutionConfig {
+        target: resolution.target.clone(),
+        manager: resolution.manager.clone(),
+        policy: SecurityPolicy::default(),
+        apt: Some(AptRepositoryConfigurationV1 {
+            source_id: StableId::parse("ubuntu-main").unwrap(),
+            suite: "noble".into(),
+            components: BTreeSet::from(["main".into()]),
+            signed_by: key_path,
+            signing_authority: StableId::parse("ubuntu-archive").unwrap(),
+            signing_key_digest: Some(key_digest),
+            trusted_metadata_digest: Some(trusted_metadata),
+        }),
+        node: None,
+        target_identity_digest: digest('d'),
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingSshTransport {
+        requests: requests.clone(),
+    };
+    let mut backend = SshOfflinePackageBackend::with_target_platform(
+        StableId::parse("home").unwrap(),
+        transport,
+        "linux",
+        "amd64",
+        digest('d'),
+    )
+    .with_target_package_resolution(config);
+
+    assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
     assert!(requests.lock().unwrap().is_empty());
 }
 

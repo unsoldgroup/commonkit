@@ -367,6 +367,10 @@ fn provision(args: &[String]) -> Result<(), ()> {
             validate_existing_path(&signed_by, false, false)?;
             let signing_authority =
                 StableId::parse(option(args, "--apt-signing-authority")?).map_err(|_| ())?;
+            let trusted_metadata_digest = option(args, "--apt-metadata-digest")
+                .ok()
+                .map(|value| Sha256Digest::parse(value).map_err(|_| ()))
+                .transpose()?;
             let key = fs::read(&signed_by).map_err(|_| ())?;
             let repository = AptRepositoryConfigurationV1 {
                 source_id: source_id.clone(),
@@ -378,7 +382,7 @@ fn provision(args: &[String]) -> Result<(), ()> {
                     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(key)))
                         .map_err(|_| ())?,
                 ),
-                trusted_metadata_digest: None,
+                trusted_metadata_digest,
             };
             let target = target.clone();
             let canonical = canonical_apt_source(&source_id)?;
