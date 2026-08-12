@@ -1116,6 +1116,19 @@ impl<'a> Reconciler<'a> {
         Self { store: Some(store) }
     }
 
+    /// Validates a durable run's receipt against its immutable plan without
+    /// opening an adapter or touching the target. Callers that need to build
+    /// adapters lazily can use this as the receipt-authentication gate.
+    pub fn validate_recovery_run(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+    ) -> Result<ReceiptState, ReconcileError> {
+        validate_plan(plan)?;
+        let journal = self.load_validated_run(run_id, plan)?;
+        Ok(journal.receipt().state)
+    }
+
     pub fn execute(
         &self,
         plan: &Plan,
@@ -1348,11 +1361,9 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
-        preflight_adapters(plan, adapters)?;
-        let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
-        let mut journal = store.load(run_id)?;
+        let mut journal = self.load_validated_run(run_id, plan)?;
         let receipt = journal.receipt();
-        validate_receipt_plan_binding(plan, receipt)?;
+        preflight_adapters(plan, adapters)?;
         let legacy_exact_forward_progress = legacy_exact_forward_progress(plan, receipt);
 
         let after_forward_barrier = plan.operations.iter().any(|operation| {
@@ -1442,22 +1453,25 @@ impl<'a> Reconciler<'a> {
         }) {
             return Err(ReconcileError::RollbackUnsupported);
         }
-        preflight_adapters(plan, adapters)?;
-        let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
-        let mut journal = store.load(run_id)?;
-        if journal.receipt().plan_id != plan.id
-            || journal.receipt().schema_version != plan.schema_version
-            || journal.receipt().contract_version != plan.contract_version
-            || journal.receipt().target_id != plan.target_id
-        {
-            return Err(ReconcileError::ReceiptPlanMismatch);
-        }
+        let mut journal = self.load_validated_run(run_id, plan)?;
         if journal.receipt().state != ReceiptState::Succeeded {
             return Err(ReconcileError::RunAlreadyTerminal(journal.receipt().state));
         }
+        preflight_adapters(plan, adapters)?;
         journal.transition(ReceiptState::RollingBack)?;
         self.persist(&journal)?;
         self.rollback_from_rolling_back(&mut journal, &plan.operations, adapters)
+    }
+
+    fn load_validated_run(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+    ) -> Result<ReceiptJournal, ReconcileError> {
+        let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
+        let journal = store.load(run_id)?;
+        validate_receipt_plan_binding(plan, journal.receipt())?;
+        Ok(journal)
     }
 
     fn recover(

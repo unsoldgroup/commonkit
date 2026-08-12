@@ -71,6 +71,7 @@ fn operation_with_capability(
 struct RecordingAdapter {
     id: StableId,
     events: Arc<Mutex<Vec<String>>>,
+    preflight_calls: Arc<Mutex<usize>>,
     fail_apply_for: Option<String>,
     fail_verify_for: Option<String>,
     fail_rollback_for: Option<String>,
@@ -135,6 +136,11 @@ impl Adapter for RecordingAdapter {
         capability == RecoveryCapability::ExactRollback || self.supports_forward
     }
 
+    fn preflight(&mut self, _operation: &Operation) -> Result<(), AdapterFailure> {
+        *self.preflight_calls.lock().expect("preflight calls") += 1;
+        Ok(())
+    }
+
     fn supports_operation(&self, operation: &Operation) -> bool {
         self.supports_recovery(operation.recovery_capability)
             && self.unsupported_resource.as_deref() != Some(operation.resource.resource_id.as_str())
@@ -196,9 +202,17 @@ impl RecordingAdapter {
 }
 
 fn adapter(events: Arc<Mutex<Vec<String>>>) -> RecordingAdapter {
+    adapter_with_preflight(events, Arc::new(Mutex::new(0)))
+}
+
+fn adapter_with_preflight(
+    events: Arc<Mutex<Vec<String>>>,
+    preflight_calls: Arc<Mutex<usize>>,
+) -> RecordingAdapter {
     RecordingAdapter {
         id: StableId::parse("files").expect("adapter"),
         events,
+        preflight_calls,
         fail_apply_for: None,
         fail_verify_for: None,
         fail_rollback_for: None,
@@ -941,6 +955,106 @@ fn restart_after_forward_barrier_never_forward_converges_exact_before_state() {
             .phase,
         OperationPhase::ForwardRecovered
     );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn recovery_rejects_missing_receipt_before_adapter_preflight() {
+    let directory = temporary_directory("recovery-missing-receipt");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let calls = Arc::new(Mutex::new(0));
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter_with_preflight(
+        Arc::new(Mutex::new(Vec::new())),
+        calls.clone(),
+    ))];
+
+    let error = Reconciler::with_store(&store).recover_run(
+        StableId::parse("missing-receipt").unwrap(),
+        &plan(),
+        &mut adapters,
+    );
+
+    assert!(matches!(error, Err(ReconcileError::Receipt(_))));
+    assert_eq!(*calls.lock().unwrap(), 0);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn recovery_rejects_tampered_receipt_before_adapter_preflight() {
+    let directory = temporary_directory("recovery-tampered-receipt");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let run_id = StableId::parse("tampered-receipt").unwrap();
+    let plan = plan();
+    store
+        .persist(&ReceiptJournal::for_plan(run_id.clone(), &plan).unwrap())
+        .unwrap();
+    let receipt_path = fs::read_dir(directory.join(run_id.as_str()))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(receipt_path, b"{}").unwrap();
+    let calls = Arc::new(Mutex::new(0));
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter_with_preflight(
+        Arc::new(Mutex::new(Vec::new())),
+        calls.clone(),
+    ))];
+
+    let error = Reconciler::with_store(&store).recover_run(run_id, &plan, &mut adapters);
+
+    assert!(matches!(error, Err(ReconcileError::Receipt(_))));
+    assert_eq!(*calls.lock().unwrap(), 0);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn explicit_rollback_rejects_missing_receipt_before_adapter_preflight() {
+    let directory = temporary_directory("rollback-missing-receipt");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let calls = Arc::new(Mutex::new(0));
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter_with_preflight(
+        Arc::new(Mutex::new(Vec::new())),
+        calls.clone(),
+    ))];
+
+    let error = Reconciler::with_store(&store).rollback_succeeded_run(
+        StableId::parse("missing-receipt").unwrap(),
+        &plan(),
+        &mut adapters,
+    );
+
+    assert!(matches!(error, Err(ReconcileError::Receipt(_))));
+    assert_eq!(*calls.lock().unwrap(), 0);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn explicit_rollback_rejects_tampered_receipt_before_adapter_preflight() {
+    let directory = temporary_directory("rollback-tampered-receipt");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let run_id = StableId::parse("tampered-receipt").unwrap();
+    let plan = plan();
+    store
+        .persist(&ReceiptJournal::for_plan(run_id.clone(), &plan).unwrap())
+        .unwrap();
+    let receipt_path = fs::read_dir(directory.join(run_id.as_str()))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(receipt_path, b"{}").unwrap();
+    let calls = Arc::new(Mutex::new(0));
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter_with_preflight(
+        Arc::new(Mutex::new(Vec::new())),
+        calls.clone(),
+    ))];
+
+    let error = Reconciler::with_store(&store).rollback_succeeded_run(run_id, &plan, &mut adapters);
+
+    assert!(matches!(error, Err(ReconcileError::Receipt(_))));
+    assert_eq!(*calls.lock().unwrap(), 0);
     fs::remove_dir_all(directory).unwrap();
 }
 

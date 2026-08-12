@@ -555,34 +555,28 @@ impl ProductionSshPlanExecutor {
                 .map_err(|_| DomainFailure::OperationFailed)?;
         let run_id = StableId::parse(format!("run-{}", &run_digest.as_str()[7..55]))
             .map_err(|_| DomainFailure::OperationFailed)?;
-        let mut adapters = self.adapter()?;
         match self.receipts.load(run_id.clone()) {
-            Ok(receipt)
-                if matches!(
-                    receipt.receipt().state,
-                    ReceiptState::Succeeded | ReceiptState::ForwardRecovered
-                ) =>
-            {
-                Ok(
-                    if receipt.receipt().state == ReceiptState::ForwardRecovered {
-                        ReconcileOutcome::ForwardRecovered
-                    } else {
-                        ReconcileOutcome::Succeeded
-                    },
-                )
+            Ok(receipt) => {
+                let reconciler = Reconciler::with_store(&self.receipts);
+                reconciler
+                    .validate_recovery_run(run_id.clone(), &durable)
+                    .map_err(|_| DomainFailure::OperationFailed)?;
+                match receipt.receipt().state {
+                    ReceiptState::Succeeded => Ok(ReconcileOutcome::Succeeded),
+                    ReceiptState::ForwardRecovered => Ok(ReconcileOutcome::ForwardRecovered),
+                    ReceiptState::RolledBack | ReceiptState::Canceled => {
+                        Ok(ReconcileOutcome::RolledBack)
+                    }
+                    _ => {
+                        let mut adapters = self.adapter()?;
+                        reconciler
+                            .recover_run(run_id, &durable, &mut adapters)
+                            .map_err(|_| DomainFailure::OperationFailed)
+                    }
+                }
             }
-            Ok(receipt)
-                if matches!(
-                    receipt.receipt().state,
-                    ReceiptState::RolledBack | ReceiptState::Canceled
-                ) =>
-            {
-                Ok(ReconcileOutcome::RolledBack)
-            }
-            Ok(_) => Reconciler::with_store(&self.receipts)
-                .recover_run(run_id, &durable, &mut adapters)
-                .map_err(|_| DomainFailure::OperationFailed),
             Err(ReceiptError::NotFound(_)) => {
+                let mut adapters = self.adapter()?;
                 let reconciler = Reconciler::with_store(&self.receipts);
                 match package_consent {
                     Some(consent) => reconciler
@@ -594,6 +588,7 @@ impl ProductionSshPlanExecutor {
                 }
             }
             Err(ReceiptError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut adapters = self.adapter()?;
                 let reconciler = Reconciler::with_store(&self.receipts);
                 match package_consent {
                     Some(consent) => reconciler
@@ -3876,6 +3871,19 @@ impl SyncDomain for ProductionSyncDomain {
         }
         let receipts =
             ReceiptStore::open(&self.receipt_root).map_err(|_| DomainFailure::OperationFailed)?;
+        let reconciler = Reconciler::with_store(&receipts);
+        let receipt_state = reconciler
+            .validate_recovery_run(run_id.clone(), &plan)
+            .map_err(|error| match error {
+                commonkit_reconcile::ReconcileError::Receipt(_)
+                | commonkit_reconcile::ReconcileError::ReceiptPlanMismatch => {
+                    DomainFailure::InvalidRequest
+                }
+                _ => DomainFailure::OperationFailed,
+            })?;
+        if receipt_state != ReceiptState::Succeeded {
+            return Err(DomainFailure::OperationFailed);
+        }
         let mut adapters: Vec<Box<dyn Adapter>> = match self
             .config
             .target_transport
@@ -3906,7 +3914,7 @@ impl SyncDomain for ProductionSyncDomain {
                 )]
             }
         };
-        let outcome = Reconciler::with_store(&receipts)
+        let outcome = reconciler
             .rollback_succeeded_run(run_id.clone(), &plan, &mut adapters)
             .map_err(|error| match error {
                 commonkit_reconcile::ReconcileError::RollbackUnsupported => {

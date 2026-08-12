@@ -8,7 +8,7 @@ use commonkit_contracts::{
     package_operation_set_digest,
 };
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
-use commonkit_reconcile::PlanStore;
+use commonkit_reconcile::{PlanStore, ReceiptJournal, ReceiptStore};
 use commonkit_service::*;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -241,6 +241,44 @@ fn package_plan_with_identity(
             ownership_map_digest: digest("ownership"),
             artifact_set_digest: digest("artifacts"),
             package_resolution_authority_digest: Some(authority_digest),
+        },
+        operations: vec![operation],
+    })
+    .unwrap()
+}
+
+fn filesystem_plan() -> commonkit_contracts::Plan {
+    let operation = finalize_operation(OperationDraft {
+        adapter_id: StableId::parse("files").unwrap(),
+        kind: OperationKind::Update,
+        resource: ResourceRef {
+            resource_type: StableId::parse("file").unwrap(),
+            resource_id: StableId::parse("editor-conf").unwrap(),
+            managed_path: None,
+        },
+        risk: Risk::Low,
+        requires_confirmation: false,
+        recovery_capability: RecoveryCapability::ExactRollback,
+        depends_on: Vec::new(),
+        before_digest: Some(digest("before")),
+        after_digest: Some(digest("after")),
+        payload_digest: digest("payload"),
+        provenance: None,
+        summary: "update editor.conf".into(),
+    })
+    .unwrap();
+    build_plan(PlanDraft {
+        target_id: StableId::parse("remote-linux").unwrap(),
+        desired_digest: digest("desired"),
+        observed_digest: digest("observed"),
+        policy_digest: digest("policy"),
+        bindings: PlanBindings {
+            target_identity_digest: digest("target"),
+            composed_loadout_digest: digest("loadout"),
+            provider_inputs_digest: digest("provider-inputs"),
+            ownership_map_digest: digest("ownership"),
+            artifact_set_digest: digest("artifacts"),
+            package_resolution_authority_digest: None,
         },
         operations: vec![operation],
     })
@@ -535,6 +573,38 @@ fn ssh_executor_rejects_rotated_target_identity_before_transport() {
     };
 
     let result = executor.execute_with_package_consent(&plan, &confirmation_id, &consent);
+
+    assert_eq!(result.status, ApplyStatus::Failed);
+    assert_eq!(remote.0.lock().unwrap().opens, 0);
+}
+
+#[test]
+fn ssh_executor_rejects_tampered_receipt_before_transport() {
+    let temporary = tempfile::tempdir().unwrap();
+    let remote = Memory::default();
+    let (_, plans, _, executor) = setup(temporary.path(), remote.clone());
+    let plan = filesystem_plan();
+    plans.persist(&plan).unwrap();
+    let confirmation = StableId::parse("tampered-receipt-confirmation").unwrap();
+    let run_digest = digest_domain_json(
+        "commonkit.production-ssh-run.v1",
+        &(&plan.id, &confirmation),
+    )
+    .unwrap();
+    let run_id = StableId::parse(format!("run-{}", &run_digest.as_str()[7..55])).unwrap();
+    let receipts = ReceiptStore::open(temporary.path().join("receipts")).unwrap();
+    receipts
+        .persist(&ReceiptJournal::for_plan(run_id.clone(), &plan).unwrap())
+        .unwrap();
+    let receipt_path = std::fs::read_dir(temporary.path().join("receipts").join(run_id.as_str()))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::write(receipt_path, b"{}").unwrap();
+
+    let result = executor.execute(&plan, &confirmation);
 
     assert_eq!(result.status, ApplyStatus::Failed);
     assert_eq!(remote.0.lock().unwrap().opens, 0);
