@@ -93,6 +93,7 @@ fn repository() -> AptRepositoryConfigurationV1 {
         signed_by: PathBuf::from("/usr/share/keyrings/ubuntu-archive-keyring.gpg"),
         signing_authority: id("ubuntu-archive-keyring"),
         signing_key_digest: None,
+        trusted_metadata_digest: None,
     }
 }
 

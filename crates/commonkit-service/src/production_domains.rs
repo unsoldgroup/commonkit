@@ -6735,6 +6735,7 @@ mod package_resolution_tests {
             signed_by: key_path,
             signing_authority: StableId::parse("ubuntu-key").unwrap(),
             signing_key_digest: None,
+            trusted_metadata_digest: None,
         };
         let manager = ManagerBindingV1 {
             manager: PackageManager::Apt,

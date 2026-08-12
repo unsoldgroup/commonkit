@@ -673,11 +673,14 @@ fn validate_target_source_evidence(
     artifacts: &ArtifactStore,
     config: &crate::TargetPackageResolutionConfig,
 ) -> Result<(), PackageMutationError> {
-    // Empty evidence is retained for immutable v1 resolutions. Such plans
-    // predate signed evidence and are still constrained by their v1 source
-    // binding and target registry checks.
+    // Only legacy APT v1 resolutions may omit signed evidence. NVM v2 always
+    // carries the checksum/signature pair that the target verifies offline.
     if resolution.source.signed_metadata.is_empty() {
-        return Ok(());
+        return (resolution.manager.manager == PackageManager::Apt
+            && resolution.schema_version == commonkit_contracts::SchemaVersion(1)
+            && resolution.source.repository_revision.is_some())
+        .then_some(())
+        .ok_or(PackageMutationError::Backend);
     }
     match resolution.manager.manager {
         PackageManager::Apt => {
@@ -697,6 +700,24 @@ fn validate_target_source_evidence(
                 evidence.authority != repository.signing_authority
                     || evidence.signature_digest != actual_key_digest
             }) {
+                return Err(PackageMutationError::Backend);
+            }
+            let metadata_digest = resolution.source.signed_metadata[0].metadata_digest.clone();
+            if resolution.source.signed_metadata.iter().any(|evidence| {
+                evidence.metadata_digest != metadata_digest
+            }) || resolution
+                .source
+                .repository_revision
+                .as_deref()
+                != metadata_digest.as_str().strip_prefix("sha256:")
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            if repository
+                .trusted_metadata_digest
+                .as_ref()
+                .is_some_and(|expected| expected != &metadata_digest)
+            {
                 return Err(PackageMutationError::Backend);
             }
             Ok(())
@@ -832,6 +853,12 @@ impl<T> SshOfflinePackageBackend<T> {
     where
         T: crate::SshFilesystemTransport,
     {
+        if resolution.manager.manager == PackageManager::Nvm
+            && resolution.schema_version == commonkit_contracts::SchemaVersion(2)
+            && resolution.source.signed_metadata.is_empty()
+        {
+            return Err(PackageMutationError::Backend);
+        }
         if let Some(artifacts) = artifacts {
             if resolution.manager.manager == PackageManager::Nvm
                 && !resolution.source.signed_metadata.is_empty()
@@ -1283,7 +1310,7 @@ impl ProcessOfflinePackageBackend {
             .env("PATH", CLOSED_NVM_PATH)
             .env("NVM_NO_SOURCE_FALLBACK", "1")
             .env("NVM_OFFLINE", "1");
-        let _bound_root = self.configure_nvm_command(&mut command)?;
+        let _bound_root = self.configure_nvm_command(&mut command, &nvm_dir, bound_nvm.as_ref())?;
         let output = command
             .output()
             .map_err(|_| PackageMutationError::Backend)?;
@@ -1487,11 +1514,11 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                     .arg(&install.node_version)
                     .env_clear()
                     .env("HOME", &self.process_root)
-                    .env("NVM_DIR", nvm_dir)
+                    .env("NVM_DIR", &nvm_dir)
                     .env("PATH", CLOSED_NVM_PATH)
                     .env("NVM_NO_SOURCE_FALLBACK", "1")
                     .env("NVM_OFFLINE", "1");
-                let _bound_root = self.configure_nvm_command(&mut command)?;
+                let _bound_root = self.configure_nvm_command(&mut command, &nvm_dir, bound_nvm.as_ref())?;
                 let status = command
                     .status()
                     .map_err(|_| PackageMutationError::Backend)?;
@@ -1527,6 +1554,8 @@ impl ProcessOfflinePackageBackend {
     fn configure_nvm_command(
         &self,
         command: &mut Command,
+        nvm_dir: &Path,
+        bound_nvm: Option<&BoundNvmDir>,
     ) -> Result<Option<std::fs::File>, PackageMutationError> {
         let Some(root) = &self._root_dir else {
             return Ok(None);
@@ -1538,10 +1567,29 @@ impl ProcessOfflinePackageBackend {
             .map_err(|_| PackageMutationError::Backend)?
             .into_std_file();
         let fd = handle.as_raw_fd();
-        command.env("HOME", ".").env("NVM_DIR", "./.nvm");
+        let nvm_handle = bound_nvm
+            .map(|bound| bound._handle.try_clone())
+            .transpose()
+            .map_err(|_| PackageMutationError::Backend)?;
+        let nvm_fd = nvm_handle
+            .as_ref()
+            .map(std::os::fd::AsRawFd::as_raw_fd);
+        if nvm_fd.is_some() {
+            command.env("HOME", &self.process_root).env("NVM_DIR", ".");
+        } else {
+            command.env("HOME", ".").env("NVM_DIR", nvm_dir);
+        }
         unsafe {
             command.pre_exec(move || {
-                if libc::fchdir(fd) == 0 {
+                let _keep_nvm_handle = &nvm_handle;
+                if let Some(nvm_fd) = nvm_fd {
+                    let flags = libc::fcntl(nvm_fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(nvm_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                let working_directory = nvm_fd.unwrap_or(fd);
+                if libc::fchdir(working_directory) == 0 {
                     Ok(())
                 } else {
                     Err(std::io::Error::last_os_error())
@@ -1825,8 +1873,19 @@ fn failure(code: &'static str) -> AdapterFailure {
 mod tests {
     use super::{
         PackageManager, ValidatedNvmScript, package_target_matches_platform, package_targets_match,
+        validate_target_source_evidence,
     };
-    use crate::PackageTargetV1;
+    use crate::{
+        AptRepositoryConfigurationV1, ArtifactEvidence, ArtifactStore, ManagerBindingV1,
+        OfflineInstallRecipeV1, PackageArtifactV1, PackageObservationV1, PackageResolutionV1,
+        PackageTargetV1, ResolvedPackage, SourceBindingV1, TargetPackageResolutionConfig,
+    };
+    use commonkit_contracts::{
+        PackageDeclaration, PackageSelector, SchemaVersion, SecurityPolicy,
+        Sha256Digest, StableId,
+    };
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
     use std::fs;
 
     fn target(os: &str, arch: &str) -> PackageTargetV1 {
@@ -1840,6 +1899,96 @@ mod tests {
             libc: None,
             manager_prefix: None,
         }
+    }
+
+    #[test]
+    fn apt_rejects_forged_metadata_digest_even_when_resolution_revision_and_artifacts_match() {
+        let root = tempfile::tempdir().unwrap();
+        let key = root.path().join("archive-keyring.gpg");
+        fs::write(&key, b"trusted apt key").unwrap();
+        let key_digest = Sha256Digest::parse(format!(
+            "sha256:{:x}",
+            Sha256::digest(b"trusted apt key")
+        ))
+        .unwrap();
+        let trusted_metadata = Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
+        let forged_metadata = Sha256Digest::parse(format!("sha256:{}", "b".repeat(64))).unwrap();
+        let source_id = StableId::parse("ubuntu-main").unwrap();
+        let source = SourceBindingV1 {
+            source_id: source_id.clone(),
+            registry_definition_digest: Sha256Digest::parse(format!("sha256:{}", "c".repeat(64))).unwrap(),
+            canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
+            repository_revision: Some("a".repeat(64)),
+            signed_metadata: vec![ArtifactEvidence {
+                authority: StableId::parse("ubuntu-archive").unwrap(),
+                metadata_digest: trusted_metadata.clone(),
+                signature_digest: key_digest.clone(),
+            }],
+        };
+        let declaration = PackageDeclaration {
+            id: StableId::parse("curl").unwrap(),
+            version: "1.0".into(),
+            manager: PackageManager::Apt,
+            source: source_id,
+            selector: Some(PackageSelector::AptBinary {
+                name: "curl".into(),
+                architecture: Some("amd64".into()),
+            }),
+        };
+        let target = target("linux", "amd64");
+        let manager = ManagerBindingV1 {
+            manager: PackageManager::Apt,
+            version: "apt".into(),
+            executable_digest: key_digest.clone(),
+            config_digest: key_digest.clone(),
+        };
+        let resolution = PackageResolutionV1 {
+            schema_version: SchemaVersion(1),
+            declaration: declaration.clone(),
+            target: target.clone(),
+            manager: manager.clone(),
+            source: source.clone(),
+            before: PackageObservationV1 {
+                installed_versions: BTreeSet::new(),
+            },
+            closure: vec![ResolvedPackage { declaration, source }],
+            artifacts: Vec::new(),
+            recipe: OfflineInstallRecipeV1::AptArchives {
+                artifact_roles: BTreeSet::new(),
+            },
+        };
+        let config = TargetPackageResolutionConfig {
+            target,
+            manager,
+            policy: SecurityPolicy::default(),
+            apt: Some(AptRepositoryConfigurationV1 {
+                source_id: StableId::parse("ubuntu-main").unwrap(),
+                suite: "noble".into(),
+                components: BTreeSet::from(["main".into()]),
+                signed_by: key,
+                signing_authority: StableId::parse("ubuntu-archive").unwrap(),
+                signing_key_digest: Some(key_digest),
+                trusted_metadata_digest: Some(trusted_metadata),
+            }),
+            node: None,
+            target_identity_digest: forged_metadata.clone(),
+        };
+        let artifacts = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+        let mut forged = resolution;
+        forged.source.repository_revision = Some("b".repeat(64));
+        forged.source.signed_metadata[0].metadata_digest = forged_metadata;
+        forged.closure[0].source = forged.source.clone();
+        let archive = artifacts.put(b"forged archive", crate::ContentSensitivity::Portable).unwrap();
+        forged.artifacts = vec![PackageArtifactV1 {
+            role: StableId::parse("apt-archive").unwrap(),
+            content: archive.clone(),
+            upstream_checksum: archive.digest.clone(),
+            size: archive.bytes,
+            materialization_key: StableId::parse("apt-archive").unwrap(),
+            source_metadata_digest: forged.source.metadata_digest().unwrap(),
+        }];
+
+        assert!(validate_target_source_evidence(&forged, &artifacts, &config).is_err());
     }
 
     #[test]

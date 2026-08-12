@@ -384,6 +384,7 @@ fn ssh_package_backend_rejects_forged_node_evidence_before_transport() {
         selector: Some(PackageSelector::NodeRuntime {}),
     };
     resolution.target.manager_prefix = Some("/tmp/commonkit-nvm".into());
+    resolution.schema_version = SchemaVersion(2);
     resolution.manager.manager = PackageManager::Nvm;
     resolution.declaration = declaration.clone();
     resolution.source = source.clone();
@@ -421,6 +422,11 @@ fn ssh_package_backend_rejects_forged_node_evidence_before_transport() {
     let artifacts = ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
 
     assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
+    assert!(requests.lock().unwrap().is_empty());
+
+    let mut missing_evidence = resolution;
+    missing_evidence.source.signed_metadata.clear();
+    assert!(backend.prepare_offline(&missing_evidence, &artifacts).is_err());
     assert!(requests.lock().unwrap().is_empty());
 }
 

@@ -135,6 +135,7 @@ fn live_binding_fixture(
         target_identity_digest: digest(b"target"),
     };
     let mut resolution = resolution(root, snapshot.nvm_script_digest.clone());
+    resolution.schema_version = SchemaVersion(2);
     resolution.target = target;
     resolution.manager = snapshot.manager;
     resolution.recipe = match resolution.recipe {
@@ -176,7 +177,20 @@ fn nvm_apply_rejects_forged_source_evidence_before_mutation() {
 }
 
 #[test]
-fn nvm_observe_revalidates_the_unchanged_live_manager_binding() {
+fn nvm_v2_apply_rejects_missing_source_evidence_before_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let (resolution, config, _) = live_binding_fixture(root.path());
+    assert_eq!(resolution.schema_version, SchemaVersion(2));
+    assert!(resolution.source.signed_metadata.is_empty());
+    let artifacts =
+        commonkit_adapters::ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    let mut backend = ProcessOfflinePackageBackend::with_package_resolution(root.path(), config);
+
+    assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
+}
+
+#[test]
+fn nvm_v2_prepare_rejects_missing_source_evidence() {
     let root = tempfile::tempdir().unwrap();
     let (resolution, config, _) = live_binding_fixture(root.path());
     let node = config.node.as_ref().unwrap();
@@ -194,7 +208,7 @@ fn nvm_observe_revalidates_the_unchanged_live_manager_binding() {
 
     let artifacts =
         commonkit_adapters::ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
-    backend.prepare_offline(&resolution, &artifacts).unwrap();
+    assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
 }
 
 #[test]
@@ -376,4 +390,38 @@ fn bound_nvm_rejects_a_symlinked_nvm_ancestor() {
 
     assert!(backend.observe(&resolution).is_err());
     assert!(!outside.path().join("escaped").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn bound_nvm_observe_keeps_the_nvm_directory_bound_after_a_path_swap() {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let script = format!(
+        "echo \"nvm_dir=$NVM_DIR home=$HOME pwd=$PWD\" >&2\nmv '{}' '{}-original'\nln -s '{}' '{}'\nif [ ! -f \"$NVM_DIR/nvm.sh\" ]; then echo no-script >&2; exit 71; fi\ntouch \"$NVM_DIR/bound-marker\"\nnvm() {{ printf '%s\\n' '-> v20.0.0'; }}\n",
+        root.path().join(".nvm").display(),
+        root.path().join(".nvm").display(),
+        outside.path().display(),
+        root.path().join(".nvm").display()
+    );
+    let script = script.as_bytes();
+    fs::create_dir_all(root.path().join(".nvm")).unwrap();
+    fs::write(root.path().join(".nvm/nvm.sh"), script).unwrap();
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root.path())
+        .unwrap();
+    let mut backend = ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle)
+        .unwrap();
+
+    let observed = backend.observe(&resolution(root.path(), digest(script))).unwrap();
+
+    assert!(observed.installed_versions.contains("20.0.0"));
+    assert!(root.path().join(".nvm").is_symlink());
+    assert!(root.path().join(".nvm-original/bound-marker").exists());
+    assert!(!outside.path().join("bound-marker").exists());
 }

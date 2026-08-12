@@ -30,6 +30,10 @@ pub struct AptRepositoryConfigurationV1 {
     /// omit this and are checked against the bound key path at runtime.
     #[serde(default)]
     pub signing_key_digest: Option<Sha256Digest>,
+    /// Optional target-bound digest of the exact signed repository metadata.
+    /// Legacy target configurations omit this anchor.
+    #[serde(default)]
+    pub trusted_metadata_digest: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

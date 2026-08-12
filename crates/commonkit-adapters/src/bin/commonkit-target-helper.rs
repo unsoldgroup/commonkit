@@ -378,6 +378,7 @@ fn provision(args: &[String]) -> Result<(), ()> {
                     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(key)))
                         .map_err(|_| ())?,
                 ),
+                trusted_metadata_digest: None,
             };
             let target = target.clone();
             let canonical = canonical_apt_source(&source_id)?;
