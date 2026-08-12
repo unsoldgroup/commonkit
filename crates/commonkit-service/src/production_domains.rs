@@ -556,8 +556,7 @@ impl ProductionSshPlanExecutor {
         {
             return Err(DomainFailure::StalePlan);
         }
-        self.validate_package_privilege(plan)
-            .map_err(|error| error)?;
+        self.validate_package_privilege(plan)?;
         let run_digest =
             digest_domain_json("commonkit.production-ssh-run.v1", &(&plan.id, confirmation))
                 .map_err(|_| DomainFailure::OperationFailed)?;
@@ -590,7 +589,7 @@ impl ProductionSshPlanExecutor {
                 }
             }),
             Err(ReceiptError::NotFound(_)) => {
-                let mut adapters = self.adapter().map_err(|error| error)?;
+                let mut adapters = self.adapter()?;
                 match package_consent {
                     Some(consent) => reconciler
                         .execute_with_package_consent(&durable, run_id, consent, &mut adapters)
@@ -601,7 +600,7 @@ impl ProductionSshPlanExecutor {
                 }
             }
             Err(ReceiptError::Io(ref error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut adapters = self.adapter().map_err(|error| error)?;
+                let mut adapters = self.adapter()?;
                 match package_consent {
                     Some(consent) => reconciler
                         .execute_with_package_consent(&durable, run_id, consent, &mut adapters)
@@ -696,8 +695,7 @@ impl PlanExecutor for ProductionSshPlanExecutor {
             .lock
             .lock()
             .map_err(|_| DomainFailure::OperationFailed)
-            .and_then(|_| self.execute_inner(plan, confirmation_id, Some(consent)))
-            .map_err(|error| error);
+            .and_then(|_| self.execute_inner(plan, confirmation_id, Some(consent)));
         match result {
             Ok(ReconcileOutcome::Succeeded | ReconcileOutcome::ForwardRecovered) => {
                 ExecutionResult {
