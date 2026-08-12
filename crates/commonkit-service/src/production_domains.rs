@@ -46,7 +46,7 @@ use commonkit_contracts::{
     StableId, StyleguideDescriptor, StyleguideSelection, assert_no_embedded_secrets,
     digest_domain_json,
 };
-use commonkit_core::{PlanDraft, RootAccess, build_plan, enforce_policy_floor};
+use commonkit_core::{PlanDraft, RootAccess, build_plan, enforce_policy_floor, resolve_principal};
 use commonkit_reconcile::{
     Adapter, PlanStore, ReceiptError, ReceiptStore, ReconcileOutcome, Reconciler,
 };
@@ -153,7 +153,6 @@ struct SyncConfig {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct EngramConfig {
     project_id: EngramProjectId,
-    owner_id: EngramOwnerId,
     project_root: NormalizedManagedPath,
     root: NormalizedManagedPath,
     scope: EngramScope,
@@ -1300,6 +1299,25 @@ fn validate_sync_config(config: &SyncConfig) -> Result<(), ProductionDomainError
     Ok(())
 }
 
+fn open_local_engram_project(
+    target_root: &Path,
+    project_root: &NormalizedManagedPath,
+) -> Result<PathBuf, DomainFailure> {
+    let mut project = target_root.to_path_buf();
+    for component in project_root.as_str().split('/') {
+        project.push(component);
+        let metadata =
+            fs::symlink_metadata(&project).map_err(|_| DomainFailure::OperationFailed)?;
+        if metadata.file_type().is_symlink() {
+            return Err(DomainFailure::OperationFailed);
+        }
+        if !metadata.is_dir() {
+            return Err(DomainFailure::OperationFailed);
+        }
+    }
+    Ok(project)
+}
+
 fn unique_destinations(
     values: Vec<CredentialDestination>,
 ) -> Result<BTreeMap<StableId, CredentialDestination>, ProductionDomainError> {
@@ -1860,6 +1878,12 @@ struct AuthenticatedProviderAuthority {
 }
 
 impl ProductionSyncDomain {
+    fn resolved_engram_owner() -> Result<EngramOwnerId, DomainFailure> {
+        resolve_principal()
+            .map(|principal| EngramOwnerId::from_principal(&principal))
+            .ok_or(DomainFailure::OperationFailed)
+    }
+
     fn engram_declaration(
         config: &SyncConfig,
     ) -> Result<EngramTargetChunkSetDeclaration, DomainFailure> {
@@ -1870,7 +1894,7 @@ impl ProductionSyncDomain {
         Ok(EngramTargetChunkSetDeclaration {
             target_id: config.target_id.clone(),
             project_id: engram.project_id.clone(),
-            owner_id: engram.owner_id.clone(),
+            owner_id: Self::resolved_engram_owner()?,
             project_root: engram.project_root.clone(),
             root: engram.root.clone(),
             scope: engram.scope,
@@ -1901,7 +1925,7 @@ impl ProductionSyncDomain {
                     .executable
                     .clone()
                     .ok_or(DomainFailure::OperationFailed)?,
-                project: config.target_root.join(engram.project_root.as_str()),
+                project: open_local_engram_project(&config.target_root, &engram.project_root)?,
                 project_id: engram.project_id.clone(),
             }),
             SyncTargetTransport::Ssh { root_id, .. } => Ok(ProductionEngramTarget::Ssh {
@@ -3610,7 +3634,7 @@ impl SyncDomain for ProductionSyncDomain {
         let declaration = EngramTargetChunkSetDeclaration {
             target_id: self.config.target_id.clone(),
             project_id: engram.project_id.clone(),
-            owner_id: engram.owner_id.clone(),
+            owner_id: Self::resolved_engram_owner()?,
             project_root: engram.project_root.clone(),
             root: engram.root.clone(),
             scope: engram.scope,
@@ -5927,6 +5951,29 @@ mod credential_durability_tests {
             Err(DomainFailure::OperationFailed)
         );
         assert!(!path.exists());
+    }
+}
+
+#[cfg(unix)]
+#[cfg(test)]
+mod engram_project_containment_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn local_engram_project_rejects_symlinked_project_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let target_root = temporary.path().join("target");
+        let outside = temporary.path().join("outside");
+        fs::create_dir(&target_root).unwrap();
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, target_root.join("project")).unwrap();
+
+        let project_root = NormalizedManagedPath::parse("project").unwrap();
+        assert_eq!(
+            open_local_engram_project(&target_root, &project_root),
+            Err(DomainFailure::OperationFailed)
+        );
     }
 }
 

@@ -40,6 +40,29 @@ fn local_filesystem_is_confined_to_one_declared_capability_root() {
 
 #[cfg(unix)]
 #[test]
+fn local_filesystem_replaces_existing_file_via_a_durable_staged_write() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = temp("atomic-write");
+    fs::create_dir_all(&root).unwrap();
+    let target = LocalTargetFilesystem::open(&root, RootAccess::ReadWrite).unwrap();
+    let path = NormalizedManagedPath::parse("manifest.json").unwrap();
+
+    target.write_file(&path, b"old").unwrap();
+    let first_inode = fs::metadata(root.join("manifest.json")).unwrap().ino();
+    target.write_file(&path, b"new").unwrap();
+    let second_inode = fs::metadata(root.join("manifest.json")).unwrap().ino();
+
+    assert_ne!(first_inode, second_inode);
+    assert_eq!(target.read_file(&path).unwrap(), Some(b"new".to_vec()));
+    assert!(!root.join(".manifest.json.commonkit-tmp").exists());
+
+    drop(target);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn local_filesystem_rejects_symlink_ancestors_and_leafs() {
     use std::os::unix::fs::symlink;
 

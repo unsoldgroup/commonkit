@@ -14,7 +14,7 @@ use commonkit_contracts::{
     LayerDocument, LayerKind, PackageConsent, SchemaVersion, SecurityPolicy, Sha256Digest,
     StableId, assert_no_embedded_secrets,
 };
-use commonkit_core::enforce_policy_floor;
+use commonkit_core::{enforce_policy_floor, resolve_principal};
 use commonkit_personal_context::{
     EncryptedRevisionStore, FieldOperation, ProfileFieldId, RevisionBinding, SecretValue,
     encrypt_revision_for_recipient_strings,
@@ -168,16 +168,12 @@ enum EngramCommand {
         #[arg(long)]
         project_id: String,
         #[arg(long)]
-        owner_id: String,
-        #[arg(long)]
         root: PathBuf,
     },
     /// Export, exchange, and import chunks between two targets owned by one principal.
     Sync {
         #[arg(long)]
         project_id: String,
-        #[arg(long)]
-        owner_id: String,
         #[arg(long)]
         left: PathBuf,
         #[arg(long)]
@@ -191,8 +187,6 @@ enum EngramCommand {
     Watch {
         #[arg(long)]
         project_id: String,
-        #[arg(long)]
-        owner_id: String,
         #[arg(long)]
         left: PathBuf,
         #[arg(long)]
@@ -1051,12 +1045,8 @@ fn run_engram(command: EngramCommand) -> Result<(), Box<dyn Error>> {
             })),
             Some(nonce("engram-reconcile")),
         )?)?,
-        EngramCommand::Status {
-            project_id,
-            owner_id,
-            root,
-        } => {
-            let declaration = engram_declaration(project_id, owner_id, root)?;
+        EngramCommand::Status { project_id, root } => {
+            let declaration = engram_declaration(project_id, root)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&EngramChunkAdapter::status(&declaration)?)?
@@ -1072,14 +1062,13 @@ fn run_engram(command: EngramCommand) -> Result<(), Box<dyn Error>> {
         }
         EngramCommand::Sync {
             project_id,
-            owner_id,
             left,
             right,
             engram_bin,
             confirmed: true,
         } => {
             let project_id = EngramProjectId::try_from(project_id)?;
-            let owner_id = EngramOwnerId::try_from(owner_id)?;
+            let owner_id = resolved_engram_owner()?;
             let left = EngramChunkSetDeclaration {
                 project_id: project_id.clone(),
                 owner_id: owner_id.clone(),
@@ -1107,7 +1096,6 @@ fn run_engram(command: EngramCommand) -> Result<(), Box<dyn Error>> {
         }
         EngramCommand::Watch {
             project_id,
-            owner_id,
             left,
             right,
             engram_bin,
@@ -1119,7 +1107,7 @@ fn run_engram(command: EngramCommand) -> Result<(), Box<dyn Error>> {
                 return Err("Engram watch interval must be at least 60 seconds".into());
             }
             let project_id = EngramProjectId::try_from(project_id)?;
-            let owner_id = EngramOwnerId::try_from(owner_id)?;
+            let owner_id = resolved_engram_owner()?;
             let left = EngramChunkSetDeclaration {
                 project_id: project_id.clone(),
                 owner_id: owner_id.clone(),
@@ -1150,15 +1138,22 @@ fn run_engram(command: EngramCommand) -> Result<(), Box<dyn Error>> {
 
 fn engram_declaration(
     project_id: String,
-    owner_id: String,
     root: PathBuf,
 ) -> Result<EngramChunkSetDeclaration, Box<dyn Error>> {
     Ok(EngramChunkSetDeclaration {
         project_id: EngramProjectId::try_from(project_id)?,
-        owner_id: EngramOwnerId::try_from(owner_id)?,
+        owner_id: resolved_engram_owner()?,
         root,
         scope: EngramScope::Project,
     })
+}
+
+fn resolved_engram_owner() -> Result<EngramOwnerId, Box<dyn Error>> {
+    resolve_principal()
+        .map(|principal| EngramOwnerId::from_principal(&principal))
+        .ok_or_else(|| {
+            "principal_unavailable: resolve the authenticated GitHub principal first".into()
+        })
 }
 
 fn run_context(command: ContextCommand) -> Result<(), Box<dyn Error>> {

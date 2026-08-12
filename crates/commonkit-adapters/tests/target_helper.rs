@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -201,6 +202,66 @@ fn helper_subprocess_applies_only_typed_requests_inside_configured_roots() {
         b"{}\n"
     );
     fs::remove_dir_all(home).unwrap();
+    fs::remove_dir_all(target).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
+#[test]
+fn helper_rejects_engram_sync_without_write_capability_or_over_protected_paths() {
+    let target = temp("engram-gate-target");
+    let state = temp("engram-gate-state");
+    fs::create_dir_all(target.join("repo/.engram")).unwrap();
+    fs::create_dir_all(&state).unwrap();
+    let executable = if cfg!(windows) {
+        PathBuf::from(std::env::var("WINDIR").unwrap()).join("System32/cmd.exe")
+    } else {
+        PathBuf::from("/usr/bin/true")
+    };
+    let request = SshFilesystemRequest::EngramSync {
+        root_id: StableId::parse("home").unwrap(),
+        project_id: "github.com/unsoldgroup/commonkit".try_into().unwrap(),
+        project_path: NormalizedManagedPath::parse("repo").unwrap(),
+        mode: commonkit_adapters::EngramTargetSyncMode::Export,
+    };
+
+    let read_only = TargetHelper::open_with_package_resolution_and_protected_paths(
+        vec![TargetRoot {
+            id: StableId::parse("home").unwrap(),
+            path: target.to_string_lossy().into_owned(),
+            access: RootAccess::ReadOnly,
+        }],
+        &state,
+        None,
+        Vec::new(),
+    )
+    .unwrap()
+    .with_engram_executable(Some(executable.clone()))
+    .unwrap();
+    assert!(matches!(
+        read_only.dispatch(request.clone()),
+        Err(commonkit_adapters::TargetFilesystemError::ReadOnly)
+    ));
+
+    let protected = TargetHelper::open_with_package_resolution_and_protected_paths(
+        vec![TargetRoot {
+            id: StableId::parse("home").unwrap(),
+            path: target.to_string_lossy().into_owned(),
+            access: RootAccess::ReadOnly,
+        }],
+        &state,
+        None,
+        vec![fs::canonicalize(target.join("repo")).unwrap()],
+    )
+    .unwrap()
+    .with_engram_executable(Some(executable))
+    .unwrap();
+    assert!(matches!(
+        protected.dispatch(request),
+        Err(commonkit_adapters::TargetFilesystemError::InvalidSshConfig(
+            _
+        ))
+    ));
+
     fs::remove_dir_all(target).unwrap();
     fs::remove_dir_all(state).unwrap();
 }

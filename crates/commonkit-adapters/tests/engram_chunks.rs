@@ -7,6 +7,7 @@ use commonkit_adapters::{
     NormalizedManagedPath, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
     SshTargetFilesystem, TargetFilesystemError,
 };
+use commonkit_contracts::Principal;
 use commonkit_core::{RootAccess, StableId};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -67,6 +68,19 @@ fn declaration(root: &std::path::Path) -> EngramChunkSetDeclaration {
 }
 
 #[test]
+fn owner_identity_is_derived_from_the_resolved_principal() {
+    let principal = Principal::parse("Alice-Example").unwrap();
+    let owner = EngramOwnerId::from_principal(&principal);
+
+    assert_eq!(owner.as_str(), "github:alice-example");
+}
+
+#[test]
+fn arbitrary_owner_labels_are_rejected() {
+    assert!(EngramOwnerId::try_from("local-alias").is_err());
+}
+
+#[test]
 fn status_reports_missing_and_extra_chunks_without_decoding_payloads() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join(".engram");
@@ -119,6 +133,43 @@ fn reconcile_exchanges_append_only_chunks_in_both_directions_and_is_idempotent()
             .len(),
         2
     );
+}
+
+#[test]
+fn reconcile_recovers_stale_stage_files_after_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let left = directory.path().join("left/.engram");
+    let right = directory.path().join("right/.engram");
+    write_chunk_set(&left, &[("11111111", b"left")]);
+    write_chunk_set(&right, &[("22222222", b"right")]);
+    fs::write(left.join("manifest.json.commonkit-tmp"), b"stale").unwrap();
+    fs::write(
+        left.join("chunks/33333333.jsonl.gz.commonkit-tmp"),
+        b"stale",
+    )
+    .unwrap();
+
+    let receipt = EngramChunkAdapter::reconcile(&declaration(&left), &declaration(&right)).unwrap();
+
+    assert_eq!(receipt.moved.len(), 2);
+    assert!(!left.join("manifest.json.commonkit-tmp").exists());
+    assert!(!left.join("chunks/33333333.jsonl.gz.commonkit-tmp").exists());
+}
+
+#[test]
+fn oversized_chunks_fail_before_unbounded_digest_work() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join(".engram");
+    write_chunk_set(&root, &[("11111111", &[0_u8; 1024])]);
+    fs::write(
+        root.join("chunks/11111111.jsonl.gz"),
+        vec![0_u8; commonkit_adapters::MAX_ENGRAM_CHUNK_BYTES as usize + 1],
+    )
+    .unwrap();
+
+    let error = EngramChunkAdapter::status(&declaration(&root)).unwrap_err();
+
+    assert_eq!(error.to_string(), "Engram chunk is too large");
 }
 
 #[test]
@@ -537,4 +588,42 @@ fn active_target_reconcile_drives_remote_export_and_import() {
         right.into_transport().unwrap().syncs,
         vec![EngramTargetSyncMode::Export, EngramTargetSyncMode::Import]
     );
+}
+
+#[test]
+fn unreachable_ssh_sync_is_an_explicit_unresolved_no_op() {
+    struct Unreachable;
+    impl SshFilesystemTransport for Unreachable {
+        fn perform(
+            &mut self,
+            _: SshFilesystemRequest,
+        ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+            Err(TargetFilesystemError::RemoteFailure {
+                status: 255,
+                message: "connection refused".to_owned(),
+            })
+        }
+    }
+
+    let left = SshTargetFilesystem::new(StableId::parse("left").unwrap(), Unreachable);
+    let right = SshTargetFilesystem::new(StableId::parse("right").unwrap(), Unreachable);
+    let declaration = |target: &str| EngramTargetChunkSetDeclaration {
+        target_id: StableId::parse(target).unwrap(),
+        project_id: "github.com/unsoldgroup/commonkit".try_into().unwrap(),
+        owner_id: EngramOwnerId::try_from("github:astemarie").unwrap(),
+        project_root: NormalizedManagedPath::parse("repo").unwrap(),
+        root: NormalizedManagedPath::parse("repo/.engram").unwrap(),
+        scope: EngramScope::Project,
+    };
+
+    let receipt = EngramChunkAdapter::reconcile_active_targets(
+        &left,
+        &declaration("left"),
+        &right,
+        &declaration("right"),
+    )
+    .unwrap();
+
+    assert_eq!(receipt.moved.len(), 0);
+    assert_eq!(receipt.unresolved.as_deref(), Some("target is unreachable"));
 }

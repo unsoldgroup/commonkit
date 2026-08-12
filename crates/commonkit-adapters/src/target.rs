@@ -282,12 +282,23 @@ impl TargetFilesystem for LocalTargetFilesystem {
         }
         self.ensure_safe_ancestors(path, true)?;
         self.reject_symlink_leaf(path)?;
+        let (parent, leaf) = open_target_parent_nofollow(&self.root, path, true)?;
+        let temporary = PathBuf::from(format!(".{}.commonkit-tmp", leaf.to_string_lossy()));
+        let _ = parent.remove_file(&temporary);
         let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        let mut file = self.root.open_with(path.as_str(), &options)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-        Ok(())
+        options.write(true).create_new(true);
+        let result = (|| {
+            let mut file = parent.open_with(&temporary, &options)?;
+            file.write_all(content)?;
+            file.sync_all()?;
+            drop(file);
+            parent.rename(&temporary, &parent, leaf)?;
+            sync_directory(&parent)
+        })();
+        if result.is_err() {
+            let _ = parent.remove_file(&temporary);
+        }
+        result.map_err(Into::into)
     }
 
     fn remove(&self, path: &NormalizedManagedPath) -> Result<(), TargetFilesystemError> {
@@ -398,6 +409,16 @@ impl TargetFilesystem for LocalTargetFilesystem {
         remove_target_entry(&parent, &leaf)?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn sync_directory(directory: &Dir) -> Result<(), std::io::Error> {
+    directory.try_clone()?.into_std_file().sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Dir) -> Result<(), std::io::Error> {
+    Ok(())
 }
 
 /// A deliberately closed SSH protocol. Implementations can map these requests to SFTP or a

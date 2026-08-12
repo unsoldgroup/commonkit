@@ -793,6 +793,20 @@ impl TargetHelper {
             | SshFilesystemRequest::Remove { root_id, path } => {
                 self.ensure_unprotected(root_id, path)?;
             }
+            SshFilesystemRequest::EngramSync {
+                root_id,
+                project_path,
+                ..
+            } => {
+                self.ensure_unprotected(root_id, project_path)?;
+                let (_, _, access) = self
+                    .roots
+                    .get(root_id)
+                    .ok_or_else(|| TargetFilesystemError::UnknownRoot(root_id.clone()))?;
+                if *access != RootAccess::ReadWrite {
+                    return Err(TargetFilesystemError::ReadOnly);
+                }
+            }
             _ => {}
         }
         match request {

@@ -64,7 +64,8 @@ pub use engram::{
     EngramChunkSetState, EngramChunkSetStatus, EngramCommandOutput, EngramCommandRunner,
     EngramError, EngramGrant, EngramGrantState, EngramOwnerId, EngramProjectId,
     EngramReconciliationReceipt, EngramScope, EngramScopeAttestation, EngramTargetChunkMovement,
-    EngramTargetChunkSetDeclaration, EngramTargetReconciliationReceipt, ProcessEngramCommandRunner,
+    EngramTargetChunkSetDeclaration, EngramTargetReconciliationReceipt, MAX_ENGRAM_CHUNK_BYTES,
+    ProcessEngramCommandRunner,
 };
 pub use files::{FileAdapter, FileAdapterError, FileIntent, ManagedRelativePath};
 pub use git_sync::{

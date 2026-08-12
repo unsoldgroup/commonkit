@@ -83,21 +83,24 @@ fn engram_status_reports_a_declared_project_chunk_set() {
             "status",
             "--project-id",
             "github.com/unsoldgroup/commonkit",
-            "--owner-id",
-            "github:astemarie",
             "--root",
             root.path().to_str().unwrap(),
         ])
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(status["state"], "in_sync");
-    assert_eq!(status["projectId"], "github.com/unsoldgroup/commonkit");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("principal_unavailable"));
+}
+
+#[test]
+fn engram_commands_do_not_accept_arbitrary_owner_labels() {
+    let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["engram", "status", "--help"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(!help.contains("--owner-id"));
 }
 
 #[test]
