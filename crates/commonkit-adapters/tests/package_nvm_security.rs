@@ -257,7 +257,7 @@ fn nvm_observe_rejects_live_manager_config_and_shell_drift() {
 #[test]
 fn production_backend_rejects_package_phases_without_target_manager_authority() {
     let root = tempfile::tempdir().unwrap();
-    let script = b"nvm() { printf '%s\\n' '-> v20.0.0'; }\\n";
+    let script = b"nvm() { printf '%s\\n' '-> v20.0.0 *'; }\\n";
     fs::create_dir(root.path().join(".nvm")).unwrap();
     fs::write(root.path().join(".nvm/nvm.sh"), script).unwrap();
     let resolution = resolution(root.path(), digest(script));
@@ -276,7 +276,7 @@ fn nvm_observe_rejects_script_drift_before_sourcing_or_side_effects() {
     fs::create_dir(&nvm).unwrap();
     let marker = root.path().join("sourced");
     let script = format!(
-        "touch '{}'\nnvm() {{ printf '%s\\n' '-> v20.0.0'; }}\n",
+        "touch '{}'\nnvm() {{ printf '%s\\n' '-> v20.0.0 *'; }}\n",
         marker.display()
     );
     let script_bytes = script.as_bytes();
@@ -297,7 +297,7 @@ fn nvm_observe_uses_a_scrubbed_closed_environment() {
     fs::create_dir(&nvm).unwrap();
     let marker = root.path().join("inherited-home-used");
     let script = format!(
-        "if [ \"$HOME\" != '{}' ]; then touch '{}'; exit 77; fi\nnvm() {{ printf '%s\\n' '-> v20.0.0'; }}\n",
+        "if [ \"$HOME\" != '{}' ]; then touch '{}'; exit 77; fi\nnvm() {{ printf '%s\\n' '-> v20.0.0 *'; }}\n",
         root.path().display(),
         marker.display()
     );
@@ -337,7 +337,7 @@ fn nvm_observe_rejects_malformed_final_versions() {
 fn nvm_observe_accepts_real_alias_rows_and_rejects_junk_only_output() {
     let outputs = [
         (
-            "v22.17.0 *\niojs -> N/A (default)\nnode -> stable (-> v22.17.0 *) (default)\nstable -> 22.17 (-> v22.17.0 *)\nunstable -> N/A (default)\n",
+            "v22.17.0 *\niojs -> N/A (default)\nnode -> stable (-> v22.17.0) (default)\nstable -> 22.17 (-> v22.17.0)\nunstable -> N/A (default)\n",
             true,
         ),
         (
@@ -415,6 +415,8 @@ fn nvm_observe_rejects_unresolved_or_malformed_current_rows() {
 fn nvm_observe_rejects_missing_arrow_spaces_and_repeated_markers() {
     let outputs = [
         "->v20.19.0\n",
+        "v20.19.0\n",
+        "-> v20.19.0\n",
         "->system * (-> v20.19.0)\n",
         "node -> stable (->v20.19.0)\n",
         "v20.19.0 * *\n",
@@ -477,7 +479,7 @@ fn nvm_observe_rejects_manager_prefix_that_does_not_match_backend_target() {
     let root = tempfile::tempdir().unwrap();
     let nvm = root.path().join(".nvm");
     fs::create_dir(&nvm).unwrap();
-    let script = b"nvm() { printf '%s\\n' '-> v20.0.0'; }\n";
+    let script = b"nvm() { printf '%s\\n' '-> v20.0.0 *'; }\n";
     fs::write(nvm.join("nvm.sh"), script).unwrap();
     let mut mismatched = resolution(root.path(), digest(script));
     mismatched.target.manager_prefix = Some("/another-target/.nvm".into());
@@ -499,7 +501,7 @@ fn bound_nvm_mutation_survives_a_post_start_root_swap() {
     let nvm = root.path().join(".nvm");
     fs::create_dir_all(&nvm).unwrap();
     let marker = "observed-on-bound-root";
-    let script = format!("nvm() {{ printf '%s\\n' '-> v20.0.0'; touch \"$HOME/{marker}\"; }}\n");
+    let script = format!("nvm() {{ printf '%s\\n' '-> v20.0.0 *'; touch \"$HOME/{marker}\"; }}\n");
     let script = script.as_bytes();
     fs::write(nvm.join("nvm.sh"), script).unwrap();
     let handle = OpenOptions::new()
@@ -533,7 +535,7 @@ fn bound_nvm_rejects_a_symlinked_nvm_ancestor() {
 
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let script = b"nvm() { printf '%s\\n' '-> v20.0.0'; touch \"$HOME/escaped\"; }\n";
+    let script = b"nvm() { printf '%s\\n' '-> v20.0.0 *'; touch \"$HOME/escaped\"; }\n";
     fs::write(outside.path().join("nvm.sh"), script).unwrap();
     std::os::unix::fs::symlink(outside.path(), root.path().join(".nvm")).unwrap();
     let handle = OpenOptions::new()
@@ -558,7 +560,7 @@ fn bound_nvm_observe_keeps_the_nvm_directory_bound_after_a_path_swap() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let script = format!(
-        "mv '{}' '{}-original'\nln -s '{}' '{}'\nif [ ! -f \"$NVM_DIR/nvm.sh\" ]; then exit 71; fi\ntouch \"$NVM_DIR/bound-marker\"\nnvm() {{ printf '%s\\n' '-> v20.0.0'; }}\n",
+        "mv '{}' '{}-original'\nln -s '{}' '{}'\nif [ ! -f \"$NVM_DIR/nvm.sh\" ]; then exit 71; fi\ntouch \"$NVM_DIR/bound-marker\"\nnvm() {{ printf '%s\\n' '-> v20.0.0 *'; }}\n",
         root.path().join(".nvm").display(),
         root.path().join(".nvm").display(),
         outside.path().display(),

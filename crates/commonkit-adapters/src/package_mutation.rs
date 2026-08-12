@@ -1614,7 +1614,8 @@ fn parse_nvm_version_row(line: &str) -> Option<String> {
     } else {
         line.strip_prefix('v')?
     };
-    parse_nvm_version_token(version)
+    let version = version.strip_suffix(" *")?;
+    valid_nvm_observation_version(version).then(|| version.to_owned())
 }
 
 fn parse_nvm_system_row(line: &str) -> Option<String> {
