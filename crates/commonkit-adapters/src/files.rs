@@ -158,6 +158,28 @@ impl FileAdapter {
         })
     }
 
+    /// Clones the capability-root handle used by this adapter. Callers that
+    /// coordinate another target-local adapter can use the same bound root
+    /// without reopening the ambient path.
+    pub fn clone_target_root_handle(&self) -> Result<std::fs::File, std::io::Error> {
+        Ok(self.target.try_clone()?.into_std_file())
+    }
+
+    /// Verifies that a target path still names the directory represented by a
+    /// previously retained root handle.
+    pub fn validate_target_root_handle(
+        target: &Path,
+        root_handle: &std::fs::File,
+    ) -> Result<(), FileAdapterError> {
+        let current = open_directory_handle(target)?;
+        let expected = directory_identity(&Dir::from_std_file(root_handle.try_clone()?))?;
+        if directory_identity(&current)? == expected {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("managed target root identity changed").into())
+        }
+    }
+
     /// Computes a canonical digest of the live state for the exact normalized
     /// resources a provider intends to manage. Inspection stays capability-
     /// rooted and follows the same semantic representation as prepare/verify.

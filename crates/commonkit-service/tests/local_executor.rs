@@ -94,6 +94,37 @@ fn durable_local_executor_reloads_plan_and_revalidates_preimage_before_mutation(
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn local_executor_rejects_a_replaced_target_root_before_mutation() {
+    let root = temp("replaced-root");
+    let (plans, plan) = fixture(&root);
+    fs::create_dir_all(root.join("target")).unwrap();
+    let executor = LocalPlanExecutor::open(
+        plans,
+        root.join("receipts"),
+        root.join("target"),
+        root.join("adapter"),
+    )
+    .unwrap();
+
+    let replacement = tempfile::tempdir().unwrap();
+    fs::rename(root.join("target"), replacement.path().join("original")).unwrap();
+    fs::create_dir_all(root.join("target")).unwrap();
+
+    let result = executor.execute(&plan, &StableId::parse("replaced-root").unwrap());
+
+    assert_eq!(result.status, ApplyStatus::Failed);
+    assert!(!root.join("target/config/commonkit.txt").exists());
+    assert!(
+        !replacement
+            .path()
+            .join("original/config/commonkit.txt")
+            .exists()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn local_execution_is_receipt_idempotent_and_startup_scan_cancels_prepared_runs() {
     let root = temp("recover");

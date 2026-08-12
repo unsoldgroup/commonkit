@@ -1781,4 +1781,32 @@ mod tests {
         );
         assert!(!root.path().join(".nvm/.cache/node/archive").exists());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_nvm_cache_write_rejects_a_preexisting_symlinked_parent() {
+        use super::ProcessOfflinePackageBackend;
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join(".nvm")).unwrap();
+        symlink(outside.path(), root.path().join(".nvm/.cache")).unwrap();
+        let handle = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root.path())
+            .unwrap();
+        let backend =
+            ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle).unwrap();
+
+        assert!(
+            backend
+                .write_nvm_cache(".cache/node/archive", b"must stay bound")
+                .is_err()
+        );
+        assert!(!outside.path().join("node/archive").exists());
+    }
 }

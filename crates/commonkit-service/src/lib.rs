@@ -1730,6 +1730,7 @@ pub struct LocalPlanExecutor {
     adapter_state: PathBuf,
     package_resolution: Option<TargetPackageResolutionConfig>,
     require_package_resolution: bool,
+    target_root_handle: std::fs::File,
     relay: Option<RelayExecutorConfig>,
     execution_lock: std::sync::Mutex<()>,
 }
@@ -1747,13 +1748,22 @@ impl LocalPlanExecutor {
         target_root: impl AsRef<Path>,
         adapter_state: impl AsRef<Path>,
     ) -> Result<Self, LocalExecutionError> {
+        let target_root = target_root.as_ref().to_path_buf();
+        let adapter_state = adapter_state.as_ref().to_path_buf();
+        // Open the target once and retain its capability root for the life of
+        // the executor. Reopening the ambient path during package execution
+        // would allow a replaced root directory to receive writes.
+        let target_root_handle = FileAdapter::open(&target_root, &adapter_state)?
+            .clone_target_root_handle()
+            .map_err(commonkit_adapters::FileAdapterError::from)?;
         Ok(Self {
             plan_store,
             receipt_store: ReceiptStore::open(receipt_root)?,
-            target_root: target_root.as_ref().to_path_buf(),
-            adapter_state: adapter_state.as_ref().to_path_buf(),
+            target_root,
+            adapter_state,
             package_resolution: None,
             require_package_resolution: false,
+            target_root_handle,
             relay: None,
             execution_lock: std::sync::Mutex::new(()),
         })
@@ -1787,12 +1797,21 @@ impl LocalPlanExecutor {
     }
 
     fn adapters(&self) -> Result<Vec<Box<dyn Adapter>>, LocalExecutionError> {
+        FileAdapter::validate_target_root_handle(&self.target_root, &self.target_root_handle)?;
         let package_artifacts = ArtifactStore::open(self.adapter_state.join("packages"))
             .map_err(LocalExecutionError::PackageArtifact)?;
+        #[cfg(unix)]
+        let process_backend = ProcessOfflinePackageBackend::new_with_bound_root(
+            &self.target_root,
+            self.target_root_handle
+                .try_clone()
+                .map_err(commonkit_adapters::FileAdapterError::from)?,
+        )?;
+        #[cfg(not(unix))]
+        let process_backend = ProcessOfflinePackageBackend::new(&self.target_root);
         let process_backend = match &self.package_resolution {
-            Some(config) => ProcessOfflinePackageBackend::new(&self.target_root)
-                .with_target_package_resolution(config.clone()),
-            None => ProcessOfflinePackageBackend::new(&self.target_root),
+            Some(config) => process_backend.with_target_package_resolution(config.clone()),
+            None => process_backend,
         };
         let process_backend = if self.require_package_resolution {
             process_backend.require_target_package_resolution()
@@ -1867,6 +1886,17 @@ impl LocalPlanExecutor {
         let durable = self.plan_store.load(&plan.id)?;
         if durable != *plan {
             return Err(LocalExecutionError::PlanMismatch);
+        }
+        if plan
+            .operations
+            .iter()
+            .any(|operation| operation.adapter_id.as_str() == "packages")
+        {
+            if let Some(config) = &self.package_resolution {
+                if plan.bindings.target_identity_digest != config.target_identity_digest {
+                    return Err(LocalExecutionError::PlanMismatch);
+                }
+            }
         }
         if let Some(relay) = &self.relay {
             let adapter = RelayAdapter::open(stable_code("relay"), &relay.live, &relay.state)?;
