@@ -1575,7 +1575,7 @@ impl ProcessOfflinePackageBackend {
             .as_ref()
             .map(std::os::fd::AsRawFd::as_raw_fd);
         if nvm_fd.is_some() {
-            command.env("HOME", &self.process_root).env("NVM_DIR", ".");
+            command.env("HOME", "..").env("NVM_DIR", ".");
         } else {
             command.env("HOME", ".").env("NVM_DIR", nvm_dir);
         }

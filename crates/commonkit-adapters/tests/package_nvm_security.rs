@@ -401,7 +401,7 @@ fn bound_nvm_observe_keeps_the_nvm_directory_bound_after_a_path_swap() {
     let root = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
     let script = format!(
-        "echo \"nvm_dir=$NVM_DIR home=$HOME pwd=$PWD\" >&2\nmv '{}' '{}-original'\nln -s '{}' '{}'\nif [ ! -f \"$NVM_DIR/nvm.sh\" ]; then echo no-script >&2; exit 71; fi\ntouch \"$NVM_DIR/bound-marker\"\nnvm() {{ printf '%s\\n' '-> v20.0.0'; }}\n",
+        "mv '{}' '{}-original'\nln -s '{}' '{}'\nif [ ! -f \"$NVM_DIR/nvm.sh\" ]; then exit 71; fi\ntouch \"$NVM_DIR/bound-marker\"\nnvm() {{ printf '%s\\n' '-> v20.0.0'; }}\n",
         root.path().join(".nvm").display(),
         root.path().join(".nvm").display(),
         outside.path().display(),
