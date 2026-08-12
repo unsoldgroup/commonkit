@@ -4,6 +4,7 @@ import { Database } from "bun:sqlite";
 import {
   analysisRunSchema, campaignSchema, drainMetricsSchema, executionRunSchema, focusBriefSchema, graphSnapshotSchema, issueSchema, triageDecisionSchema,
   type AnalysisRun, type Campaign, type DrainMetrics, type ExecutionRun, type FocusBrief, type GraphSnapshot, type TriageDecision, type ZoneId,
+  type WorkBundle,
 } from "@commonkit/linear-graph-protocol";
 import { summarizeTeams } from "./normalizer.js";
 
@@ -88,6 +89,61 @@ export class GraphStore {
   saveCampaign(campaign: Campaign) {
     const value = campaignSchema.parse(campaign);
     this.db.query("INSERT INTO campaigns(id, payload) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(value.id, JSON.stringify(value));
+  }
+
+  approveBundle(bundleId: string, decision: "approve" | "reject", note: string | undefined, timestamp: string): { ok: true; campaign: Campaign; bundle: WorkBundle } | { ok: false; reason: "not_found" | "compare_failed" } {
+    return this.db.transaction(() => {
+      const target = this.loadCampaigns().find((campaign) => campaign.bundles.some((bundle) => bundle.id === bundleId));
+      if (!target) return { ok: false as const, reason: "not_found" as const };
+      const current = target.bundles.find((bundle) => bundle.id === bundleId)!;
+      if (current.status !== "proposed") return { ok: false as const, reason: "compare_failed" as const };
+      const bundles = target.bundles.map((bundle) => bundle.id === bundleId
+        ? { ...bundle, status: decision === "approve" ? "approved" as const : "rejected" as const, approvedAt: decision === "approve" ? timestamp : null, approvalNote: note ?? null, updatedAt: timestamp }
+        : bundle);
+      const campaign = campaignSchema.parse({ ...target, bundles, status: decision === "approve" ? "approved" : target.status, updatedAt: timestamp });
+      this.saveCampaign(campaign);
+      return { ok: true as const, campaign, bundle: campaign.bundles.find((bundle) => bundle.id === bundleId)! };
+    })();
+  }
+
+  approveResolution(resolutionId: string, decision: "approve" | "reject", timestamp: string): { ok: true; campaign: Campaign; resolution: NonNullable<Campaign["resolutionSet"]> } | { ok: false; reason: "not_found" | "compare_failed" } {
+    return this.db.transaction(() => {
+      const target = this.loadCampaigns().find((campaign) => campaign.resolutionSet?.id === resolutionId);
+      if (!target?.resolutionSet) return { ok: false as const, reason: "not_found" as const };
+      if (target.resolutionSet.status !== "proposed") return { ok: false as const, reason: "compare_failed" as const };
+      const resolutionSet = { ...target.resolutionSet, status: decision === "approve" ? "approved" as const : "rejected" as const, approvedAt: decision === "approve" ? timestamp : null, updatedAt: timestamp };
+      const campaign = campaignSchema.parse({ ...target, resolutionSet, updatedAt: timestamp });
+      this.saveCampaign(campaign);
+      return { ok: true as const, campaign, resolution: campaign.resolutionSet! };
+    })();
+  }
+
+  claimBundleExecution(bundleId: string, execution: ExecutionRun): { ok: true; campaign: Campaign; bundle: WorkBundle; execution: ExecutionRun } | { ok: false; reason: "not_found" | "compare_failed" } {
+    return this.db.transaction(() => {
+      if (this.loadExecutionRun(execution.id)) return { ok: false as const, reason: "compare_failed" as const };
+      const target = this.loadCampaigns().find((campaign) => campaign.bundles.some((bundle) => bundle.id === bundleId));
+      if (!target) return { ok: false as const, reason: "not_found" as const };
+      const current = target.bundles.find((bundle) => bundle.id === bundleId)!;
+      if (current.status !== "approved" || !current.approvedAt) return { ok: false as const, reason: "compare_failed" as const };
+      const timestamp = execution.startedAt;
+      const campaign = campaignSchema.parse({ ...target, status: "running", bundles: target.bundles.map((bundle) => bundle.id === bundleId ? { ...bundle, status: "running" as const, updatedAt: timestamp } : bundle), updatedAt: timestamp });
+      this.saveCampaign(campaign);
+      this.saveExecutionRun(execution);
+      return { ok: true as const, campaign, bundle: campaign.bundles.find((bundle) => bundle.id === bundleId)!, execution };
+    })();
+  }
+
+  completeBundleExecution(campaignId: string, bundleId: string, execution: ExecutionRun, finalStatus: WorkBundle["status"], campaignStatus: Campaign["status"]): { ok: true; campaign: Campaign } | { ok: false; reason: "not_found" | "compare_failed" } {
+    return this.db.transaction(() => {
+      const campaign = this.loadCampaign(campaignId);
+      if (!campaign) return { ok: false as const, reason: "not_found" as const };
+      const current = campaign.bundles.find((bundle) => bundle.id === bundleId);
+      if (!current || current.status !== "running") return { ok: false as const, reason: "compare_failed" as const };
+      this.saveExecutionRun(execution);
+      const updated = campaignSchema.parse({ ...campaign, status: campaignStatus, bundles: campaign.bundles.map((bundle) => bundle.id === bundleId ? { ...bundle, status: finalStatus, updatedAt: execution.completedAt, approvalNote: execution.error ?? bundle.approvalNote } : bundle), updatedAt: execution.completedAt });
+      this.saveCampaign(updated);
+      return { ok: true as const, campaign: updated };
+    })();
   }
 
   loadCampaign(id: string): Campaign | null {

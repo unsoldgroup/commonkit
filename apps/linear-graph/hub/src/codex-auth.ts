@@ -67,7 +67,7 @@ function deviceHints(output: string) {
 function envFor(options: CodexAuthOptions) {
   return {
     PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
-    ...(options.codexHome ? { CODEX_HOME: options.codexHome } : {}),
+    ...(options.codexHome ? { HOME: options.codexHome, CODEX_HOME: options.codexHome } : {}),
   };
 }
 

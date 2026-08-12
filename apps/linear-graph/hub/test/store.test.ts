@@ -51,4 +51,20 @@ describe("graph store compatibility", () => {
     expect(reloaded?.evidence[0]?.text).toContain("Intent persisted");
     store.close();
   });
+
+  test("CAS-serializes bundle approval and execution claims", () => {
+    const store = new GraphStore(":memory:");
+    const timestamp = "2026-08-02T00:00:00.000Z";
+    const campaign = { id: "campaign:cas", title: "CAS", prompt: "cas", status: "ready" as const, issueIds: ["issue-1"], processedIssueCount: 1, totalIssueCount: 1, bundles: [{ id: "bundle:cas", campaignId: "campaign:cas", title: "CAS", summary: "One issue", issueIds: ["issue-1"], issues: [{ issueId: "issue-1", order: 1 }], dependencyIssueIds: [], expectedReduction: 1, status: "proposed" as const, createdAt: timestamp, updatedAt: timestamp, approvedAt: null, approvalNote: null }], resolutionSet: null, snapshotAt: timestamp, createdAt: timestamp, updatedAt: timestamp, error: null };
+    store.saveCampaign(campaign);
+    const approved = store.approveBundle("bundle:cas", "approve", "first", timestamp);
+    expect(approved.ok && approved.bundle.status).toBe("approved");
+    expect(store.approveBundle("bundle:cas", "approve", "duplicate", timestamp)).toMatchObject({ ok: false, reason: "compare_failed" });
+    const queued = { id: "execution:cas", bundleId: "bundle:cas", repository: "commonkit", branch: null, worktreePath: null, status: "queued" as const, startedAt: timestamp, completedAt: null, exitCode: null, stdout: "", stderr: "", evidence: [], error: null, createdAt: timestamp };
+    const claimed = store.claimBundleExecution("bundle:cas", queued);
+    expect(claimed.ok && claimed.execution.status).toBe("queued");
+    const duplicate = { ...queued, id: "execution:cas-duplicate" };
+    expect(store.claimBundleExecution("bundle:cas", duplicate)).toMatchObject({ ok: false, reason: "compare_failed" });
+    store.close();
+  });
 });

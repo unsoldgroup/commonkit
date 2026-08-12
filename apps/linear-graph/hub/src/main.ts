@@ -52,11 +52,11 @@ const hub = startGraphHub({
   port: Number(process.env.LINEAR_GRAPH_PORT ?? 8790),
   linear: createLinearSource({ token: required("LINEAR_API_TOKEN"), repoMap: repoMap() }),
   codex: {
-    apiKey: codexApiKey, model: process.env.LINEAR_GRAPH_CODEX_MODEL,
+    apiKey: codexApiKey, model: process.env.LINEAR_GRAPH_CODEX_MODEL, home: process.env.CODEX_HOME, codexHome: process.env.CODEX_HOME,
     ...(process.env.LINEAR_GRAPH_CODEX_TIMEOUT_MS ? { timeoutMs: Number(process.env.LINEAR_GRAPH_CODEX_TIMEOUT_MS) } : {}),
   },
   codexAuth: { mode: codexAuthMode, codexHome: process.env.CODEX_HOME, apiKeyConfigured: Boolean(codexApiKey) },
-  execution: executionRepoMap ? { repositoryAllowlist: executionRepoMap, apiKey: codexApiKey, model: process.env.LINEAR_GRAPH_CODEX_MODEL } : undefined,
+  execution: executionRepoMap ? { repositoryAllowlist: executionRepoMap, apiKey: codexApiKey, home: process.env.CODEX_HOME, codexHome: process.env.CODEX_HOME, model: process.env.LINEAR_GRAPH_CODEX_MODEL } : undefined,
 });
 console.log(`Linear graph hub listening on ${hub.url}`);
 

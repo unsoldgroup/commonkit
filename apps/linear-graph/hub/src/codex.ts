@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { codexAnalysisSchema, focusRecommendationSchema, semanticEdgeSuggestionSchema, topicAssignmentSchema, DEFAULT_ZONES, type CodexAnalysis, type Issue } from "@commonkit/linear-graph-protocol";
+import { redactSensitiveText } from "./redaction.js";
 
 const ZONE_IDS = new Set(DEFAULT_ZONES.map((zone) => zone.id));
 
@@ -19,7 +20,7 @@ function sanitizeAnalysis(raw: unknown): CodexAnalysis {
     const zone = String(record.zone ?? "").trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+/, "");
     return { ...record, zone: ZONE_IDS.has(zone) ? zone : "unsorted" };
   });
-  return codexAnalysisSchema.parse({
+  const parsed = codexAnalysisSchema.parse({
     ...(typeof doc.brief === "string" && doc.brief.trim() ? { brief: doc.brief.trim() } : {}),
     assignments: keep(assignments, topicAssignmentSchema),
     semanticEdges: keep(list(doc.semanticEdges), semanticEdgeSuggestionSchema),
@@ -34,6 +35,14 @@ function sanitizeAnalysis(raw: unknown): CodexAnalysis {
         && (record.nextAction === null || typeof record.nextAction === "string");
     }),
   });
+  return {
+    ...parsed,
+    brief: parsed.brief ? redactSensitiveText(parsed.brief) : undefined,
+    assignments: parsed.assignments.map((item) => ({ ...item, rationale: redactSensitiveText(item.rationale), topicTags: item.topicTags.map((value) => redactSensitiveText(value)) })),
+    semanticEdges: parsed.semanticEdges.map((item) => ({ ...item, rationale: redactSensitiveText(item.rationale) })),
+    recommendations: parsed.recommendations.map((item) => ({ ...item, whyNow: redactSensitiveText(item.whyNow), nextAction: redactSensitiveText(item.nextAction) })),
+    triageDecisions: parsed.triageDecisions?.map((item) => ({ ...item, rationale: redactSensitiveText(item.rationale), nextAction: item.nextAction ? redactSensitiveText(item.nextAction) : null })),
+  };
 }
 
 export interface CodexRunnerOptions {
@@ -42,6 +51,8 @@ export interface CodexRunnerOptions {
   model?: string;
   timeoutMs?: number;
   cwd?: string;
+  home?: string;
+  codexHome?: string;
   spawn?: (command: string[], options: { cwd?: string; env: Record<string, string>; stdin: "pipe"; stdout: "pipe"; stderr: "pipe" }) => Bun.Subprocess;
 }
 
@@ -106,12 +117,12 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
   const candidateIds = new Set(candidates.map((issue) => issue.id));
   const boundedInput = {
     issues: candidates.map((issue) => ({
-      id: issue.id, identifier: issue.identifier, title: issue.title, description: issue.description ?? null,
-      team: issue.team, project: issue.project, status: issue.status, priority: issue.priority, labels: issue.labels,
-      dueDate: issue.dueDate, repo: issue.repo, zone: issue.zone, topicTags: issue.topicTags,
+      id: issue.id, identifier: redactSensitiveText(issue.identifier), title: redactSensitiveText(issue.title), description: issue.description ? redactSensitiveText(issue.description) : null,
+      team: { ...issue.team, key: redactSensitiveText(issue.team.key), name: redactSensitiveText(issue.team.name) }, project: issue.project ? { ...issue.project, name: redactSensitiveText(issue.project.name) } : null, status: issue.status, priority: issue.priority, labels: issue.labels.map((value) => redactSensitiveText(value)),
+      dueDate: issue.dueDate, repo: issue.repo ? redactSensitiveText(issue.repo) : null, zone: issue.zone, topicTags: issue.topicTags.map((value) => redactSensitiveText(value)),
     })),
     edges: input.edges.filter((edge) => { const item = edge as { sourceId?: unknown; targetId?: unknown }; return candidateIds.has(String(item.sourceId)) && candidateIds.has(String(item.targetId)); }),
-    focusBrief: input.focusBrief?.slice(0, 5000),
+    focusBrief: input.focusBrief ? redactSensitiveText(input.focusBrief.slice(0, 5000)) : undefined,
   };
   const prompt = [
     "You are the analysis engine for a private Linear work graph.",
@@ -123,7 +134,7 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
   ].join("\n");
   const command = [options.executable ?? "codex", "exec", "--ephemeral", "--sandbox", "read-only", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check", "--json", "--output-schema", schemaPath, "--model", options.model ?? "gpt-5.6-terra", "-"];
   const spawn = options.spawn ?? ((cmd, spawnOptions) => Bun.spawn(cmd, spawnOptions));
-  const processEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", ...(options.apiKey ? { CODEX_API_KEY: options.apiKey } : {}), ...(process.env.CODEX_HOME ? { CODEX_HOME: process.env.CODEX_HOME } : {}) };
+  const processEnv = { PATH: process.env.PATH ?? "/usr/bin:/bin", ...(options.codexHome ? { HOME: options.codexHome, CODEX_HOME: options.codexHome } : {}) };
   const child = spawn(command, { cwd: options.cwd, env: processEnv, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   // A killed child still reports exitCode 0, so without this flag a timeout
   // surfaces as "Codex returned no structured analysis" from the truncated stream.
@@ -151,7 +162,7 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
     ]);
     if (timedOut) throw new Error(`Codex timed out after ${timeoutMs}ms with ${input.issues.length} issues; raise LINEAR_GRAPH_CODEX_TIMEOUT_MS or reduce the candidate set`);
     if (exitCode !== 0) {
-      const diagnostic = (stderr.trim() || stdout.trim()).slice(-1200);
+      const diagnostic = redactSensitiveText((stderr.trim() || stdout.trim()).slice(-1200));
       throw new Error(`Codex exited with ${exitCode}${diagnostic ? `: ${diagnostic}` : ""}`);
     }
     return sanitizeAnalysis(parseCodexEvents(stdout));

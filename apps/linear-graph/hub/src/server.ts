@@ -14,6 +14,7 @@ import { computeDrainMetrics, proposeCampaign } from "./drain.js";
 import { executeApprovedBundle, type ExecutionRunnerOptions } from "./execution.js";
 import { syncLinear, type LinearSource } from "./linear.js";
 import { inferTopicAssignment, summarizeTeams } from "./normalizer.js";
+import { redactSensitiveText } from "./redaction.js";
 import { GraphStore } from "./store.js";
 
 export interface GraphHubOptions {
@@ -213,30 +214,22 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       if (bundleMatch && request.method === "POST") {
         try {
           const body = await parseBody(request, bundleApprovalRequestSchema);
-          const target = store.loadCampaigns().find((campaign) => campaign.bundles.some((bundle) => bundle.id === bundleMatch[1]));
-          if (!target) return error("Bundle not found", 404);
           const timestamp = now().toISOString();
-          const bundles = target.bundles.map((bundle) => bundle.id === bundleMatch[1]
-            ? { ...bundle, status: body.decision === "approve" ? "approved" as const : "rejected" as const, approvedAt: body.decision === "approve" ? timestamp : null, approvalNote: body.note ?? null, updatedAt: timestamp }
-            : bundle);
-          const campaign: Campaign = { ...target, bundles, status: bundles.some((bundle) => bundle.status === "approved") ? "approved" : target.status, updatedAt: timestamp };
-          store.saveCampaign(campaign);
+          const result = store.approveBundle(bundleMatch[1], body.decision, body.note, timestamp);
+          if (!result.ok) return error(result.reason === "not_found" ? "Bundle not found" : "Bundle changed; refresh before approving", result.reason === "not_found" ? 404 : 409);
           updateDrainMetrics();
-          return json(bundles.find((bundle) => bundle.id === bundleMatch[1]));
+          return json(result.bundle);
         } catch { return error("Invalid bundle approval", 400); }
       }
       const resolutionMatch = /^\/api\/resolution-sets\/([^/]+)\/approval$/.exec(url.pathname);
       if (resolutionMatch && request.method === "POST") {
         try {
           const body = await parseBody(request, bundleApprovalRequestSchema);
-          const target = store.loadCampaigns().find((campaign) => campaign.resolutionSet?.id === resolutionMatch[1]);
-          if (!target?.resolutionSet) return error("Resolution set not found", 404);
           const timestamp = now().toISOString();
-          const resolutionSet = { ...target.resolutionSet, status: body.decision === "approve" ? "approved" as const : "rejected" as const, approvedAt: body.decision === "approve" ? timestamp : null, updatedAt: timestamp };
-          const campaign: Campaign = { ...target, resolutionSet, updatedAt: timestamp };
-          store.saveCampaign(campaign);
+          const result = store.approveResolution(resolutionMatch[1], body.decision, timestamp);
+          if (!result.ok) return error(result.reason === "not_found" ? "Resolution set not found" : "Resolution set changed; refresh before approving", result.reason === "not_found" ? 404 : 409);
           updateDrainMetrics();
-          return json(resolutionSet);
+          return json(result.resolution);
         } catch { return error("Invalid resolution approval", 400); }
       }
       if (executionMatch && request.method === "POST") {
@@ -249,23 +242,22 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
           if (!campaign || !bundle) return error("Bundle not found", 404);
           if (bundle.status !== "approved" || !bundle.approvedAt) return error("Bundle must be approved before execution", 409);
           if (!options.execution.repositoryAllowlist[body.repository]) return error("Repository is not in the execution allowlist", 400);
-          const executionId = `execution:${crypto.randomUUID()}`;
           const timestamp = now().toISOString();
-          const runningCampaign: Campaign = { ...campaign, bundles: campaign.bundles.map((candidate) => candidate.id === bundle.id ? { ...candidate, status: "running" as const, updatedAt: timestamp } : candidate), updatedAt: timestamp };
-          store.saveCampaign(runningCampaign);
-          store.saveExecutionRun({ id: executionId, bundleId: bundle.id, repository: body.repository, branch: null, worktreePath: null, status: "queued", startedAt: timestamp, completedAt: null, exitCode: null, stdout: "", stderr: "", evidence: [{ kind: "runner", text: "Execution intent persisted before Codex start." }], error: null, instruction: body.instruction, issueIds: bundle.issueIds, createdAt: timestamp });
-          const issueContext = current.nodes.filter((issue) => bundle.issueIds.includes(issue.id)).map((issue) => ({ identifier: issue.identifier, title: issue.title, description: issue.description }));
-          const result = await executeApprovedBundle({ executionId, bundle: { ...bundle, status: "approved" }, repository: body.repository, issueContext, instruction: body.instruction }, options.execution);
+          const instruction = body.instruction ? redactSensitiveText(body.instruction.slice(0, 2_000)) : undefined;
+          const executionId = `execution:${crypto.randomUUID()}`;
+          const intent: ExecutionRun = { id: executionId, bundleId: bundle.id, repository: body.repository, branch: null, worktreePath: null, status: "queued", startedAt: timestamp, completedAt: null, exitCode: null, stdout: "", stderr: "", evidence: [{ kind: "runner", text: "Execution intent persisted before Codex start." }], error: null, instruction, issueIds: bundle.issueIds, createdAt: timestamp };
+          const claimed = store.claimBundleExecution(bundle.id, intent);
+          if (!claimed.ok) return error(claimed.reason === "not_found" ? "Bundle not found" : "Bundle is already running or changed; refresh before retrying", claimed.reason === "not_found" ? 404 : 409);
+          const issueContext = current.nodes.filter((issue) => claimed.bundle.issueIds.includes(issue.id)).map((issue) => ({ identifier: issue.identifier, title: issue.title, description: issue.description }));
+          const result = await executeApprovedBundle({ executionId, bundle: { ...claimed.bundle, status: "approved", approvedAt: claimed.bundle.approvedAt }, repository: body.repository, issueContext, instruction }, options.execution);
           const execution: ExecutionRun = {
             id: result.id, bundleId: result.bundleId, repository: result.repository, branch: result.branch, worktreePath: result.worktreePath,
             status: result.status, startedAt: result.startedAt, completedAt: result.completedAt, exitCode: result.exitCode,
-            stdout: result.stdout, stderr: result.stderr, evidence: [{ kind: "runner", text: "Execution intent persisted before Codex start." }, ...result.evidence], error: result.error, instruction: body.instruction, issueIds: bundle.issueIds, createdAt: timestamp,
+            stdout: result.stdout, stderr: result.stderr, evidence: [{ kind: "runner", text: "Execution intent persisted before Codex start." }, ...result.evidence], error: result.error, instruction, issueIds: bundle.issueIds, createdAt: timestamp,
           };
-          store.saveExecutionRun(execution);
           const finalStatus: WorkBundle["status"] = result.status === "completed" ? "verified" : result.status === "timed_out" ? "blocked" : "failed";
-          const finalBundles: WorkBundle[] = runningCampaign.bundles.map((candidate) => candidate.id === bundle.id ? { ...candidate, status: finalStatus, updatedAt: now().toISOString(), approvalNote: result.status === "completed" ? "Codex completed; merge and deploy remain human-approved." : result.error } : candidate);
-          const campaignStatus = result.status === "completed" && finalBundles.every((candidate) => ["verified", "rejected"].includes(candidate.status)) ? "completed" as const : result.status === "failed" ? "failed" as const : "running" as const;
-          store.saveCampaign({ ...runningCampaign, status: campaignStatus, bundles: finalBundles, updatedAt: now().toISOString() });
+          const campaignStatus: Campaign["status"] = result.status === "completed" && claimed.campaign.bundles.every((candidate) => candidate.id === bundle.id || ["verified", "rejected"].includes(candidate.status)) ? "completed" : result.status === "failed" ? "failed" : "running";
+          store.completeBundleExecution(claimed.campaign.id, bundle.id, execution, finalStatus, campaignStatus);
           updateDrainMetrics();
           return json({ execution, campaignId: campaign.id }, result.status === "completed" ? 202 : 502);
         } catch (caught) { return error(caught instanceof Error ? caught.message : "Execution failed", 502); }

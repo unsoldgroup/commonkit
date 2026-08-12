@@ -17,6 +17,7 @@ describe("Codex auth manager", () => {
     let login: any;
     const manager = createCodexAuthManager({ mode: "subscription", codexHome: "/tmp/codex-test", spawn(command, options) {
       commands.push(command);
+      expect(options.env).toMatchObject({ HOME: "/tmp/codex-test", CODEX_HOME: "/tmp/codex-test" });
       expect(options.env).not.toHaveProperty("CODEX_API_KEY");
       if (command[2] === "status") return { exited: Promise.resolve(0), stdout: stream("Logged in using ChatGPT\naccess-sess-123456789012345\n"), stderr: stream("") } as any;
       login = { exited: new Promise<number>(() => undefined), killed: false, stdout: stream("Open https://auth.openai.com/codex/device\nEnter code GERY-PHROH\n"), stderr: stream("") };
