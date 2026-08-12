@@ -1093,6 +1093,35 @@ fn explicit_rollback_rejects_tampered_receipt_before_adapter_preflight() {
 }
 
 #[test]
+fn journal_rollback_helper_rejects_forward_only_plans_directly() {
+    let directory = temporary_directory("rollback-helper-forward-only");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let plan = plan_with(vec![operation_with_capability(
+        "files",
+        "forward",
+        RecoveryCapability::ConvergeForwardOnly,
+    )]);
+    let run_id = StableId::parse("rollback-helper-forward-only").unwrap();
+    let journal = ReceiptJournal::for_plan(run_id.clone(), &plan).unwrap();
+    let calls = Arc::new(Mutex::new(0));
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter_with_preflight(
+        Arc::new(Mutex::new(Vec::new())),
+        calls.clone(),
+    ))];
+
+    let error = Reconciler::with_store(&store).rollback_succeeded_run_with_journal(
+        run_id,
+        &plan,
+        journal,
+        &mut adapters,
+    );
+
+    assert!(matches!(error, Err(ReconcileError::RollbackUnsupported)));
+    assert_eq!(*calls.lock().unwrap(), 0);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn ambiguous_forward_recovery_fails_without_apply_or_rollback() {
     let directory = temporary_directory("forward-ambiguous");
     let store = ReceiptStore::open(&directory).unwrap();

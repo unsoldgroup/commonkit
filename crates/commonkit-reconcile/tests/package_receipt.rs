@@ -58,7 +58,7 @@ fn authorization(operation_id: Sha256Digest) -> PackageReceiptAuthorization {
         evidence: vec![PackageReceiptEvidence {
             operation_id,
             resolution_digest: digest('b'),
-            target_authority_digest: digest('1'),
+            target_authority_digest: digest('6'),
             manager: PackageManager::Apt,
             manager_authority_digest: digest('9'),
             source_id: StableId::parse("ubuntu-main").unwrap(),

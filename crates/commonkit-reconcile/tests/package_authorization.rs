@@ -70,6 +70,7 @@ struct PackageAdapterStub {
     forbid_observation: bool,
     recovery_observation: RecoveryObservation,
     verify_failure: bool,
+    tamper_target_authority: bool,
 }
 
 impl Adapter for PackageAdapterStub {
@@ -109,7 +110,11 @@ impl Adapter for PackageAdapterStub {
             PackageReceiptEvidence {
                 operation_id: operation.id.clone(),
                 resolution_digest: operation.payload_digest.clone(),
-                target_authority_digest: digest('1'),
+                target_authority_digest: if self.tamper_target_authority {
+                    digest('3')
+                } else {
+                    digest('6')
+                },
                 manager: PackageManager::Apt,
                 manager_authority_digest: digest('9'),
                 source_id: StableId::parse("ubuntu-main").unwrap(),
@@ -159,7 +164,7 @@ fn package_authorization(operation: &Operation) -> PackageReceiptAuthorization {
         evidence: vec![PackageReceiptEvidence {
             operation_id: operation.id.clone(),
             resolution_digest: operation.payload_digest.clone(),
-            target_authority_digest: digest('3'),
+            target_authority_digest: digest('6'),
             manager: PackageManager::Apt,
             manager_authority_digest: digest('4'),
             source_id: StableId::parse("ubuntu-main").unwrap(),
@@ -209,6 +214,7 @@ fn interrupted_package_recovery_accepts_v2_plan_bound_to_v3_receipt() {
         forbid_observation: false,
         recovery_observation: RecoveryObservation::After,
         verify_failure: false,
+        tamper_target_authority: false,
     })];
     let outcome = Reconciler::with_store(&store)
         .recover_run(run_id.clone(), &plan, &mut adapters)
@@ -277,6 +283,7 @@ fn package_recovery_requires_after_observation_before_repairing_evidence() {
         forbid_observation: false,
         recovery_observation: RecoveryObservation::Before,
         verify_failure: false,
+        tamper_target_authority: false,
     })];
     let outcome = Reconciler::with_store(&store)
         .recover_run(run_id.clone(), &plan, &mut adapters)
@@ -364,6 +371,7 @@ fn package_recovery_repairs_forward_recovered_failed_evidence_gap_after_after_ob
         forbid_observation: false,
         recovery_observation: RecoveryObservation::After,
         verify_failure: false,
+        tamper_target_authority: false,
     })];
     let outcome = Reconciler::with_store(&store)
         .recover_run(run_id.clone(), &plan, &mut adapters)
@@ -466,6 +474,7 @@ fn package_recovery_repairs_failed_evidence_after_forward_failure_checkpoint() {
         forbid_observation: false,
         recovery_observation: RecoveryObservation::After,
         verify_failure: false,
+        tamper_target_authority: false,
     })];
     let outcome = Reconciler::with_store(&store)
         .recover_run(run_id.clone(), &plan, &mut adapters)
@@ -490,6 +499,7 @@ fn package_recovery_repairs_failed_evidence_after_forward_failure_checkpoint() {
         forbid_observation: true,
         recovery_observation: RecoveryObservation::After,
         verify_failure: false,
+        tamper_target_authority: false,
     })];
     assert!(matches!(
         Reconciler::with_store(&store).recover_run(
@@ -523,6 +533,7 @@ fn package_plan_requires_exact_consent_before_receipt_or_mutation() {
         forbid_observation: false,
         recovery_observation: RecoveryObservation::After,
         verify_failure: false,
+        tamper_target_authority: false,
     })];
     let before = std::fs::read_dir(&root).unwrap().count();
 
@@ -594,6 +605,7 @@ fn package_verify_failure_records_only_sanitized_failed_evidence() {
         forbid_observation: false,
         recovery_observation: RecoveryObservation::After,
         verify_failure: true,
+        tamper_target_authority: false,
     })];
 
     let outcome = Reconciler::with_store(&store)
@@ -622,5 +634,45 @@ fn package_verify_failure_records_only_sanitized_failed_evidence() {
         }
     );
     assert_eq!(evidence.final_digest, None);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn adapter_evidence_tamper_is_rejected_before_receipt_creation() {
+    let root = temporary_directory("package-evidence-tamper");
+    let store = ReceiptStore::open(&root).unwrap();
+    let plan = package_plan();
+    let operation = &plan.operations[0];
+    let consent = PackageConsent {
+        confirmation_id: StableId::parse("confirm-packages").unwrap(),
+        operation_set_digest: package_operation_set_digest(
+            &plan,
+            &[PackageOperationConsentBinding {
+                operation_id: operation.id.clone(),
+                resolution_digest: operation.payload_digest.clone(),
+            }],
+        )
+        .unwrap(),
+    };
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
+        id: StableId::parse("packages").unwrap(),
+        mutation_count: 0,
+        forbid_observation: false,
+        recovery_observation: RecoveryObservation::After,
+        verify_failure: false,
+        tamper_target_authority: true,
+    })];
+    let before = std::fs::read_dir(&root).unwrap().count();
+    assert!(
+        Reconciler::with_store(&store)
+            .execute_with_package_consent(
+                &plan,
+                StableId::parse("tampered-evidence").unwrap(),
+                &consent,
+                &mut adapters,
+            )
+            .is_err()
+    );
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), before);
     std::fs::remove_dir_all(root).unwrap();
 }

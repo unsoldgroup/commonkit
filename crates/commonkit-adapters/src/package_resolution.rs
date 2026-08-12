@@ -1465,6 +1465,7 @@ fn validate_persisted_resolution(
     validate_target(&resolution.target)?;
     validate_manager(&resolution.manager)?;
     validate_source(&resolution.source)?;
+    validate_before_observation(resolution)?;
     if resolution.declaration.source != resolution.source.source_id {
         return Err(PackageResolutionError::SourceBindingMismatch);
     }
@@ -1557,6 +1558,113 @@ fn validate_persisted_resolution(
         (PackageManager::Nvm, _) => Err(PackageResolutionError::InvalidNodeRequest),
         (_, _) => Ok(()),
     }
+}
+
+/// The before observation is persisted package state, not an opaque backend
+/// transcript. Keep the two native observation formats canonical before they
+/// can be carried into a receipt or used by an offline mutator.
+fn validate_before_observation(
+    resolution: &PackageResolutionV1,
+) -> Result<(), PackageResolutionError> {
+    match resolution.manager.manager {
+        PackageManager::Apt => validate_apt_before_observation(resolution),
+        PackageManager::Nvm => {
+            if resolution
+                .before
+                .installed_versions
+                .iter()
+                .any(|version| !valid_canonical_node_version(version))
+            {
+                Err(PackageResolutionError::MalformedObservation)
+            } else {
+                Ok(())
+            }
+        }
+        // The v1 contract still permits providers other than the native APT
+        // and NVM backends. Preserve those legacy observations while ensuring
+        // they cannot carry command output or control characters.
+        _ => resolution
+            .before
+            .installed_versions
+            .iter()
+            .all(|value| valid_canonical_observation_value(value))
+            .then_some(())
+            .ok_or(PackageResolutionError::MalformedObservation),
+    }
+}
+
+fn validate_apt_before_observation(
+    resolution: &PackageResolutionV1,
+) -> Result<(), PackageResolutionError> {
+    let mut identities = BTreeMap::<(String, String), String>::new();
+    let mut live_safety_marker = None;
+    for identity in &resolution.before.installed_versions {
+        if let Some(digest) = identity.strip_prefix("commonkit-apt-live-safety=") {
+            if live_safety_marker.replace(digest).is_some() || Sha256Digest::parse(digest).is_err()
+            {
+                return Err(PackageResolutionError::MalformedObservation);
+            }
+            continue;
+        }
+        let Some((name, architecture, version)) = parse_canonical_apt_identity(identity) else {
+            return Err(PackageResolutionError::MalformedObservation);
+        };
+        if architecture != "all" && architecture != resolution.target.arch {
+            return Err(PackageResolutionError::MalformedObservation);
+        }
+        let key = (name.to_owned(), architecture.to_owned());
+        if identities.insert(key, version.to_owned()).is_some() {
+            return Err(PackageResolutionError::MalformedObservation);
+        }
+    }
+    Ok(())
+}
+
+fn parse_canonical_apt_identity(identity: &str) -> Option<(&str, &str, &str)> {
+    if identity.matches('=').count() != 1 {
+        return None;
+    }
+    let (name_architecture, version) = identity.split_once('=')?;
+    let (name, architecture) = name_architecture.split_once(':')?;
+    if name.is_empty()
+        || architecture.is_empty()
+        || version.is_empty()
+        || name.contains(':')
+        || architecture.contains(':')
+        || !valid_canonical_observation_value(name)
+        || !valid_canonical_observation_value(architecture)
+        || !valid_canonical_observation_value(version)
+    {
+        return None;
+    }
+    Some((name, architecture, version))
+}
+
+fn valid_canonical_node_version(version: &str) -> bool {
+    let mut parts = version.split('.');
+    let Some(major) = parts.next() else {
+        return false;
+    };
+    let Some(minor) = parts.next() else {
+        return false;
+    };
+    let Some(patch) = parts.next() else {
+        return false;
+    };
+    parts.next().is_none()
+        && [major, minor, patch].iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part == &"0" || !part.starts_with('0'))
+        })
+}
+
+fn valid_canonical_observation_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .chars()
+            .all(|character| character.is_ascii_graphic() && !character.is_ascii_whitespace())
 }
 
 fn resolved_root_matches(resolved: &PackageDeclaration, requested: &PackageDeclaration) -> bool {
@@ -1930,6 +2038,8 @@ pub enum PackageResolutionError {
     MissingRootPackage,
     #[error("package resolution closure contains a duplicate")]
     DuplicateClosurePackage,
+    #[error("package resolution before observation is malformed")]
+    MalformedObservation,
     #[error("package resolution artifact set does not exactly match fetched artifacts")]
     ArtifactSetMismatch,
     #[error("package resolution contains duplicate artifact references")]

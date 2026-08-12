@@ -7,8 +7,8 @@ use commonkit_adapters::{
     PackageFetchResultV1, PackageObservationV1, PackageResolutionAuthority,
     PackageResolutionBackend, PackageResolutionCoordinator, PackageResolutionDraftV1,
     PackageResolutionError, PackageResolutionProbeV1, PackageResolutionRequestV1,
-    PackageSourceRegistry, PackageTargetV1, ProviderInputs, ResolvedPackage, ResourceProvenance,
-    SourceBindingV1,
+    PackageResolutionV1, PackageSourceRegistry, PackageTargetV1, ProviderInputs, ResolvedPackage,
+    ResourceProvenance, SourceBindingV1,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, Sha256Digest, StableId,
@@ -535,6 +535,50 @@ fn identical_resolution_inputs_persist_identical_resolution_and_artifact_referen
     for artifact in &first.artifacts {
         assert_eq!(store.load(artifact).unwrap(), bytes);
     }
+}
+
+#[test]
+fn malformed_persisted_before_observation_is_rejected_before_authority_acceptance() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ArtifactStore::open(root.path().join("artifacts")).unwrap();
+    let registry = PackageSourceRegistry::builtin().unwrap();
+    let bytes = b"immutable package archive";
+    let mut backend = fixture_backend(bytes);
+    let mut fetch = FixtureFetch {
+        bytes: BTreeMap::from([(
+            backend.fetch_requests[0].immutable_locator.clone(),
+            bytes.to_vec(),
+        )]),
+        calls: 0,
+    };
+    let resolved = PackageResolutionCoordinator::new(
+        &allowed_policy(),
+        &registry,
+        manager_binding(),
+        &mut backend,
+        &mut fetch,
+    )
+    .resolve(&desired(), &target(), &store)
+    .unwrap();
+    let mut malformed: PackageResolutionV1 =
+        serde_json::from_slice(&store.load(&resolved.resolution).unwrap()).unwrap();
+    // A persisted observation is a canonical package inventory, never a
+    // command transcript (or an arbitrary value that could carry secrets).
+    malformed
+        .before
+        .installed_versions
+        .insert("backend output leaked here".into());
+    let authority = PackageResolutionAuthority::new(
+        &target(),
+        &manager_binding(),
+        &registry,
+        &allowed_policy(),
+    )
+    .unwrap();
+    assert!(matches!(
+        authority.validate_resolution(&malformed),
+        Err(PackageResolutionError::MalformedObservation)
+    ));
 }
 
 #[test]

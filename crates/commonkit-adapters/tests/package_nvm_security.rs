@@ -384,8 +384,8 @@ fn bound_nvm_rejects_a_symlinked_nvm_ancestor() {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(root.path())
         .unwrap();
-    let mut backend =
-        ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle).unwrap();
+    let mut backend = ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle)
+        .unwrap();
     let resolution = resolution(root.path(), digest(script));
 
     assert!(backend.observe(&resolution).is_err());
@@ -415,8 +415,8 @@ fn bound_nvm_observe_keeps_the_nvm_directory_bound_after_a_path_swap() {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(root.path())
         .unwrap();
-    let mut backend = ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle)
-        .unwrap();
+    let mut backend =
+        ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle).unwrap();
 
     let observed = backend.observe(&resolution(root.path(), digest(script))).unwrap();
 

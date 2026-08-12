@@ -12,7 +12,8 @@ use cap_std::fs::Dir;
 use commonkit_contracts::{
     Operation, OperationKind, PackageExitClassification, PackageManager,
     PackageOperationConsentBinding, PackageReceiptEvidence, PackageSelector, RecoveryCapability,
-    ResourceRef, Risk, SecurityPolicy, Sha256Digest, StableId, digest_domain_json,
+    ResourceRef, Risk, SecurityPolicy, Sha256Digest, StableId,
+    canonical_package_installed_versions, digest_domain_json,
 };
 use commonkit_core::{OperationDraft, finalize_operation};
 use commonkit_reconcile::{Adapter, AdapterFailure, RecoveryObservation};
@@ -226,7 +227,7 @@ impl PackageAdapter {
         let (_, resolution) = self
             .load_resolution(operation)
             .map_err(|_| failure("package_resolution_invalid"))?;
-        ensure_supported(&resolution, self.backend.as_ref())?;
+        ensure_supported(&resolution, self.backend.as_ref()).map_err(|error| error)?;
         Ok(resolution)
     }
 
@@ -376,7 +377,9 @@ impl Adapter for PackageAdapter {
         {
             return Err(failure("package_operation_unsupported"));
         }
-        self.resolution(operation).map(|_| ())
+        self.resolution(operation)
+            .map(|_| ())
+            .map_err(|error| error)
     }
 
     fn package_authorization_binding(
@@ -415,13 +418,64 @@ impl Adapter for PackageAdapter {
                 manager_authority_digest,
                 source_id: resolution.source.source_id.clone(),
                 source_authority_digest: resolution.source.registry_definition_digest.clone(),
-                before_installed_versions: resolution.before.installed_versions.clone(),
+                before_installed_versions: canonical_package_installed_versions(
+                    resolution.manager.manager,
+                    &resolution.before.installed_versions,
+                )
+                .map_err(|_| failure("package_observation_invalid"))?,
                 no_preimage_reason:
                     commonkit_contracts::PackageNoPreimageReason::AdditiveForwardOnly,
                 exit_classification: PackageExitClassification::NotRun,
                 final_digest: None,
             },
         )))
+    }
+
+    fn validate_package_authorization_evidence(
+        &self,
+        operation: &Operation,
+        evidence: &PackageReceiptEvidence,
+    ) -> Result<(), AdapterFailure> {
+        let (_, resolution) = self
+            .load_resolution(operation)
+            .map_err(|_| failure("package_resolution_invalid"))?;
+        ensure_supported(&resolution, self.backend.as_ref())?;
+        let target_authority_digest = self
+            .authority
+            .as_ref()
+            .map(|authority| authority.digest().clone())
+            .unwrap_or_else(|| {
+                runtime_authority(&resolution)
+                    .expect("validated authority")
+                    .digest()
+                    .clone()
+            });
+        let manager_authority_digest = digest_domain_json(
+            "commonkit.package-manager-authority.v1",
+            &resolution.manager,
+        )
+        .map_err(|_| failure("package_authority_digest_failed"))?;
+        let before_installed_versions = canonical_package_installed_versions(
+            resolution.manager.manager,
+            &resolution.before.installed_versions,
+        )
+        .map_err(|_| failure("package_observation_invalid"))?;
+        if evidence.operation_id != operation.id
+            || evidence.resolution_digest != operation.payload_digest
+            || evidence.target_authority_digest != target_authority_digest
+            || evidence.manager != resolution.manager.manager
+            || evidence.manager_authority_digest != manager_authority_digest
+            || evidence.source_id != resolution.source.source_id
+            || evidence.source_authority_digest != resolution.source.registry_definition_digest
+            || evidence.before_installed_versions != before_installed_versions
+            || evidence.no_preimage_reason
+                != commonkit_contracts::PackageNoPreimageReason::AdditiveForwardOnly
+            || evidence.exit_classification != PackageExitClassification::NotRun
+            || evidence.final_digest.is_some()
+        {
+            return Err(failure("package_authorization_evidence_mismatch"));
+        }
+        Ok(())
     }
 
     fn package_final_digest(
@@ -1588,7 +1642,8 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
                     .env("PATH", CLOSED_NVM_PATH)
                     .env("NVM_NO_SOURCE_FALLBACK", "1")
                     .env("NVM_OFFLINE", "1");
-                let _bound_root = self.configure_nvm_command(&mut command, &nvm_dir, bound_nvm.as_ref())?;
+                let _bound_root =
+                    self.configure_nvm_command(&mut command, &nvm_dir, bound_nvm.as_ref())?;
                 let status = command
                     .status()
                     .map_err(|_| PackageMutationError::Backend)?;
@@ -1641,9 +1696,7 @@ impl ProcessOfflinePackageBackend {
             .map(|bound| bound._handle.try_clone())
             .transpose()
             .map_err(|_| PackageMutationError::Backend)?;
-        let nvm_fd = nvm_handle
-            .as_ref()
-            .map(std::os::fd::AsRawFd::as_raw_fd);
+        let nvm_fd = nvm_handle.as_ref().map(std::os::fd::AsRawFd::as_raw_fd);
         if nvm_fd.is_some() {
             command.env("HOME", "..").env("NVM_DIR", ".");
         } else {
@@ -1654,7 +1707,9 @@ impl ProcessOfflinePackageBackend {
                 let _keep_nvm_handle = &nvm_handle;
                 if let Some(nvm_fd) = nvm_fd {
                     let flags = libc::fcntl(nvm_fd, libc::F_GETFD);
-                    if flags < 0 || libc::fcntl(nvm_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                    if flags < 0
+                        || libc::fcntl(nvm_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0
+                    {
                         return Err(std::io::Error::last_os_error());
                     }
                 }
@@ -1951,8 +2006,7 @@ mod tests {
         PackageTargetV1, ResolvedPackage, SourceBindingV1, TargetPackageResolutionConfig,
     };
     use commonkit_contracts::{
-        PackageDeclaration, PackageSelector, SchemaVersion, SecurityPolicy,
-        Sha256Digest, StableId,
+        PackageDeclaration, PackageSelector, SchemaVersion, SecurityPolicy, Sha256Digest, StableId,
     };
     use sha2::{Digest, Sha256};
     use std::collections::BTreeSet;
@@ -1976,17 +2030,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let key = root.path().join("archive-keyring.gpg");
         fs::write(&key, b"trusted apt key").unwrap();
-        let key_digest = Sha256Digest::parse(format!(
-            "sha256:{:x}",
-            Sha256::digest(b"trusted apt key")
-        ))
-        .unwrap();
+        let key_digest =
+            Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(b"trusted apt key")))
+                .unwrap();
         let trusted_metadata = Sha256Digest::parse(format!("sha256:{}", "a".repeat(64))).unwrap();
         let forged_metadata = Sha256Digest::parse(format!("sha256:{}", "b".repeat(64))).unwrap();
         let source_id = StableId::parse("ubuntu-main").unwrap();
         let source = SourceBindingV1 {
             source_id: source_id.clone(),
-            registry_definition_digest: Sha256Digest::parse(format!("sha256:{}", "c".repeat(64))).unwrap(),
+            registry_definition_digest: Sha256Digest::parse(format!("sha256:{}", "c".repeat(64)))
+                .unwrap(),
             canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
             repository_revision: Some("a".repeat(64)),
             signed_metadata: vec![ArtifactEvidence {
@@ -2021,7 +2074,10 @@ mod tests {
             before: PackageObservationV1 {
                 installed_versions: BTreeSet::new(),
             },
-            closure: vec![ResolvedPackage { declaration, source }],
+            closure: vec![ResolvedPackage {
+                declaration,
+                source,
+            }],
             artifacts: Vec::new(),
             recipe: OfflineInstallRecipeV1::AptArchives {
                 artifact_roles: BTreeSet::new(),
@@ -2048,7 +2104,9 @@ mod tests {
         forged.source.repository_revision = Some("b".repeat(64));
         forged.source.signed_metadata[0].metadata_digest = forged_metadata;
         forged.closure[0].source = forged.source.clone();
-        let archive = artifacts.put(b"forged archive", crate::ContentSensitivity::Portable).unwrap();
+        let archive = artifacts
+            .put(b"forged archive", crate::ContentSensitivity::Portable)
+            .unwrap();
         forged.artifacts = vec![PackageArtifactV1 {
             role: StableId::parse("apt-archive").unwrap(),
             content: archive.clone(),

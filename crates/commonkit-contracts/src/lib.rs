@@ -846,6 +846,64 @@ pub enum PackageManager {
     Rustup,
 }
 
+/// Return the receipt-safe, canonical form of a target package observation.
+/// Native backends may retain an APT live-safety marker in the persisted
+/// resolution, but that marker is authority evidence rather than an
+/// installed package identity and is never copied into a receipt.
+pub fn canonical_package_installed_versions(
+    manager: PackageManager,
+    installed_versions: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, ContractError> {
+    let mut canonical = BTreeSet::new();
+    for value in installed_versions {
+        if manager == PackageManager::Apt {
+            if let Some(digest) = value.strip_prefix("commonkit-apt-live-safety=") {
+                Sha256Digest::parse(digest)
+                    .map_err(|_| ContractError::InvalidPackageObservation)?;
+                continue;
+            }
+            if value.matches('=').count() != 1 {
+                return Err(ContractError::InvalidPackageObservation);
+            }
+            let Some((name_architecture, version)) = value.split_once('=') else {
+                return Err(ContractError::InvalidPackageObservation);
+            };
+            let Some((name, architecture)) = name_architecture.split_once(':') else {
+                return Err(ContractError::InvalidPackageObservation);
+            };
+            if name.is_empty()
+                || architecture.is_empty()
+                || version.is_empty()
+                || name.contains(':')
+                || architecture.contains(':')
+            {
+                return Err(ContractError::InvalidPackageObservation);
+            }
+        } else if manager == PackageManager::Nvm {
+            let parts = value.split('.').collect::<Vec<_>>();
+            if parts.len() != 3
+                || parts.iter().any(|part| {
+                    part.is_empty()
+                        || !part.bytes().all(|byte| byte.is_ascii_digit())
+                        || (*part != "0" && part.starts_with('0'))
+                })
+            {
+                return Err(ContractError::InvalidPackageObservation);
+            }
+        }
+        if value.is_empty()
+            || value.len() > 256
+            || value
+                .chars()
+                .any(|character| !character.is_ascii_graphic() || character.is_ascii_whitespace())
+        {
+            return Err(ContractError::InvalidPackageObservation);
+        }
+        canonical.insert(value.clone());
+    }
+    Ok(canonical)
+}
+
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -2159,6 +2217,8 @@ pub enum ContractError {
     InvalidStyleguideDescriptor,
     #[error("package versions must be non-empty exact pins without whitespace or range syntax")]
     InvalidPackageDeclaration,
+    #[error("package installed observation is not canonical")]
+    InvalidPackageObservation,
     #[error("package consent does not bind the exact additive forward-only package operation set")]
     InvalidPackageConsent,
     #[error("optimization limits must be positive")]

@@ -24,8 +24,8 @@ use commonkit_contracts::{
     PACKAGE_RECEIPT_SCHEMA_VERSION, PackageConsent, PackageExitClassification,
     PackageOperationConsentBinding, PackageReceiptAuthorization, PackageReceiptEvidence, Plan,
     PlanBindings, ReceiptState, ReceiptTransition, RecoveryCapability, RunReceipt, SCHEMA_VERSION,
-    SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
-    package_operation_set_digest,
+    SchemaVersion, Sha256Digest, StableId, canonical_json, canonical_package_installed_versions,
+    digest_domain_json, package_operation_set_digest,
 };
 use commonkit_core::{PlanBuildError, PlanDraft, build_plan};
 use serde::{Deserialize, Serialize};
@@ -358,6 +358,7 @@ impl ReceiptJournal {
 /// complete transition or the next complete transition, never a torn update.
 pub struct ReceiptStore {
     root: PathBuf,
+    recovery_lock: std::sync::Mutex<()>,
 }
 
 /// Immutable content-addressed storage for approved plans.
@@ -1032,6 +1033,17 @@ pub trait Adapter {
     {
         Ok(None)
     }
+    /// Re-checks adapter-owned evidence against its persisted resolution. The
+    /// reconciler separately validates the plan-owned fields; this seam keeps
+    /// manager/source authority and sanitized before-state checks at the
+    /// adapter boundary where the resolution is available.
+    fn validate_package_authorization_evidence(
+        &self,
+        _operation: &Operation,
+        _evidence: &PackageReceiptEvidence,
+    ) -> Result<(), AdapterFailure> {
+        Ok(())
+    }
     /// Returns sanitized final package-state evidence for the v3 receipt.
     fn package_final_digest(
         &mut self,
@@ -1105,6 +1117,7 @@ impl ReconcileOutcome {
 #[derive(Default)]
 pub struct Reconciler<'a> {
     store: Option<&'a ReceiptStore>,
+    lock_held: bool,
 }
 
 impl<'a> Reconciler<'a> {
@@ -1113,7 +1126,18 @@ impl<'a> Reconciler<'a> {
     }
 
     pub fn with_store(store: &'a ReceiptStore) -> Self {
-        Self { store: Some(store) }
+        Self {
+            store: Some(store),
+            lock_held: false,
+        }
+    }
+
+    /// Constructs a reconciler for use inside `ReceiptStore::with_recovery_lock`.
+    pub fn with_store_locked(store: &'a ReceiptStore) -> Self {
+        Self {
+            store: Some(store),
+            lock_held: true,
+        }
     }
 
     /// Validates a durable run's receipt against its immutable plan without
@@ -1140,7 +1164,11 @@ impl<'a> Reconciler<'a> {
     /// after it was loaded. This check is intentionally before adapter setup.
     pub fn ensure_current_run(&self, journal: &ReceiptJournal) -> Result<(), ReconcileError> {
         let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
-        let current = store.load(journal.receipt().run_id.clone())?;
+        let current = if self.lock_held {
+            store.load_unlocked(journal.receipt().run_id.clone())?
+        } else {
+            store.load(journal.receipt().run_id.clone())?
+        };
         if current.receipt() != journal.receipt() {
             return Err(ReconcileError::ReceiptSnapshotChanged);
         }
@@ -1210,6 +1238,9 @@ impl<'a> Reconciler<'a> {
                 .ok_or_else(|| ReconcileError::PackageAuthorizationUnavailable {
                     adapter_id: operation.adapter_id.clone(),
                 })?;
+            adapter
+                .validate_package_authorization_evidence(operation, &operation_evidence)
+                .map_err(ReconcileError::AdapterPreflightFailed)?;
             bindings.push(binding);
             evidence.push(operation_evidence);
         }
@@ -1379,11 +1410,31 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
-        let journal = self.load_validated_run(run_id.clone(), plan)?;
-        self.recover_run_with_journal(run_id, plan, journal, adapters)
+        if self.store.is_none() {
+            return Err(ReconcileError::DurableStoreRequired);
+        }
+        self.with_recovery_lock(|locked| {
+            let journal = locked.load_validated_run(run_id.clone(), plan)?;
+            locked.recover_run_with_journal_locked(run_id, plan, journal, adapters)
+        })
     }
 
     pub fn recover_run_with_journal(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+        journal: ReceiptJournal,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        if self.store.is_none() {
+            return Err(ReconcileError::DurableStoreRequired);
+        }
+        self.with_recovery_lock(|locked| {
+            locked.recover_run_with_journal_locked(run_id, plan, journal, adapters)
+        })
+    }
+
+    pub fn recover_run_with_journal_locked(
         &self,
         run_id: StableId,
         plan: &Plan,
@@ -1487,11 +1538,31 @@ impl<'a> Reconciler<'a> {
         }) {
             return Err(ReconcileError::RollbackUnsupported);
         }
-        let journal = self.load_validated_run(run_id.clone(), plan)?;
-        self.rollback_succeeded_run_with_journal(run_id, plan, journal, adapters)
+        if self.store.is_none() {
+            return Err(ReconcileError::DurableStoreRequired);
+        }
+        self.with_recovery_lock(|locked| {
+            let journal = locked.load_validated_run(run_id.clone(), plan)?;
+            locked.rollback_succeeded_run_with_journal_locked(run_id, plan, journal, adapters)
+        })
     }
 
     pub fn rollback_succeeded_run_with_journal(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+        journal: ReceiptJournal,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        if self.store.is_none() {
+            return Err(ReconcileError::DurableStoreRequired);
+        }
+        self.with_recovery_lock(|locked| {
+            locked.rollback_succeeded_run_with_journal_locked(run_id, plan, journal, adapters)
+        })
+    }
+
+    pub fn rollback_succeeded_run_with_journal_locked(
         &self,
         run_id: StableId,
         plan: &Plan,
@@ -1499,6 +1570,11 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
+        if plan.operations.iter().any(|operation| {
+            operation.recovery_capability == RecoveryCapability::ConvergeForwardOnly
+        }) {
+            return Err(ReconcileError::RollbackUnsupported);
+        }
         if journal.receipt().run_id != run_id {
             return Err(ReconcileError::ReceiptPlanMismatch);
         }
@@ -1519,7 +1595,11 @@ impl<'a> Reconciler<'a> {
         plan: &Plan,
     ) -> Result<ReceiptJournal, ReconcileError> {
         let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
-        let journal = store.load(run_id)?;
+        let journal = if self.lock_held {
+            store.load_unlocked(run_id)?
+        } else {
+            store.load(run_id)?
+        };
         validate_receipt_plan_binding(plan, journal.receipt())?;
         Ok(journal)
     }
@@ -1747,9 +1827,22 @@ impl<'a> Reconciler<'a> {
 
     fn persist(&self, journal: &ReceiptJournal) -> Result<(), ReconcileError> {
         if let Some(store) = self.store {
-            store.persist(journal)?;
+            if self.lock_held {
+                store.persist_unlocked(journal)?;
+            } else {
+                store.persist(journal)?;
+            }
         }
         Ok(())
+    }
+
+    fn with_recovery_lock<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        let store = self.store.expect("recovery requires a receipt store");
+        let _guard = store.recovery_lock.lock().expect("receipt recovery lock");
+        f(&Self {
+            store: Some(store),
+            lock_held: true,
+        })
     }
 }
 
@@ -2035,7 +2128,14 @@ impl ReceiptStore {
         sync_directory(root.as_ref())?;
         Ok(Self {
             root: root.as_ref().to_path_buf(),
+            recovery_lock: std::sync::Mutex::new(()),
         })
+    }
+
+    /// Serializes recovery validation, adapter setup, and receipt mutation.
+    pub fn with_recovery_lock<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        let _guard = self.recovery_lock.lock().expect("receipt recovery lock");
+        f(self)
     }
 
     /// Returns every durably recorded run identifier in stable order.
@@ -2061,12 +2161,17 @@ impl ReceiptStore {
     }
 
     pub fn persist(&self, journal: &ReceiptJournal) -> Result<(), ReceiptError> {
+        let _guard = self.recovery_lock.lock().expect("receipt recovery lock");
+        self.persist_unlocked(journal)
+    }
+
+    fn persist_unlocked(&self, journal: &ReceiptJournal) -> Result<(), ReceiptError> {
         journal.verify_chain()?;
         let receipt = journal.receipt();
         let run_directory = self.root.join(receipt.run_id.as_str());
         fs::create_dir_all(&run_directory)?;
 
-        if let Ok(current) = self.load(receipt.run_id.clone()) {
+        if let Ok(current) = self.load_unlocked(receipt.run_id.clone()) {
             let current_count = current.receipt().transitions.len();
             let incoming_count = receipt.transitions.len();
             if current_count >= incoming_count {
@@ -2110,6 +2215,11 @@ impl ReceiptStore {
     }
 
     pub fn load(&self, run_id: StableId) -> Result<ReceiptJournal, ReceiptError> {
+        let _guard = self.recovery_lock.lock().expect("receipt recovery lock");
+        self.load_unlocked(run_id)
+    }
+
+    fn load_unlocked(&self, run_id: StableId) -> Result<ReceiptJournal, ReceiptError> {
         let run_directory = self.root.join(run_id.as_str());
         let mut snapshots = Vec::new();
         for entry in fs::read_dir(&run_directory)? {
@@ -2295,6 +2405,14 @@ fn validate_package_authorization_shape(
         if !operation_ids.insert(&evidence.operation_id) {
             return Err(ReceiptError::InvalidPackageAuthorization);
         }
+        let canonical = canonical_package_installed_versions(
+            evidence.manager,
+            &evidence.before_installed_versions,
+        )
+        .map_err(|_| ReceiptError::InvalidPackageAuthorization)?;
+        if canonical != evidence.before_installed_versions {
+            return Err(ReceiptError::InvalidPackageAuthorization);
+        }
         match (&evidence.exit_classification, &evidence.final_digest) {
             (PackageExitClassification::Succeeded, Some(_))
             | (PackageExitClassification::NotRun, None)
@@ -2330,6 +2448,25 @@ fn validate_package_receipt_authorization(
         })
     {
         return Err(ReceiptError::InvalidPackageAuthorization);
+    }
+    let target_authority_digest = plan
+        .bindings
+        .package_resolution_authority_digest
+        .as_ref()
+        .ok_or(ReceiptError::InvalidPackageAuthorization)?;
+    for operation in package_operations {
+        let evidence = authorization
+            .evidence
+            .iter()
+            .find(|evidence| evidence.operation_id == operation.id)
+            .ok_or(ReceiptError::InvalidPackageAuthorization)?;
+        if evidence.resolution_digest != operation.payload_digest
+            || evidence.target_authority_digest != *target_authority_digest
+            || evidence.no_preimage_reason
+                != commonkit_contracts::PackageNoPreimageReason::AdditiveForwardOnly
+        {
+            return Err(ReceiptError::InvalidPackageAuthorization);
+        }
     }
     Ok(())
 }
