@@ -20,10 +20,12 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    ArtifactStore, NodeOfflineInstallRecipeV1, NodeRuntimeHost, OfflineInstallRecipeV1,
-    PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1, PackageResourcePlanner,
-    ProviderPlanError, ResolvedPackageIntent, ResourceProvenance,
+    ArtifactStore, COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS, NodeOfflineInstallRecipeV1,
+    NodeRuntimeHost, OfflineInstallRecipeV1, PackageObservationV1, PackageResolutionAuthority,
+    PackageResolutionV1, PackageResourcePlanner, ProviderPlanError, ResolvedPackageIntent,
+    ResourceProvenance,
     apt_resolution::apt_package_identity,
+    node_resolution::{NodeReleaseSignatureVerifier, ProcessNodeReleaseSignatureVerifier},
 };
 
 const CLOSED_NVM_PATH: &str = "/usr/bin:/bin";
@@ -661,6 +663,119 @@ fn runtime_authority(
         .map_err(|_| PackageMutationError::Backend)
 }
 
+/// Validate source evidence against the target-owned trust anchors immediately
+/// before a package phase. The persisted registry definition is not enough:
+/// it can bind a forged source metadata digest while leaving the evidence
+/// itself attacker-controlled. This check is deliberately offline and only
+/// consumes target configuration plus already-staged artifacts.
+fn validate_target_source_evidence(
+    resolution: &PackageResolutionV1,
+    artifacts: &ArtifactStore,
+    config: &crate::TargetPackageResolutionConfig,
+) -> Result<(), PackageMutationError> {
+    // Empty evidence is retained for immutable v1 resolutions. Such plans
+    // predate signed evidence and are still constrained by their v1 source
+    // binding and target registry checks.
+    if resolution.source.signed_metadata.is_empty() {
+        return Ok(());
+    }
+    match resolution.manager.manager {
+        PackageManager::Apt => {
+            let repository = config.apt.as_ref().ok_or(PackageMutationError::Backend)?;
+            let key = read_regular_no_follow(&repository.signed_by)?;
+            let actual_key_digest =
+                Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&key)))
+                    .map_err(|_| PackageMutationError::Backend)?;
+            if repository
+                .signing_key_digest
+                .as_ref()
+                .is_some_and(|expected| expected != &actual_key_digest)
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            if resolution.source.signed_metadata.iter().any(|evidence| {
+                evidence.authority != repository.signing_authority
+                    || evidence.signature_digest != actual_key_digest
+            }) {
+                return Err(PackageMutationError::Backend);
+            }
+            Ok(())
+        }
+        PackageManager::Nvm => {
+            let node = config.node.as_ref().ok_or(PackageMutationError::Backend)?;
+            let keyring = read_regular_no_follow(&node.release_keyring)?;
+            let actual_keyring_digest =
+                Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(&keyring)))
+                    .map_err(|_| PackageMutationError::Backend)?;
+            if node
+                .release_keyring_digest
+                .as_ref()
+                .is_some_and(|expected| expected != &actual_keyring_digest)
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            if resolution.source.signed_metadata.len() != 1 {
+                return Err(PackageMutationError::Backend);
+            }
+            let evidence = &resolution.source.signed_metadata[0];
+            if evidence.authority != StableId::parse("node-release-key").unwrap() {
+                return Err(PackageMutationError::Backend);
+            }
+            let checksums = resolution
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.role.as_str() == "node-checksums")
+                .ok_or(PackageMutationError::Backend)?;
+            let signature = resolution
+                .artifacts
+                .iter()
+                .find(|artifact| artifact.role.as_str() == "node-signature")
+                .ok_or(PackageMutationError::Backend)?;
+            let checksums_bytes = artifacts
+                .load(&checksums.content)
+                .map_err(|_| PackageMutationError::Backend)?;
+            let signature_bytes = artifacts
+                .load(&signature.content)
+                .map_err(|_| PackageMutationError::Backend)?;
+            validate_nvm_evidence_artifacts(evidence, &checksums_bytes, &signature_bytes)?;
+            let mut verifier = ProcessNodeReleaseSignatureVerifier::new_with_digest(
+                node.gpgv_executable.clone(),
+                Some(node.gpgv_executable_digest.clone()),
+            );
+            let verified = verifier
+                .verify(&signature_bytes, &keyring)
+                .map_err(|_| PackageMutationError::Backend)?;
+            if verified.signed_payload != checksums_bytes
+                || !COMMONKIT_NODE_RELEASE_KEY_FINGERPRINTS
+                    .iter()
+                    .any(|fingerprint| {
+                        fingerprint.eq_ignore_ascii_case(&verified.signer_fingerprint)
+                    })
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            Ok(())
+        }
+        _ => Err(PackageMutationError::UnsupportedRecipe),
+    }
+}
+
+fn validate_nvm_evidence_artifacts(
+    evidence: &crate::ArtifactEvidence,
+    checksums: &[u8],
+    signature: &[u8],
+) -> Result<(), PackageMutationError> {
+    let checksums_digest = Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(checksums)))
+        .map_err(|_| PackageMutationError::Backend)?;
+    let signature_digest = Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(signature)))
+        .map_err(|_| PackageMutationError::Backend)?;
+    if evidence.metadata_digest != checksums_digest || evidence.signature_digest != signature_digest
+    {
+        return Err(PackageMutationError::Backend);
+    }
+    Ok(())
+}
+
 /// Native target implementation for the two production offline recipes.
 /// Every archive is loaded from the controller-persisted artifact store;
 /// package commands are fixed and never receive a repository or URL.
@@ -717,6 +832,39 @@ impl<T> SshOfflinePackageBackend<T> {
     where
         T: crate::SshFilesystemTransport,
     {
+        if let Some(artifacts) = artifacts {
+            if resolution.manager.manager == PackageManager::Nvm
+                && !resolution.source.signed_metadata.is_empty()
+            {
+                if resolution.source.signed_metadata.len() != 1
+                    || resolution.source.signed_metadata[0].authority
+                        != StableId::parse("node-release-key").unwrap()
+                {
+                    return Err(PackageMutationError::Backend);
+                }
+                let checksums = resolution
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.role.as_str() == "node-checksums")
+                    .ok_or(PackageMutationError::Backend)?;
+                let signature = resolution
+                    .artifacts
+                    .iter()
+                    .find(|artifact| artifact.role.as_str() == "node-signature")
+                    .ok_or(PackageMutationError::Backend)?;
+                let checksums_bytes = artifacts
+                    .load(&checksums.content)
+                    .map_err(|_| PackageMutationError::Backend)?;
+                let signature_bytes = artifacts
+                    .load(&signature.content)
+                    .map_err(|_| PackageMutationError::Backend)?;
+                validate_nvm_evidence_artifacts(
+                    &resolution.source.signed_metadata[0],
+                    &checksums_bytes,
+                    &signature_bytes,
+                )?;
+            }
+        }
         let transferred = match artifacts {
             Some(artifacts) => self.stage_artifacts(resolution, artifacts)?,
             None => Vec::new(),
@@ -1246,6 +1394,9 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         artifacts: &ArtifactStore,
     ) -> Result<(), PackageMutationError> {
         self.revalidate_live_manager_binding(resolution)?;
+        if let Some(config) = &self.package_resolution {
+            validate_target_source_evidence(resolution, artifacts, config)?;
+        }
         if resolution.manager.manager == PackageManager::Nvm {
             self.ensure_nvm_target(resolution)?;
         }
@@ -1271,6 +1422,9 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         artifacts: &ArtifactStore,
     ) -> Result<(), PackageMutationError> {
         self.revalidate_live_manager_binding(resolution)?;
+        if let Some(config) = &self.package_resolution {
+            validate_target_source_evidence(resolution, artifacts, config)?;
+        }
         match resolution.manager.manager {
             PackageManager::Apt => {
                 let OfflineInstallRecipeV1::AptArchives { artifact_roles } = &resolution.recipe
@@ -1353,9 +1507,12 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
     fn verify_offline(
         &mut self,
         resolution: &PackageResolutionV1,
-        _artifacts: &ArtifactStore,
+        artifacts: &ArtifactStore,
     ) -> Result<(), PackageMutationError> {
         self.revalidate_live_manager_binding(resolution)?;
+        if let Some(config) = &self.package_resolution {
+            validate_target_source_evidence(resolution, artifacts, config)?;
+        }
         let observed = self.observe(resolution)?;
         if PackageAdapter::after_resolution(resolution, &observed) {
             Ok(())

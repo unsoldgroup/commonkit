@@ -92,6 +92,7 @@ fn repository() -> AptRepositoryConfigurationV1 {
         components: BTreeSet::from(["main".into()]),
         signed_by: PathBuf::from("/usr/share/keyrings/ubuntu-archive-keyring.gpg"),
         signing_authority: id("ubuntu-archive-keyring"),
+        signing_key_digest: None,
     }
 }
 

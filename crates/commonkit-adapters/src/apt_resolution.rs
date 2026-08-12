@@ -26,6 +26,10 @@ pub struct AptRepositoryConfigurationV1 {
     pub components: BTreeSet<String>,
     pub signed_by: PathBuf,
     pub signing_authority: StableId,
+    /// Digest of the target-local trusted signing key. Older v1 configurations
+    /// omit this and are checked against the bound key path at runtime.
+    #[serde(default)]
+    pub signing_key_digest: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

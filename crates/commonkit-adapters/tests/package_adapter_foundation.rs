@@ -359,6 +359,71 @@ fn ssh_package_backend_stages_chunked_artifacts_before_reference_only_mutation()
     ));
 }
 
+#[test]
+fn ssh_package_backend_rejects_forged_node_evidence_before_transport() {
+    let (mut resolution, _) = apt_resolution();
+    let source_id = StableId::parse("nodejs-nvm").unwrap();
+    let source = SourceBindingV1 {
+        source_id: source_id.clone(),
+        registry_definition_digest: digest('a'),
+        canonical_repository: "https://nodejs.org/dist".into(),
+        repository_revision: Some(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+        ),
+        signed_metadata: vec![commonkit_adapters::ArtifactEvidence {
+            authority: StableId::parse("node-release-key").unwrap(),
+            metadata_digest: digest('c'),
+            signature_digest: digest('d'),
+        }],
+    };
+    let declaration = PackageDeclaration {
+        id: StableId::parse("node").unwrap(),
+        version: "20.0.0".into(),
+        manager: PackageManager::Nvm,
+        source: source_id,
+        selector: Some(PackageSelector::NodeRuntime {}),
+    };
+    resolution.target.manager_prefix = Some("/tmp/commonkit-nvm".into());
+    resolution.manager.manager = PackageManager::Nvm;
+    resolution.declaration = declaration.clone();
+    resolution.source = source.clone();
+    resolution.closure = vec![ResolvedPackage {
+        declaration,
+        source,
+    }];
+    resolution.recipe = OfflineInstallRecipeV1::NodeArchive {
+        artifact_roles: BTreeSet::new(),
+        install: Some(commonkit_adapters::NodeOfflineInstallRecipeV1 {
+            node_version: "20.0.0".into(),
+            archive_file_name: "node-v20.0.0-linux-x64.tar.xz".into(),
+            cache_relative_path: ".cache/node.tar.xz".into(),
+            nvm_version: "0.40.6".into(),
+            nvm_script_digest: digest('e'),
+            shell_executable_digest: digest('f'),
+            offline: true,
+            no_source_fallback: true,
+            per_version_lock: true,
+            install_latest_npm: false,
+            migrate_packages: false,
+        }),
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let transport = RecordingSshTransport {
+        requests: requests.clone(),
+    };
+    let mut backend = SshOfflinePackageBackend::with_target_platform(
+        StableId::parse("home").unwrap(),
+        transport,
+        "linux",
+        "amd64",
+        digest('c'),
+    );
+    let artifacts = ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+
+    assert!(backend.prepare_offline(&resolution, &artifacts).is_err());
+    assert!(requests.lock().unwrap().is_empty());
+}
+
 fn operation(resolution_digest: Sha256Digest) -> Operation {
     commonkit_core::finalize_operation(OperationDraft {
         adapter_id: StableId::parse("packages").unwrap(),

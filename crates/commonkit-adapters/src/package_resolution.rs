@@ -75,6 +75,11 @@ pub struct TargetNodeResolutionConfig {
     pub release_keyring: std::path::PathBuf,
     pub gpgv_executable: std::path::PathBuf,
     pub gpgv_executable_digest: Sha256Digest,
+    /// Digest of the target-local Node release keyring. Older v1
+    /// configurations omit this and are checked against the bound keyring
+    /// path at runtime.
+    #[serde(default)]
+    pub release_keyring_digest: Option<Sha256Digest>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]

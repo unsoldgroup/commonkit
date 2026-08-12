@@ -106,6 +106,7 @@ fn production_apt_command_plan_matches_only_closed_read_only_shapes() {
             components: BTreeSet::from(["main".into()]),
             signed_by: PathBuf::from("/usr/share/keyrings/ubuntu-archive-keyring.gpg"),
             signing_authority: stable_id("ubuntu-archive-keyring"),
+            signing_key_digest: None,
         },
     };
 
@@ -849,6 +850,7 @@ impl NativeHarnessConfig {
             components: self.apt_components.clone(),
             signed_by: self.apt_signing_key.clone(),
             signing_authority: self.apt_signing_authority.clone(),
+            signing_key_digest: None,
         }
     }
 }

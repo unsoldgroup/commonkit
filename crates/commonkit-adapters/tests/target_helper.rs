@@ -6,12 +6,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use commonkit_adapters::{
-    FileMode, NodeRuntimeHost, NormalizedManagedPath, PackageArtifactV1, PackageDesiredIntent,
-    PackageMutationArtifact, PackageMutationPhase, PackageResolutionV1, PackageSourceRegistry,
-    PackageTargetV1, ProcessNodeRuntimeHost, ResolvedPackage, SafeSymlinkTarget, SourceBindingV1,
-    SshFilesystemRequest, SshFilesystemResponse, SymlinkTargetKind, TargetHelper,
-    TargetNodeResolutionConfig, TargetPackageResolutionConfig, TargetResource,
-    package_resolution_request_digest,
+    ArtifactEvidence, FileMode, NodeRuntimeHost, NormalizedManagedPath, PackageArtifactV1,
+    PackageDesiredIntent, PackageMutationArtifact, PackageMutationPhase, PackageResolutionV1,
+    PackageSourceRegistry, PackageTargetV1, ProcessNodeRuntimeHost, ResolvedPackage,
+    SafeSymlinkTarget, SourceBindingV1, SshFilesystemRequest, SshFilesystemResponse,
+    SymlinkTargetKind, TargetHelper, TargetNodeResolutionConfig, TargetPackageResolutionConfig,
+    TargetResource, package_resolution_request_digest,
 };
 use commonkit_contracts::{
     PackageDeclaration, PackageManager, PackageSelector, SecurityPolicy, digest_domain_json,
@@ -21,6 +21,10 @@ use sha2::{Digest, Sha256};
 
 fn temp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("commonkit-helper-{name}-{}", std::process::id()))
+}
+
+fn digest(seed: char) -> Sha256Digest {
+    Sha256Digest::parse(format!("sha256:{}", seed.to_string().repeat(64))).unwrap()
 }
 
 #[cfg(unix)]
@@ -266,6 +270,7 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
             release_keyring: keyring.clone(),
             gpgv_executable: gpgv,
             gpgv_executable_digest: snapshot.gpgv_executable_digest.clone(),
+            release_keyring_digest: Some(snapshot.release_keyring_digest.clone()),
         }),
         target_identity_digest: Sha256Digest::parse(format!("sha256:{}", "c".repeat(64))).unwrap(),
     };
@@ -336,16 +341,17 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
         Some(config),
     )
     .unwrap();
-    let request = |resolution: PackageResolutionV1, artifacts, target_identity_digest| {
+    let request = |phase, resolution: PackageResolutionV1, artifacts, target_identity_digest| {
         SshFilesystemRequest::PackageMutation {
             root_id: StableId::parse("home").unwrap(),
-            phase: PackageMutationPhase::Observe,
+            phase,
             resolution,
             artifacts,
             target_identity_digest,
         }
     };
     let accepted = helper.dispatch(request(
+        PackageMutationPhase::Observe,
         resolution.clone(),
         Vec::new(),
         Some(target_identity_digest.clone()),
@@ -393,6 +399,7 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
         }),
     };
     let observed = helper.dispatch(request(
+        PackageMutationPhase::Observe,
         observed_resolution,
         Vec::new(),
         Some(target_identity_digest.clone()),
@@ -412,6 +419,7 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
         Sha256Digest::parse(format!("sha256:{}", "d".repeat(64))).unwrap();
     assert!(matches!(
         helper.dispatch(request(
+            PackageMutationPhase::Observe,
             altered,
             Vec::new(),
             Some(target_identity_digest.clone()),
@@ -421,6 +429,7 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
 
     assert!(matches!(
         helper.dispatch(request(
+            PackageMutationPhase::Observe,
             resolution.clone(),
             Vec::new(),
             Some(Sha256Digest::parse(format!("sha256:{}", "f".repeat(64))).unwrap()),
@@ -437,11 +446,29 @@ fn package_mutation_revalidates_target_authority_and_exact_artifacts() {
     };
     assert!(matches!(
         helper.dispatch(request(
-            resolution,
+            PackageMutationPhase::Observe,
+            resolution.clone(),
             vec![forged_artifact],
-            Some(target_identity_digest),
+            Some(target_identity_digest.clone()),
         )),
         Err(commonkit_adapters::TargetFilesystemError::RemoteArtifact)
+    ));
+
+    let mut forged = resolution.clone();
+    forged.source.signed_metadata = vec![ArtifactEvidence {
+        authority: StableId::parse("node-release-key").unwrap(),
+        metadata_digest: digest('a'),
+        signature_digest: digest('b'),
+    }];
+    forged.closure[0].source = forged.source.clone();
+    assert!(matches!(
+        helper.dispatch(request(
+            PackageMutationPhase::Prepare,
+            forged,
+            Vec::new(),
+            Some(target_identity_digest.clone()),
+        )),
+        Err(commonkit_adapters::TargetFilesystemError::PackageCommandFailed)
     ));
 
     let _ = fs::remove_dir_all(root);

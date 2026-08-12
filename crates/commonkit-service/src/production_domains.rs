@@ -165,6 +165,8 @@ struct NodeResolutionConfig {
     gpgv_executable: PathBuf,
     #[serde(default)]
     gpgv_executable_digest: Option<Sha256Digest>,
+    #[serde(default)]
+    release_keyring_digest: Option<Sha256Digest>,
 }
 
 impl SyncConfig {
@@ -180,6 +182,7 @@ impl SyncConfig {
                     release_keyring: node.release_keyring.clone(),
                     gpgv_executable: node.gpgv_executable.clone(),
                     gpgv_executable_digest: digest,
+                    release_keyring_digest: node.release_keyring_digest.clone(),
                 })
         });
         Some(TargetPackageResolutionConfig {
@@ -6723,6 +6726,7 @@ mod package_resolution_tests {
             components: BTreeSet::from(["main".into()]),
             signed_by: key_path,
             signing_authority: StableId::parse("ubuntu-key").unwrap(),
+            signing_key_digest: None,
         };
         let manager = ManagerBindingV1 {
             manager: PackageManager::Apt,

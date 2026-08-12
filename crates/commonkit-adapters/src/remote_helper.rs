@@ -1534,6 +1534,13 @@ fn target_package_source_registry(
                 Sha256::digest(&key)
             ))
             .map_err(|_| TargetFilesystemError::PackageResolutionUnavailable)?;
+            if apt
+                .signing_key_digest
+                .as_ref()
+                .is_some_and(|expected| expected != &key_digest)
+            {
+                return Err(TargetFilesystemError::PackageResolutionUnavailable);
+            }
             PackageSourceRegistry::builtin()
                 .and_then(|registry| {
                     registry.with_apt_source_authority(

@@ -367,12 +367,17 @@ fn provision(args: &[String]) -> Result<(), ()> {
             validate_existing_path(&signed_by, false, false)?;
             let signing_authority =
                 StableId::parse(option(args, "--apt-signing-authority")?).map_err(|_| ())?;
+            let key = fs::read(&signed_by).map_err(|_| ())?;
             let repository = AptRepositoryConfigurationV1 {
                 source_id: source_id.clone(),
                 suite,
                 components,
                 signed_by,
                 signing_authority,
+                signing_key_digest: Some(
+                    Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(key)))
+                        .map_err(|_| ())?,
+                ),
             };
             let target = target.clone();
             let canonical = canonical_apt_source(&source_id)?;
@@ -408,6 +413,7 @@ fn provision(args: &[String]) -> Result<(), ()> {
                 release_keyring: keyring,
                 gpgv_executable: gpgv,
                 gpgv_executable_digest: snapshot.gpgv_executable_digest,
+                release_keyring_digest: Some(snapshot.release_keyring_digest),
             };
             (
                 snapshot.manager,

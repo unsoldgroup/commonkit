@@ -3,10 +3,10 @@ use std::fs;
 use std::path::Path;
 
 use commonkit_adapters::{
-    ManagerBindingV1, NodeOfflineInstallRecipeV1, NodeRuntimeHost, OfflineInstallRecipeV1,
-    PackageMutationBackend, PackageObservationV1, PackageResolutionV1, PackageTargetV1,
-    ProcessNodeRuntimeHost, ProcessOfflinePackageBackend, ResolvedPackage, SourceBindingV1,
-    TargetNodeResolutionConfig, TargetPackageResolutionConfig,
+    ArtifactEvidence, ManagerBindingV1, NodeOfflineInstallRecipeV1, NodeRuntimeHost,
+    OfflineInstallRecipeV1, PackageMutationBackend, PackageObservationV1, PackageResolutionV1,
+    PackageTargetV1, ProcessNodeRuntimeHost, ProcessOfflinePackageBackend, ResolvedPackage,
+    SourceBindingV1, TargetNodeResolutionConfig, TargetPackageResolutionConfig,
 };
 use commonkit_contracts::SecurityPolicy;
 use commonkit_contracts::{
@@ -130,6 +130,7 @@ fn live_binding_fixture(
             release_keyring: keyring,
             gpgv_executable: gpgv,
             gpgv_executable_digest: snapshot.gpgv_executable_digest,
+            release_keyring_digest: Some(snapshot.release_keyring_digest),
         }),
         target_identity_digest: digest(b"target"),
     };
@@ -152,6 +153,26 @@ fn live_binding_fixture(
         recipe => recipe,
     };
     (resolution, config, nvm.join("nvm.sh"))
+}
+
+#[test]
+fn nvm_apply_rejects_forged_source_evidence_before_mutation() {
+    let root = tempfile::tempdir().unwrap();
+    let (mut resolution, config, _) = live_binding_fixture(root.path());
+    resolution.source.signed_metadata = vec![ArtifactEvidence {
+        authority: commonkit_contracts::StableId::parse("node-release-key").unwrap(),
+        metadata_digest: digest(b"forged-checksums"),
+        signature_digest: digest(b"forged-signature"),
+    }];
+    resolution.closure[0].source = resolution.source.clone();
+    let artifacts =
+        commonkit_adapters::ArtifactStore::open(tempfile::tempdir().unwrap().path()).unwrap();
+    let mut backend = ProcessOfflinePackageBackend::with_package_resolution(root.path(), config);
+
+    assert!(
+        backend.prepare_offline(&resolution, &artifacts).is_err(),
+        "forged matching source evidence must be rejected before a package phase"
+    );
 }
 
 #[test]
