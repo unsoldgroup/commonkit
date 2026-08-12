@@ -405,7 +405,14 @@ impl<R: RemoteProcessRunner> SshFilesystemTransport for OpenSshTransport<R> {
                 SshFilesystemResponse::Absent | SshFilesystemResponse::File { .. },
             ) => true,
             (
-                SshFilesystemRequest::WriteFile { .. } | SshFilesystemRequest::Remove { .. },
+                SshFilesystemRequest::InspectResource { .. },
+                SshFilesystemResponse::Resource { .. },
+            ) => true,
+            (
+                SshFilesystemRequest::WriteFile { .. }
+                | SshFilesystemRequest::WriteDirectory { .. }
+                | SshFilesystemRequest::WriteSymlink { .. }
+                | SshFilesystemRequest::Remove { .. },
                 SshFilesystemResponse::Applied,
             ) => true,
             (

@@ -282,6 +282,85 @@ fn config() -> OpenSshConfig {
     .unwrap()
 }
 
+fn runner_with_response(response: SshFilesystemResponse) -> FakeRunner {
+    let mut runner = FakeRunner::default();
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: b"build.example.com ssh-ed25519 AAAAcorrect\n".to_vec(),
+        stderr: vec![],
+    });
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout:
+            b"256 SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA build.example.com (ED25519)\n"
+                .to_vec(),
+        stderr: vec![],
+    });
+    runner.outputs.push_back(ProcessOutput {
+        status: 0,
+        stdout: serde_json::to_vec(&response).unwrap(),
+        stderr: vec![],
+    });
+    runner
+}
+
+#[test]
+fn transport_accepts_inspect_resource_response() {
+    let response = SshFilesystemResponse::Resource {
+        resource: commonkit_adapters::TargetResource::Directory { mode: Some(0o755) },
+    };
+    let mut transport =
+        OpenSshTransport::new(config(), runner_with_response(response.clone())).unwrap();
+
+    assert_eq!(
+        transport
+            .perform(SshFilesystemRequest::InspectResource {
+                root_id: StableId::parse("home").unwrap(),
+                path: commonkit_adapters::NormalizedManagedPath::parse(".config/tool").unwrap(),
+            })
+            .unwrap(),
+        response
+    );
+}
+
+#[test]
+fn transport_accepts_write_directory_response() {
+    let response = SshFilesystemResponse::Applied;
+    let mut transport =
+        OpenSshTransport::new(config(), runner_with_response(response.clone())).unwrap();
+
+    assert_eq!(
+        transport
+            .perform(SshFilesystemRequest::WriteDirectory {
+                root_id: StableId::parse("home").unwrap(),
+                path: commonkit_adapters::NormalizedManagedPath::parse(".config/tool").unwrap(),
+                mode: Some(commonkit_adapters::FileMode::parse(0o755).unwrap()),
+            })
+            .unwrap(),
+        response
+    );
+}
+
+#[test]
+fn transport_accepts_write_symlink_response() {
+    let response = SshFilesystemResponse::Applied;
+    let path = commonkit_adapters::NormalizedManagedPath::parse(".config/tool").unwrap();
+    let mut transport =
+        OpenSshTransport::new(config(), runner_with_response(response.clone())).unwrap();
+
+    assert_eq!(
+        transport
+            .perform(SshFilesystemRequest::WriteSymlink {
+                root_id: StableId::parse("home").unwrap(),
+                target: commonkit_adapters::SafeSymlinkTarget::parse(&path, "target").unwrap(),
+                path,
+                target_kind: commonkit_adapters::SymlinkTargetKind::File,
+            })
+            .unwrap(),
+        response
+    );
+}
+
 struct LocalHelperRunner {
     home: PathBuf,
     drop_final_response: bool,
