@@ -514,13 +514,12 @@ fn approved_package_plan_opens_the_typed_ssh_adapter_instead_of_the_unavailable_
         .collect(),
         ..SecurityPolicy::default()
     };
-    let (remote_authority, _, _) =
-        PackageResolutionAuthority::load_remote_by_resolution_digest(
-            &resolution_ref.digest,
-            &package_artifacts,
-            &package_policy,
-        )
-        .unwrap();
+    let (remote_authority, _, _) = PackageResolutionAuthority::load_remote_by_resolution_digest(
+        &resolution_ref.digest,
+        &package_artifacts,
+        &package_policy,
+    )
+    .unwrap();
     let plan = package_plan(resolution_ref.digest, remote_authority.digest().clone());
     plans.persist(&plan).unwrap();
     let confirmation_id = StableId::parse("package-confirmation").unwrap();
