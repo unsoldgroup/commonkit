@@ -145,7 +145,7 @@ test("manual release policy requires native desktop and daemon lifecycle evidenc
 test("installed lifecycle atomically reloads an already-running daemon after onboarding", async () => {
   const lifecycle = (await readFile(new URL("../../../scripts/installed-lifecycle.sh", import.meta.url), "utf8"))
     .replaceAll("\r\n", "\n");
-  const firstStart = lifecycle.indexOf("trap stop_daemon EXIT\nstart_daemon");
+  const firstStart = lifecycle.search(/(?:^|\n)start_daemon\n/);
   const initialized = lifecycle.indexOf('"$commonkit" init connect');
   const reload = lifecycle.indexOf('daemon reload-domains --confirmed');
   const firstPlan = lifecycle.indexOf('"$commonkit" sync --confirmed');
