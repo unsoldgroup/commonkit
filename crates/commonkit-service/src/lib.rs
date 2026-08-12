@@ -1797,7 +1797,8 @@ impl LocalPlanExecutor {
     }
 
     fn adapters(&self) -> Result<Vec<Box<dyn Adapter>>, LocalExecutionError> {
-        FileAdapter::validate_target_root_handle(&self.target_root, &self.target_root_handle)?;
+        let file_adapter = FileAdapter::open(&self.target_root, &self.adapter_state)?;
+        file_adapter.validate_against_root_handle(&self.target_root_handle)?;
         let package_artifacts = ArtifactStore::open(self.adapter_state.join("packages"))
             .map_err(LocalExecutionError::PackageArtifact)?;
         #[cfg(unix)]
@@ -1823,7 +1824,7 @@ impl LocalPlanExecutor {
         ])
         .map_err(LocalExecutionError::PackageBackend)?;
         let mut adapters: Vec<Box<dyn Adapter>> = vec![
-            Box::new(FileAdapter::open(&self.target_root, &self.adapter_state)?),
+            Box::new(file_adapter),
             Box::new(PackageAdapter::new_offline(
                 package_artifacts,
                 Box::new(package_backend),

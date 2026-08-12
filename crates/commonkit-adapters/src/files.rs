@@ -165,15 +165,14 @@ impl FileAdapter {
         Ok(self.target.try_clone()?.into_std_file())
     }
 
-    /// Verifies that a target path still names the directory represented by a
-    /// previously retained root handle.
-    pub fn validate_target_root_handle(
-        target: &Path,
+    /// Verifies that this adapter's already-opened root is the retained root
+    /// capability used by another target-local adapter.
+    pub fn validate_against_root_handle(
+        &self,
         root_handle: &std::fs::File,
     ) -> Result<(), FileAdapterError> {
-        let current = open_directory_handle(target)?;
         let expected = directory_identity(&Dir::from_std_file(root_handle.try_clone()?))?;
-        if directory_identity(&current)? == expected {
+        if self.target_identity == expected {
             Ok(())
         } else {
             Err(std::io::Error::other("managed target root identity changed").into())
