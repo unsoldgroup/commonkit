@@ -255,6 +255,69 @@ struct RecordingSshTransport {
     requests: Arc<Mutex<Vec<SshFilesystemRequest>>>,
 }
 
+#[derive(Clone)]
+struct ObservingSshTransport {
+    observed: BTreeSet<String>,
+}
+
+impl SshFilesystemTransport for ObservingSshTransport {
+    fn perform(
+        &mut self,
+        request: SshFilesystemRequest,
+    ) -> Result<SshFilesystemResponse, TargetFilesystemError> {
+        match request {
+            SshFilesystemRequest::PackageMutation {
+                phase: commonkit_adapters::PackageMutationPhase::Observe,
+                ..
+            } => Ok(SshFilesystemResponse::PackageObserved {
+                installed_versions: self.observed.clone(),
+            }),
+            SshFilesystemRequest::PackageMutation { .. } => Ok(SshFilesystemResponse::Applied),
+            _ => Err(TargetFilesystemError::InvalidRemoteResponse),
+        }
+    }
+}
+
+#[test]
+fn ssh_package_backend_rejects_malformed_and_foreign_final_observations() {
+    for observed in [
+        BTreeSet::from(["ripgrep:amd64=14.1.1-1ubuntu1 extra".into()]),
+        BTreeSet::from(["ripgrep:arm64=14.1.1-1ubuntu1".into()]),
+        BTreeSet::from([
+            "ripgrep:amd64=14.1.1-1ubuntu1".into(),
+            "ripgrep:amd64=14.1.1-1ubuntu2".into(),
+        ]),
+    ] {
+        let (resolution, _) = apt_resolution();
+        let mut backend = SshOfflinePackageBackend::with_target_platform(
+            StableId::parse("home").unwrap(),
+            ObservingSshTransport { observed },
+            "linux",
+            "amd64",
+            digest('c'),
+        );
+        assert!(
+            backend.observe(&resolution).is_err(),
+            "SSH must reject malformed or foreign final observations"
+        );
+    }
+}
+
+#[test]
+fn ssh_package_backend_accepts_canonical_final_observation() {
+    let (resolution, _) = apt_resolution();
+    let mut backend = SshOfflinePackageBackend::with_target_platform(
+        StableId::parse("home").unwrap(),
+        ObservingSshTransport {
+            observed: BTreeSet::from(["ripgrep:amd64=14.1.1-1ubuntu1".into()]),
+        },
+        "linux",
+        "amd64",
+        digest('c'),
+    );
+    assert!(backend.observe(&resolution).is_ok());
+}
+
 impl SshFilesystemTransport for RecordingSshTransport {
     fn perform(
         &mut self,

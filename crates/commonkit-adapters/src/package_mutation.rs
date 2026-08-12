@@ -227,7 +227,7 @@ impl PackageAdapter {
         let (_, resolution) = self
             .load_resolution(operation)
             .map_err(|_| failure("package_resolution_invalid"))?;
-        ensure_supported(&resolution, self.backend.as_ref()).map_err(|error| error)?;
+        ensure_supported(&resolution, self.backend.as_ref())?;
         Ok(resolution)
     }
 
@@ -260,6 +260,8 @@ impl PackageAdapter {
         operation: &Operation,
     ) -> Result<Option<Sha256Digest>, AdapterFailure> {
         let (resolution, observed) = self.observe_state(operation)?;
+        let observed = canonical_final_observation(&resolution, &observed)
+            .map_err(|_| failure("package_observation_invalid"))?;
         digest_domain_json("commonkit.package-final-state.v1", &(resolution, observed))
             .map(Some)
             .map_err(|_| failure("package_digest_failed"))
@@ -377,9 +379,7 @@ impl Adapter for PackageAdapter {
         {
             return Err(failure("package_operation_unsupported"));
         }
-        self.resolution(operation)
-            .map(|_| ())
-            .map_err(|error| error)
+        self.resolution(operation).map(|_| ())
     }
 
     fn package_authorization_binding(
@@ -490,11 +490,9 @@ impl Adapter for PackageAdapter {
         operation: &Operation,
     ) -> Result<RecoveryObservation, AdapterFailure> {
         let (resolution, observed) = self.observe_state(operation)?;
-        if resolution.manager.manager == PackageManager::Apt
-            && !valid_apt_observation(&observed, &resolution.target.arch)
-        {
+        let Ok(observed) = canonical_final_observation(&resolution, &observed) else {
             return Ok(RecoveryObservation::Other);
-        }
+        };
         let before = if resolution.manager.manager == PackageManager::Apt {
             apt_before_observation(&resolution)
         } else {
@@ -655,6 +653,37 @@ fn valid_apt_observation(observed: &PackageObservationV1, target_architecture: &
     !name_versions.values().any(|architectures| {
         architectures.contains("all") && architectures.contains(target_architecture)
     })
+}
+
+fn canonical_final_observation(
+    resolution: &PackageResolutionV1,
+    observed: &PackageObservationV1,
+) -> Result<PackageObservationV1, PackageMutationError> {
+    match resolution.manager.manager {
+        PackageManager::Apt if valid_apt_observation(observed, &resolution.target.arch) => {
+            Ok(observed.clone())
+        }
+        PackageManager::Nvm
+            if observed
+                .installed_versions
+                .iter()
+                .all(|version| valid_nvm_observation_version(version)) =>
+        {
+            Ok(observed.clone())
+        }
+        PackageManager::Apt | PackageManager::Nvm => Err(PackageMutationError::Backend),
+        _ => Err(PackageMutationError::UnsupportedRecipe),
+    }
+}
+
+fn valid_nvm_observation_version(version: &str) -> bool {
+    let parts = version.split('.').collect::<Vec<_>>();
+    parts.len() == 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (*part == "0" || !part.starts_with('0'))
+        })
 }
 
 fn apt_before_observation(resolution: &PackageResolutionV1) -> Option<PackageObservationV1> {
@@ -1174,7 +1203,10 @@ impl<T: crate::SshFilesystemTransport + Send> PackageMutationBackend
     ) -> Result<PackageObservationV1, PackageMutationError> {
         match self.request(crate::PackageMutationPhase::Observe, resolution, None)? {
             crate::SshFilesystemResponse::PackageObserved { installed_versions } => {
-                Ok(PackageObservationV1 { installed_versions })
+                canonical_final_observation(
+                    resolution,
+                    &PackageObservationV1 { installed_versions },
+                )
             }
             _ => Err(PackageMutationError::Backend),
         }
@@ -1401,9 +1433,7 @@ impl ProcessOfflinePackageBackend {
                 .map(str::to_owned)
                 .collect(),
         };
-        valid_apt_observation(&observed, &resolution.target.arch)
-            .then_some(observed)
-            .ok_or(PackageMutationError::Backend)
+        canonical_final_observation(resolution, &observed)
     }
 
     fn observe_nvm(
@@ -1441,13 +1471,26 @@ impl ProcessOfflinePackageBackend {
         if !output.status.success() {
             return Err(PackageMutationError::Backend);
         }
-        let installed_versions = String::from_utf8_lossy(&output.stdout)
-            .split_whitespace()
-            .filter_map(|field| field.strip_prefix('v'))
-            .filter(|version| version.chars().next().is_some_and(|c| c.is_ascii_digit()))
-            .map(str::to_owned)
-            .collect();
-        Ok(PackageObservationV1 { installed_versions })
+        let mut installed_versions = BTreeSet::new();
+        for field in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+            let Some(version) = field.strip_prefix('v') else {
+                continue;
+            };
+            if !version
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit())
+            {
+                continue;
+            }
+            if !valid_nvm_observation_version(version) {
+                return Err(PackageMutationError::Backend);
+            }
+            // `nvm ls` repeats the active version in its alias rows. The
+            // canonical set deliberately collapses those identical rows.
+            installed_versions.insert(version.to_owned());
+        }
+        canonical_final_observation(resolution, &PackageObservationV1 { installed_versions })
     }
 
     fn validate_nvm_script(

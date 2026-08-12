@@ -316,6 +316,24 @@ fn nvm_observe_uses_a_scrubbed_closed_environment() {
 }
 
 #[test]
+fn nvm_observe_rejects_malformed_final_versions() {
+    let output = "-> v20.0.0-extra";
+    let root = tempfile::tempdir().unwrap();
+    let script = format!("nvm() {{ printf '%s\\n' '{}'; }}\n", output);
+    let script_bytes = script.as_bytes();
+    fs::create_dir(root.path().join(".nvm")).unwrap();
+    fs::write(root.path().join(".nvm/nvm.sh"), script_bytes).unwrap();
+    let mut backend = ProcessOfflinePackageBackend::new(root.path());
+
+    assert!(
+        backend
+            .observe(&resolution(root.path(), digest(script_bytes)))
+            .is_err(),
+        "malformed NVM observations must fail closed: {output}"
+    );
+}
+
+#[test]
 fn nvm_observe_rejects_manager_prefix_that_does_not_match_backend_target() {
     let root = tempfile::tempdir().unwrap();
     let nvm = root.path().join(".nvm");
@@ -350,8 +368,8 @@ fn bound_nvm_mutation_survives_a_post_start_root_swap() {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(root.path())
         .unwrap();
-    let mut backend =
-        ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle).unwrap();
+    let mut backend = ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle)
+        .unwrap();
     let resolution = resolution(root.path(), digest(script));
     let replacement = tempfile::tempdir().unwrap();
     fs::rename(root.path(), replacement.path().join("original")).unwrap();
@@ -384,8 +402,8 @@ fn bound_nvm_rejects_a_symlinked_nvm_ancestor() {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
         .open(root.path())
         .unwrap();
-    let mut backend = ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle)
-        .unwrap();
+    let mut backend =
+        ProcessOfflinePackageBackend::new_with_bound_root(root.path(), handle).unwrap();
     let resolution = resolution(root.path(), digest(script));
 
     assert!(backend.observe(&resolution).is_err());
