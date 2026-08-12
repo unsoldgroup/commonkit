@@ -145,7 +145,18 @@ fn apt_resolution() -> (PackageResolutionV1, PackageResolutionAuthority) {
         executable_digest: digest("apt-executable"),
         config_digest: digest("apt-config"),
     };
-    let registry = PackageSourceRegistry::builtin().unwrap();
+    let registry = PackageSourceRegistry::builtin()
+        .unwrap()
+        .with_apt_source_authority(
+            &source_id,
+            AptSourceAuthorityV1 {
+                suite: "noble".into(),
+                components: BTreeSet::from(["main".into()]),
+                signing_authority: StableId::parse("ubuntu-archive").unwrap(),
+                signing_key_digest: digest("apt-key"),
+            },
+        )
+        .unwrap();
     let policy = SecurityPolicy {
         allowlists: [(
             StableId::parse("package_sources").unwrap(),
@@ -172,8 +183,12 @@ fn apt_resolution() -> (PackageResolutionV1, PackageResolutionAuthority) {
             .source_definition_digest(&StableId::parse("ubuntu-main").unwrap())
             .unwrap(),
         canonical_repository: "https://archive.ubuntu.com/ubuntu".into(),
-        repository_revision: Some("0".repeat(64)),
-        signed_metadata: Vec::new(),
+        repository_revision: Some(digest("apt-metadata").as_str()[7..].into()),
+        signed_metadata: vec![ArtifactEvidence {
+            authority: StableId::parse("ubuntu-archive").unwrap(),
+            metadata_digest: digest("apt-metadata"),
+            signature_digest: digest("apt-key"),
+        }],
     };
     (
         PackageResolutionV1 {
@@ -416,6 +431,28 @@ fn setup_with_capabilities(
         "targetTransport":{"type":"ssh","rootId":"home-root","host":"fixture","user":if root_capable {"root"} else {"al"},"port":22,"rootCapable":root_capable,
             "knownHosts":root.join("known_hosts"),"fingerprint":"SHA256:fixturefixturefixture"},
         "targetPlatform":{"operatingSystem":"linux","architecture":"x86_64"},
+        "packageResolution": {
+            "target": {"os":"linux", "osVersion":"24.04", "distroId":"ubuntu", "distroVersion":"24.04", "codename":"noble", "arch":"amd64", "libc":"glibc"},
+            "manager": {"manager":"apt", "version":"2.7.14", "executableDigest":digest("apt-executable"), "configDigest":digest("apt-config")},
+            "policy": serde_json::to_value(SecurityPolicy {
+                allowlists: [(
+                    StableId::parse("package_sources").unwrap(),
+                    BTreeSet::from(["ubuntu-main".into()]),
+                )]
+                .into_iter()
+                .collect(),
+                ..SecurityPolicy::default()
+            }).unwrap(),
+            "apt": {
+                "sourceId": "ubuntu-main",
+                "suite": "noble",
+                "components": ["main"],
+                "signedBy": "/usr/share/keyrings/ubuntu-archive-keyring.gpg",
+                "signingAuthority": "ubuntu-archive",
+                "signingKeyDigest": digest("apt-key"),
+                "trustedMetadataDigest": digest("apt-metadata")
+            }
+        },
         "declaredRoots":["home"],"relayClientRoot":"home","protectedRoots":[],"caseSensitive":true,
         "targetIdentityDigest":digest("target"),"composedLoadoutDigest":digest("loadout"),"policyDigest":digest("policy")
     }});
@@ -460,7 +497,7 @@ fn approved_package_plan_opens_the_typed_ssh_adapter_instead_of_the_unavailable_
     let temporary = tempfile::tempdir().unwrap();
     let remote = Memory::default();
     let (_, plans, _, executor) = setup(temporary.path(), remote.clone());
-    let (resolution, authority) = apt_resolution();
+    let (resolution, _authority) = apt_resolution();
     let package_artifacts = ArtifactStore::open(temporary.path().join("adapter/packages")).unwrap();
     let resolution_ref = package_artifacts
         .put(
@@ -468,7 +505,23 @@ fn approved_package_plan_opens_the_typed_ssh_adapter_instead_of_the_unavailable_
             ContentSensitivity::Portable,
         )
         .unwrap();
-    let plan = package_plan(resolution_ref.digest, authority.digest().clone());
+    let package_policy = SecurityPolicy {
+        allowlists: [(
+            StableId::parse("package_sources").unwrap(),
+            BTreeSet::from(["ubuntu-main".into()]),
+        )]
+        .into_iter()
+        .collect(),
+        ..SecurityPolicy::default()
+    };
+    let (remote_authority, _, _) =
+        PackageResolutionAuthority::load_remote_by_resolution_digest(
+            &resolution_ref.digest,
+            &package_artifacts,
+            &package_policy,
+        )
+        .unwrap();
+    let plan = package_plan(resolution_ref.digest, remote_authority.digest().clone());
     plans.persist(&plan).unwrap();
     let confirmation_id = StableId::parse("package-confirmation").unwrap();
     let consent = PackageConsent {
@@ -484,7 +537,6 @@ fn approved_package_plan_opens_the_typed_ssh_adapter_instead_of_the_unavailable_
     };
 
     let result = executor.execute_with_package_consent(&plan, &confirmation_id, &consent);
-
     assert_eq!(result.status, ApplyStatus::Succeeded);
     assert_eq!(result.failure_code, None);
     let remote = remote.0.lock().unwrap();

@@ -607,10 +607,13 @@ fn apt_recovery_fails_closed_for_marker_drift_or_substitution() {
         ),
         (
             BTreeSet::from([
+                apt_live_safety_marker(),
+                "libc6:amd64=2.39-0ubuntu8.6".into(),
+            ]),
+            BTreeSet::from([
                 "commonkit-apt-live-safety=not-a-digest".into(),
                 "libc6:amd64=2.39-0ubuntu8.6".into(),
             ]),
-            BTreeSet::from(["libc6:amd64=2.39-0ubuntu8.6".into()]),
         ),
         (
             BTreeSet::from([
@@ -863,7 +866,7 @@ fn apt_recovery_does_not_treat_ambiguous_observed_architectures_as_after() {
 fn apt_recovery_does_not_treat_malformed_before_identity_as_before() {
     let (mut resolution, authority) = apt_resolution();
     resolution.before = PackageObservationV1 {
-        installed_versions: BTreeSet::from(["ripgrep=14.1.1-1ubuntu1".into()]),
+        installed_versions: BTreeSet::from([apt_live_safety_marker()]),
     };
     let root = tempfile::tempdir().unwrap();
     let artifacts = ArtifactStore::open(root.path()).unwrap();
@@ -876,7 +879,9 @@ fn apt_recovery_does_not_treat_malformed_before_identity_as_before() {
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
         target_supported: true,
-        observed: resolution.before.clone(),
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from(["ripgrep=14.1.1-1ubuntu1".into()]),
+        },
         calls: Arc::new(Mutex::new(Vec::new())),
     };
     let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
@@ -891,6 +896,9 @@ fn apt_recovery_does_not_treat_malformed_before_identity_as_before() {
 fn apt_recovery_does_not_treat_duplicate_version_identities_as_before() {
     let (mut resolution, authority) = apt_resolution();
     resolution.before = PackageObservationV1 {
+        installed_versions: BTreeSet::from([apt_live_safety_marker()]),
+    };
+    let observed = PackageObservationV1 {
         installed_versions: BTreeSet::from([
             "ripgrep:amd64=14.1.1-1ubuntu1".into(),
             "ripgrep:amd64=14.1.1-1ubuntu2".into(),
@@ -907,7 +915,7 @@ fn apt_recovery_does_not_treat_duplicate_version_identities_as_before() {
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
         target_supported: true,
-        observed: resolution.before.clone(),
+        observed,
         calls: Arc::new(Mutex::new(Vec::new())),
     };
     let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
@@ -922,7 +930,7 @@ fn apt_recovery_does_not_treat_duplicate_version_identities_as_before() {
 fn apt_recovery_does_not_treat_foreign_before_identity_as_before() {
     let (mut resolution, authority) = apt_resolution();
     resolution.before = PackageObservationV1 {
-        installed_versions: BTreeSet::from(["ripgrep:arm64=14.1.1-1ubuntu1".into()]),
+        installed_versions: BTreeSet::from([apt_live_safety_marker()]),
     };
     let root = tempfile::tempdir().unwrap();
     let artifacts = ArtifactStore::open(root.path()).unwrap();
@@ -935,7 +943,9 @@ fn apt_recovery_does_not_treat_foreign_before_identity_as_before() {
     let backend = FakeMutationBackend {
         manager: PackageManager::Apt,
         target_supported: true,
-        observed: resolution.before.clone(),
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::from(["ripgrep:arm64=14.1.1-1ubuntu1".into()]),
+        },
         calls: Arc::new(Mutex::new(Vec::new())),
     };
     let mut adapter = PackageAdapter::new(authority, artifacts, Box::new(backend));
