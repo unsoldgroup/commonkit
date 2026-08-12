@@ -6380,7 +6380,7 @@ mod package_resolution_tests {
             codename: None,
             arch: "x86_64".into(),
             libc: None,
-            manager_prefix: Some("/Users/al/.nvm".into()),
+            manager_prefix: Some("/fixture/node/.nvm".into()),
         })
         .target_package_resolution()
         .unwrap();
@@ -6400,7 +6400,7 @@ mod package_resolution_tests {
             codename: None,
             arch: "amd64".into(),
             libc: None,
-            manager_prefix: Some("/Users/al/.nvm".into()),
+            manager_prefix: Some("/fixture/node/.nvm".into()),
         };
         let manager = ManagerBindingV1 {
             manager: PackageManager::Nvm,
