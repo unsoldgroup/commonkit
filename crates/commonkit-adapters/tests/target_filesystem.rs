@@ -92,6 +92,158 @@ fn local_filesystem_rejects_symlink_ancestors_and_leafs() {
     fs::remove_dir_all(outside).unwrap();
 }
 
+#[cfg(unix)]
+fn swap_entry_with_symlink(
+    entry: PathBuf,
+    outside: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::Ordering;
+
+    std::thread::spawn(move || {
+        let parked = entry.with_extension("commonkit-swap");
+        while !stop.load(Ordering::Relaxed) {
+            if fs::rename(&entry, &parked).is_ok() {
+                let _ = symlink(&outside, &entry);
+                for _ in 0..64 {
+                    std::thread::yield_now();
+                }
+                let _ = fs::remove_file(&entry);
+                let _ = fs::rename(&parked, &entry);
+            }
+        }
+        let _ = fs::remove_file(&entry);
+        let _ = fs::rename(&parked, &entry);
+    })
+}
+
+#[cfg(unix)]
+fn stop_swap(
+    stop: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    worker: std::thread::JoinHandle<()>,
+) {
+    use std::sync::atomic::Ordering;
+
+    stop.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn local_filesystem_list_directory_never_follows_swapped_ancestors_or_leafs() {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let root = temp("list-swap-root");
+    let outside = temp("list-swap-outside");
+    fs::create_dir_all(root.join("selected/nested")).unwrap();
+    fs::create_dir_all(outside.join("nested")).unwrap();
+    fs::write(root.join("selected/nested/inside.txt"), b"inside").unwrap();
+    fs::write(outside.join("nested/outside.txt"), b"outside").unwrap();
+    let target = LocalTargetFilesystem::open(&root, RootAccess::ReadWrite).unwrap();
+
+    for (entry, path, outside_entries, expected) in [
+        (
+            root.join("selected"),
+            NormalizedManagedPath::parse("selected/nested").unwrap(),
+            outside.join("nested"),
+            vec!["inside.txt".to_owned()],
+        ),
+        (
+            root.join("selected/nested"),
+            NormalizedManagedPath::parse("selected/nested").unwrap(),
+            outside.join("nested"),
+            vec!["inside.txt".to_owned()],
+        ),
+    ] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = swap_entry_with_symlink(entry, outside_entries, stop.clone());
+        for _ in 0..20_000 {
+            if let Ok(entries) = target.list_directory(&path) {
+                assert_eq!(entries, expected);
+            }
+        }
+        stop_swap(&stop, worker);
+    }
+
+    drop(target);
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn local_filesystem_read_file_never_follows_swapped_ancestors_or_leafs() {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let root = temp("read-swap-root");
+    let outside = temp("read-swap-outside");
+    fs::create_dir_all(root.join("selected/nested")).unwrap();
+    fs::create_dir_all(outside.join("nested")).unwrap();
+    fs::write(root.join("selected/nested/value"), b"inside").unwrap();
+    fs::write(outside.join("nested/value"), b"outside").unwrap();
+    let target = LocalTargetFilesystem::open(&root, RootAccess::ReadWrite).unwrap();
+
+    for (entry, outside_entry) in [
+        (root.join("selected"), outside.clone()),
+        (
+            root.join("selected/nested/value"),
+            outside.join("nested/value"),
+        ),
+    ] {
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = swap_entry_with_symlink(entry, outside_entry, stop.clone());
+        for _ in 0..20_000 {
+            if let Ok(Some(bytes)) =
+                target.read_file(&NormalizedManagedPath::parse("selected/nested/value").unwrap())
+            {
+                assert_eq!(bytes, b"inside");
+            }
+        }
+        stop_swap(&stop, worker);
+    }
+
+    drop(target);
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn local_filesystem_remove_never_follows_swapped_ancestors_or_leafs() {
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let root = temp("remove-swap-root");
+    let outside = temp("remove-swap-outside");
+    fs::create_dir_all(root.join("selected/nested")).unwrap();
+    fs::create_dir_all(outside.join("nested")).unwrap();
+    fs::write(root.join("selected/nested/victim"), b"inside").unwrap();
+    fs::write(outside.join("nested/victim"), b"outside").unwrap();
+    let target = LocalTargetFilesystem::open(&root, RootAccess::ReadWrite).unwrap();
+    let path = NormalizedManagedPath::parse("selected/nested/victim").unwrap();
+
+    for (entry, outside_entry) in [
+        (root.join("selected"), outside.clone()),
+        (
+            root.join("selected/nested/victim"),
+            outside.join("nested/victim"),
+        ),
+    ] {
+        fs::write(root.join("selected/nested/victim"), b"inside").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = swap_entry_with_symlink(entry, outside_entry, stop.clone());
+        for _ in 0..20_000 {
+            let _ = target.remove(&path);
+            assert!(outside.join("nested/victim").exists());
+        }
+        stop_swap(&stop, worker);
+    }
+
+    drop(target);
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(outside).unwrap();
+}
+
 #[test]
 fn read_only_root_refuses_mutation() {
     let root = temp("readonly");

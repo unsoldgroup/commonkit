@@ -247,15 +247,10 @@ impl TargetFilesystem for LocalTargetFilesystem {
         &self,
         path: &NormalizedManagedPath,
     ) -> Result<Vec<String>, TargetFilesystemError> {
-        self.ensure_safe_ancestors(path, false)?;
-        let metadata = self.root.symlink_metadata(path.as_str())?;
-        if metadata_is_reparse_or_symlink(&metadata) {
-            return Err(TargetFilesystemError::SymlinkEncountered(path.to_string()));
-        }
-        if !metadata.is_dir() {
-            return Err(TargetFilesystemError::NotDirectory(path.to_string()));
-        }
-        let directory = self.root.open_dir(path.as_str())?;
+        let (parent, leaf) = open_target_parent_nofollow(&self.root, path, false)
+            .map_err(|error| classify_nofollow_path_error(error, path))?;
+        let directory = open_target_dir_nofollow(&parent, &leaf)
+            .map_err(|error| classify_directory_open_error(&parent, &leaf, path, error))?;
         let mut entries = Vec::new();
         for entry in directory.entries()? {
             let entry = entry?;
@@ -278,11 +273,16 @@ impl TargetFilesystem for LocalTargetFilesystem {
         &self,
         path: &NormalizedManagedPath,
     ) -> Result<Option<Vec<u8>>, TargetFilesystemError> {
-        self.ensure_safe_ancestors(path, false)?;
-        if !self.reject_symlink_leaf(path)? {
-            return Ok(None);
-        }
-        let mut file = self.root.open(path.as_str())?;
+        let (parent, leaf) = match open_target_parent_nofollow(&self.root, path, false) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(classify_nofollow_path_error(error, path)),
+        };
+        let mut file = match open_target_file_nofollow(&parent, &leaf) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(classify_leaf_open_error(&parent, &leaf, path, error)),
+        };
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(Some(bytes))
@@ -321,10 +321,23 @@ impl TargetFilesystem for LocalTargetFilesystem {
         if self.access != RootAccess::ReadWrite {
             return Err(TargetFilesystemError::ReadOnly);
         }
-        self.ensure_safe_ancestors(path, false)?;
-        if self.reject_symlink_leaf(path)? {
-            self.root.remove_file(path.as_str())?;
+        let (parent, leaf) = match open_target_parent_nofollow(&self.root, path, false) {
+            Ok(value) => value,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(classify_nofollow_path_error(error, path)),
+        };
+        let metadata = match parent.symlink_metadata(&leaf) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if metadata_is_reparse_or_symlink(&metadata) {
+            return Err(TargetFilesystemError::SymlinkEncountered(path.to_string()));
         }
+        if !metadata.is_file() {
+            return Err(TargetFilesystemError::NotFile(path.to_string()));
+        }
+        parent.remove_file(&leaf)?;
         Ok(())
     }
 
@@ -1010,6 +1023,47 @@ pub enum TargetFilesystemError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Resource(#[from] crate::ResourceError),
+}
+
+fn classify_nofollow_path_error(
+    error: std::io::Error,
+    path: &NormalizedManagedPath,
+) -> TargetFilesystemError {
+    if error.kind() == std::io::ErrorKind::InvalidInput {
+        TargetFilesystemError::SymlinkEncountered(path.to_string())
+    } else {
+        error.into()
+    }
+}
+
+fn classify_directory_open_error(
+    parent: &Dir,
+    leaf: &Path,
+    path: &NormalizedManagedPath,
+    error: std::io::Error,
+) -> TargetFilesystemError {
+    match parent.symlink_metadata(leaf) {
+        Ok(metadata) if metadata_is_reparse_or_symlink(&metadata) => {
+            TargetFilesystemError::SymlinkEncountered(path.to_string())
+        }
+        Ok(metadata) if !metadata.is_dir() => TargetFilesystemError::NotDirectory(path.to_string()),
+        _ => classify_nofollow_path_error(error, path),
+    }
+}
+
+fn classify_leaf_open_error(
+    parent: &Dir,
+    leaf: &Path,
+    path: &NormalizedManagedPath,
+    error: std::io::Error,
+) -> TargetFilesystemError {
+    match parent.symlink_metadata(leaf) {
+        Ok(metadata) if metadata_is_reparse_or_symlink(&metadata) => {
+            TargetFilesystemError::SymlinkEncountered(path.to_string())
+        }
+        Ok(metadata) if !metadata.is_file() => TargetFilesystemError::NotFile(path.to_string()),
+        _ => classify_nofollow_path_error(error, path),
+    }
 }
 
 fn open_target_parent_nofollow(
