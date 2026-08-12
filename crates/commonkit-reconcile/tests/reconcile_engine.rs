@@ -1009,6 +1009,40 @@ fn recovery_rejects_tampered_receipt_before_adapter_preflight() {
 }
 
 #[test]
+fn recovery_rejects_a_receipt_mutated_after_load_before_adapter_preflight() {
+    let directory = temporary_directory("recovery-receipt-race");
+    let store = ReceiptStore::open(&directory).unwrap();
+    let run_id = StableId::parse("receipt-race").unwrap();
+    let plan = plan();
+    store
+        .persist(&ReceiptJournal::for_plan(run_id.clone(), &plan).unwrap())
+        .unwrap();
+    let reconciler = Reconciler::with_store(&store);
+    let loaded = reconciler
+        .load_validated_run(run_id.clone(), &plan)
+        .unwrap();
+
+    let mut newer = store.load(run_id.clone()).unwrap();
+    newer.transition(ReceiptState::Canceled).unwrap();
+    store.persist(&newer).unwrap();
+
+    let calls = Arc::new(Mutex::new(0));
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(adapter_with_preflight(
+        Arc::new(Mutex::new(Vec::new())),
+        calls.clone(),
+    ))];
+    let error = reconciler.recover_run_with_journal(run_id.clone(), &plan, loaded, &mut adapters);
+
+    assert!(matches!(error, Err(ReconcileError::ReceiptSnapshotChanged)));
+    assert_eq!(*calls.lock().unwrap(), 0);
+    assert_eq!(
+        store.load(run_id).unwrap().receipt().state,
+        ReceiptState::Canceled
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn explicit_rollback_rejects_missing_receipt_before_adapter_preflight() {
     let directory = temporary_directory("rollback-missing-receipt");
     let store = ReceiptStore::open(&directory).unwrap();

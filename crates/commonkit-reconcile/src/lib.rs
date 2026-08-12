@@ -1119,14 +1119,32 @@ impl<'a> Reconciler<'a> {
     /// Validates a durable run's receipt against its immutable plan without
     /// opening an adapter or touching the target. Callers that need to build
     /// adapters lazily can use this as the receipt-authentication gate.
+    pub fn load_validated_run(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+    ) -> Result<ReceiptJournal, ReconcileError> {
+        validate_plan(plan)?;
+        self.load_validated_run_from_store(run_id, plan)
+    }
+
     pub fn validate_recovery_run(
         &self,
         run_id: StableId,
         plan: &Plan,
     ) -> Result<ReceiptState, ReconcileError> {
-        validate_plan(plan)?;
-        let journal = self.load_validated_run(run_id, plan)?;
-        Ok(journal.receipt().state)
+        Ok(self.load_validated_run(run_id, plan)?.receipt().state)
+    }
+
+    /// Rejects a journal if a newer immutable receipt snapshot was committed
+    /// after it was loaded. This check is intentionally before adapter setup.
+    pub fn ensure_current_run(&self, journal: &ReceiptJournal) -> Result<(), ReconcileError> {
+        let store = self.store.ok_or(ReconcileError::DurableStoreRequired)?;
+        let current = store.load(journal.receipt().run_id.clone())?;
+        if current.receipt() != journal.receipt() {
+            return Err(ReconcileError::ReceiptSnapshotChanged);
+        }
+        Ok(())
     }
 
     pub fn execute(
@@ -1361,7 +1379,23 @@ impl<'a> Reconciler<'a> {
         adapters: &mut [Box<dyn Adapter>],
     ) -> Result<ReconcileOutcome, ReconcileError> {
         validate_plan(plan)?;
-        let mut journal = self.load_validated_run(run_id, plan)?;
+        let journal = self.load_validated_run(run_id.clone(), plan)?;
+        self.recover_run_with_journal(run_id, plan, journal, adapters)
+    }
+
+    pub fn recover_run_with_journal(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+        mut journal: ReceiptJournal,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        validate_plan(plan)?;
+        if journal.receipt().run_id != run_id {
+            return Err(ReconcileError::ReceiptPlanMismatch);
+        }
+        validate_receipt_plan_binding(plan, journal.receipt())?;
+        self.ensure_current_run(&journal)?;
         let receipt = journal.receipt();
         preflight_adapters(plan, adapters)?;
         let legacy_exact_forward_progress = legacy_exact_forward_progress(plan, receipt);
@@ -1453,7 +1487,23 @@ impl<'a> Reconciler<'a> {
         }) {
             return Err(ReconcileError::RollbackUnsupported);
         }
-        let mut journal = self.load_validated_run(run_id, plan)?;
+        let journal = self.load_validated_run(run_id.clone(), plan)?;
+        self.rollback_succeeded_run_with_journal(run_id, plan, journal, adapters)
+    }
+
+    pub fn rollback_succeeded_run_with_journal(
+        &self,
+        run_id: StableId,
+        plan: &Plan,
+        mut journal: ReceiptJournal,
+        adapters: &mut [Box<dyn Adapter>],
+    ) -> Result<ReconcileOutcome, ReconcileError> {
+        validate_plan(plan)?;
+        if journal.receipt().run_id != run_id {
+            return Err(ReconcileError::ReceiptPlanMismatch);
+        }
+        validate_receipt_plan_binding(plan, journal.receipt())?;
+        self.ensure_current_run(&journal)?;
         if journal.receipt().state != ReceiptState::Succeeded {
             return Err(ReconcileError::RunAlreadyTerminal(journal.receipt().state));
         }
@@ -1463,7 +1513,7 @@ impl<'a> Reconciler<'a> {
         self.rollback_from_rolling_back(&mut journal, &plan.operations, adapters)
     }
 
-    fn load_validated_run(
+    fn load_validated_run_from_store(
         &self,
         run_id: StableId,
         plan: &Plan,
@@ -1968,6 +2018,8 @@ pub enum ReconcileError {
     DurableStoreRequired,
     #[error("receipt is not bound to the supplied plan")]
     ReceiptPlanMismatch,
+    #[error("receipt snapshot changed during recovery validation")]
+    ReceiptSnapshotChanged,
     #[error("run is already terminal in state {0:?}")]
     RunAlreadyTerminal(ReceiptState),
 }
