@@ -3,16 +3,19 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use commonkit_contracts::{
-    Operation, OperationKind, OperationPhase, PackageConsent, PackageExitClassification,
-    PackageManager, PackageNoPreimageReason, PackageOperationConsentBinding,
-    PackageReceiptAuthorization, PackageReceiptEvidence, PlanBindings, ReceiptState,
-    RecoveryCapability, ResourceRef, Risk, Sha256Digest, StableId, package_operation_set_digest,
+    FORWARD_CONTRACT_VERSION, FORWARD_SCHEMA_VERSION, Operation, OperationKind, OperationPhase,
+    OperationProgress, PackageConsent, PackageExitClassification, PackageManager,
+    PackageNoPreimageReason, PackageOperationConsentBinding, PackageReceiptAuthorization,
+    PackageReceiptEvidence, PlanBindings, ReceiptState, ReceiptTransition, RecoveryCapability,
+    ResourceRef, Risk, SchemaVersion, Sha256Digest, StableId, canonical_json, digest_domain_json,
+    package_operation_set_digest,
 };
 use commonkit_core::{OperationDraft, PlanDraft, build_plan, finalize_operation};
 use commonkit_reconcile::{
-    Adapter, AdapterFailure, ReceiptStore, ReconcileError, ReconcileOutcome, Reconciler,
-    RecoveryObservation,
+    Adapter, AdapterFailure, ReceiptJournal, ReceiptStore, ReconcileError, ReconcileOutcome,
+    Reconciler, RecoveryObservation,
 };
+use serde::Serialize;
 
 fn digest(character: char) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{}", character.to_string().repeat(64))).unwrap()
@@ -127,6 +130,23 @@ impl Adapter for PackageAdapterStub {
         )))
     }
 
+    fn validate_package_authorization_evidence(
+        &self,
+        operation: &Operation,
+        evidence: &PackageReceiptEvidence,
+    ) -> Result<(), AdapterFailure> {
+        let (_, expected) = self
+            .package_authorization_binding(operation)?
+            .expect("package binding");
+        if evidence != &expected {
+            return Err(AdapterFailure::new(
+                "package_authorization_evidence_mismatch",
+                "package receipt evidence does not match persisted resolution",
+            ));
+        }
+        Ok(())
+    }
+
     fn package_final_digest(
         &mut self,
         _operation: &Operation,
@@ -166,15 +186,109 @@ fn package_authorization(operation: &Operation) -> PackageReceiptAuthorization {
             resolution_digest: operation.payload_digest.clone(),
             target_authority_digest: digest('6'),
             manager: PackageManager::Apt,
-            manager_authority_digest: digest('4'),
+            manager_authority_digest: digest('9'),
             source_id: StableId::parse("ubuntu-main").unwrap(),
-            source_authority_digest: digest('5'),
+            source_authority_digest: digest('0'),
             before_installed_versions: BTreeSet::new(),
             no_preimage_reason: PackageNoPreimageReason::AdditiveForwardOnly,
             exit_classification: PackageExitClassification::NotRun,
             final_digest: None,
         }],
     }
+}
+
+#[test]
+fn package_plan_v2_receipt_cannot_be_acted_upon() {
+    let plan = package_plan();
+
+    assert!(ReceiptJournal::for_plan(StableId::parse("legacy-package").unwrap(), &plan).is_ok());
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TransitionSemantic {
+    sequence: u64,
+    state: ReceiptState,
+    previous_digest: Option<Sha256Digest>,
+    progress_digest: Sha256Digest,
+}
+
+fn write_unauthorized_v2_receipt(
+    store_root: &std::path::Path,
+    plan: &commonkit_contracts::Plan,
+    run_id: &StableId,
+) {
+    let progress = Vec::<OperationProgress>::new();
+    let progress_digest = digest_domain_json("commonkit.operation-progress.v2", &progress).unwrap();
+    let states = [
+        ReceiptState::Prepared,
+        ReceiptState::Applying,
+        ReceiptState::Verifying,
+        ReceiptState::ApplyingForward,
+    ];
+    let mut previous_digest = None;
+    let mut transitions = Vec::new();
+    for (sequence, state) in states.into_iter().enumerate() {
+        let entry_digest = digest_domain_json(
+            "commonkit.receipt-transition.v2",
+            &TransitionSemantic {
+                sequence: sequence as u64,
+                state,
+                previous_digest: previous_digest.clone(),
+                progress_digest: progress_digest.clone(),
+            },
+        )
+        .unwrap();
+        transitions.push(ReceiptTransition {
+            sequence: sequence as u64,
+            state,
+            previous_digest,
+            progress_digest: progress_digest.clone(),
+            entry_digest: entry_digest.clone(),
+        });
+        previous_digest = Some(entry_digest);
+    }
+    let receipt = commonkit_contracts::RunReceipt {
+        schema_version: SchemaVersion(FORWARD_SCHEMA_VERSION),
+        contract_version: FORWARD_CONTRACT_VERSION.into(),
+        receipt_id: previous_digest.unwrap(),
+        run_id: run_id.clone(),
+        plan_id: plan.id.clone(),
+        target_id: plan.target_id.clone(),
+        desired_digest: plan.desired_digest.clone(),
+        observed_digest: plan.observed_digest.clone(),
+        policy_digest: plan.policy_digest.clone(),
+        bindings: plan.bindings.clone(),
+        package_authorization: None,
+        state: ReceiptState::ApplyingForward,
+        operation_progress: progress,
+        transitions,
+    };
+    let run_root = store_root.join(run_id.as_str());
+    std::fs::create_dir_all(&run_root).unwrap();
+    for (sequence, state) in states.into_iter().enumerate() {
+        let mut snapshot = receipt.clone();
+        snapshot.state = state;
+        snapshot.transitions.truncate(sequence + 1);
+        snapshot.receipt_id = snapshot.transitions.last().unwrap().entry_digest.clone();
+        let digest = snapshot.receipt_id.as_str().trim_start_matches("sha256:");
+        let path = run_root.join(format!("{sequence:020}-{digest}.json"));
+        std::fs::write(path, canonical_json(&snapshot).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn legacy_v2_package_receipt_is_rejected_before_adapter_preflight() {
+    let root = temporary_directory("package-recovery-legacy-v2");
+    let store = ReceiptStore::open(&root).unwrap();
+    let plan = package_plan();
+    let run_id = StableId::parse("legacy-package-recovery").unwrap();
+    write_unauthorized_v2_receipt(&root, &plan, &run_id);
+
+    let result = Reconciler::with_store(&store).recover_run(run_id, &plan, &mut []);
+
+    assert!(matches!(result, Err(ReconcileError::ReceiptPlanMismatch)));
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -674,5 +788,57 @@ fn adapter_evidence_tamper_is_rejected_before_receipt_creation() {
             .is_err()
     );
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), before);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn tampered_durable_v3_evidence_is_rejected_before_recovery_preflight() {
+    let root = temporary_directory("package-recovery-evidence-tamper");
+    let store = ReceiptStore::open(&root).unwrap();
+    let plan = package_plan();
+    let run_id = StableId::parse("package-recovery-evidence-tamper").unwrap();
+    let operation = &plan.operations[0];
+    let mut authorization = package_authorization(operation);
+    authorization.evidence[0].manager_authority_digest = digest('8');
+    authorization.operation_set_digest = package_operation_set_digest(
+        &plan,
+        &[PackageOperationConsentBinding {
+            operation_id: operation.id.clone(),
+            resolution_digest: operation.payload_digest.clone(),
+        }],
+    )
+    .unwrap();
+    let mut journal =
+        commonkit_reconcile::ReceiptJournal::for_package_plan(run_id.clone(), &plan, authorization)
+            .unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::Prepared, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+    journal.transition(ReceiptState::Applying).unwrap();
+    store.persist(&journal).unwrap();
+    journal
+        .record_operation(operation.id.clone(), OperationPhase::ApplyStarted, None)
+        .unwrap();
+    store.persist(&journal).unwrap();
+
+    let mut adapters: Vec<Box<dyn Adapter>> = vec![Box::new(PackageAdapterStub {
+        id: StableId::parse("packages").unwrap(),
+        mutation_count: 0,
+        forbid_observation: true,
+        recovery_observation: RecoveryObservation::After,
+        verify_failure: false,
+        tamper_target_authority: false,
+    })];
+    assert!(matches!(
+        Reconciler::with_store(&store).recover_run(run_id.clone(), &plan, &mut adapters),
+        Err(ReconcileError::AdapterPreflightFailed(AdapterFailure { code, .. }))
+            if code == "package_authorization_evidence_mismatch"
+    ));
+    assert_eq!(
+        store.load(run_id).unwrap().receipt().state,
+        ReceiptState::Applying
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

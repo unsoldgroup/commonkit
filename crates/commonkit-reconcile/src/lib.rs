@@ -1448,6 +1448,7 @@ impl<'a> Reconciler<'a> {
         validate_receipt_plan_binding(plan, journal.receipt())?;
         self.ensure_current_run(&journal)?;
         let receipt = journal.receipt();
+        validate_package_receipt_evidence(plan, receipt, adapters)?;
         preflight_adapters(plan, adapters)?;
         let legacy_exact_forward_progress = legacy_exact_forward_progress(plan, receipt);
 
@@ -1908,6 +1909,39 @@ fn package_evidence_pending(journal: &ReceiptJournal, operation: &Operation) -> 
         })
 }
 
+/// Revalidates the immutable package portion of a v3 receipt against the
+/// operation's persisted resolution before recovery opens the preflight path.
+/// Terminal exit evidence is deliberately excluded: recovery may be repairing
+/// a receipt after the operation already reached a terminal package outcome.
+fn validate_package_receipt_evidence(
+    plan: &Plan,
+    receipt: &RunReceipt,
+    adapters: &mut [Box<dyn Adapter>],
+) -> Result<(), ReconcileError> {
+    let Some(authorization) = receipt.package_authorization.as_ref() else {
+        return Ok(());
+    };
+
+    for operation in plan
+        .operations
+        .iter()
+        .filter(|operation| is_package_operation(operation))
+    {
+        let evidence = authorization
+            .evidence
+            .iter()
+            .find(|evidence| evidence.operation_id == operation.id)
+            .ok_or(ReconcileError::ReceiptPlanMismatch)?;
+        let mut before_evidence = evidence.clone();
+        before_evidence.exit_classification = PackageExitClassification::NotRun;
+        before_evidence.final_digest = None;
+        adapter_for(adapters, &operation.adapter_id)?
+            .validate_package_authorization_evidence(operation, &before_evidence)
+            .map_err(ReconcileError::AdapterPreflightFailed)?;
+    }
+    Ok(())
+}
+
 fn stable_failure_code(failure: &AdapterFailure) -> StableId {
     StableId::parse(failure.code.clone())
         .unwrap_or_else(|_| StableId::parse("adapter_failure").expect("static stable ID"))
@@ -2035,18 +2069,26 @@ fn validate_receipt_plan_binding(plan: &Plan, receipt: &RunReceipt) -> Result<()
         return Err(ReconcileError::ReceiptPlanMismatch);
     }
 
+    let package_plan = plan.operations.iter().any(is_package_operation);
+    let package_receipt = receipt.schema_version.0 == PACKAGE_RECEIPT_SCHEMA_VERSION
+        && receipt.contract_version == PACKAGE_RECEIPT_CONTRACT_VERSION
+        && receipt.package_authorization.is_some();
+    if package_plan && !package_receipt {
+        return Err(ReconcileError::ReceiptPlanMismatch);
+    }
+
     let exact_version = receipt.schema_version == plan.schema_version
         && receipt.contract_version == plan.contract_version;
     let package_receipt_upgrade = plan.schema_version.0 == FORWARD_SCHEMA_VERSION
         && plan.contract_version == FORWARD_CONTRACT_VERSION
         && receipt.schema_version.0 == PACKAGE_RECEIPT_SCHEMA_VERSION
         && receipt.contract_version == PACKAGE_RECEIPT_CONTRACT_VERSION
-        && receipt.package_authorization.is_some();
+        && package_receipt;
     if !exact_version && !package_receipt_upgrade {
         return Err(ReconcileError::ReceiptPlanMismatch);
     }
 
-    if package_receipt_upgrade {
+    if package_plan || package_receipt_upgrade {
         let authorization = receipt
             .package_authorization
             .as_ref()
