@@ -2694,7 +2694,13 @@ impl ProductionSyncDomain {
         // immutable plans, but only when the binding is exactly the trusted
         // legacy authority for this configured target.
         if config.target.os.eq_ignore_ascii_case("darwin") {
-            let legacy = self.configured_package_authority(&config.target, config)?;
+            let mut legacy_target = config.target.clone();
+            // The old planner preserved Darwin as the OS alias but already
+            // canonicalized its architecture (amd64 -> x86_64, aarch64 ->
+            // arm64) before hashing the authority.
+            legacy_target.arch =
+                canonical_package_architecture(&legacy_target.os, &legacy_target.arch)?;
+            let legacy = self.configured_package_authority(&legacy_target, config)?;
             if expected_digest == Some(legacy.digest()) {
                 return Ok(legacy);
             }
@@ -6392,7 +6398,7 @@ mod package_resolution_tests {
             distro_id: None,
             distro_version: None,
             codename: None,
-            arch: "x86_64".into(),
+            arch: "amd64".into(),
             libc: None,
             manager_prefix: Some("/Users/al/.nvm".into()),
         };
@@ -6432,7 +6438,7 @@ mod package_resolution_tests {
             }),
             relay_endpoint: None,
         };
-        let domain = ProductionSyncDomain {
+        let mut domain = ProductionSyncDomain {
             config,
             plan_store: Arc::new(PlanStore::open(root.join("plans")).unwrap()),
             receipt_root: root.join("receipts"),
@@ -6440,14 +6446,29 @@ mod package_resolution_tests {
         };
         let registry =
             package_source_registry(domain.config.package_resolution.as_ref().unwrap()).unwrap();
+        let mut legacy_target = target.clone();
+        legacy_target.arch = "x86_64".into();
         let legacy_authority =
-            PackageResolutionAuthority::new(&target, &manager, &registry, &policy).unwrap();
+            PackageResolutionAuthority::new(&legacy_target, &manager, &registry, &policy).unwrap();
 
         let verified = domain
             .configured_package_authority_for_verify(Some(legacy_authority.digest()))
             .unwrap();
         assert_eq!(verified.digest(), legacy_authority.digest());
         assert_eq!(verified.target().os, "darwin");
+
+        let mut aarch_target = target.clone();
+        aarch_target.arch = "aarch64".into();
+        domain.config.package_resolution.as_mut().unwrap().target = aarch_target;
+        domain.config.target_platform.as_mut().unwrap().architecture = "aarch64".into();
+        legacy_target.arch = "arm64".into();
+        let aarch_authority =
+            PackageResolutionAuthority::new(&legacy_target, &manager, &registry, &policy).unwrap();
+        let verified_aarch = domain
+            .configured_package_authority_for_verify(Some(aarch_authority.digest()))
+            .unwrap();
+        assert_eq!(verified_aarch.digest(), aarch_authority.digest());
+        assert_eq!(verified_aarch.target().os, "darwin");
         assert!(
             domain
                 .configured_package_authority_for_verify(Some(
