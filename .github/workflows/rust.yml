@@ -29,7 +29,7 @@ concurrency:
 env:
   # The same dir rcargo's worker uses. This is what collapses what used to be
   # 86.7G of per-worktree target/ dirs into a single cache.
-  CARGO_TARGET_DIR: /root/.cargo/shared-target
+  CARGO_TARGET_DIR: /srv/cargo-target
   CARGO_TERM_COLOR: always
   # Incremental artifacts are large and worthless across machines/refs; they
   # were a major contributor to the disk blowup.
