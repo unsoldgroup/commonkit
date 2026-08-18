@@ -1,0 +1,65 @@
+# Rust CI on the Hostinger self-hosted runner.
+#
+# This is the committed-ref half of the "never build on the Mac" setup. The
+# other half is `rcargo`, which rsyncs a dirty worktree to the same box for
+# compile checks without a commit. Both write into the SAME shared target dir,
+# so a CI run warms the cache for the next rcargo run and vice versa.
+#
+# Why self-hosted rather than GitHub-hosted: the shared target dir persists
+# between runs, so a typical build is incremental instead of a cold 3-minute
+# compile. It also keeps Rust builds off the Mac, which is the whole point —
+# ~/.cargo/shared-target had reached 17G locally before this existed.
+name: Rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:      # so it can be triggered from a phone via `gh workflow run`
+
+permissions:
+  contents: read
+
+# One shared target dir on one box: concurrent jobs on the same ref would
+# contend on cargo's build lock and just serialise with worse output.
+concurrency:
+  group: rust-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The same dir rcargo's worker uses. This is what collapses what used to be
+  # 86.7G of per-worktree target/ dirs into a single cache.
+  CARGO_TARGET_DIR: /root/.cargo/shared-target
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are large and worthless across machines/refs; they
+  # were a major contributor to the disk blowup.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  check:
+    runs-on: [self-hosted, hostinger-rust]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        run: cargo --version && rustc --version
+
+      - name: Check
+        run: cargo check --workspace --all-targets
+
+      - name: Clippy
+        # Non-blocking for now: turn `continue-on-error` off once the existing
+        # lint backlog is clear, otherwise every PR goes red on pre-existing work.
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Report target dir size
+        if: always()
+        run: |
+          echo "### Shared target dir" >> "$GITHUB_STEP_SUMMARY"
+          du -sh "$CARGO_TARGET_DIR" 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
+          df -h / | tail -1 >> "$GITHUB_STEP_SUMMARY"
