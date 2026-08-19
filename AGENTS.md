@@ -39,3 +39,18 @@ pnpm --dir apps/desktop typecheck
 
 Installed lifecycle and release commands are documented in
 `docs/RELEASING.md`. GitHub-hosted status is never required.
+
+## Done status
+
+Al must never have to guess whether the work is finished. This rule applies to
+Claude, Codex, and every delegated agent. End every task response with one of
+these status lines as the final line:
+
+```
+✅ READY TO CLOSE - ALL DONE — <what is finished>
+🚧 NOT DONE — <the single next step, and what is blocking it if anything>
+```
+
+Use `✅ READY TO CLOSE - ALL DONE` only when the requested changes are finished,
+the relevant checks passed, and no follow-up work remains. Otherwise use
+`🚧 NOT DONE` and name the single next step or blocker.

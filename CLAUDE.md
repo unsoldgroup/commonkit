@@ -14,6 +14,21 @@ CommonKit does not use GitHub Actions.
 - Keep validation and release logic in repository scripts so the same commands
   can run interactively or on a manually invoked platform runner.
 
+## Done status
+
+Al must never have to guess whether the work is finished. This rule applies to
+Claude, Codex, and every delegated agent. End every task response with one of
+these status lines as the final line:
+
+```
+✅ READY TO CLOSE - ALL DONE — <what is finished>
+🚧 NOT DONE — <the single next step, and what is blocking it if anything>
+```
+
+Use `✅ READY TO CLOSE - ALL DONE` only when the requested changes are finished,
+the relevant checks passed, and no follow-up work remains. Otherwise use
+`🚧 NOT DONE` and name the single next step or blocker.
+
 ## Required local checks
 
 For relevant changes, run:
