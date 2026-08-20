@@ -12,13 +12,18 @@ a remote host, or from solo work to a shared team repository. CommonKit keeps
 the source portable while adapters translate it into each agent's native
 configuration.
 
+> [!IMPORTANT]
+> The `commonkit` CLI is the primary product surface and recommended onboarding
+> path. The CommonKit desktop GUI is an alpha release for evaluation and
+> feedback.
+
 [Explore CommonKit](https://unsoldgroup.github.io/commonkit/) ·
 [Read the Unsold.Group case study](docs/case-study-unsold-group.md) ·
-[Install from npm](#clean-machine-source-install)
+[Install the CLI from npm](#install-the-cli)
 
-![CommonKit 0.2.0 status panel showing observed skills, devices, agent sessions, and an explicitly unchecked drift state.](docs/assets/commonkit-status-0.2.0.webp)
+![CommonKit 0.2.0 alpha desktop status panel showing observed skills, devices, agent sessions, and an explicitly unchecked drift state.](docs/assets/commonkit-status-0.2.0.webp)
 
-_Verified installed state on macOS; the local target name is anonymized for publication._
+_Alpha desktop build on macOS; the local target name is anonymized for publication._
 
 ## Context should travel
 
@@ -94,11 +99,7 @@ plane.
 - Plans bind desired, observed, policy, provider-input, ownership, and artifact
   digests. A changed input rejects an approved plan as stale.
 
-## Clean-machine source install
-
-Requirements are Rust 1.85+, Node.js 24+, pnpm 10.28.2, Git, and SSH. APM and
-chezmoi are optional until a loadout selects them; CommonKit validates their
-exact configured versions before use.
+## Install the CLI
 
 For a normal CLI and daemon installation, use the public npm package:
 
@@ -109,12 +110,23 @@ commonkit daemon install
 commonkit daemon start
 ```
 
-The npm launcher selects the matching native Rust package for the current OS
-and architecture, verifies its executables by SHA-256, and exposes
-`commonkit`, `commonkitd`, and `commonkit-target-helper`. The signed desktop
-application remains a separate native download.
+The CLI is CommonKit's primary release path. The npm launcher selects the
+matching native Rust package for the current OS and architecture, verifies its
+executables by SHA-256, and exposes `commonkit`, `commonkitd`, and
+`commonkit-target-helper`. The desktop GUI is an alpha release distributed
+separately as a native download.
+
+Node.js 24 or newer is the current npm bootstrap requirement. Git, SSH, an
+authenticated GitHub CLI, and at least one authenticated agent client are
+needed for normal kit onboarding. CommonKit should carry most of the longer
+agent-tool list through opt-in loadouts; the exact current and proposed
+ownership boundary is in [`docs/BOOTSTRAP.md`](docs/BOOTSTRAP.md).
 
 To build CommonKit from source instead:
+
+Source requirements are Rust 1.85+, Node.js 24+, pnpm 10.28.2, Git, and SSH.
+APM and chezmoi are optional until a loadout selects them; CommonKit validates
+their exact configured versions before use.
 
 ```sh
 git clone https://github.com/unsoldgroup/commonkit.git
@@ -131,28 +143,15 @@ For unattended operation, run `commonkit daemon install` and `commonkit daemon s
 [the service guide](docs/DAEMON-SERVICE.md). SSH targets use the separately packaged helper in
 [the target-helper guide](docs/TARGET-HELPER.md).
 
-## Onboarding
+## CLI-first onboarding
 
-GUI, solo CLI, and agent-assisted setup all use the same onboarding core. It
-validates repository ownership, non-overlapping private and managed roots,
-layer IDs, provider pins and inputs, and publication consent before making an
-external change. Successful onboarding always produces a first plan for review;
-it does not apply that plan.
+The CLI is the recommended setup path. CLI, agent-assisted, and desktop GUI
+onboarding use the same core validation: repository ownership, non-overlapping
+private and managed roots, layer IDs, provider pins and inputs, and publication
+consent. Successful onboarding always produces a first plan for review; it does
+not apply that plan.
 
-### GUI onboarding
-
-Open CommonKit from the menu bar and choose **Get started**. The four-step setup connects your
-GitHub account, creates or connects a private setup repository, names this computer, and starts
-with a safe managed folder. Existing APM or chezmoi settings are optional advanced imports.
-CommonKit prepares a preview first; it does not change the selected folder until you review and
-explicitly apply that plan.
-
-The development build uses the installed GitHub CLI as its credential broker. If you are already
-signed in with `gh`, CommonKit detects that account. Otherwise **Sign in with GitHub** opens the
-browser flow and copies its one-time code for you to paste. Tokens remain in GitHub CLI's native
-credential storage and are never returned to the desktop webview.
-
-### Solo CLI onboarding
+### CLI onboarding
 
 The daemon creates private, platform-native config and state roots plus a
 0600/ACL-protected control token. In a second terminal, create or connect a kit:
@@ -189,6 +188,24 @@ portable registration before asking for approval. The agent must not add
 creation or registration push. After initialization, it should show the
 machine-readable JSON result and the read-only first plan, then stop again
 before any `commonkit apply ... --confirmed`.
+
+### Desktop GUI onboarding (alpha)
+
+The desktop GUI is an alpha release. Use it for evaluation and feedback; use
+the CLI for the primary supported onboarding path.
+
+Open CommonKit from the menu bar and choose **Get started**. The four-step
+setup connects your GitHub account, creates or connects a private setup
+repository, names this computer, and starts with a safe managed folder.
+Existing APM or chezmoi settings are optional advanced imports. CommonKit
+prepares a preview first; it does not change the selected folder until you
+review and explicitly apply that plan.
+
+The alpha build uses the installed GitHub CLI as its credential broker. If you
+are already signed in with `gh`, CommonKit detects that account. Otherwise
+**Sign in with GitHub** opens the browser flow and copies its one-time code for
+you to paste. Tokens remain in GitHub CLI's native credential storage and are
+never returned to the desktop webview.
 
 ## About Me profile
 
@@ -254,33 +271,55 @@ Snapshot restore similarly stages and authenticates the snapshot and target
 preimage, coordinates configured service stop/start commands, and resumes or
 rolls back an interrupted transaction on daemon restart.
 
-## Session Board
+## Optional Session Board
 
-The Session Board is CommonKit's glanceable approval surface: a hub on the
-always-on VPS serves `https://board.unsold.cloud` (tailnet-only) while
-per-machine reporters dial out over WebSocket, streaming every Claude, Codex,
-and Orca session plus the decisions they are waiting on. Approval cards answer
-who/what/why (project, operation, agent intent from the transcript) with the
-exact payload, and offer Allow, Always (persists a previewed project-local
-permission rule through Claude Code's own `updatedPermissions` mechanism), and
-Deny with an optional steer message delivered to the owning Orca terminal.
-Every decision is a human tap and every failure path fails open to the normal
-terminal prompt (`docs/adr/0008`, `docs/adr/0009`). Code lives in
+The Session Board is an optional, glanceable human-approval surface. It is not
+required to install or use CommonKit, the CLI, the daemon, or normal Claude and
+Codex permission prompts. Teams may deploy the reference hub-and-spoke service
+on infrastructure they control when they want remote approval cards for active
+agent sessions.
+
+Approval cards answer who, what, and why with the exact pending payload. Every
+decision is a human action. The board never auto-approves, and every failure
+path returns to the agent client's normal terminal prompt (`docs/adr/0008`,
+`docs/adr/0009`). Code lives in
 [`apps/session-board`](apps/session-board) and
 [`packages/session-board-protocol`](packages/session-board-protocol); the
 operations runbook, including deploy scripts, web push, and token rotation, is
 [`docs/session-board.md`](docs/session-board.md), and the domain glossary is in
 `CONTEXT.md`.
 
-## Persistent MCP relay
+## Optional Cloudflare integration
+
+Cloudflare is not required for CommonKit, the CLI, the daemon, or normal agent
+permission prompts. Teams may use two independent Cloudflare services:
+
+- A **Cloudflare MCP server portal** is the preferred way to consolidate
+  eligible remote HTTP MCP servers behind one endpoint, Access policy, curated
+  tool exposure, context optimization, and centralized logs.
+- **Cloudflare Tunnel and Access** protect the optional Session Board. Board
+  users must authenticate through GitHub as the Access identity provider; do
+  not expose the browser surface with One-time PIN or an open policy.
+
+CommonKit remains the source of truth for desired state, grants, credential
+references, and receipts. The Cloudflare portal is a replaceable data plane,
+and the portal adapter is designed but not yet shipped. The complete ownership,
+setup, security, and fallback model is in
+[`docs/CLOUDFLARE.md`](docs/CLOUDFLARE.md).
+
+## Local MCP relay fallback
 
 The Rust daemon owns a loopback-only, bearer-authenticated MCP endpoint at
-`http://127.0.0.1:3764/mcp`. APM owns portable MCP declarations and generated
-client configuration; CommonKit translates those declarations into persistent
-relay desired state and applies relay changes transactionally. The legacy Node
-`mcp-local-relay` package remains in `packages/mcp-local-relay` during
-migration, with shared black-box compatibility fixtures covering initialization,
-tool listing and calls, errors, bounded responses, health, and legacy config.
+`http://127.0.0.1:3764/mcp`. Use it for stdio, local, private, offline, and
+portal-incompatible capabilities. It is the less-preferred aggregation path for
+ordinary remote HTTP servers when a Cloudflare portal is available.
+
+APM owns portable MCP declarations and generated client configuration;
+CommonKit translates those declarations into relay desired state and applies
+relay changes transactionally. The legacy Node `mcp-local-relay` package
+remains in `packages/mcp-local-relay` during migration, with shared black-box
+compatibility fixtures covering initialization, tool listing and calls, errors,
+bounded responses, health, and legacy config.
 
 ## Development and verification
 

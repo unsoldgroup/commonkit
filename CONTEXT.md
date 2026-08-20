@@ -169,6 +169,14 @@ _Avoid_: MCP relay, tool registry
 The replaceable local or hosted transport through which agents discover and invoke authorized capabilities.
 _Avoid_: Context plane, source of truth
 
+**MCP server portal**:
+The Cloudflare-hosted capability data plane preferred for eligible remote HTTP MCP servers, with one endpoint, Access policy, curated tool exposure, and remote-call logs.
+_Avoid_: Canonical registry, local MCP bridge
+
+**Device relay**:
+The Target-local compatibility data plane for stdio, local, private, offline, and portal-incompatible capabilities.
+_Avoid_: Organization identity provider, canonical registry
+
 **Upstream publication**:
 An explicit user-authorized act that shares selected user-owned context with the organization.
 _Avoid_: Sync back, telemetry
@@ -423,9 +431,9 @@ _Avoid_: Theme, wave, batch, campaign
 - Machine-enforceable organization and project controls are compiled into CommonKit policy and apply independently of prompt contents.
 - Human-readable procedures may be retrieved on demand; an operation governed only by a procedure remains blocked until the agent retrieves that procedure.
 - The **Context plane** and **Capability control plane** remain owned by CommonKit and independent of any relay or hosted gateway.
-- The **Capability data plane** uses a persistent device relay as the default agent endpoint for local, stdio, offline, and private capabilities.
-- An organization may add a hosted MCP portal adapter for remote, organization-governed capabilities without making that portal the canonical registry.
-- The device relay may route organization-governed remote calls through the selected hosted portal while keeping device-private calls local.
+- The **Capability data plane** prefers an **MCP server portal** for eligible remote, organization-governed HTTP capabilities without making that portal the canonical registry.
+- The **Device relay** remains the compatibility endpoint for local, stdio, offline, private, and portal-incompatible capabilities.
+- A client may use both stable endpoints. Routing portal calls through the **Device relay** is a less-preferred compatibility mode for clients that cannot hold both.
 - User-owned context remains private unless the user performs an explicit **Upstream publication**.
 - **Upstream publication** creates a separate, reviewed **Generalized contribution** and never transfers ownership of the source personal record.
 - The user reviews the exact **Generalized contribution** before submission; the source profile field and value remain private.
@@ -491,7 +499,7 @@ _Avoid_: Theme, wave, batch, campaign
 - A **Grant** resolves to Git-owned content plus a live graph edge. Content reachable in Git is not granted without an edge, and an edge whose content is absent is unresolved rather than an error.
 - Revoking a **Grant** takes effect at the graph, not at the grantee's next pull.
 - **Reconciliation** never treats secrets or machine identity as portable CommonKit content.
-- **mcp-local-relay** is an independently publishable package in the CommonKit repository. It remains the MCP data plane; CommonKit owns desired-state composition and reconciliation.
+- **mcp-local-relay** is an independently publishable package in the CommonKit repository. It remains the **Device relay** compatibility data plane; CommonKit owns desired-state composition and reconciliation.
 - A GitHub repository is the durable store for portable, reviewable CommonKit state. Secrets and mutable database files do not belong in Git.
 - A local CommonKit service exposes peer interfaces for the macOS status bar, CLI, and MCP tools. The status bar does not communicate through MCP.
 - The version 1 runtime is implemented in Rust and shared by the CLI, local service, MCP server, and Tauri 2 desktop application. The existing TypeScript reconciliation engine and `mcp-local-relay` runtime are migration sources, not permanent sidecars.
@@ -518,7 +526,7 @@ _Avoid_: Theme, wave, batch, campaign
 - "Profile" described a selected subset; resolved: use **Loadout** unless later user research favors a more conventional term.
 - "Profile" is now valid only as **User profile**, the user-owned structured context produced by interview; it does not mean **Loadout**.
 - Organization initiation does not imply organization ownership of personal context; resolved: users own their **User context** and sharing upstream requires explicit publication.
-- MCP scaling was initially framed as local relay versus hosted gateway; resolved: CommonKit uses a hybrid **Capability data plane**, with the device relay as the default endpoint and hosted portals as optional organization adapters.
+- MCP scaling was initially framed as local relay versus hosted gateway; resolved: CommonKit uses a hybrid **Capability data plane**, preferring a Cloudflare **MCP server portal** for eligible remote HTTP capabilities and retaining the **Device relay** for local and incompatible capabilities (ADR 0024).
 - CommonKit-owned accounts versus external identity was initially open; resolved for version 1: GitHub bootstraps **Organization membership**, behind a replaceable identity-provider boundary.
 - Personal-context recovery was initially open; resolved: users receive both an offline recovery key and a password-manager-provisioned encrypted recovery identity, while organizations receive neither.
 - Personal-context encryption granularity was initially open; resolved: use partially encrypted structured files with canonical schema field names visible for reviewable Git history and pre-authorization discovery while acknowledging metadata leakage.
@@ -574,9 +582,9 @@ The first portable-context release delivers the complete private-context loop:
 6. Deterministic task briefs, on-demand context retrieval, and compiled policy enforcement.
 7. Project-and-purpose grants targeting organization-defined agent trust classes.
 8. Audience-specific context receipts, revocation, and bounded deletion.
-9. The persistent device relay as the default capability endpoint.
+9. The persistent **Device relay** as the local and compatibility capability endpoint.
 
-Generalized upstream contributions and the hosted Cloudflare MCP portal adapter are designed but deferred to the next release.
+Generalized upstream contributions and the preferred Cloudflare **MCP server portal** adapter are designed but deferred to the next release. Until that adapter ships, operators provision the portal separately and the **Device relay** remains the operational fallback.
 
 ## Version 1 contract
 
@@ -599,7 +607,7 @@ Version 1 supports macOS, Linux, and Windows as first-class managed targets. Eve
 
 ## Session Board
 
-The Session Board is CommonKit's glanceable approval surface: a hub on the always-on VPS (`board.unsold.cloud`, tailnet-only) fed by per-machine reporters, showing every Claude/Codex/Orca session and the decisions they are waiting on.
+The Session Board is an optional glanceable approval surface: a private-origin hub fed by per-machine reporters, with browser access protected by Cloudflare Access using GitHub as its identity provider. It shows the Claude/Codex/Orca sessions and decisions an authorized user is allowed to see.
 
 **Glossary**
 - **Pending action**: a decision a human owes a session — a Claude permission prompt, a Codex numbered option prompt, or an Orca gate.

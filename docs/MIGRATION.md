@@ -8,9 +8,20 @@ Existing native Claude and Codex declarations remain supported during migration.
 
 Chezmoi sources may migrate ordinary files, directories, modes, safe relative symlinks, and isolation-safe templates. Scripts, hooks, externals, destination-dependent behavior, `create_`, `modify_`, exact/removal semantics, provider secret access, and executable/network template functions must move to explicit CommonKit services, credentials, or native resources until parity is proven.
 
-## MCP relay
+## MCP data plane
 
-Portable MCP declarations describe upstream intent. CommonKit owns the persistent relay at its stable loopback endpoint and generates client configuration pointing to it. Existing unmanaged relay entries are preserved; pruning CommonKit-owned entries requires an approved plan. Literal credential headers must become references.
+Portable MCP declarations describe upstream intent. Move eligible remote HTTP
+servers to a Cloudflare MCP server portal when centralized Access policy, tool
+curation, context optimization, and logs are wanted. Keep stdio, local, private,
+offline, and portal-incompatible servers on CommonKit's stable loopback relay.
+The portal is the preferred remote aggregation path; the relay is the
+compatibility fallback.
+
+The Cloudflare adapter is designed but not shipped, so portal provisioning is
+currently an explicit operator step. Existing unmanaged relay entries are
+preserved; pruning CommonKit-owned entries requires an approved plan. Literal
+credential headers must become references. Neither data plane replaces
+CommonKit's canonical declarations, grants, plans, or receipts.
 
 ## Portable state and databases
 
@@ -51,4 +62,10 @@ macOS link inventory or native lifecycle.
 
 ## Release and update migration
 
-Choose an explicit update channel and review its signed release notes before migration. Do not switch an existing installation to desktop auto-update until updater metadata signature verification and rollback guidance have been exercised on that platform. Standalone CLI users update through the matching signed release artifact; installers must preserve portable kit data by default while removing application-managed services and startup entries on uninstall.
+Choose an explicit update channel and review its signed release notes before
+migration. The standalone CLI is the primary migration path. The desktop GUI is
+alpha; do not switch an existing installation to desktop auto-update until
+updater metadata signature verification and rollback guidance have been
+exercised on that platform. CLI users update through the matching signed
+release artifact. Installers must preserve portable kit data by default while
+removing application-managed services and startup entries on uninstall.

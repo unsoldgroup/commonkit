@@ -4,40 +4,59 @@ CommonKit does not use GitHub Actions. Releases are assembled from a trusted
 release workstation and validated on manually invoked platform runners. No
 GitHub-hosted workflow, check, billing state, or status is a release gate.
 
-## Release gate
+## Release channels
 
-A release requires:
+The standalone CLI is CommonKit's primary release channel. A CLI release does
+not wait for a desktop artifact. The desktop GUI is a separate alpha channel
+for evaluation and feedback.
+
+### Primary CLI release gate
+
+A CLI release requires:
+
+- standalone `commonkit`, `commonkitd`, and `commonkit-target-helper` binaries
+  for every supported platform;
+- SHA-256 checksums, an SPDX SBOM, and release notes for every payload; and
+- native install → reconcile → verify → snapshot/restore → recover → update →
+  uninstall evidence from every platform claimed by that release.
+
+### Desktop GUI alpha gate
+
+A desktop alpha release additionally requires:
 
 - a signed and notarized universal macOS application;
 - a signed Windows NSIS installer;
 - Linux AppImage and Debian packages;
-- a standalone CLI for every supported platform;
-- SHA-256 checksums, an SPDX SBOM, release notes, and detached Tauri updater
-  signatures for every updater payload; and
-- native install → reconcile → verify → snapshot/restore → recover → update →
-  uninstall evidence from macOS, Linux, and Windows.
+- detached Tauri updater signatures and explicit alpha release notes for every
+  updater payload; and
+- the desktop install, onboarding, update, rollback, and uninstall evidence for
+  each platform named by the alpha release.
 
 The release process fails closed when any code-signing, notarization,
 updater-signing, endpoint, checksum, signature, SBOM, or native lifecycle input
-is absent or invalid. Secrets stay in the operator's secret store and are
-injected only into the release command; they are never committed or logged.
+required by the selected channel is absent or invalid. Secrets stay in the
+operator's secret store and are injected only into the release command; they
+are never committed or logged.
 
 ## Manual release procedure
 
 1. Check out the exact version tag on the trusted release workstation.
 2. Run the complete local test and lint commands from `CLAUDE.md`.
 3. On each native platform or manually invoked platform runner, build the
-   desktop and standalone CLI with the repository scripts:
-   `scripts/build-release-cli.sh`, `scripts/stage-desktop-sidecars.sh`, and the
-   Tauri build command.
-4. Sign and notarize the native artifacts using the platform release identity.
-5. Collect artifacts with `scripts/collect-release-assets.sh`.
-6. Validate configuration with `scripts/prepare-release-config.mjs`.
-7. Generate checksums with `scripts/checksum-release-assets.sh`, generate the
+   primary CLI artifacts with `scripts/build-release-cli.sh`.
+4. For a desktop alpha candidate, also run
+   `scripts/stage-desktop-sidecars.sh` and the Tauri build command.
+5. Sign and notarize the artifacts required by the selected release channel
+   using the platform release identity.
+6. Collect desktop alpha artifacts with `scripts/collect-release-assets.sh`
+   when that channel is selected.
+7. Validate configuration with `scripts/prepare-release-config.mjs`.
+8. Generate checksums with `scripts/checksum-release-assets.sh`, generate the
    updater manifest with `scripts/assemble-updater-manifest.mjs`, and validate
-   the complete set with `scripts/verify-release-assets.mjs`.
-8. Publish the two versioned release candidates to the chosen artifact store.
-9. Set `COMMONKIT_QUALIFICATION_COMMIT` to the exact source commit and run
+   any desktop alpha set with `scripts/verify-release-assets.mjs`.
+9. Publish the versioned candidates for the selected channel to the chosen
+   artifact store.
+10. Set `COMMONKIT_QUALIFICATION_COMMIT` to the exact source commit and run
    `scripts/qualify-eight-flows.sh <evidence-root> <installed-bin>` on macOS,
    Linux, and Windows. It executes `scripts/installed-lifecycle.sh` in an
    isolated scratch directory and records the native platform, architecture,
@@ -47,7 +66,7 @@ injected only into the release command; they are never committed or logged.
    `docs/evidence/portable-context/<platform>.json` for the exact release
    revision. Its `repositoryRevision` is SHA-256 of the 40-character commit
    string, not the Git object ID itself.
-10. Record the platform, architecture, artifact digests, commands, and results
+11. Record the platform, architecture, artifact digests, commands, and results
     in the release evidence.
 
 The local updater fixture does not use a production updater identity.

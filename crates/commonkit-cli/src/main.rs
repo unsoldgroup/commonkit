@@ -396,16 +396,21 @@ enum SnapshotCommand {
 
 #[derive(Subcommand)]
 enum InitCommand {
+    /// Create a new portable kit repository and register this target.
     Create(InitArgs),
+    /// Connect this target to an existing portable kit repository.
     Connect(InitArgs),
 }
 
 #[derive(clap::Args)]
 struct InitArgs {
+    /// GitHub repository in OWNER/NAME form.
     #[arg(long)]
     repository: String,
+    /// Local directory for the portable kit checkout.
     #[arg(long)]
     kit_directory: PathBuf,
+    /// Loadout ID to activate on this target.
     #[arg(long)]
     loadout: String,
     /// Optional project-loadout layer ID, applied after the personal kit.
@@ -414,8 +419,10 @@ struct InitArgs {
     /// Optional target-override layer ID, applied last.
     #[arg(long)]
     target_override: Option<String>,
+    /// Stable ID for this managed target.
     #[arg(long)]
     target: String,
+    /// Root directory CommonKit may manage on this target.
     #[arg(long)]
     target_root: PathBuf,
     /// Desired-state provider used by this loadout.
@@ -424,19 +431,25 @@ struct InitArgs {
     /// Exact provider version (required for APM and chezmoi).
     #[arg(long)]
     provider_version: Option<String>,
+    /// Absolute path to the pinned provider executable.
     #[arg(long)]
     provider_executable: Option<PathBuf>,
+    /// Absolute path to the APM manifest to import.
     #[arg(long)]
     apm_manifest: Option<PathBuf>,
+    /// Absolute path to the APM lockfile to import.
     #[arg(long)]
     apm_lockfile: Option<PathBuf>,
+    /// Absolute path to the APM policy file to import.
     #[arg(long)]
     apm_policy: Option<PathBuf>,
+    /// Absolute path to the chezmoi source directory to import.
     #[arg(long)]
     chezmoi_source: Option<PathBuf>,
+    /// Absolute path to the chezmoi configuration file to import.
     #[arg(long)]
     chezmoi_config: Option<PathBuf>,
-    /// Commit and push the portable target registration (required for connect).
+    /// Allow CommonKit to create or update the repository, then commit and push the target registration. Required for both create and connect.
     #[arg(long)]
     publish_registration: bool,
 }

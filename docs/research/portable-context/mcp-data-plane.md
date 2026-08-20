@@ -10,9 +10,10 @@ Use a hybrid architecture with three explicit planes:
 2. **Capability control plane — CommonKit-owned.** Resolves MCP servers, tools,
    grants, credentials references, and desired state from layered CommonKit
    inputs.
-3. **Capability data plane — replaceable adapters.** A persistent device relay
-   handles local/private capabilities. An optional organization portal handles
-   remote organization-governed MCPs.
+3. **Capability data plane — replaceable adapters.** A Cloudflare MCP server
+   portal is preferred for eligible remote organization-governed MCPs. A
+   persistent device relay handles local, stdio, private, offline, and
+   portal-incompatible capabilities.
 
 Cloudflare calls its current hosted product **MCP server portals**. “Agents
 Gateway” is an obsolete name. Cloudflare Gateway is a separate Zero Trust/DLP
@@ -64,10 +65,12 @@ stdio/local/private        remote/org-governed
        correlated CommonKit receipt
 ```
 
-The client should normally connect to the device relay. The relay can route an
-organization-governed remote capability through the configured portal while
-keeping local capabilities local. Direct portal connection may remain an
-explicit thin-client mode.
+The client should normally connect directly to the organization portal for
+eligible remote HTTP capabilities and to the device relay for local or
+incompatible capabilities. A loadout may therefore expose two stable endpoints.
+The relay can proxy a portal only for clients that cannot hold both endpoints;
+that compatibility mode is less preferred because it adds another hop and
+failure boundary.
 
 ## Constraints to verify in a spike
 
