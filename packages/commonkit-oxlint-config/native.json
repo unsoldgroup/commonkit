@@ -1,0 +1,12 @@
+{
+  "plugins": ["typescript", "unicorn", "import", "promise", "node"],
+  "rules": {
+    "no-debugger": "error"
+  },
+  "overrides": [
+    {
+      "files": ["**/*.test.{js,cjs,mjs,ts,tsx}"],
+      "plugins": ["jest", "vitest"]
+    }
+  ]
+}

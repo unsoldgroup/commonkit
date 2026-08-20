@@ -1,0 +1,23 @@
+{
+  "name": "@commonkit/oxlint-config",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./native": "./native.json"
+  },
+  "files": [
+    "native.json",
+    "skills"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "peerDependencies": {
+    "oxlint": "1.79.0"
+  },
+  "scripts": {
+    "test": "node canary.mjs"
+  },
+  "license": "MIT"
+}
