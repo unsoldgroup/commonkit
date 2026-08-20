@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "extends": ["./packages/commonkit-oxlint-config/native.json"],
+  "categories": {
+    "correctness": "warn"
+  },
+  "env": {
+    "builtin": true,
+    "browser": true,
+    "node": true
+  },
+  "ignorePatterns": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/target/**",
+    "**/.vite/**",
+    "apps/desktop/src/bindings/**",
+    "packages/commonkit-oxlint-config/canary/**"
+  ],
+  "settings": {},
+  "options": {}
+}

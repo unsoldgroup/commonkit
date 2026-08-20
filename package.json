@@ -11,7 +11,8 @@
     "ci:desktop-typecheck": "pnpm install --frozen-lockfile && pnpm --dir apps/desktop typecheck",
     "build": "pnpm --filter mcp-local-relay build && pnpm --filter @commonkit/session-board-protocol build",
     "build:linear-graph": "pnpm --filter @commonkit/linear-graph-web build",
-    "test": "pnpm run test:commonkit && pnpm run test:relay && pnpm --filter @commonkit/session-board-protocol build && pnpm run test:session-board-protocol && pnpm run test:session-board-hub && pnpm run test:session-board-reporter && pnpm run test:session-board-hook && pnpm run test:session-board-web",
+    "lint:oxlint": "oxlint --config .oxlintrc.json apps packages scripts src test",
+    "test": "pnpm run test:commonkit && pnpm run test:relay && pnpm --filter @commonkit/session-board-protocol build && pnpm run test:session-board-protocol && pnpm run test:session-board-hub && pnpm run test:session-board-reporter && pnpm run test:session-board-hook && pnpm run test:session-board-web && pnpm run test:oxlint-canary",
     "test:commonkit": "node --test test/*.test.mjs",
     "test:relay": "pnpm --filter mcp-local-relay test",
     "test:session-board-protocol": "pnpm --filter @commonkit/session-board-protocol test",
@@ -20,8 +21,12 @@
     "test:session-board-hook": "pnpm --filter @commonkit/session-board-hook test",
     "test:session-board-web": "pnpm --filter @commonkit/session-board-web test",
     "test:linear-graph": "pnpm --filter @commonkit/linear-graph-protocol test && pnpm --filter @commonkit/linear-graph-hub test && pnpm --filter @commonkit/linear-graph-web test",
-    "typecheck": "pnpm --filter mcp-local-relay typecheck && pnpm --filter @commonkit/session-board-protocol typecheck && pnpm --filter @commonkit/session-board-reporter typecheck && pnpm --filter @commonkit/session-board-web typecheck",
+    "test:oxlint-canary": "pnpm --filter @commonkit/oxlint-config test",
+    "typecheck": "pnpm --filter @commonkit/session-board-protocol build && pnpm --filter mcp-local-relay typecheck && pnpm --filter @commonkit/session-board-protocol typecheck && pnpm --filter @commonkit/session-board-reporter typecheck && pnpm --filter @commonkit/session-board-web typecheck",
     "typecheck:linear-graph": "pnpm --filter @commonkit/linear-graph-protocol typecheck && pnpm --filter @commonkit/linear-graph-hub typecheck && pnpm --filter @commonkit/linear-graph-web typecheck"
+  },
+  "devDependencies": {
+    "oxlint": "1.79.0"
   },
   "engines": {
     "node": ">=24"

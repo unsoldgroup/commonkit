@@ -32,6 +32,7 @@ Run the relevant local suites directly. The standard complete check is:
 ```sh
 cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+pnpm run lint:oxlint
 pnpm test
 pnpm --dir apps/desktop test
 pnpm --dir apps/desktop typecheck

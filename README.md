@@ -287,6 +287,7 @@ tool listing and calls, errors, bounded responses, health, and legacy config.
 ```sh
 cargo test --workspace --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+pnpm run lint:oxlint
 pnpm typecheck
 pnpm test
 ```

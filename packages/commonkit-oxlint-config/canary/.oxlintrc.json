@@ -1,0 +1,13 @@
+{
+  "extends": ["../native.json"],
+  "categories": {
+    "correctness": "warn"
+  },
+  "env": {
+    "builtin": true,
+    "node": true
+  },
+  "ignorePatterns": ["ignored.js"],
+  "settings": {},
+  "options": {}
+}
