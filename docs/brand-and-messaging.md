@@ -16,6 +16,28 @@ policies, and credential references for each environment.
 **Enemy:** Fragmented manual setup. CommonKit composes APM, Chezmoi, SkillOpt,
 password managers, and MCP infrastructure; it does not position against them.
 
+## Interface priority
+
+The `commonkit` CLI is the primary product and release surface. Installation,
+onboarding, support, and release copy lead with the CLI.
+
+The desktop GUI is an alpha release for evaluation and feedback. Write
+“desktop GUI (alpha)” on its first mention. Do not present it as production
+ready, as a prerequisite, or as an equal release gate. It reuses the same core
+contracts but does not define CLI readiness.
+
+The Session Board is an optional approval surface. CommonKit, its CLI, its
+daemon, and normal client permission prompts work without it. Present the board
+as an opt-in reference deployment for teams that want remote, glanceable human
+approvals. If deployed, its browser surface is protected by Cloudflare Access
+using GitHub as the identity provider.
+
+Cloudflare integration is optional. Present a Cloudflare MCP server portal as
+the preferred aggregation path for eligible remote HTTP MCP servers. Present
+the local relay as the compatibility path for stdio, local, private, offline,
+and portal-incompatible capabilities. CommonKit remains the source of truth;
+neither data plane becomes the canonical registry.
+
 ## Message hierarchy
 
 1. **Carry context.** Move proven working context across agents, machines,
@@ -141,6 +163,10 @@ nostalgia. Use it selectively for status, actions, and proof.
 - Bitwarden Secrets Manager is the first native password-manager provider.
 - Native skill optimization produces isolated, reviewable candidates and
   requires human approval before promotion.
+- The CLI is CommonKit's primary product surface and recommended onboarding
+  path.
+- The desktop GUI is an alpha release.
+- The Session Board is optional.
 
 ### Qualify
 
@@ -159,6 +185,9 @@ nostalgia. Use it selectively for status, actions, and proof.
 - "Skills improve themselves."
 - "CommonKit replaces APM, Chezmoi, SkillOpt, or your password manager."
 - "One-click rollback" until installed-platform and snapshot recovery gates pass.
+- "The desktop GUI is production ready."
+- "The desktop GUI and CLI are equal release surfaces."
+- "The Session Board is required."
 
 ## Reader journey
 
@@ -170,5 +199,5 @@ nostalgia. Use it selectively for status, actions, and proof.
 5. Understand define → preview → apply → verify.
 6. Verify the safety limits and provider boundaries.
 7. See the real Unsold.Group multi-target case study.
-8. Configure one target and run a dry reconciliation.
+8. Configure one target through the CLI and run a dry reconciliation.
 9. Follow links into architecture, threat model, and provider details.

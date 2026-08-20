@@ -1,6 +1,6 @@
 # CommonKit
 
-Install the CommonKit Rust command-line runtime:
+Install CommonKit's primary Rust command-line runtime:
 
 ```sh
 npm install --global @alunsoldgroup/commonkit
@@ -12,5 +12,6 @@ The package installs `commonkit`, `commonkitd`, and
 Native executables are verified against their published SHA-256 digests before
 launch.
 
-The CommonKit desktop application is distributed separately as a signed native
-application. See <https://github.com/unsoldgroup/commonkit>.
+The CommonKit desktop GUI is a separate alpha release for evaluation and
+feedback. It is not required to use the CLI or daemon. See
+<https://github.com/unsoldgroup/commonkit>.

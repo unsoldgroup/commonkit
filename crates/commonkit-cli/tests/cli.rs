@@ -276,6 +276,56 @@ fn init_exposes_create_connect_and_rejects_malformed_repository_before_gh() {
 }
 
 #[test]
+fn init_help_explains_onboarding_without_external_documentation() {
+    for mode in ["create", "connect"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+            .args(["init", mode, "--help"])
+            .output()
+            .expect("init mode help");
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).expect("utf8");
+        assert!(
+            help.contains("GitHub repository in OWNER/NAME form"),
+            "{help}"
+        );
+        assert!(
+            help.contains("Local directory for the portable kit"),
+            "{help}"
+        );
+        assert!(help.contains("Loadout ID to activate"), "{help}");
+        assert!(help.contains("Stable ID for this managed target"), "{help}");
+        assert!(
+            help.contains("Root directory CommonKit may manage"),
+            "{help}"
+        );
+        assert!(
+            help.contains("Required for both create and connect"),
+            "{help}"
+        );
+    }
+
+    let create = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["init", "create", "--help"])
+        .output()
+        .expect("init create help");
+    assert!(
+        String::from_utf8(create.stdout)
+            .expect("utf8")
+            .starts_with("Create a new portable kit repository")
+    );
+
+    let connect = Command::new(env!("CARGO_BIN_EXE_commonkit"))
+        .args(["init", "connect", "--help"])
+        .output()
+        .expect("init connect help");
+    assert!(
+        String::from_utf8(connect.stdout)
+            .expect("utf8")
+            .starts_with("Connect this target to an existing portable kit repository")
+    );
+}
+
+#[test]
 fn composes_layers_and_explains_the_winning_value() {
     let directory = temporary_directory("cli-compose");
     fs::create_dir_all(&directory).expect("directory");

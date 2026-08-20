@@ -6,10 +6,12 @@
 
 web
 
-Tauri 2 desktop shell (WebView, no framework). macOS is the primary and first-class
-target; the same webview also ships on Linux and Windows. This is a native-feeling
-desktop application, not a website, but its design language is the app's own rather
-than a reproduction of AppKit.
+Tauri 2 desktop GUI (WebView, no framework). The GUI is an alpha release for
+evaluation and feedback. The `commonkit` CLI is the primary product and release
+surface. macOS is the alpha GUI's first-class target; the same webview can ship
+on Linux and Windows. This is a native-feeling desktop application, not a
+website, but its design language is the app's own rather than a reproduction of
+AppKit.
 
 ## Users
 
@@ -42,8 +44,9 @@ inspectable, content-bound plan with provenance and risk before it exists on dis
   with `gh` already authenticated.
 - Credential brokering goes through the installed GitHub CLI; tokens never return to
   the webview.
-- The app runs alongside a local background service (`commonkitd`) and a CLI
-  (`commonkit`); the desktop window is one of three equal surfaces onto the same core.
+- The app runs alongside the local background service (`commonkitd`). The
+  `commonkit` CLI is the primary complete control surface. The alpha desktop
+  reuses the same core and must not redefine CLI behavior or readiness.
 - The window is 1200x800, minimum 860x600. There is no mobile viewport.
 - The walkthrough is four steps: GitHub, this computer, existing settings, review.
 
@@ -85,7 +88,8 @@ inspectable, content-bound plan with provenance and risk before it exists on dis
 1. Nothing is applied without a reviewed, named plan and an explicit confirmation.
 2. Show what will happen before it happens; a preview is the product, not a courtesy.
 3. Secrets and personal context stay out of portable configuration and out of this window.
-4. The same core is reachable from CLI, daemon, and desktop; no surface hides a capability.
+4. The CLI is the primary complete control surface. The daemon and alpha
+   desktop reuse its core contracts without gating CLI releases.
 5. Portability is the promise; every screen should make the machine feel like one of many.
 
 ## Accessibility & Inclusion

@@ -1,6 +1,17 @@
 # Session Board deployment
 
-Session Board is a tailnet-only hub-and-spoke service. The Bun hub runs on the VPS Target and serves the board through Caddy at `https://board.unsold.cloud`. Each Mac Target runs one outbound reporter connection to the hub. The reporter reads Orca's local JSON-RPC WebSocket first and falls back to `orca worktree ps --json` every two seconds through the same state-source interface.
+> [!IMPORTANT]
+> Session Board is optional. CommonKit, the CLI, the daemon, and normal client
+> permission prompts work without it. Deploy the board only when a team wants
+> a remote, glanceable human-approval surface.
+
+Session Board is a private-origin hub-and-spoke reference deployment. The Bun
+hub runs on the VPS Target. Browser traffic reaches it through Cloudflare
+Tunnel and an Access application that uses GitHub as its identity provider.
+Each Mac Target runs one outbound reporter connection to the hub. The reporter
+reads Orca's local JSON-RPC WebSocket first and falls back to
+`orca worktree ps --json` every two seconds through the same state-source
+interface.
 
 State travels up to the hub. Decisions travel down to the reporter. An approval is acted on only after a human taps the board. Nothing auto-approves. If the Claude hook cannot reach the reporter or times out, it fails open to Claude's normal TUI prompt.
 
@@ -12,10 +23,15 @@ Clone this repository on both Targets. Use Bun and pnpm from the same non-root a
 
 On the VPS Target, install:
 
-- Bun, pnpm, Caddy, and a running system Caddy service.
+- Bun, pnpm, Caddy, `cloudflared`, and a running system Caddy service.
 - acme.sh at `~/.acme.sh/acme.sh` for the service user.
 - A Cloudflare API token with DNS edit access for the `unsold.cloud` zone (Cloudflare is the authoritative DNS; the Hostinger zone copy is not served).
 - `sudo` access for installing the Caddy certificate and site snippet and reloading Caddy.
+
+The Cloudflare Zero Trust account must have GitHub configured as an identity
+provider. Create the GitHub OAuth app and test the integration before opening
+the Board to users. The OAuth client secret stays in Cloudflare; it never enters
+the repository or the Board environment.
 
 The main `/etc/caddy/Caddyfile` must import the snippets directory once:
 
@@ -29,17 +45,24 @@ The VPS service is a systemd user service. Enable lingering so it starts at boot
 sudo loginctl enable-linger "$USER"
 ```
 
-On each Mac Target, install Bun, pnpm, Orca, and Tailscale. Confirm the Mac can resolve and reach `board.unsold.cloud` over the tailnet before installing the reporter.
+On each Mac Target, install Bun, pnpm, and Orca. Confirm the Mac can reach the
+Board hostname before installing the reporter. Tailscale is optional for
+private origin administration and is not the browser authentication boundary.
 
 ## DNS
 
-Create this record in the Cloudflare `unsold.cloud` zone:
+Create this record in the Cloudflare `unsold.cloud` zone after creating the
+Tunnel:
 
 | Type | Name | Value | Proxy |
 | --- | --- | --- | --- |
-| A | `board` | VPS tailnet IPv4 address | DNS only |
+| CNAME | `board` | `<tunnel-id>.cfargotunnel.com` | Proxied |
 
-The address must be the VPS Tailscale address, not its public address. Access therefore requires the client to be on the tailnet. Do not expose the hub port or this hostname through a public reverse proxy. The installer does not create or change this record. The Cloudflare token passed to acme.sh is used only for the temporary DNS-01 validation record.
+Route the Tunnel ingress to `http://127.0.0.1:8787`. Do not expose the hub port
+or publish an A record to the VPS. The installer does not create the Tunnel,
+DNS record, GitHub identity provider, or Access application. The Cloudflare
+token passed to acme.sh is used only for the temporary DNS-01 validation
+record.
 
 ## Install the VPS hub
 
@@ -73,8 +96,12 @@ Verify:
 ```sh
 systemctl --user status board-hub.service
 journalctl --user -u board-hub.service -n 100 --no-pager
-curl --fail --show-error https://board.unsold.cloud/state
+curl --fail --show-error http://127.0.0.1:8787/state
 ```
+
+This verifies the private origin only. After configuring Tunnel and Access,
+open the Board hostname in a browser and confirm it redirects to GitHub before
+showing any Board state.
 
 Hub controls:
 
@@ -100,11 +127,17 @@ Every verdict comes from a human tap. Failures and timeouts return no decision a
 
 The hub records human decisions for seven days in `data/decisions.json`. The board's Decisions tab reads them from `GET /decisions`; older records are removed as new decisions are appended.
 
-The tailnet is the read boundary. `GET /state`, `GET /events`, `GET /sessions/:id/tail`, `GET /decisions`, and the VAPID public-key read are tokenless. Mutating endpoints are gated: decisions and push subscription registration require either a verified Cloudflare Access identity or the board action bearer token, while reporter writes use that Target's reporter token.
+Cloudflare Access is the browser read boundary. At the origin, `GET /state`,
+`GET /events`, `GET /sessions/:id/tail`, `GET /decisions`, and the VAPID
+public-key read are tokenless, so the origin must remain private. Mutating
+endpoints are gated: decisions and push subscription registration require
+either a verified Cloudflare Access identity or the board action bearer token,
+while reporter writes use that Target's reporter token.
 
 ### Cloudflare Access sign-in
 
-A browser session authenticated by Cloudflare Access carries a signed
+A browser session authenticated through the GitHub identity provider in
+Cloudflare Access carries a signed
 `Cf-Access-Jwt-Assertion` header and is never prompted for a token. Machine
 callers — the reporter and the permission hook — keep their bearer tokens, so
 neither needs an Access service token.
@@ -122,19 +155,32 @@ token prompt:
 
 Operator steps, all outside this repository:
 
-1. Add a `cloudflared` ingress rule for the board hostname pointing at
+1. Create a GitHub OAuth app for the Cloudflare Access team domain. Use
+   `https://<team>.cloudflareaccess.com/cdn-cgi/access/callback` as the callback.
+2. Add and test GitHub under **Zero Trust > Integrations > Identity providers**.
+3. Add a `cloudflared` ingress rule for the Board hostname pointing at
    `http://127.0.0.1:8787`, alongside the existing rules in
    `/etc/cloudflared/config.yml`.
-2. Change the board DNS record from a dns-only A record pointing at the tailnet
-   IP to a **proxied** CNAME for the tunnel. Access cannot see traffic that never
-   reaches the Cloudflare edge, which is why the dns-only record must go.
-3. Create the Access application for the board hostname with a **One-time PIN by
-   email** policy, and copy its audience tag into `SESSION_BOARD_ACCESS_AUD`.
-4. Add an Access **Bypass** rule for `/reporter` so reporter WebSocket traffic is
-   unaffected.
+4. Create the proxied CNAME for the Tunnel. Access cannot protect traffic that
+   does not reach the Cloudflare edge.
+5. Create a self-hosted Access application for the Board hostname. Select only
+   GitHub as its login method and allow explicit GitHub users or the intended
+   GitHub organization/team. Do not enable One-time PIN, **Include everyone**,
+   or **all valid emails**. Copy the audience tag into
+   `SESSION_BOARD_ACCESS_AUD`.
+6. Create a second, path-specific Access application for exactly `/reporter`
+   with a **Bypass** policy because the current reporter cannot send Access
+   service-token headers. The hub still requires a unique per-Target reporter
+   bearer token. Never bypass the hostname or any browser route.
+7. Set both hub variables, restart the service, and test one allowed GitHub
+   identity and one denied identity.
 
-Until those steps are done the variables should stay unset, and the board keeps
-its existing bearer-token behaviour.
+Until these steps are complete, use the origin only for private installation
+diagnostics. Do not treat the Board as deployed or give users its URL.
+
+See [Cloudflare integration](CLOUDFLARE.md) and
+[Cloudflare's GitHub identity-provider guide](https://developers.cloudflare.com/cloudflare-one/integrations/identity-providers/github/)
+for the complete boundary.
 
 ## Push subscriptions
 
