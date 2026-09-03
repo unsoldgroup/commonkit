@@ -49,3 +49,41 @@ test("allows rtest, non-Vitest tests, and search commands", async () => {
   assert.equal(invoke("pnpm test", cwd).status, 0);
   assert.equal(invoke("rg -n 'vitest' package.json", cwd).status, 0);
 });
+
+test("allows commands that only describe a Vitest run in prose", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "no-local-vitest-prose-"));
+
+  // The exact shape that blocked `gh pr create` on 2026-09-03: a heredoc PR body
+  // documenting the command that was run on the remote runner.
+  const heredoc = [
+    "gh pr create --title 'Fix' --body \"$(cat <<'EOF'",
+    "## Verification",
+    "- `rtest pnpm exec vitest related --run` -- 116 tests passed",
+    "EOF",
+    ')"',
+  ].join("\n");
+  assert.equal(invoke(heredoc, cwd).status, 0);
+
+  // Same mention carried by a text flag rather than a heredoc.
+  assert.equal(
+    invoke('git commit -m "note: run vitest via rtest, never locally"', cwd).status,
+    0,
+  );
+  assert.equal(
+    invoke("gh pr create --body 'ran pnpm exec vitest on the VPS'", cwd).status,
+    0,
+  );
+});
+
+test("still blocks a real Vitest run that appears alongside prose", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "no-local-vitest-mixed-"));
+
+  // Stripping prose must not become a way to smuggle a real invocation past the
+  // hook -- the command outside the quoted body still runs.
+  assert.equal(
+    invoke('git commit -m "describing vitest" && pnpm exec vitest run', cwd).status,
+    2,
+  );
+  // A quoted string that is NOT a text-carrying flag value is still scanned.
+  assert.equal(invoke('ssh box "pnpm exec vitest run"', cwd).status, 2);
+});
