@@ -152,13 +152,22 @@ Three ideas, in order of how cheaply CommonKit could adopt them.
 
 ## Proposed tickets
 
-Five candidates, each verified against CommonKit's current code rather than
-assumed. Ordered by value for effort. Team `Unsoldantarctica` (UNS), house
-Goal / Scope / Done when format.
+Five candidates were drafted, each verified against CommonKit's current code
+rather than assumed. Three were filed on team `Unsoldantarctica`; the drafting
+of candidates 3 and 5 is kept below with the reasoning for folding one in and
+declining the other.
+
+| # | Candidate | Outcome |
+| --- | --- | --- |
+| 1 | `CLAUDE.md` as a pointer to `AGENTS.md` | Filed — [UNS-1659](https://linear.app/unsoldantarctica/issue/UNS-1659), High |
+| 2 | Provenance header and content hash | Filed — [UNS-1660](https://linear.app/unsoldantarctica/issue/UNS-1660), Medium |
+| 3 | Offline drift check | Folded into UNS-1660 |
+| 4 | Source reference on About Me claims | Filed — [UNS-1661](https://linear.app/unsoldantarctica/issue/UNS-1661), Medium |
+| 5 | Calibrated confidence bands | Not filed — see below |
 
 ### 1. Project `CLAUDE.md` as a pointer to `AGENTS.md` to cut always-on cost
 
-**Priority**: High.
+**Filed as UNS-1659. Priority**: High.
 
 **Goal**
 
@@ -192,7 +201,7 @@ the invariant block, repeated verbatim.
 
 ### 2. Stamp every materialized file with a provenance header and content hash
 
-**Priority**: Medium.
+**Filed as UNS-1660, with candidate 3 folded in. Priority**: Medium.
 
 **Goal**
 
@@ -225,7 +234,9 @@ states what it should hash to and names the command that regenerates it.
 
 ### 3. Offline `commonkit check` for materialized-file drift
 
-**Priority**: Medium.
+**Folded into UNS-1660, not filed separately.** The header without a reader is
+half the value, and the reader cannot exist without the header, so the two are
+one unit of work rather than a ticket and its blocker.
 
 **Goal**
 
@@ -254,7 +265,7 @@ a hash, and exits. Depends on ticket 2 for the embedded hash.
 
 ### 4. Require a source reference, not just a source kind, on About Me claims
 
-**Priority**: Medium.
+**Filed as UNS-1661. Priority**: Medium.
 
 **Goal**
 
@@ -285,7 +296,17 @@ write time. This is the strongest idea in the package.
 
 ### 5. Calibrated confidence bands for About Me suggestions
 
-**Priority**: Low.
+**Not filed.** This is the one candidate that copies MEMIA's design without
+evidence that CommonKit has the problem it solves. MEMIA needs bands because it
+ingests whole mail exports unattended and would otherwise flood the user;
+CommonKit's About Me suggestions arise from a direct statement in conversation,
+already human-in-the-loop, at a volume nobody has complained about. Building
+scoring, evidence capture and a calibration loop for an unobserved problem is
+speculative work on a flow that currently behaves.
+
+Revisit if suggestion fatigue is actually reported, or if About Me ever grows
+an unattended ingestion path — that is the condition that makes the idea
+necessary rather than merely elegant. The draft is kept below for that day.
 
 **Goal**
 
