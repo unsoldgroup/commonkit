@@ -511,6 +511,11 @@ impl Adapter for PackageAdapter {
             if observed.installed_versions == before.installed_versions {
                 RecoveryObservation::Before
             } else if Self::after_resolution(&resolution, &observed) {
+                if resolution.manager.manager == PackageManager::Nvm {
+                    self.backend
+                        .verify_offline(&resolution, &self.artifacts)
+                        .map_err(|_| failure("package_verify_failed"))?;
+                }
                 RecoveryObservation::After
             } else {
                 RecoveryObservation::Other
@@ -1801,6 +1806,9 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
         }
         let observed = self.observe(resolution)?;
         if PackageAdapter::after_resolution(resolution, &observed) {
+            if resolution.manager.manager == PackageManager::Nvm {
+                self.verify_nvm_executable(resolution)?;
+            }
             Ok(())
         } else {
             Err(PackageMutationError::Backend)
@@ -1809,6 +1817,143 @@ impl PackageMutationBackend for ProcessOfflinePackageBackend {
 }
 
 impl ProcessOfflinePackageBackend {
+    #[cfg(not(unix))]
+    fn verify_nvm_executable(
+        &self,
+        _resolution: &PackageResolutionV1,
+    ) -> Result<(), PackageMutationError> {
+        Err(PackageMutationError::Backend)
+    }
+
+    #[cfg(unix)]
+    fn verify_nvm_executable(
+        &self,
+        resolution: &PackageResolutionV1,
+    ) -> Result<(), PackageMutationError> {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let root = match &self._root_dir {
+            Some(root) => root
+                .try_clone()
+                .map_err(|_| PackageMutationError::Backend)?,
+            None => {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                    .open(&self.process_root)
+                    .map_err(|_| PackageMutationError::Backend)?;
+                cap_std::fs::Dir::from_std_file(file)
+            }
+        };
+        for package in &resolution.closure {
+            let requested_version = package
+                .declaration
+                .version
+                .strip_prefix('v')
+                .unwrap_or(&package.declaration.version);
+            if !valid_nvm_observation_version(requested_version) {
+                return Err(PackageMutationError::Backend);
+            }
+            let mut directory = root
+                .try_clone()
+                .map_err(|_| PackageMutationError::Backend)?;
+            for component in [
+                ".nvm",
+                "versions",
+                "node",
+                &format!("v{requested_version}"),
+                "bin",
+            ] {
+                directory =
+                    crate::target::open_target_dir_nofollow(&directory, Path::new(component))
+                        .map_err(|_| PackageMutationError::Backend)?;
+            }
+            let binary = crate::target::open_target_file_nofollow(&directory, Path::new("node"))
+                .map_err(|_| PackageMutationError::Backend)?
+                .into_std();
+            let fd = binary.as_raw_fd();
+            #[cfg(target_os = "linux")]
+            let executable = format!("/proc/self/fd/{fd}");
+            #[cfg(not(target_os = "linux"))]
+            let executable = format!("/dev/fd/{fd}");
+            let mut output = tempfile::tempfile().map_err(|_| PackageMutationError::Backend)?;
+            let mut command = Command::new(executable);
+            command
+                .arg("--version")
+                .env_clear()
+                .env("HOME", &self.process_root)
+                .env("NVM_DIR", self.process_root.join(".nvm"))
+                .env("PATH", CLOSED_NVM_PATH)
+                .env("NVM_OFFLINE", "1")
+                .env("NVM_NO_SOURCE_FALLBACK", "1")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .stdout(
+                    output
+                        .try_clone()
+                        .map_err(|_| PackageMutationError::Backend)?,
+                );
+            // Execute the opened target inode, retaining mount noexec enforcement.
+            // Bound output on disk too, so a broken binary cannot fill the target.
+            unsafe {
+                command.pre_exec(move || {
+                    let limit = libc::rlimit {
+                        rlim_cur: 64,
+                        rlim_max: 64,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().map_err(|_| PackageMutationError::Backend)?;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) if status.success() => break,
+                    Ok(Some(_)) => return Err(PackageMutationError::Backend),
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(PackageMutationError::Backend);
+                    }
+                }
+            }
+            output
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| PackageMutationError::Backend)?;
+            let mut version = Vec::new();
+            if output
+                .metadata()
+                .map_err(|_| PackageMutationError::Backend)?
+                .len()
+                != format!("v{requested_version}\n").len() as u64
+            {
+                return Err(PackageMutationError::Backend);
+            }
+            output
+                .take(64)
+                .read_to_end(&mut version)
+                .map_err(|_| PackageMutationError::Backend)?;
+            if version != format!("v{requested_version}\n").as_bytes() {
+                return Err(PackageMutationError::Backend);
+            }
+        }
+        Ok(())
+    }
+
     #[cfg(unix)]
     fn configure_nvm_command(
         &self,
