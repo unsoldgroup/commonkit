@@ -18,6 +18,104 @@ fn digest(bytes: &[u8]) -> Sha256Digest {
     Sha256Digest::parse(format!("sha256:{:x}", Sha256::digest(bytes))).unwrap()
 }
 
+#[cfg(unix)]
+#[test]
+fn nvm_verification_requires_the_exact_target_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    for (binary, executable, accepted) in [
+        (Some("#!/bin/sh\nprintf 'v20.0.0\\n'\n"), true, true),
+        (Some("#!/bin/sh\nprintf 'v19.0.0\\n'\n"), true, false),
+        (Some("#!/bin/sh\nprintf 'v20.0.0\\n'\n"), false, false),
+        (Some("#!/bin/sh\nexec /bin/sleep 30\n"), true, false),
+        (None, false, false),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let nvm = root.path().join(".nvm");
+        fs::create_dir_all(nvm.join("versions/node/v20.0.0/bin")).unwrap();
+        let script = b"nvm() { printf '%s\\n' '-> v20.0.0 *'; }\n";
+        fs::write(nvm.join("nvm.sh"), script).unwrap();
+        if let Some(binary) = binary {
+            let node = nvm.join("versions/node/v20.0.0/bin/node");
+            fs::write(&node, binary).unwrap();
+            fs::set_permissions(
+                &node,
+                fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 }),
+            )
+            .unwrap();
+        }
+        let mut backend = ProcessOfflinePackageBackend::new(root.path());
+        let store = commonkit_adapters::ArtifactStore::open(root.path().join("artifacts")).unwrap();
+        assert_eq!(
+            backend
+                .verify_offline(&resolution(root.path(), digest(script)), &store)
+                .is_ok(),
+            accepted,
+            "reported NVM version must not substitute for exact executable identity: {binary:?}, executable={executable}"
+        );
+        if accepted {
+            let mut prefixed = resolution(root.path(), digest(script));
+            prefixed.declaration.version = "v20.0.0".into();
+            prefixed.closure[0].declaration.version = "v20.0.0".into();
+            assert!(backend.verify_offline(&prefixed, &store).is_ok());
+        }
+        // Recovery must check executable identity too, even when NVM lists
+        // the requested version as installed after an interrupted mutation.
+        let mut persisted = resolution(root.path(), digest(script));
+        persisted.schema_version = SchemaVersion(2);
+        if let OfflineInstallRecipeV1::NodeArchive {
+            install: Some(install),
+            ..
+        } = &mut persisted.recipe
+        {
+            install.cache_relative_path =
+                ".cache/bin/node-v20.0.0-linux-x64/node-v20.0.0-linux-x64.tar.xz".into();
+        }
+        let source = StableId::parse("nodejs-nvm").unwrap();
+        persisted.source.source_id = source.clone();
+        persisted.source.repository_revision =
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into());
+        persisted.declaration.source = source.clone();
+        persisted.closure[0].source = persisted.source.clone();
+        persisted.closure[0].declaration.source = source;
+        let reference = store
+            .put(
+                &serde_json::to_vec(&persisted).unwrap(),
+                commonkit_adapters::ContentSensitivity::Portable,
+            )
+            .unwrap();
+        let operation = commonkit_core::finalize_operation(commonkit_core::OperationDraft {
+            adapter_id: StableId::parse("packages").unwrap(),
+            kind: commonkit_contracts::OperationKind::Create,
+            resource: commonkit_contracts::ResourceRef {
+                resource_type: StableId::parse("package").unwrap(),
+                resource_id: StableId::parse("node").unwrap(),
+                managed_path: None,
+            },
+            risk: commonkit_contracts::Risk::Medium,
+            requires_confirmation: true,
+            recovery_capability: commonkit_contracts::RecoveryCapability::ConvergeForwardOnly,
+            depends_on: Vec::new(),
+            before_digest: None,
+            after_digest: Some(digest(b"desired")),
+            payload_digest: reference.digest,
+            provenance: None,
+            summary: "recover exact Node runtime".into(),
+        })
+        .unwrap();
+        let mut adapter = commonkit_adapters::PackageAdapter::new_offline(store, Box::new(backend));
+        use commonkit_reconcile::Adapter;
+        let recovery = adapter.observe_recovery(&operation);
+        if accepted {
+            assert_eq!(
+                recovery,
+                Ok(commonkit_reconcile::RecoveryObservation::After)
+            );
+        } else {
+            assert_eq!(recovery.unwrap_err().code, "package_verify_failed");
+        }
+    }
+}
+
 fn resolution(target_root: &Path, script_digest: Sha256Digest) -> PackageResolutionV1 {
     let source_id = StableId::parse("nodejs").unwrap();
     let declaration = PackageDeclaration {
