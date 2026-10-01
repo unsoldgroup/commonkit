@@ -5,11 +5,12 @@ use std::sync::{Arc, Mutex};
 use commonkit_adapters::{
     ARTIFACT_CHUNK_SIZE, AptRepositoryConfigurationV1, AptSourceAuthorityV1, ArtifactEvidence,
     ArtifactStore, ContentSensitivity, ManagerBindingV1, OfflineInstallRecipeV1, PackageAdapter,
-    PackageArtifactV1, PackageMutationBackend, PackageMutationError, PackageObservationV1,
-    PackageResolutionAuthority, PackageResolutionV1, PackageSourceRegistry, PackageTargetV1,
-    ProcessOfflinePackageBackend, ResolvedPackage, SourceBindingV1, SshFilesystemRequest,
-    SshFilesystemResponse, SshFilesystemTransport, SshOfflinePackageBackend, TargetFilesystemError,
-    TargetPackageResolutionConfig, artifact_chunk_response_digest,
+    PackageArtifactV1, PackageMutationBackend, PackageMutationBackendRegistry,
+    PackageMutationError, PackageObservationV1, PackageResolutionAuthority, PackageResolutionV1,
+    PackageSourceRegistry, PackageTargetV1, ProcessOfflinePackageBackend, ResolvedPackage,
+    SourceBindingV1, SshFilesystemRequest, SshFilesystemResponse, SshFilesystemTransport,
+    SshOfflinePackageBackend, TargetFilesystemError, TargetPackageResolutionConfig,
+    artifact_chunk_response_digest,
 };
 use commonkit_contracts::{
     Operation, OperationKind, PackageDeclaration, PackageManager, PackageSelector,
@@ -25,6 +26,69 @@ fn package_adapter_api_exposes_only_the_typed_offline_backend_seam() {
 
     assert_send::<PackageAdapter>();
     let _typed_backend: Option<Box<dyn PackageMutationBackend>> = None;
+}
+
+fn registry_backend(manager: PackageManager) -> Box<dyn PackageMutationBackend> {
+    Box::new(FakeMutationBackend {
+        manager,
+        target_supported: true,
+        observed: PackageObservationV1 {
+            installed_versions: BTreeSet::new(),
+        },
+        calls: Arc::new(Mutex::new(Vec::new())),
+    })
+}
+
+#[test]
+fn registry_rejects_duplicate_claims_for_every_manager() {
+    for manager in [
+        PackageManager::Homebrew,
+        PackageManager::Apt,
+        PackageManager::Fnm,
+        PackageManager::Nvm,
+        PackageManager::Rustup,
+    ] {
+        assert_eq!(
+            PackageMutationBackendRegistry::new([
+                registry_backend(manager),
+                registry_backend(manager),
+            ])
+            .err(),
+            Some(PackageMutationError::Backend),
+            "duplicate {manager:?} backends must fail closed",
+        );
+    }
+}
+
+#[test]
+fn registry_accepts_distinct_claims_for_every_manager() {
+    let managers = [
+        PackageManager::Homebrew,
+        PackageManager::Apt,
+        PackageManager::Fnm,
+        PackageManager::Nvm,
+        PackageManager::Rustup,
+    ];
+    let registry = PackageMutationBackendRegistry::new(managers.map(registry_backend))
+        .expect("distinct claims register");
+    for manager in managers {
+        assert!(registry.supports_manager(manager));
+    }
+}
+
+#[test]
+fn registry_rejects_overlap_with_a_multi_manager_backend() {
+    let nested = PackageMutationBackendRegistry::new([
+        registry_backend(PackageManager::Homebrew),
+        registry_backend(PackageManager::Rustup),
+    ])
+    .unwrap();
+    let backends: [Box<dyn PackageMutationBackend>; 2] =
+        [Box::new(nested), registry_backend(PackageManager::Rustup)];
+    assert_eq!(
+        PackageMutationBackendRegistry::new(backends).err(),
+        Some(PackageMutationError::Backend)
+    );
 }
 
 fn digest(seed: char) -> Sha256Digest {
