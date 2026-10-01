@@ -86,11 +86,17 @@ impl PackageMutationBackendRegistry {
         let mut registered: Vec<Box<dyn PackageMutationBackend>> = Vec::new();
         for backend in backends {
             if registered.iter().any(|existing| {
-                [PackageManager::Apt, PackageManager::Nvm]
-                    .iter()
-                    .any(|manager| {
-                        existing.supports_manager(*manager) && backend.supports_manager(*manager)
-                    })
+                [
+                    PackageManager::Homebrew,
+                    PackageManager::Apt,
+                    PackageManager::Fnm,
+                    PackageManager::Nvm,
+                    PackageManager::Rustup,
+                ]
+                .iter()
+                .any(|manager| {
+                    existing.supports_manager(*manager) && backend.supports_manager(*manager)
+                })
             }) {
                 return Err(PackageMutationError::Backend);
             }
