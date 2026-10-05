@@ -29,6 +29,17 @@ if [[ ${command_args[0]} != pnpm ]]; then
   exit 64
 fi
 
+# A shared host can supply its authoritative admission broker. Hand off before
+# install; otherwise per-tool caps add up beyond the machine's total capacity.
+broker=${RTEST_BROKER:-/usr/local/lib/vps-ci/vps-test-run}
+if [[ -x $broker ]]; then
+  exec "$broker" "$canonical_workspace" "${command_args[@]}"
+fi
+if [[ -n ${RTEST_BROKER:-} || -d ${RTEST_HOST_CONFIG:-/etc/vps-ci} ]]; then
+  echo 'commonkit-rtest-worker: configured admission broker unavailable; refusing unbudgeted fallback' >&2
+  exit 75
+fi
+
 lock_file=${RTEST_LOCK_FILE:-/root/rtest/.vitest.lock}
 mkdir -p "$(dirname "$lock_file")"
 exec 9>"$lock_file"
