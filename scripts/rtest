@@ -44,6 +44,7 @@ rsync -az --delete \
   --rsync-path="mkdir -p '${remote}' && rsync" \
   -e "ssh -i ${key} -o BatchMode=yes -o ConnectTimeout=10" \
   --exclude='.git' --exclude='node_modules/' --exclude='.env*' --exclude='*.log' \
+  --exclude='.rtest-last-used' --exclude='.rtest-gc-node_modules/' \
   --exclude='/dist/' --exclude='/build/' --exclude='/.next/' --exclude='/.wrangler/' \
   --exclude='/coverage/' --exclude='/playwright-report/' --exclude='/test-results/' \
   --exclude='/.turbo/' --exclude='.build/' --exclude='target/' \

@@ -88,11 +88,31 @@ test("rtest excludes generated and platform-specific build artifacts", async () 
   }
 });
 
+test("remote worker delegates to host admission before any installation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "commonkit-rtest-broker-"));
+  const workspace = join(directory, "workspace");
+  await mkdir(workspace);
+  const broker = join(directory, "broker");
+  const calls = join(directory, "calls");
+  await executable(broker, `#!/bin/sh\nprintf '%s\\0' "$@" > '${calls}'\nexit 75\n`);
+  const result = spawnSync(worker, [workspace], {
+    input: Buffer.from("pnpm\0exec\0vitest\0run\0test/a b.test.ts\0"),
+    env: { ...process.env, RTEST_WORKSPACE_ROOT: directory, RTEST_BROKER: broker },
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 75);
+  assert.deepEqual((await readFile(calls)).toString().split("\0").filter(Boolean),
+    [await realpath(workspace), "pnpm", "exec", "vitest", "run", "test/a b.test.ts"]);
+});
+
 test("remote worker serializes jobs and applies the memory and CPU envelope", async () => {
   const directory = await mkdtemp(join(tmpdir(), "commonkit-rtest-worker-"));
   const bin = join(directory, "bin");
   const calls = join(directory, "systemd.args");
   const workspace = join(directory, "example-a1b2c3d4e5f6");
+  const standaloneWorker = join(directory, "standalone-worker");
+  await executable(standaloneWorker, (await readFile(worker, "utf8"))
+    .replace('/usr/local/lib/vps-ci/vps-test-run', join(directory, 'absent-broker')));
   await mkdir(bin);
   await mkdir(workspace);
   await executable(join(bin, "flock"), "#!/bin/sh\nexit 0\n");
@@ -101,13 +121,14 @@ test("remote worker serializes jobs and applies the memory and CPU envelope", as
     `#!/bin/sh\nprintf '%s\\0' \"$@\" > '${calls}'\n`,
   );
 
-  const result = spawnSync(worker, [workspace], {
+  const result = spawnSync(standaloneWorker, [workspace], {
     input: Buffer.from("pnpm\0exec\0vitest\0run\0"),
     encoding: "utf8",
     env: {
       ...process.env,
       PATH: `${bin}:/usr/bin:/bin`,
       RTEST_LOCK_FILE: join(directory, "lock"),
+      RTEST_HOST_CONFIG: join(directory, "standalone-host"),
       RTEST_WORKSPACE_ROOT: directory,
     },
   });
@@ -139,4 +160,16 @@ test("remote worker rejects invalid workspaces and commands", () => {
   });
   assert.equal(badCommand.status, 64);
   assert.match(badCommand.stderr, /only pnpm commands are allowed/);
+});
+
+test("missing configured broker never falls back to independent capacity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "commonkit-rtest-missing-"));
+  const workspace = join(directory, "workspace");
+  await mkdir(workspace);
+  const result = spawnSync(worker, [workspace], {
+    input: Buffer.from("pnpm\0test\0"), encoding: "utf8",
+    env: { ...process.env, RTEST_WORKSPACE_ROOT: directory, RTEST_BROKER: join(directory, "missing") },
+  });
+  assert.equal(result.status, 75);
+  assert.match(result.stderr, /refusing unbudgeted fallback/);
 });
