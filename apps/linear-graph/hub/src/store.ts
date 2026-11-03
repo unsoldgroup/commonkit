@@ -25,6 +25,19 @@ export class GraphStore {
       CREATE TABLE IF NOT EXISTS campaigns (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS drain_metrics (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS execution_runs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
+    this.closeInterruptedRuns();
+  }
+
+  /**
+   * A run still "running" when the store opens was cut off by a hub exit; nothing will ever
+   * finish it. Mark it failed so the backlog is visible history, not a stuck queue (USG-383:
+   * 1,670 such rows from a crash loop). Idempotent: completed and failed rows are untouched.
+   */
+  closeInterruptedRuns(): number {
+    return this.db.query(`UPDATE analysis_runs SET payload = json_set(payload, '$.status', 'failed',
+        '$.completedAt', coalesce(json_extract(payload, '$.completedAt'), json_extract(payload, '$.startedAt')),
+        '$.error', 'Interrupted: the hub exited before this run finished')
+      WHERE json_extract(payload, '$.status') = 'running'`).run().changes;
   }
 
   saveSnapshot(snapshot: GraphSnapshot) {

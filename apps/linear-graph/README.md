@@ -21,6 +21,35 @@ action token; Linear and Codex credentials are never exposed to the browser. The
 is daily at 07:00 Europe/Madrid by default (override with `LINEAR_GRAPH_TIMEZONE`), with a startup
 run when no completed snapshot exists.
 
+## Structure, ranking and freshness (USG-383)
+
+Linear is the primary structure. Every daily run syncs Linear, assigns zones from Linear's own
+links (issues joined by parent, blocks or related share the zone that wins a vote of manual
+overrides and keyword inference; components above 40 issues keep per-issue zones), ranks work
+deterministically, and publishes that snapshot before Codex runs. Codex is optional enrichment
+(brief, dashed semantic edges, triage); its failure is recorded on the run as
+`Codex enrichment skipped: …` and never freezes the graph.
+
+Ranking order: issues named in Al's manual focus brief (in brief order), then unblocked before
+blocked, Linear priority (urgent first, none last), number of open issues it unblocks, in progress
+before todo before backlog, due date, most recently updated. A generated brief never pins.
+
+Read endpoints (tailnet-only through Caddy; FR consumers use `http://127.0.0.1:$LINEAR_GRAPH_PORT`):
+
+- `GET /api/freshness` returns `{ syncedAt, generatedAt, ageSeconds, staleAfterHours: 36, stale, lastRun }`.
+  `stale` is true when there is no snapshot or it is older than 36 hours. `/health` carries the
+  same `ageSeconds` and `stale`.
+- `GET /api/next-up?limit=10` (1 to 50) returns the freshness fields plus `items`:
+  `{ ref, short_description, why_now, next_action, priority, pinned, zone, relations: [{ ref, kind, short_description }] }`.
+  `priority` is Linear's number (0 none, 1 urgent … 4 low). `kind` is one of `blocked_by`,
+  `blocks`, `parent`, `child`, `related`, `duplicate`; only open related issues are listed (max 6).
+  Descriptions are issue titles with emails and quote ids replaced; they are not otherwise
+  screened for customer names.
+
+On open, the store marks any analysis run still `running` as failed ("Interrupted"): those were
+cut off by a hub exit. A restart within an hour of the last attempt does not re-sync Linear, and
+Linear rate limits (429, or 400 `RATELIMITED`) back off and retry.
+
 ## VPS deployment
 
 On the VPS, install Bun, pnpm, Caddy, and acme.sh first. Then run the installer with secrets

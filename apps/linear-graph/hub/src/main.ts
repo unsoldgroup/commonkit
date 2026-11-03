@@ -62,7 +62,10 @@ console.log(`Linear graph hub listening on ${hub.url}`);
 
 if (process.env.LINEAR_GRAPH_AUTO_ANALYZE !== "0") {
   const latest = hub.store.latestAnalysisRun();
-  if (!latest || latest.status !== "completed") {
+  // A restart within the hour must not re-sync Linear: each sync is ~65 pages, and a
+  // crash loop once burned the Linear rate limit 60 times a day (USG-383).
+  const recentAttempt = latest && Date.now() - Date.parse(latest.startedAt) < 3_600_000;
+  if (!recentAttempt && (!latest || latest.status !== "completed")) {
     void hub.runAnalysis().catch((error) => console.error("Linear graph initial analysis failed", error));
   }
   const scheduleNext = () => {

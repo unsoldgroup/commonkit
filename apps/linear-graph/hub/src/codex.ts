@@ -45,6 +45,20 @@ function sanitizeAnalysis(raw: unknown): CodexAnalysis {
   };
 }
 
+/**
+ * Write a prompt to a child's stdin without ever crashing the hub. On Linux, Bun's
+ * FileSink.end() returns a Promise that rejects with EPIPE when the child exits before
+ * draining a large prompt; left unhandled, that rejection killed the whole process and
+ * put linear-graph.service into a restart loop (USG-383). The child's exit code and
+ * stderr carry the real failure.
+ */
+export function feedStdin(stdin: unknown, text: string) {
+  if (!stdin || typeof stdin !== "object") return;
+  const sink = stdin as { write(chunk: string): unknown; end(): unknown };
+  const swallow = (value: unknown) => { if (value instanceof Promise) value.catch(() => {}); };
+  try { swallow(sink.write(text)); swallow(sink.end()); } catch { /* child already gone */ }
+}
+
 export interface CodexRunnerOptions {
   executable?: string;
   apiKey?: string;
@@ -149,16 +163,7 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
   const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeoutMs);
   try {
     // Codex accepts a prompt from stdin when the final argument is '-'.
-    const stdin = child.stdin;
-    if (stdin && typeof stdin !== "number") {
-      try {
-        stdin.write(prompt);
-        stdin.end();
-      } catch {
-        // The child may reject stdin immediately (for example, a local CLI/config error).
-        // Its exit code and stderr below provide the actionable failure instead of crashing the hub.
-      }
-    }
+    feedStdin(child.stdin, prompt);
     const stdoutStream = child.stdout && typeof child.stdout !== "number" ? child.stdout : undefined;
     const stderrStream = child.stderr && typeof child.stderr !== "number" ? child.stderr : undefined;
     const [exitCode, stdout, stderr] = await Promise.all([
