@@ -14,7 +14,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/commonkit/linear-graph @@DATA_DIR@@ @@REPO_DIR@@/.git
+# The codex on PATH is the vps-ci agent-launch shim, which records a reservation in
+# /run/vps-ci/agents. Read-only there, every Codex run exited 1 (USG-383).
+ReadWritePaths=%h/.local/share/commonkit/linear-graph @@DATA_DIR@@ @@REPO_DIR@@/.git -/run/vps-ci/agents
 
 [Install]
 WantedBy=default.target

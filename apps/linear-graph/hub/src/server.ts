@@ -7,12 +7,13 @@ import {
   executionRequestSchema, triageDecisionRequestSchema, updateFocusBriefRequestSchema, updateTopicRequestSchema,
   type AnalysisRun, type Campaign, type ExecutionRun, type GraphSnapshot, type TriageDecision, type WorkBundle,
 } from "@commonkit/linear-graph-protocol";
-import { applyCodexAnalysis, defaultRecommendations, focusSnapshot } from "./analysis.js";
+import { applyCodexAnalysis, focusSnapshot } from "./analysis.js";
 import { createCodexAuthManager, type CodexAuthOptions } from "./codex-auth.js";
 import { runCodexAnalysis, type CodexRunnerOptions } from "./codex.js";
 import { computeDrainMetrics, proposeCampaign } from "./drain.js";
 import { executeApprovedBundle, type ExecutionRunnerOptions } from "./execution.js";
 import { syncLinear, type LinearSource } from "./linear.js";
+import { assignRelationZones, freshness, nextUp, rankedRecommendations } from "./nextup.js";
 import { inferTopicAssignment, summarizeTeams } from "./normalizer.js";
 import { redactSensitiveText } from "./redaction.js";
 import { GraphStore } from "./store.js";
@@ -101,30 +102,46 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       try {
         if (!options.linear) throw new Error("Linear source is not configured");
         const sync = await syncLinear(options.linear, store.topicOverrides());
-        const baseline: GraphSnapshot = graphSnapshotSchema.parse({ generatedAt: now().toISOString(), syncedAt: sync.syncedAt, stale: false, nodes: sync.issues, edges: sync.edges, teams: sync.teams, zones: DEFAULT_ZONES, recommendations: defaultRecommendations(sync.issues), latestAnalysisRunId: id });
+        // USG-383: Linear is the primary structure. Zones come from parent/blocks/related
+        // links and ranking from priority + relations, so the snapshot is published before
+        // (and independent of) Codex. Codex failures no longer freeze the graph.
+        const issues = assignRelationZones(sync.issues, sync.edges);
+        const baseline: GraphSnapshot = graphSnapshotSchema.parse({ generatedAt: now().toISOString(), syncedAt: sync.syncedAt, stale: false, nodes: issues, edges: sync.edges, teams: sync.teams, zones: DEFAULT_ZONES, recommendations: rankedRecommendations(issues, sync.edges, existingBrief), latestAnalysisRunId: id });
         fallback = baseline;
-        const result = options.codex ? await runCodexAnalysis({ issues: sync.issues, edges: sync.edges, focusBrief: store.loadBrief()?.text }, options.codex) : { assignments: [], semanticEdges: [], recommendations: baseline.recommendations, triageDecisions: [] };
-        if (options.codex && !result.brief) throw new Error("Codex returned no daily brief");
-        const applied = applyCodexAnalysis(sync.issues, sync.edges, result, sync.syncedAt, id);
-        const snapshot = { ...applied.snapshot, zones: baseline.zones, recommendations: applied.snapshot.recommendations.length ? applied.snapshot.recommendations : baseline.recommendations };
-        store.saveSnapshot(snapshot);
-        current = snapshot;
-        const codexTriage = result.triageDecisions ?? [];
-        if (options.codex && result.brief) {
-          const timestamp = now().toISOString();
-          store.saveBrief({ text: result.brief, updatedAt: timestamp, generatedAt: timestamp, snapshotAt: snapshot.syncedAt, status: "ready", source: "codex", error: null });
-          for (const decision of codexTriage) {
-            const previous = store.loadTriageDecision(decision.issueId);
-            store.saveTriageDecision({ ...decision, createdAt: previous?.createdAt ?? timestamp, updatedAt: timestamp, source: "codex" });
+        store.saveSnapshot(baseline);
+        current = baseline;
+        let enrichmentError: string | null = null;
+        let inputHash: string | null = null;
+        if (options.codex) {
+          try {
+            const result = await runCodexAnalysis({ issues, edges: sync.edges, focusBrief: store.loadBrief()?.text }, options.codex);
+            if (!result.brief) throw new Error("Codex returned no daily brief");
+            const applied = applyCodexAnalysis(issues, sync.edges, result, sync.syncedAt, id);
+            const snapshot = { ...applied.snapshot, zones: baseline.zones, recommendations: baseline.recommendations };
+            store.saveSnapshot(snapshot);
+            current = snapshot;
+            inputHash = applied.inputHash;
+            const timestamp = now().toISOString();
+            // Al's manual brief is the ranking input; never overwrite it with a generated one.
+            if (store.loadBrief()?.source !== "manual") store.saveBrief({ text: result.brief, updatedAt: timestamp, generatedAt: timestamp, snapshotAt: snapshot.syncedAt, status: "ready", source: "codex", error: null });
+            for (const decision of result.triageDecisions ?? []) {
+              const previous = store.loadTriageDecision(decision.issueId);
+              store.saveTriageDecision({ ...decision, createdAt: previous?.createdAt ?? timestamp, updatedAt: timestamp, source: "codex" });
+            }
+          } catch (caught) {
+            enrichmentError = `Codex enrichment skipped: ${caught instanceof Error ? caught.message : "failed"}`.slice(0, 1000);
+            console.error("Linear graph Codex enrichment failed", caught);
           }
-        } else if (!existingBrief) {
-          const activeCount = snapshot.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
-          store.saveBrief({ text: `Universe synced: ${activeCount} active issues are ready for triage and bundle planning.`, updatedAt: now().toISOString(), generatedAt: now().toISOString(), snapshotAt: snapshot.syncedAt, status: "ready", source: "fallback", error: null });
-        } else {
-          store.saveBrief({ ...store.loadBrief()!, status: "ready", error: null, updatedAt: now().toISOString(), generatedAt: now().toISOString(), snapshotAt: snapshot.syncedAt });
+        }
+        const brief = store.loadBrief();
+        if (!brief) {
+          const activeCount = baseline.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
+          store.saveBrief({ text: `Universe synced: ${activeCount} active issues are ready for triage and bundle planning.`, updatedAt: now().toISOString(), generatedAt: now().toISOString(), snapshotAt: baseline.syncedAt, status: "ready", source: "fallback", error: null });
+        } else if (brief.status !== "ready" || brief.snapshotAt !== baseline.syncedAt) {
+          store.saveBrief({ ...brief, status: "ready", error: null, updatedAt: now().toISOString(), snapshotAt: baseline.syncedAt });
         }
         updateDrainMetrics();
-        const completed = { ...running, completedAt: now().toISOString(), status: "completed", issueCount: sync.rawCount, inputHash: applied.inputHash } as const;
+        const completed = { ...running, completedAt: now().toISOString(), status: "completed", issueCount: sync.rawCount, error: enrichmentError, inputHash } as const;
         store.saveAnalysisRun(completed);
         return completed;
       } catch (caught) {
@@ -147,7 +164,16 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
     hostname: options.hostname ?? "127.0.0.1", port: options.port ?? 8790,
     async fetch(request) {
       const url = new URL(request.url);
-      if (url.pathname === "/health" && request.method === "GET") return json({ ok: true, snapshotAt: current?.generatedAt ?? null, stale: current?.stale ?? true });
+      if (url.pathname === "/health" && request.method === "GET") {
+        const fresh = freshness(current, store.latestAnalysisRun(), now());
+        return json({ ok: true, snapshotAt: current?.generatedAt ?? null, syncedAt: fresh.syncedAt, ageSeconds: fresh.ageSeconds, stale: fresh.stale });
+      }
+      if (url.pathname === "/api/freshness" && request.method === "GET") return json(freshness(current, store.latestAnalysisRun(), now()));
+      if (url.pathname === "/api/next-up" && request.method === "GET") {
+        if (!current) return error("No snapshot available", 503);
+        const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit")) || 10));
+        return json(nextUp(current, store.loadBrief(), store.latestAnalysisRun(), now(), limit));
+      }
       if (url.pathname === "/api/graph" && request.method === "GET") {
         if (!current) return error("No snapshot available", 503);
         const snapshot = url.searchParams.get("view") === "focus" ? focusSnapshot(current) : current;
@@ -265,7 +291,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         } catch (caught) { return error(caught instanceof Error ? caught.message : "Execution failed", 502); }
       }
       if (url.pathname === "/api/focus-brief" && request.method === "PUT") {
-        try { const body = await parseBody(request, updateFocusBriefRequestSchema); const timestamp = now().toISOString(); const brief = focusBriefSchema.parse({ ...body, updatedAt: timestamp, generatedAt: timestamp, status: "ready", source: "manual", error: null }); store.saveBrief(brief); return json(brief); } catch { return error("Invalid focus brief", 400); }
+        try { const body = await parseBody(request, updateFocusBriefRequestSchema); const timestamp = now().toISOString(); const brief = focusBriefSchema.parse({ ...body, updatedAt: timestamp, generatedAt: timestamp, status: "ready", source: "manual", error: null }); store.saveBrief(brief); if (current) { current = graphSnapshotSchema.parse({ ...current, recommendations: rankedRecommendations(current.nodes, current.edges, brief) }); store.saveSnapshot(current); } return json(brief); } catch { return error("Invalid focus brief", 400); }
       }
       const topicMatch = /^\/api\/issues\/([^/]+)\/topic$/.exec(url.pathname);
       if (topicMatch && request.method === "PUT") {

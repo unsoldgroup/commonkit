@@ -23,18 +23,30 @@ const QUERY = `query GraphIssues($after: String) {
   }
 }`;
 
-export function createLinearSource(options: { token: string; endpoint?: string; fetcher?: typeof fetch; repoMap?: LinearSource["repoMap"] }): LinearSource {
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export function createLinearSource(options: { token: string; endpoint?: string; fetcher?: typeof fetch; repoMap?: LinearSource["repoMap"]; retryDelayMs?: number; maxRetries?: number }): LinearSource {
   const request = options.fetcher ?? fetch;
   const endpoint = options.endpoint ?? "https://api.linear.app/graphql";
   return {
     repoMap: options.repoMap,
     async fetchIssues(cursor) {
-      const response = await request(endpoint, {
-        method: "POST",
-        headers: { "Authorization": options.token, "Content-Type": "application/json" },
-        body: JSON.stringify({ query: QUERY, variables: { after: cursor ?? null } }),
-      });
-      if (!response.ok) throw new Error(`Linear request failed (${response.status})`);
+      let response: Response;
+      // Linear rate-limits with 429, or 400 + RATELIMITED. Back off instead of failing the
+      // whole daily sync on one page (USG-383: 22 days lost to 400s, 7 to 429s).
+      for (let attempt = 0; ; attempt += 1) {
+        response = await request(endpoint, {
+          method: "POST",
+          headers: { "Authorization": options.token, "Content-Type": "application/json" },
+          body: JSON.stringify({ query: QUERY, variables: { after: cursor ?? null } }),
+        });
+        if (response.ok) break;
+        const detail = (await response.text().catch(() => "")).slice(0, 300);
+        const limited = response.status === 429 || (response.status === 400 && detail.includes("RATELIMITED"));
+        if (!limited || attempt >= (options.maxRetries ?? 3)) throw new Error(`Linear request failed (${response.status})${detail ? `: ${detail}` : ""}`);
+        const retryAfter = Number(response.headers.get("Retry-After"));
+        await sleep(Math.min(300_000, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : (options.retryDelayMs ?? 60_000) * 2 ** attempt));
+      }
       const body = await response.json() as { errors?: Array<{ message?: string }>; data?: { issues?: LinearPage } };
       if (body.errors?.length) throw new Error(`Linear GraphQL error: ${body.errors.map((error) => error.message ?? "unknown").join("; ")}`);
       if (!body.data?.issues) throw new Error("Linear response did not contain issues");

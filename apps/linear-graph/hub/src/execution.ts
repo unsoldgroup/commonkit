@@ -3,6 +3,7 @@ import { mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { WorkBundle } from "@commonkit/linear-graph-protocol";
+import { feedStdin } from "./codex.js";
 import { boundText, redactSensitiveText } from "./redaction.js";
 
 /** The small process surface the execution runner needs. */
@@ -234,7 +235,7 @@ export async function executeApprovedBundle(
     let timedOut = false;
     const timeout = setTimeout(() => { timedOut = true; child.kill(); }, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     try {
-      if (child.stdin && typeof child.stdin !== "number") { child.stdin.write(issuePrompt(request)); child.stdin.end(); }
+      feedStdin(child.stdin, issuePrompt(request));
       const [exitCode, stdout, stderr] = await Promise.all([child.exited, outputText(child.stdout), outputText(child.stderr)]);
       const max = options.maxOutputChars ?? DEFAULT_MAX_OUTPUT_CHARS;
       const stdoutSafe = capOutput(redactSensitiveText(stdout, options.apiKey ? [options.apiKey] : []), max);
