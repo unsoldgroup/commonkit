@@ -123,13 +123,26 @@ export function rankedRecommendations(issues: Issue[], edges: GraphEdge[], brief
   }));
 }
 
+const EMAIL = /[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
+const QUOTE_ID = /\b[A-Z]{2,5}-(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{6,}\b/g;
+
 /** Titles can carry customer data on EXP tickets; the office frame must never show emails or quote ids. */
 export function shortDescription(title: string, max = 90): string {
   const clean = redactSensitiveText(title)
-    .replace(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g, "[email]")
-    .replace(/\b[A-Z]{2,5}-(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*\d)[A-Z0-9]{6,}\b/g, "[quote]")
+    .replace(EMAIL, "[email]")
+    .replace(QUOTE_ID, "[quote]")
     .replace(/\s+/g, " ").trim();
   return clean.length <= max ? clean : `${clean.slice(0, max - 1).trimEnd()}…`;
+}
+
+/**
+ * Frame label: a title naming an email or quote id is customer-specific, and the rest of it
+ * (a customer name) is too, so the whole title is dropped for the ticket ref (USG-384).
+ */
+export function frameLabel(ref: string, title: string, max = 90): string {
+  const clean = redactSensitiveText(title);
+  if (/\[(?:email|quote)\]/i.test(clean) || clean.search(EMAIL) >= 0 || clean.search(QUOTE_ID) >= 0) return ref;
+  return shortDescription(clean, max) || ref;
 }
 
 export function freshness(snapshot: GraphSnapshot | null, lastRun: AnalysisRun | null, now: Date) {
@@ -148,13 +161,13 @@ export function freshness(snapshot: GraphSnapshot | null, lastRun: AnalysisRun |
 export function nextUp(snapshot: GraphSnapshot, brief: FocusBrief | null, lastRun: AnalysisRun | null, now: Date, limit = 10) {
   const items = rankIssues(snapshot.nodes, snapshot.edges, brief).slice(0, limit).map((item) => ({
     ref: item.issue.identifier,
-    short_description: shortDescription(item.issue.title),
+    short_description: frameLabel(item.issue.identifier, item.issue.title),
     why_now: shortDescription(item.whyNow, 160),
     next_action: item.nextAction,
     priority: item.issue.priority,
     pinned: item.pinned,
     zone: item.issue.zone,
-    relations: item.relations.slice(0, 6).map((rel) => ({ ref: rel.issue.identifier, kind: rel.kind, short_description: shortDescription(rel.issue.title, 60) })),
+    relations: item.relations.slice(0, 6).map((rel) => ({ ref: rel.issue.identifier, kind: rel.kind, short_description: frameLabel(rel.issue.identifier, rel.issue.title, 60) })),
   }));
   return { ...freshness(snapshot, lastRun, now), items };
 }
