@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { feedStdin } from "../src/codex.js";
 import { createLinearSource } from "../src/linear.js";
-import { assignRelationZones, freshness, nextUp, rankIssues, shortDescription } from "../src/nextup.js";
+import { assignRelationZones, frameLabel, freshness, nextUp, rankIssues, shortDescription } from "../src/nextup.js";
 import { normalizeLinearEdges, normalizeLinearIssue } from "../src/normalizer.js";
 import { startGraphHub } from "../src/server.js";
 import { GraphStore } from "../src/store.js";
@@ -63,6 +63,16 @@ describe("USG-383 next-up ranking", () => {
     expect(feed.items[0]).toEqual({ ref: "USG-1", short_description: "Issue 1", why_now: "Medium priority", next_action: "Start work on USG-1", priority: 3, pinned: false, zone: "unsorted", relations: [{ ref: "USG-2", kind: "parent", short_description: "Issue 2" }] });
     expect(freshness(snapshot, null, new Date("2026-11-02T12:00:01.000Z")).stale).toBe(true);
     expect(freshness(null, null, new Date()).stale).toBe(true);
+    expect(frameLabel("EXP-9", "Refund Jane Doe jane@x.com EXP-1UMHD9A41")).toBe("EXP-9");
+    expect(frameLabel("EXP-9", "Call Jane Doe re EXP-1UMHD9A41")).toBe("EXP-9");
+    expect(frameLabel("EXP-9", "Refund Jane Doe [email] [Quote]")).toBe("EXP-9");
+    expect(frameLabel("EXP-9", "Fix checkout per EXP-4663")).toBe("Fix checkout per EXP-4663");
+    const leaky = build([raw("1", { title: "Refund Jane Doe jane@x.com EXP-1UMHD9A41", parent: { id: "2" } }), raw("2", { title: "Email jane@x.com" })]);
+    const leakyFeed = nextUp({ ...snapshot, nodes: leaky.issues, edges: leaky.edges }, null, null, new Date("2026-11-02T11:00:00.000Z"), 5);
+    for (const item of leakyFeed.items) {
+      expect(item.short_description).toBe(item.ref);
+      for (const rel of item.relations) expect(rel.short_description).toBe(rel.ref);
+    }
   });
 });
 
