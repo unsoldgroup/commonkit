@@ -23,6 +23,9 @@ export type GraphNode = {
   updatedAt?: string;
   topic?: string;
   topicId?: string;
+  theme?: string;
+  themeSuggestion?: string;
+  themeConfidence?: number;
   topics?: string[];
   assignee?: string;
   estimate?: number;
@@ -73,7 +76,7 @@ export function normalizeIssue(issue: Issue): GraphNode {
     status: issue.status.name, statusType: issue.status.type, priority: issue.priority,
     priorityLabel: issue.priority === 1 ? "Urgent" : issue.priority === 2 ? "High" : issue.priority === 3 ? "Medium" : issue.priority === 4 ? "Low" : undefined,
     dueDate: issue.dueDate ?? undefined, updatedAt: issue.updatedAt, topic: issue.zone, topicId: issue.zone,
-    topics: issue.topicTags, assignee: undefined, labels: issue.labels, parentId: issue.parentId ?? undefined,
+    topics: issue.topicTags, theme: issue.theme ?? "pending", themeSuggestion: issue.themeSuggestion, themeConfidence: issue.themeConfidence, assignee: undefined, labels: issue.labels, parentId: issue.parentId ?? undefined,
   };
 }
 

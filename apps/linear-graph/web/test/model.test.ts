@@ -1,10 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { membershipGraph, retainSelection, uniqueTopics, deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, matchesNode, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
+import { clearFilters, membershipGraph, retainSelection, uniqueTopics, deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, matchesNode, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
 import { demoPayload } from "../src/protocol.js";
 
 const base: Filters = { query: "", teams: new Set(), topics: new Set(), showSemantic: true, showCompleted: false };
 
 describe("linear graph view model", () => {
+  test("clearing filters removes a theme and restores the graph, including in history", () => {
+    const filters: Filters = { ...base, showCompleted: true, theme: "nonexistent", query: "", teams: new Set(), topics: new Set() };
+    expect(emptyStateKind(demoPayload.snapshot, demoPayload.recommendations, filters, "universe")).toBe("filtered");
+    clearFilters(filters);
+    expect(filters.theme).toBeUndefined();
+    expect(visibleGraph(demoPayload.snapshot, demoPayload.recommendations, filters, "universe").nodes.length).toBeGreaterThan(0);
+    expect(filters.showCompleted).toBe(true);
+  });
   test("focus view keeps recommendations and one-hop context", () => {
     const graph = visibleGraph(demoPayload.snapshot, demoPayload.recommendations, base, "focus");
     expect(graph.nodes.map((node) => node.identifier)).toContain("CK-142");
@@ -44,6 +52,14 @@ describe("linear graph view model", () => {
     const completed = { ...demoPayload.snapshot, nodes: [...demoPayload.snapshot.nodes, { ...demoPayload.snapshot.nodes[0], id: "done", identifier: "DONE-1", statusType: "completed" as const }] };
     expect(visibleGraph(completed, demoPayload.recommendations, base, "universe").nodes.some((node) => node.id === "done")).toBe(false);
     expect(visibleGraph(completed, demoPayload.recommendations, { ...base, showCompleted: true }, "universe").nodes.some((node) => node.id === "done")).toBe(true);
+  });
+
+  test("theme selection filters graph nodes and edges without changing membership", () => {
+    const snapshot = { ...demoPayload.snapshot, nodes: demoPayload.snapshot.nodes.map((node, i) => ({ ...node, theme: i === 0 ? "checkout" : "unclear" })) };
+    const graph = visibleGraph(snapshot, demoPayload.recommendations, { ...base, theme: "checkout" }, "universe");
+    expect(graph.nodes.map((node) => node.id)).toEqual([snapshot.nodes[0]!.id]);
+    expect(graph.edges).toHaveLength(0);
+    expect(snapshot.nodes).toHaveLength(demoPayload.snapshot.nodes.length);
   });
 
   test("team metadata has deterministic colors and counts", () => {
