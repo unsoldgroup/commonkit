@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { readFileSync } from "node:fs";
 import { MAX_PROMPT_BYTES, runCodexAnalysis, type CodexRunnerOptions } from "../src/codex.js";
 import { normalizeLinearIssue } from "../src/normalizer.js";
 import { startGraphHub } from "../src/server.js";
@@ -36,6 +37,173 @@ export function fakeCodex(respond: (input: any, prompt: string) => unknown = ans
     } as never;
   } };
 }
+
+const referenceCases: [string, (out: any, id: string) => void][] = [
+  ["semanticEdges[0].sourceId", (out, id) => { out.semanticEdges = [{ sourceId: id, targetId: "00", confidence: 0.9, rationale: "Related" }]; }],
+  ["semanticEdges[0].targetId", (out, id) => { out.semanticEdges = [{ sourceId: "00", targetId: id, confidence: 0.9, rationale: "Related" }]; }],
+  ["recommendations[0].issueId", (out, id) => { out.recommendations = [{ issueId: id, rank: 1, score: 1, confidence: 0.9, whyNow: "Ready", nextAction: "Implement", evidenceIssueIds: ["00"] }]; }],
+  ["recommendations[0].evidenceIssueIds[0]", (out, id) => { out.recommendations = [{ issueId: "00", rank: 1, score: 1, confidence: 0.9, whyNow: "Ready", nextAction: "Implement", evidenceIssueIds: [id] }]; }],
+  ["triageDecisions[0].evidenceIssueIds[0]", (out, id) => { out.triageDecisions[0].evidenceIssueIds = [id]; }],
+];
+
+test("every reference field has bounded private diagnostics and exactly one correction", async () => {
+  for (const [path, change] of referenceCases) {
+    for (const foreign of ["33333333-3333-4333-8333-333333333333", "private customer prose ".repeat(1000)]) {
+      let calls = 0;
+      let message = "";
+      const progress: EnrichmentProgress[] = [];
+      try {
+        await runCodexAnalysis({ issues: [issue("00")], edges: [] }, fakeCodex((input) => {
+          calls++;
+          const out = answer(input); change(out, foreign); return out;
+        }), (value) => progress.push(value));
+      } catch (error) { message = (error as Error).message; }
+      expect(calls).toBe(2);
+      expect(message).toContain(path);
+      expect(message).toContain(foreign.startsWith("333") ? foreign : "sha256:");
+      expect(message).not.toContain("private customer");
+      expect(message.length).toBeLessThan(1000);
+      expect(progress.at(-1)).toMatchObject({ status: "failed", analyzedIssues: 0, completedBatches: 0 });
+    }
+  }
+});
+
+test("reference correction succeeds with identical complete context", async () => {
+  for (const [path, change] of referenceCases) {
+    let calls = 0;
+    let original = "";
+    await runCodexAnalysis({ issues: [issue("00", "Full description ".repeat(500))], edges: [], focusBrief: "Focus" }, fakeCodex((input, prompt) => {
+      calls++;
+      const out = answer(input);
+      if (calls === 1) { original = JSON.stringify(input); change(out, "unknown"); }
+      else {
+        expect(JSON.stringify(input)).toBe(original);
+        expect(prompt).toContain(path);
+        expect(prompt).toContain("correction 1/1");
+        expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(MAX_PROMPT_BYTES);
+      }
+      return out;
+    }));
+    expect(calls).toBe(2);
+  }
+});
+
+test("related context is allowed in evidence and edges but not recommendation subjects", async () => {
+  for (const [path, change] of referenceCases) {
+    let firstBatchCalls = 0;
+    const input = {
+      issues: Array.from({ length: 26 }, (_, i) => issue(String(i).padStart(2, "0"))),
+      edges: [{ sourceId: "00", targetId: "25", kind: "blocks", source: "linear" }],
+    };
+    const run = runCodexAnalysis(input, fakeCodex((payload) => {
+      const out = answer(payload);
+      if (payload.issues?.[0].id === "00") { firstBatchCalls++; change(out, "25"); }
+      return out;
+    }));
+    if (path === "recommendations[0].issueId") {
+      await expect(run).rejects.toThrow(path);
+      expect(firstBatchCalls).toBe(2);
+    } else {
+      expect((await run).assignments).toHaveLength(26);
+      expect(firstBatchCalls).toBe(1);
+    }
+  }
+});
+
+test("coverage and reference errors share one correction budget in either order", async () => {
+  for (const referenceFirst of [true, false]) {
+    let calls = 0;
+    await expect(runCodexAnalysis({ issues: [issue("00")], edges: [] }, fakeCodex((input) => {
+      calls++;
+      const out = answer(input);
+      if ((calls === 1) === referenceFirst) out.triageDecisions![0]!.evidenceIssueIds = ["unknown"];
+      else out.assignments = [];
+      return out;
+    }))).rejects.toThrow("correction 1/1 failed");
+    expect(calls).toBe(2);
+  }
+});
+
+test("generation schema constrains each reference domain and bounds dense-neighborhood enums", async () => {
+  for (const count of [26, 100, 101]) {
+    let first = true;
+    const base = fakeCodex();
+    const issues = Array.from({ length: count }, (_, i) => issue(String(i).padStart(3, "0")));
+    const edges = issues.slice(1).map((row) => ({ sourceId: "000", targetId: row.id }));
+    await runCodexAnalysis({ issues, edges }, { spawn(command, options) {
+      if (first) {
+        first = false;
+        const schema = JSON.parse(readFileSync(command[command.indexOf("--output-schema") + 1]!, "utf8"));
+        const props = schema.properties;
+        const primary = issues.slice(0, 25).map((row) => row.id);
+        const references = issues.map((row) => row.id);
+        for (const collection of ["assignments", "triageDecisions", "recommendations"]) {
+          expect(props[collection].items.properties.issueId.enum).toEqual(primary);
+        }
+        const fields = [
+          props.semanticEdges.items.properties.sourceId,
+          props.semanticEdges.items.properties.targetId,
+          props.recommendations.items.properties.evidenceIssueIds.items,
+          props.triageDecisions.items.properties.evidenceIssueIds.items,
+        ];
+        for (const field of fields) {
+          expect(field.type).toBe("string");
+          expect(field.enum).toEqual(count <= 100 ? references : undefined);
+        }
+        let enumValues = 0;
+        const walk = (value: any) => {
+          if (!value || typeof value !== "object") return;
+          if (Array.isArray(value.enum)) enumValues += value.enum.length;
+          Object.values(value).forEach(walk);
+        };
+        walk(schema);
+        expect(enumValues).toBeLessThan(1000);
+        expect(JSON.stringify(schema).length).toBeLessThan(120000);
+      }
+      return base.spawn!(command, options);
+    } });
+  }
+});
+
+test("many invalid references report the count and at most two locations", async () => {
+  let message = "";
+  try {
+    await runCodexAnalysis({ issues: [issue("00")], edges: [] }, fakeCodex((input) => ({
+      ...answer(input),
+      semanticEdges: Array.from({ length: 1000 }, () => ({ sourceId: "private prose", targetId: "more private prose", confidence: 1, rationale: "Related" })),
+    })));
+  } catch (error) { message = (error as Error).message; }
+  expect(message).toContain("invalid=2000");
+  expect(message).toContain("semanticEdges[0].sourceId");
+  expect(message).toContain("semanticEdges[0].targetId");
+  expect(message).not.toContain("semanticEdges[1]");
+  expect(message).not.toContain("private prose");
+  expect(message.length).toBeLessThan(1000);
+});
+
+test("reference failure after a valid batch never publishes partial enrichment", async () => {
+  const store = new GraphStore(":memory:");
+  let calls = 0;
+  const rows = Array.from({ length: 26 }, (_, i) => issue(String(i))).map((row) => ({ ...row, state: row.status, labels: { nodes: [] } }));
+  const hub = startGraphHub({ actionToken: "test", port: 0, store,
+    linear: { async fetchIssues() { return { nodes: rows, pageInfo: { hasNextPage: false } }; } },
+    codex: fakeCodex((input) => {
+      calls++;
+      const out = answer(input);
+      if (calls >= 2) out.triageDecisions![0]!.evidenceIssueIds = ["unknown"];
+      return out;
+    }),
+  });
+  try {
+    const run = await hub.runAnalysis();
+    expect(run.enrichment).toMatchObject({ status: "failed", analyzedIssues: 25, completedBatches: 1 });
+    expect(run.error).toContain("Reference correction 1/1 failed");
+    expect(calls).toBe(3);
+    expect(store.loadTriageDecisions()).toEqual([]);
+    expect(store.loadSnapshot()!.nodes).toHaveLength(26);
+    expect(store.loadBrief()!.source).toBe("fallback");
+  } finally { await hub.stop(); }
+});
 
 test("multi-megabyte input covers every open issue and full description in bounded prompts", async () => {
   const issues = Array.from({ length: 130 }, (_, i) => issue(String(i), `${i}:` + '"\\\n'.repeat(12000)));
@@ -137,18 +305,13 @@ test("a second coverage failure exhausts correction and retains only previously 
   expect(progress.at(-1)).toMatchObject({ status: "failed", analyzedIssues: 25, completedBatches: 1, totalBatches: 2 });
 });
 
-test("schema and reference failures do not spend a coverage correction", async () => {
-  for (const kind of ["schema", "reference"]) {
-    let calls = 0;
-    await expect(runCodexAnalysis({ issues: [issue("1")], edges: [] }, fakeCodex((input) => {
-      calls++;
-      const out = answer(input);
-      if (kind === "schema") return { bad: true };
-      out.triageDecisions![0]!.evidenceIssueIds = ["unknown"];
-      return out;
-    }))).rejects.toThrow();
-    expect(calls).toBe(1);
-  }
+test("schema failures do not spend a correction", async () => {
+  let calls = 0;
+  await expect(runCodexAnalysis({ issues: [issue("1")], edges: [] }, fakeCodex(() => {
+    calls++;
+    return { bad: true };
+  }))).rejects.toThrow("schema validation");
+  expect(calls).toBe(1);
 });
 
 test("a malformed correction stops without a third request", async () => {
@@ -179,13 +342,18 @@ test("correction overhead cannot exceed the prompt budget or truncate context", 
   }));
   // Empty descriptions serialize as null; replacing null with a quoted ASCII
   // string costs two fewer overhead bytes.
-  let calls = 0;
-  await expect(runCodexAnalysis({ issues: [issue("1", "x".repeat(MAX_PROMPT_BYTES - bytes + 2))], edges: [] }, fakeCodex((input, prompt) => {
-    calls++;
-    expect(Buffer.byteLength(prompt)).toBe(MAX_PROMPT_BYTES);
-    return { ...answer(input), assignments: [] };
-  }))).rejects.toThrow("Coverage correction exceeds prompt budget: Codex coverage incomplete");
-  expect(calls).toBe(1);
+  for (const reference of [false, true]) {
+    let calls = 0;
+    await expect(runCodexAnalysis({ issues: [issue("1", "x".repeat(MAX_PROMPT_BYTES - bytes + 2))], edges: [] }, fakeCodex((input, prompt) => {
+      calls++;
+      expect(Buffer.byteLength(prompt)).toBe(MAX_PROMPT_BYTES);
+      const out = answer(input);
+      if (reference) out.triageDecisions![0]!.evidenceIssueIds = ["unknown"];
+      else out.assignments = [];
+      return out;
+    }))).rejects.toThrow(`${reference ? "Reference" : "Coverage"} correction exceeds prompt budget`);
+    expect(calls).toBe(1);
+  }
 });
 
 test("oversized single issues fail explicitly before spawning, never silently truncate", async () => {
