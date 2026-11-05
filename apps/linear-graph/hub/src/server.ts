@@ -18,6 +18,7 @@ import { inferTopicAssignment, summarizeTeams } from "./normalizer.js";
 import { redactSensitiveText } from "./redaction.js";
 import { GraphStore } from "./store.js";
 import { projectMembership } from "./membership.js";
+import { classifyTheme, themeInputHash } from "./themes.js";
 
 export interface GraphHubOptions {
   port?: number;
@@ -31,6 +32,7 @@ export interface GraphHubOptions {
   execution?: Omit<ExecutionRunnerOptions, "repositoryAllowlist"> & { repositoryAllowlist: Readonly<Record<string, string>> };
   webDistPath?: string;
   now?: () => Date;
+  themes?: { gatewayUrl: string; token: string; gatewayToken?: string; fetch?: typeof fetch };
 }
 export interface GraphHub { url: string; store: GraphStore; runAnalysis(): Promise<AnalysisRun>; stop(): Promise<void> }
 
@@ -77,6 +79,34 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
     store.saveSnapshot({ ...grouped, teams: summarizeTeams(grouped.nodes) });
   }
   let current = grouped;
+  let themeJob: Promise<void> | undefined;
+  let themeError: string | null = null;
+  let stopping = false;
+  const runThemes = () => {
+    if (!options.themes || !current || themeJob || stopping) return;
+    const nodes = current.nodes.filter((n) => !["completed", "canceled"].includes(n.status.type));
+    themeJob = (async () => {
+      let failures = 0;
+      let consecutiveFailures = 0;
+      for (const node of nodes) {
+        if (stopping) break;
+        const hash = themeInputHash(node.title);
+        if (store.getTheme(node.id, hash)) continue;
+        try {
+          const result = await classifyTheme(node.title, options.themes!);
+          store.saveTheme(node.id, hash, result.theme, result.confidence);
+          consecutiveFailures = 0;
+        } catch {
+          // Skip a single bad issue; stop repeated outages before making thousands of calls.
+          failures++;
+          if (++consecutiveFailures >= 3) break;
+        }
+      }
+      themeError = failures ? "Theme grouping failed; retrying later." : null;
+    })().finally(() => { themeJob = undefined; });
+  };
+  const themeTimer = options.themes ? setInterval(runThemes, 15 * 60_000) : undefined;
+  if (themeTimer) setTimeout(runThemes, 0);
   const interruptedBrief = store.loadBrief();
   if (interruptedBrief?.status === "running" && store.latestAnalysisRun()?.status === "failed") {
     store.saveBrief({ ...interruptedBrief, status: "stale", error: store.latestAnalysisRun()!.error, updatedAt: now().toISOString() });
@@ -116,6 +146,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         fallback = baseline;
         store.saveSnapshot(baseline);
         current = baseline;
+        runThemes();
         // Refresh fallback counts on every sync, even while Codex is running.
         // A previous Codex brief keeps its original provenance until replaced.
         const previousBrief = store.loadBrief();
@@ -198,8 +229,9 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       if (url.pathname === "/api/graph" && request.method === "GET") {
         if (!current) return error("No snapshot available", 503);
         const membership = projectMembership(current, url.searchParams.get("history") === "true");
-        const snapshot = url.searchParams.get("view") === "focus" ? focusSnapshot(membership) : membership;
-        return json({ snapshot, brief: store.loadBrief(), analysis: store.latestAnalysisRun(), drain: updateDrainMetrics() });
+        const selected = url.searchParams.get("view") === "focus" ? focusSnapshot(membership) : membership;
+        const snapshot = { ...selected, nodes: selected.nodes.map((node) => ({ ...node, theme: store.getTheme(node.id, themeInputHash(node.title))?.theme ?? "pending" })) };
+        return json({ snapshot, brief: store.loadBrief(), analysis: store.latestAnalysisRun(), drain: updateDrainMetrics(), themes: { enabled: Boolean(options.themes), running: Boolean(themeJob), error: themeError } });
       }
       if (url.pathname === "/api/focus-brief" && request.method === "GET") return json(store.loadBrief() ?? { text: "", updatedAt: now().toISOString(), status: "stale", source: "fallback", error: "No brief has been generated yet" });
       if (url.pathname === "/api/analysis-runs/latest" && request.method === "GET") return json(store.latestAnalysisRun());
@@ -329,5 +361,5 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       return error("Not found", 404);
     },
   });
-  return { url: `http://${options.hostname ?? "127.0.0.1"}:${server.port}`, store, runAnalysis, async stop() { server.stop(); if (!options.store) store.close(); } };
+  return { url: `http://${options.hostname ?? "127.0.0.1"}:${server.port}`, store, runAnalysis, async stop() { stopping = true; if (themeTimer) clearInterval(themeTimer); server.stop(); await themeJob; if (!options.store) store.close(); } };
 }

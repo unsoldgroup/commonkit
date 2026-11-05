@@ -2,7 +2,7 @@ import type { GraphEdge, GraphNode, GraphSnapshot, TeamMetadata, TopicZone, Focu
 
 export type ViewMode = "focus" | "universe";
 export type GraphLayoutName = "fcose" | "grid";
-export type Filters = { query: string; teams: Set<string>; topics: Set<string>; showSemantic: boolean; showCompleted: boolean };
+export type Filters = { query: string; teams: Set<string>; topics: Set<string>; showSemantic: boolean; showCompleted: boolean; theme?: string };
 export type SelectionViewportAction = "fit" | "preserve";
 export type TeamSummary = { id?: string; key?: string; name: string; count: number; activeCount?: number; completedCount?: number; canceledCount?: number; color: string };
 export type ZoneMetric = TopicZone & { issueCount: number; activeCount: number; completedCount: number; canceledCount: number; weightedWorkload: number };
@@ -75,7 +75,7 @@ export const deterministicGridColumns = (nodeCount: number) => Math.max(1, Math.
 
 /** Identifies graph-affecting state so shell-only updates do not rerun layout. */
 export function graphRenderKey(revision: number, view: ViewMode, filters: Filters) {
-  return JSON.stringify([revision, view, filters.query, [...filters.teams].sort(), [...filters.topics].sort(), filters.showSemantic, filters.showCompleted]);
+  return JSON.stringify([revision, view, filters.query, [...filters.teams].sort(), [...filters.topics].sort(), filters.showSemantic, filters.showCompleted, filters.theme]);
 }
 
 /** Selecting a different ticket fits the graph, but never recenters it afterward. */
@@ -98,7 +98,7 @@ export function matchesNode(node: GraphNode, filters: Filters) {
   const teamMatch = !filters.teams.size || filters.teams.has(node.team);
   const topicMatch = !filters.topics.size || filters.topics.has(node.topic ?? "") || (node.topics ?? []).some((topic) => filters.topics.has(topic));
   const completedMatch = filters.showCompleted || !["completed", "canceled"].includes(node.statusType ?? "");
-  return queryMatch && teamMatch && topicMatch && completedMatch;
+  return queryMatch && teamMatch && topicMatch && completedMatch && (!filters.theme || (node.theme ?? "pending") === filters.theme);
 }
 
 export function visibleGraph(snapshot: GraphSnapshot, recommendations: FocusRecommendation[], filters: Filters, view: ViewMode): { nodes: GraphNode[]; edges: GraphEdge[]; zones: TopicZone[] } {

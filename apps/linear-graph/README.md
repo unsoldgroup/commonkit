@@ -1,5 +1,27 @@
 # Linear work graph
 
+## Thematic grouping (USG-403)
+
+The hub can classify open issue titles with Cloudflare Clef independently of
+the daily Codex analysis. Configure `LINEAR_GRAPH_CLEF_GATEWAY_URL` as the
+existing AI Gateway provider-native URL ending `/workers-ai/@cf/cloudflare/clef`
+and `LINEAR_GRAPH_CLEF_TOKEN` as an existing Workers AI credential in the hub's
+root-only environment. Both are required. No inference happens without them.
+For authenticated gateways set `LINEAR_GRAPH_CLEF_GATEWAY_TOKEN` as well. Requests use
+`cf-aig-skip-log`, redact and cap titles at 500 characters, and omit descriptions.
+The model is billed by input tokens; check gateway data handling and spend limits
+before enabling it.
+
+Assignments are separate from snapshots and keyed by issue ID and a hash of
+the redacted title and taxonomy version. The hub resumes missing assignments
+after restart or snapshot update, one request at a time, and retries failures
+after 15 minutes without disrupting Codex. Completed issues are not classified.
+Failures retain existing assignments; three consecutive failures stop the pass.
+The graph distinguishes awaiting grouping
+from low-confidence `Unclear` results; the 0.5 threshold is provisional, not
+a measured accuracy guarantee. Theme selection filters the graph and edges.
+Use Refresh to see progress. A changed title invalidates its prior assignment.
+
 The graph is a private, read-only focus dashboard for Linear issues. It groups issues into
 stable topical zones, renders parent and relationship edges, and adds only high-confidence
 Codex suggestions as dashed edges. The UI has Focus and Universe views, filters, an accessible

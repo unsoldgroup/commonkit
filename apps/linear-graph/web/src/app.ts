@@ -18,6 +18,7 @@ let loading = false;
 let initialLoading = true;
 let graphError: string | null = null;
 let analysisError: string | null = null;
+let themeStatus = "";
 let campaignProposal: Campaign | null = null;
 let campaigns: Campaign[] = [];
 let executions: ExecutionRun[] = [];
@@ -36,6 +37,7 @@ let graphAbort: AbortController | undefined;
 
 function esc(value: unknown) { const el = document.createElement("span"); el.textContent = String(value ?? ""); return el.innerHTML; }
 let membershipCache: { source: GraphPayload["snapshot"]; history: boolean; graph: GraphPayload["snapshot"] } | undefined;
+const themes: Record<string, string> = { checkout: "Checkout", quotes: "Quotes", policies: "Policies", pricing: "Pricing & carriers", communications: "Communications", security: "Security", delivery: "Delivery & reliability", data: "Data & APIs", scraping: "Scraping", documentation: "Documentation", other: "Other", unclear: "Unclear", pending: "Awaiting grouping" };
 function membership() {
   if (!membershipCache || membershipCache.source !== payload.snapshot || membershipCache.history !== filters.showCompleted) {
     membershipCache = { source: payload.snapshot, history: filters.showCompleted, graph: membershipGraph(payload.snapshot, filters.showCompleted) };
@@ -169,7 +171,7 @@ function renderShell() {
     <aside class="rail" aria-label="Focus controls">
       <section class="brief-card ${graphError || analysisError || ["failed", "stale"].includes(payload.brief?.status ?? "") ? "has-error" : ""}"><div class="section-kicker"><span class="status-dot"></span> TODAY'S BRIEF</div><p id="brief-copy"></p>${analysisError ? `<small class="brief-error">${esc(analysisError)}</small>` : payload.analysis?.status === "failed" ? `<small class="brief-error">${esc(payload.analysis.error ?? "The last brief run failed.")}</small>` : payload.brief?.error ? `<small class="brief-error">${esc(payload.brief.error)}</small>` : graphError ? `<small class="brief-error">${esc(graphError)}</small>` : ""}<button id="edit-brief" class="quiet-button" type="button">Edit brief <span>↗</span></button></section>
       <section class="rail-section"><div class="section-heading"><h2>Recommended</h2><span class="count">${payload.recommendations.length}</span></div><div id="recommendations" class="recommendations"></div></section>
-      <section class="rail-section"><div class="section-heading"><h2>Workstreams</h2><span class="count">${membership().nodes.length}</span></div><div id="zones" class="zones"></div></section>
+      <section class="rail-section"><div class="section-heading"><h2>Themes</h2><span class="count">${membership().nodes.length}</span></div>${themeStatus ? `<p class="muted">${esc(themeStatus)} <button type="button" data-refresh-themes>Refresh</button></p>` : ""}<div class="teams" aria-label="Filter by theme"><button type="button" class="team-row ${!filters.theme ? "active" : ""}" data-theme="all">All <span>${membership().nodes.length}</span></button>${Object.entries(themes).map(([id, label]) => `<button type="button" class="team-row ${filters.theme === id ? "active" : ""}" data-theme="${id}">${label}<span>${membership().nodes.filter((node) => (node.theme ?? "pending") === id).length}</span></button>`).join("")}</div></section><section class="rail-section"><div class="section-heading"><h2>Workstreams</h2><span class="count">${membership().nodes.length}</span></div><div id="zones" class="zones"></div></section>
       <section class="rail-section team-section"><div class="section-heading"><h2>Teams</h2><span class="count">${teams.length}</span></div><div id="teams" class="teams">${teams.map((team) => `<button type="button" class="team-row ${filters.teams.has(team.name) ? "active" : ""}" data-filter-kind="team" data-filter-value="${esc(team.name)}"><i style="--team:${team.color}"></i><span>${esc(team.name)}</span><b>${team.count}</b></button>`).join("") || `<p class="muted">No team metadata yet.</p>`}</div></section>
     </aside>
     <section class="workspace">
@@ -353,6 +355,8 @@ async function loadGraph() {
     if (!response.ok) throw new Error("Graph unavailable");
     const body = await response.json() as Record<string, unknown>;
     if (requestId !== graphRequestId || controller.signal.aborted || requestedView !== view || requestedHistory !== filters.showCompleted) return;
+    const state = body.themes as { enabled?: boolean; running?: boolean; error?: string | null } | undefined;
+    themeStatus = !state?.enabled ? "Theme grouping is not configured." : state.error || (state.running ? "Grouping tickets. Refresh to update." : "");
     if (body.snapshot && typeof body.snapshot === "object" && "nodes" in body.snapshot) { const snapshot = body.snapshot as Parameters<typeof normalizePayload>[0]; payload = normalizePayload(snapshot, body.brief as Parameters<typeof normalizePayload>[1], body.analysis as Parameters<typeof normalizePayload>[2]); graphRevision += 1; fitNextGraph = true; }
     else if ("nodes" in body) { payload = normalizePayload(body as Parameters<typeof normalizePayload>[0]); graphRevision += 1; fitNextGraph = true; }
     graphError = null;
@@ -447,6 +451,15 @@ document.addEventListener("input", (event) => { const input = event.target as HT
 document.addEventListener("change", (event) => { const select = event.target as HTMLSelectElement; if (select.id === "topic-select" && selectedId) void saveTopic(selectedId, select.value).catch(() => toast("Could not save topic")); });
 document.addEventListener("keydown", (event) => { const tag = document.activeElement?.tagName; if (["INPUT", "TEXTAREA", "SELECT"].includes(tag ?? "")) { if (event.key === "Escape") (document.activeElement as HTMLElement).blur(); return; } const key = event.key.toLowerCase(); if (event.key === "/") { event.preventDefault(); ($( "#search") as HTMLInputElement)?.focus(); return; } if (event.key === "+" || event.key === "=") { event.preventDefault(); runGraphAction("zoom-in"); return; } if (event.key === "-" || event.key === "_") { event.preventDefault(); runGraphAction("zoom-out"); return; } if (event.key === "0") { event.preventDefault(); runGraphAction("fit"); return; } if (key === "r") { event.preventDefault(); runGraphAction("reset"); return; } if (key === "f") { event.preventDefault(); view = "focus"; void loadGraph(); return; } if (key === "u") { event.preventDefault(); view = "universe"; void loadGraph(); return; } if (event.key === "?") { event.preventDefault(); toggleShortcuts(); return; } if (event.key === "Escape") { if (!($("#shortcuts-help") as HTMLElement).hidden) { toggleShortcuts(false); return; } if (selectedId) { selectedId = null; renderShell(); } } });
 
+document.addEventListener("click", (event) => {
+  if ((event.target as Element).closest("button[data-refresh-themes]")) { void loadGraph(); return; }
+  const button = (event.target as Element).closest<HTMLButtonElement>("button[data-theme]");
+  if (!button) return;
+  filters.theme = button.dataset.theme === "all" ? undefined : button.dataset.theme;
+  view = "universe";
+  fitNextGraph = true;
+  renderShell();
+});
 void loadGraph();
 void refreshCodexStatus();
 startCodexStatusPolling();

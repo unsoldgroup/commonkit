@@ -46,6 +46,14 @@ describe("linear graph view model", () => {
     expect(visibleGraph(completed, demoPayload.recommendations, { ...base, showCompleted: true }, "universe").nodes.some((node) => node.id === "done")).toBe(true);
   });
 
+  test("theme selection filters graph nodes and edges without changing membership", () => {
+    const snapshot = { ...demoPayload.snapshot, nodes: demoPayload.snapshot.nodes.map((node, i) => ({ ...node, theme: i === 0 ? "checkout" : "unclear" })) };
+    const graph = visibleGraph(snapshot, demoPayload.recommendations, { ...base, theme: "checkout" }, "universe");
+    expect(graph.nodes.map((node) => node.id)).toEqual([snapshot.nodes[0]!.id]);
+    expect(graph.edges).toHaveLength(0);
+    expect(snapshot.nodes).toHaveLength(demoPayload.snapshot.nodes.length);
+  });
+
   test("team metadata has deterministic colors and counts", () => {
     const summaries = teamSummaries(demoPayload.snapshot.nodes);
     expect(summaries.map((team) => [team.name, team.count])).toEqual([["CommonKit", 2], ["Expedition Insure", 2], ["Unsold", 2]]);

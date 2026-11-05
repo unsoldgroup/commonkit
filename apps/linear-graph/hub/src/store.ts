@@ -23,6 +23,7 @@ export class GraphStore {
       CREATE TABLE IF NOT EXISTS analysis_runs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS triage_decisions (issue_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS campaigns (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS theme_assignments (issue_id TEXT PRIMARY KEY, input_hash TEXT NOT NULL, theme TEXT NOT NULL, confidence REAL NOT NULL);
       CREATE TABLE IF NOT EXISTS drain_metrics (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS execution_runs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
     this.closeInterruptedRuns();
@@ -57,6 +58,14 @@ export class GraphStore {
       recommendations: snapshot.recommendations.map((recommendation) => ({ ...recommendation, whyNow: safeText(recommendation.whyNow, 1_000), nextAction: safeText(recommendation.nextAction, 500) })),
     });
     this.db.query("INSERT INTO snapshots (id, payload) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload").run(JSON.stringify(value));
+  }
+
+  getTheme(issueId: string, inputHash: string): { theme: string; confidence: number } | null {
+    return this.db.query("SELECT theme, confidence FROM theme_assignments WHERE issue_id=? AND input_hash=?").get(issueId, inputHash) as { theme: string; confidence: number } | null;
+  }
+
+  saveTheme(issueId: string, inputHash: string, theme: string, confidence: number) {
+    this.db.query("INSERT OR REPLACE INTO theme_assignments(issue_id,input_hash,theme,confidence) VALUES(?,?,?,?)").run(issueId, inputHash, theme, confidence);
   }
 
   loadSnapshot(): GraphSnapshot | null {
