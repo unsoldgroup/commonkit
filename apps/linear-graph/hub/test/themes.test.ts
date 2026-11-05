@@ -75,6 +75,13 @@ test("three failing issues are deferred across restart so later issues are class
     expect(secondAttempts).toBe(1);
     expect(store.getTheme(nodes[3]!.id, themeInputHash(nodes[3]!.title))?.theme).toBe("checkout");
     expect(store.themeRetryAfter(nodes[0]!.id, themeInputHash("Changed title"))).toBeNull();
+    let retried = 0, retriedThree!: () => void;
+    const retryPass = new Promise<void>((resolve) => { retriedThree = resolve; });
+    const retry = startGraphHub({ actionToken: "test", port: 0, store, now: () => new Date(Date.parse(date) + 3_600_000), themes: { ...config, fetch: (async () => { if (++retried === 3) retriedThree(); return new Response("bad", { status: 500 }); }) as unknown as typeof fetch } });
+    await retryPass;
+    await retry.stop();
+    expect(retried).toBe(3);
+    expect(store.themeRetryAfter(nodes[0]!.id, themeInputHash(nodes[0]!.title))).toBe(Date.parse(date) + 7_200_000);
   } finally { store.close(); }
 });
 
