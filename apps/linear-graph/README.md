@@ -63,8 +63,11 @@ plus its relationship context that cannot fit fails planning explicitly, before
 any provider call. It must be resolved before claiming complete enrichment.
 
 Each batch must return exactly one valid assignment and triage decision per
-issue. Unknown IDs, duplicate/missing coverage, malformed rows and schema errors
-fail the enrichment; invalid rows are never silently discarded. The provider's
+issue. Coverage errors report both collections' expected/actual row counts and
+missing, duplicate and foreign ID counts. Duplicate counts mean distinct IDs
+appearing more than once. Each category includes at most two ID samples: UUIDs
+are shown directly and other strings are SHA-256 fingerprints, never arbitrary
+provider text. The provider's
 JSON schema derives from the runtime schema. Every batch brief participates in
 bounded hierarchical synthesis. Existing limits of 1,000 semantic suggestions
 and 50 Codex recommendations apply to the combined result; these suggestion
@@ -87,8 +90,33 @@ stale when enrichment fails. Manual brief text remains untouched. Failed
 enrichment is also recorded on the brief. The model, provider, login, sandbox,
 action-token policy, frame feed and daily schedule are unchanged. The existing
 `LINEAR_GRAPH_CODEX_TIMEOUT_MS` (default 600,000) applies to each bounded provider
-request; batches run serially with no automatic retries. Large universes take
-multiple calls and may take substantially longer than one request.
+request. A structurally valid response with missing, duplicate or foreign
+assignment/triage IDs gets at most **one correction request per batch**. It
+receives the same full payload plus the coverage diagnostic and a request for
+a complete replacement. Both collections and all references must pass the
+original validation; no rows from the invalid response are kept. Counts advance
+only after validation. A second invalid response fails enrichment without
+publishing partial results. Transport, timeout, schema, reference and synthesis
+failures are not retried. If correction instructions exceed the existing prompt
+budget, the batch fails explicitly without truncating its context.
+
+Batches remain serial: at most twice the planned batch count in analysis calls,
+plus the existing synthesis calls. For 87 batches, that is at most 174 analysis
+calls, with at most 87 additional per-request timeouts. Large universes can take
+substantially longer than one request; there is no automatic whole-run retry.
+
+The 2026-11-05 11:37 sync failed batch 4/87 after 75/2160 active issues on
+`f4a03309bf9aaf1e009cd46b442a78b249e2812f`. Its response was not retained, so the
+original missing/duplicate/foreign breakdown is unknown. Three targeted
+replays of snapshot batch 4 using the existing provider/model/subscription
+settings each returned exactly 25 assignments and 25 triage decisions with
+zero coverage discrepancies. The snapshot reconstructed 87 batches; batch 4
+had six related endpoints, a 49,595-byte prompt, and no descriptions at the
+snapshot's 5,000-character storage limit. These are successful replays, not a
+reproduction of the original bad response. Intermittent output drift is an
+inference. Synthetic seam regressions cover each discrepancy independently;
+real-provider correction after an actual bad response and complete-universe
+success still require validation after parent review and authorized rollout.
 
 ### USG-399 rollout handoff
 

@@ -1,4 +1,5 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
@@ -145,15 +146,33 @@ function prepareBatches(input: AnalysisInput) {
   return batches;
 }
 
+// IDs are model output too. Only UUIDs may be printed verbatim; fingerprint
+// everything else so arbitrary prose, customer details or credentials cannot
+// enter persisted errors. Samples stay bounded below the store's error limit.
+function coverageIds(ids: string[]) {
+  const safe = (id: string) => /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id)
+    ? id : `sha256:${createHash("sha256").update(id).digest("hex").slice(0, 12)}`;
+  return `[${ids.slice(0, 2).map(safe).join(",")}${ids.length > 2 ? `,+${ids.length - 2}` : ""}]`;
+}
+
+class CoverageError extends Error {}
+
 function validateBatch(raw: unknown, batch: ReturnType<typeof prepareBatches>[number]) {
   let result: CodexAnalysis;
   try { result = sanitizeAnalysis(raw); } catch { throw new Error("Codex output failed schema validation"); }
   if (!result.brief?.trim() || !result.triageDecisions) throw new Error("Codex omitted brief or triage decisions");
-  for (const rows of [result.assignments, result.triageDecisions]) {
-    const seen = new Set(rows.map((row) => row.issueId));
-    if (rows.length !== batch.ids.size || seen.size !== rows.length || [...seen].some((id) => !batch.ids.has(id))) {
-      throw new Error("Codex coverage incomplete: expected exactly one assignment and triage decision per batch issue");
-    }
+  const coverage = (["assignments", "triageDecisions"] as const).map((collection) => {
+    const rows = result[collection]!;
+    const counts = new Map<string, number>();
+    for (const row of rows) counts.set(row.issueId, (counts.get(row.issueId) ?? 0) + 1);
+    const missing = [...batch.ids].filter((id) => !counts.has(id));
+    const duplicate = [...counts].filter(([, count]) => count > 1).map(([id]) => id);
+    const foreign = [...counts.keys()].filter((id) => !batch.ids.has(id));
+    return { invalid: missing.length + duplicate.length + foreign.length > 0,
+      diagnostic: `${collection}: expected=${batch.ids.size} actual=${rows.length} missing=${missing.length} ${coverageIds(missing)} duplicate=${duplicate.length} ${coverageIds(duplicate)} foreign=${foreign.length} ${coverageIds(foreign)}` };
+  });
+  if (coverage.some((item) => item.invalid)) {
+    throw new CoverageError(`Codex coverage incomplete; ${coverage.map((item) => item.diagnostic).join("; ")}`);
   }
   const references = [
     ...result.semanticEdges.flatMap((edge) => [edge.sourceId, edge.targetId]),
@@ -166,6 +185,33 @@ function validateBatch(raw: unknown, batch: ReturnType<typeof prepareBatches>[nu
   return result;
 }
 
+async function analyzeBatch(batch: ReturnType<typeof prepareBatches>[number], options: CodexRunnerOptions) {
+  try {
+    return validateBatch(await runPrompt(batch.prompt, outputSchema, options), batch);
+  } catch (error) {
+    // Only a structurally valid response with wrong coverage is correctable here.
+    // Never retry transport, timeout, schema or reference failures automatically.
+    if (!(error instanceof CoverageError)) throw error;
+    const prompt = [
+      "Coverage correction 1/1: the previous response failed validation.",
+      error.message,
+      `Return a complete replacement with exactly ${batch.ids.size} assignments and ${batch.ids.size} triageDecisions.`,
+      "Use every issues[].id exactly once in each collection, never its identifier or a relatedIssues ID. Check both collections before returning.",
+      batch.prompt,
+    ].join("\n");
+    // Keep the original context intact. A near-budget batch may not have room
+    // for correction instructions; fail explicitly instead of truncating it.
+    if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) {
+      throw new Error(`Coverage correction exceeds prompt budget: ${error.message}`);
+    }
+    try {
+      return validateBatch(await runPrompt(prompt, outputSchema, options), batch);
+    } catch (correctionError) {
+      throw new Error(`Coverage correction 1/1 failed: ${correctionError instanceof Error ? correctionError.message : "analysis failed"}`);
+    }
+  }
+}
+
 export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunnerOptions, onProgress?: (progress: EnrichmentProgress) => void): Promise<CodexAnalysis> {
   let progress: EnrichmentProgress = { status: "running", phase: "planning", totalIssues: input.issues.filter((issue) => !["completed", "canceled"].includes(issue.status.type)).length, analyzedIssues: 0, totalBatches: 0, completedBatches: 0 };
   const report = (patch: Partial<EnrichmentProgress>) => { progress = { ...progress, ...patch }; onProgress?.(progress); };
@@ -176,8 +222,7 @@ export async function runCodexAnalysis(input: AnalysisInput, options: CodexRunne
     const results: CodexAnalysis[] = [];
     for (const [index, batch] of batches.entries()) {
       try {
-        const raw = await runPrompt(batch.prompt, outputSchema, options);
-        results.push(validateBatch(raw, batch));
+        results.push(await analyzeBatch(batch, options));
       } catch (error) {
         throw new Error(`Batch ${index + 1}/${batches.length} failed after ${progress.analyzedIssues}/${progress.totalIssues} issues: ${error instanceof Error ? error.message : "analysis failed"}`);
       }
