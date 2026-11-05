@@ -33,10 +33,12 @@ export function applyCodexAnalysis(issues: Issue[], linearEdges: GraphEdge[], an
 export function focusSnapshot(snapshot: ReturnType<typeof graphSnapshotSchema.parse>, limit = 15) {
   const recommendations = snapshot.recommendations.slice(0, limit);
   const selected = new Set(recommendations.map((item) => item.issueId));
+  const seeds = new Set(selected);
   for (const edge of snapshot.edges) {
-    if (selected.has(edge.sourceId) || selected.has(edge.targetId)) { selected.add(edge.sourceId); selected.add(edge.targetId); }
+    if (seeds.has(edge.sourceId) || seeds.has(edge.targetId)) { selected.add(edge.sourceId); selected.add(edge.targetId); }
   }
-  return { ...snapshot, nodes: snapshot.nodes.filter((node) => selected.has(node.id)), edges: snapshot.edges.filter((edge) => selected.has(edge.sourceId) && selected.has(edge.targetId)) };
+  const nodes = snapshot.nodes.filter((node) => selected.has(node.id));
+  return { ...snapshot, nodes, teams: summarizeTeams(nodes), edges: snapshot.edges.filter((edge) => selected.has(edge.sourceId) && selected.has(edge.targetId)) };
 }
 
 export function defaultRecommendations(issues: Issue[]): FocusRecommendation[] {

@@ -5,6 +5,31 @@ stable topical zones, renders parent and relationship edges, and adds only high-
 Codex suggestions as dashed edges. The UI has Focus and Universe views, filters, an accessible
 issue list, editable focus brief, and a primary-topic correction control.
 
+## Open membership (USG-401)
+
+`GET /api/graph` defaults to open issues (backlog, unstarted and started).
+`history=true` explicitly includes completed and canceled issues. Both modes
+prune edges to their returned endpoints and recompute team counts. Stored
+snapshots remain complete for provenance, history and ranking relationships.
+`view=focus` applies one-hop focus after membership and counts that projection.
+The browser loads the full chosen membership and applies Focus locally, so
+Open universe, workstreams, team counts and filter options share one population.
+Search and Focus narrow the canvas/list; their subset is not the universe count.
+Workstream memberships may overlap because secondary topic tags are retained.
+History selections and filters disappear when they leave the open population.
+
+Frame selection remains the ordered `/api/next-up?limit=20` contract: first
+eligible item after phone pins/snoozes, with Linear-priority fallback when the
+graph is stale. No Codex ranking or new daily persistence is introduced. The
+producer and rendered dashboard are owned by `al-unsoldgroup/clawdbot-vps-setup`
+(`vps-ci/frame_work.py` and `workers/frame-feed/src/views.js`), not footage-frame.
+
+USG-401 rollout: merge the reviewed CommonKit PR into the deploy branch's tracked
+upstream, then use the unchanged `apps/linear-graph/deploy/update-vps.sh` wrapper.
+No analysis run, migration or credential change is needed. Compare default and
+history API membership/counts and check the browser toggle after deployment.
+Frame producer/dashboard rollout is separate and documented in its companion PR.
+
 ## Local development
 
 ```sh

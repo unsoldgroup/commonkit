@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, matchesNode, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
+import { membershipGraph, retainSelection, uniqueTopics, deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, matchesNode, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
 import { demoPayload } from "../src/protocol.js";
 
 const base: Filters = { query: "", teams: new Set(), topics: new Set(), showSemantic: true, showCompleted: false };
@@ -51,7 +51,7 @@ describe("linear graph view model", () => {
     expect(summaries.map((team) => [team.name, team.count])).toEqual([["CommonKit", 2], ["Expedition Insure", 2], ["Unsold", 2]]);
     expect(teamColor("Unsold")).toBe(teamColor("Unsold"));
     expect(teamColor("Unsold")).not.toBe(teamColor("CommonKit"));
-    expect(teamSummaries([], demoPayload.snapshot.teams).map((team) => team.name)).toEqual(["CommonKit", "Expedition Insure", "Unsold"]);
+    expect(teamSummaries([], demoPayload.snapshot.teams)).toEqual([]);
   });
 
   test("empty-state kind distinguishes unavailable, filtered, and unprioritized work", () => {
@@ -113,4 +113,22 @@ describe("linear graph view model", () => {
     expect(filtered.nodes.every((node) => node.topic === "Product" || node.topics?.includes("Product"))).toBe(true);
     expect(filtered.zones.map((zone) => zone.id)).toEqual(demoPayload.snapshot.zones.map((zone) => zone.id));
   });
+});
+
+test("all UI surfaces share open membership and history selection is cleared on return", () => {
+  const source = { ...demoPayload.snapshot, nodes: [...demoPayload.snapshot.nodes,
+    { ...demoPayload.snapshot.nodes[0], id: "done", team: "Closed team", topic: "Closed topic", topics: ["Closed topic"], statusType: "completed" as const },
+    { ...demoPayload.snapshot.nodes[0], id: "canceled", statusType: "canceled" as const }],
+    edges: [...demoPayload.snapshot.edges, { ...demoPayload.snapshot.edges[0], id: "closed-edge", source: "done", target: "canceled" }] };
+  const open = membershipGraph(source);
+  expect(open.nodes).toHaveLength(demoPayload.snapshot.nodes.length);
+  expect(open.edges.some((edge) => edge.id === "closed-edge")).toBe(false);
+  expect(teamSummaries(open.nodes, source.teams).reduce((n, team) => n + team.count, 0)).toBe(open.nodes.length);
+  expect(uniqueTopics(open.nodes)).not.toContain("Closed topic");
+  expect(visibleGraph(source, demoPayload.recommendations, base, "universe").nodes).toEqual(open.nodes);
+  const history = membershipGraph(source, true);
+  expect(history.nodes).toHaveLength(open.nodes.length + 2);
+  expect(retainSelection(["done", "canceled", open.nodes[0].id], history.nodes)).toHaveLength(3);
+  expect(retainSelection(["done", "canceled", open.nodes[0].id], open.nodes)).toEqual([open.nodes[0].id]);
+  expect(source.nodes).toHaveLength(open.nodes.length + 2);
 });

@@ -30,10 +30,24 @@ export function statusShape(statusType?: GraphNode["statusType"]) {
 }
 
 export function teamSummaries(nodes: GraphNode[], metadata: TeamMetadata[] = []): TeamSummary[] {
-  if (metadata.length) return metadata.slice().sort((left, right) => left.key.localeCompare(right.key) || left.id.localeCompare(right.id)).map((team) => ({ id: team.id, key: team.key, name: team.name, count: team.issueCount, activeCount: team.activeIssueCount, completedCount: team.completedIssueCount, canceledCount: team.canceledIssueCount, color: teamColor(team.key || team.name) }));
   const counts = new Map<string, number>();
   for (const node of nodes) counts.set(node.team, (counts.get(node.team) ?? 0) + 1);
-  return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, count]) => ({ name, count, color: teamColor(name) }));
+  return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, count]) => {
+    const team = metadata.find((item) => item.name === name);
+    return { id: team?.id, key: team?.key, name, count, color: teamColor(team?.key || name) };
+  });
+}
+
+/** Also covers demo/old servers; every UI surface consumes this same membership. */
+export function membershipGraph(snapshot: GraphSnapshot, history = false): GraphSnapshot {
+  const nodes = snapshot.nodes.filter((node) => history || !["completed", "canceled"].includes(node.statusType ?? ""));
+  const ids = new Set(nodes.map((node) => node.id));
+  return { ...snapshot, nodes, edges: snapshot.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)) };
+}
+
+export function retainSelection(selected: Iterable<string>, nodes: GraphNode[]) {
+  const ids = new Set(nodes.map((node) => node.id));
+  return [...selected].filter((id) => ids.has(id));
 }
 
 const workloadWeight = (priority?: number) => priority === 1 ? 4 : priority === 2 ? 3 : priority === 3 ? 2 : 1;
@@ -88,6 +102,7 @@ export function matchesNode(node: GraphNode, filters: Filters) {
 }
 
 export function visibleGraph(snapshot: GraphSnapshot, recommendations: FocusRecommendation[], filters: Filters, view: ViewMode): { nodes: GraphNode[]; edges: GraphEdge[]; zones: TopicZone[] } {
+  snapshot = membershipGraph(snapshot, filters.showCompleted);
   const focusedIds = new Set(recommendations.slice(0, 15).map((item) => item.issueId));
   const focusNeighbors = new Set(focusedIds);
   for (const edge of snapshot.edges) if (focusedIds.has(edge.source) || focusedIds.has(edge.target)) { focusNeighbors.add(edge.source); focusNeighbors.add(edge.target); }

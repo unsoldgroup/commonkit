@@ -186,7 +186,7 @@ describe("linear graph hub", () => {
     const focus = focusSnapshot(snapshot);
     expect(snapshot.nodes.map((node) => node.id)).toEqual([first.id, second.id]);
     expect(focus.nodes.map((node) => node.id)).toEqual([first.id]);
-    expect(focus.teams).toEqual(snapshot.teams);
+    expect(focus.teams[0].issueCount).toBe(focus.nodes.length);
   });
 
 });
