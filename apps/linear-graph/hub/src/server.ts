@@ -5,7 +5,7 @@ import { z } from "zod";
 import {
   DEFAULT_ZONES, bundleApprovalRequestSchema, campaignRequestSchema, focusBriefSchema, graphSnapshotSchema,
   executionRequestSchema, triageDecisionRequestSchema, updateFocusBriefRequestSchema, updateTopicRequestSchema,
-  type AnalysisRun, type Campaign, type ExecutionRun, type GraphSnapshot, type TriageDecision, type WorkBundle,
+  type AnalysisRun, type Campaign, type ExecutionRun, type GraphSnapshot, type TriageDecision, type WorkBundle, type EnrichmentProgress,
 } from "@commonkit/linear-graph-protocol";
 import { applyCodexAnalysis, focusSnapshot } from "./analysis.js";
 import { createCodexAuthManager, type CodexAuthOptions } from "./codex-auth.js";
@@ -76,6 +76,10 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
     store.saveSnapshot({ ...grouped, teams: summarizeTeams(grouped.nodes) });
   }
   let current = grouped;
+  const interruptedBrief = store.loadBrief();
+  if (interruptedBrief?.status === "running" && store.latestAnalysisRun()?.status === "failed") {
+    store.saveBrief({ ...interruptedBrief, status: "stale", error: store.latestAnalysisRun()!.error, updatedAt: now().toISOString() });
+  }
   if (current && !store.loadBrief()) {
     const activeCount = current.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
     const timestamp = now().toISOString();
@@ -99,6 +103,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       const existingBrief = store.loadBrief();
       if (existingBrief) store.saveBrief({ ...existingBrief, status: "running", error: null, updatedAt: now().toISOString() });
       let fallback: GraphSnapshot | null = null;
+      let enrichment: EnrichmentProgress | undefined;
       try {
         if (!options.linear) throw new Error("Linear source is not configured");
         const sync = await syncLinear(options.linear, store.topicOverrides());
@@ -110,11 +115,22 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         fallback = baseline;
         store.saveSnapshot(baseline);
         current = baseline;
+        // Refresh fallback counts on every sync, even while Codex is running.
+        // A previous Codex brief keeps its original provenance until replaced.
+        const previousBrief = store.loadBrief();
+        if (!previousBrief || previousBrief.source === "fallback") {
+          const activeCount = issues.filter((issue) => !["completed", "canceled"].includes(issue.status.type)).length;
+          const timestamp = now().toISOString();
+          store.saveBrief({ text: `Universe synced: ${activeCount} active issues are ready for triage and bundle planning.`, updatedAt: timestamp, generatedAt: timestamp, snapshotAt: baseline.syncedAt, status: options.codex ? "running" : "ready", source: "fallback", error: null });
+        }
         let enrichmentError: string | null = null;
         let inputHash: string | null = null;
         if (options.codex) {
           try {
-            const result = await runCodexAnalysis({ issues, edges: sync.edges, focusBrief: store.loadBrief()?.text }, options.codex);
+            const result = await runCodexAnalysis({ issues, edges: sync.edges, focusBrief: existingBrief?.source === "manual" ? existingBrief.text : undefined }, options.codex, (progress) => {
+              enrichment = progress;
+              store.saveAnalysisRun({ ...running, issueCount: sync.rawCount, enrichment });
+            });
             if (!result.brief) throw new Error("Codex returned no daily brief");
             const applied = applyCodexAnalysis(issues, sync.edges, result, sync.syncedAt, id);
             const snapshot = { ...applied.snapshot, zones: baseline.zones, recommendations: baseline.recommendations };
@@ -129,19 +145,19 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
               store.saveTriageDecision({ ...decision, createdAt: previous?.createdAt ?? timestamp, updatedAt: timestamp, source: "codex" });
             }
           } catch (caught) {
+            if (enrichment) enrichment = { ...enrichment, status: "failed" };
             enrichmentError = `Codex enrichment skipped: ${caught instanceof Error ? caught.message : "failed"}`.slice(0, 1000);
-            console.error("Linear graph Codex enrichment failed", caught);
+            console.error("Linear graph Codex enrichment failed", enrichmentError);
           }
         }
         const brief = store.loadBrief();
-        if (!brief) {
-          const activeCount = baseline.nodes.filter((node) => !["completed", "canceled"].includes(node.status.type)).length;
-          store.saveBrief({ text: `Universe synced: ${activeCount} active issues are ready for triage and bundle planning.`, updatedAt: now().toISOString(), generatedAt: now().toISOString(), snapshotAt: baseline.syncedAt, status: "ready", source: "fallback", error: null });
-        } else if (brief.status !== "ready" || brief.snapshotAt !== baseline.syncedAt) {
-          store.saveBrief({ ...brief, status: "ready", error: null, updatedAt: now().toISOString(), snapshotAt: baseline.syncedAt });
+        if (brief) {
+          const stale = brief.source !== "manual" && brief.snapshotAt !== baseline.syncedAt;
+          const status = brief.source === "manual" ? "ready" : stale ? "stale" : enrichmentError ? "failed" : "ready";
+          store.saveBrief({ ...brief, status, error: enrichmentError, updatedAt: now().toISOString() });
         }
         updateDrainMetrics();
-        const completed = { ...running, completedAt: now().toISOString(), status: "completed", issueCount: sync.rawCount, error: enrichmentError, inputHash } as const;
+        const completed = { ...running, completedAt: now().toISOString(), status: "completed", issueCount: sync.rawCount, error: enrichmentError, inputHash, ...(enrichment ? { enrichment } : {}) } as const;
         store.saveAnalysisRun(completed);
         return completed;
       } catch (caught) {
@@ -150,7 +166,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
           current = graphSnapshotSchema.parse({ ...staleSnapshot, stale: true });
           store.saveSnapshot(current);
         }
-        const failed = { ...running, completedAt: now().toISOString(), status: "failed", error: caught instanceof Error ? caught.message.slice(0, 1000) : "analysis failed" } as const;
+        const failed = { ...running, completedAt: now().toISOString(), status: "failed", error: caught instanceof Error ? caught.message.slice(0, 1000) : "analysis failed", ...(enrichment ? { enrichment: { ...enrichment, status: "failed" as const } } : {}) } as const;
         const staleBrief = store.loadBrief();
         if (staleBrief) store.saveBrief({ ...staleBrief, status: "stale", error: failed.error, updatedAt: now().toISOString() });
         store.saveAnalysisRun(failed);
@@ -168,7 +184,11 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         const fresh = freshness(current, store.latestAnalysisRun(), now());
         return json({ ok: true, snapshotAt: current?.generatedAt ?? null, syncedAt: fresh.syncedAt, ageSeconds: fresh.ageSeconds, stale: fresh.stale });
       }
-      if (url.pathname === "/api/freshness" && request.method === "GET") return json(freshness(current, store.latestAnalysisRun(), now()));
+      if (url.pathname === "/api/freshness" && request.method === "GET") {
+        const lastRun = store.latestAnalysisRun();
+        const fresh = freshness(current, lastRun, now());
+        return json({ ...fresh, lastRun: fresh.lastRun ? { ...fresh.lastRun, ...(lastRun?.enrichment ? { enrichment: lastRun.enrichment } : {}) } : null });
+      }
       if (url.pathname === "/api/next-up" && request.method === "GET") {
         if (!current) return error("No snapshot available", 503);
         const limit = Math.min(50, Math.max(1, Number(url.searchParams.get("limit")) || 10));

@@ -76,62 +76,44 @@ describe("linear graph hub", () => {
       kill: () => resolveExit(0),
     };
     await expect(
-      runCodexAnalysis({ issues: [], edges: [] }, { timeoutMs: 10, spawn: () => child as never }),
+      runCodexAnalysis({ issues: [normalizeLinearIssue(raw("one"))], edges: [] }, { timeoutMs: 10, spawn: () => child as never }),
     ).rejects.toThrow(/timed out after 10ms/);
-  });
-
-  test("sends the complete active universe and all connected edges to Codex", async () => {
-    const issues = Array.from({ length: 701 }, (_, index) => normalizeLinearIssue(raw(`full-${index}`)));
-    const edges = Array.from({ length: 3001 }, (_, index) => ({ id: `edge-${index}`, sourceId: issues[0]!.id, targetId: issues[1]!.id, kind: "related", source: "linear" }));
-    let prompt = "";
-    const stream = (text: string) => new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(text)); controller.close(); } });
-    await runCodexAnalysis({ issues, edges }, {
-      spawn: (_command, options) => ({
-        stdin: { write(value: string) { prompt = value; }, end() {} },
-        stdout: stream(JSON.stringify({ brief: "Full universe reviewed.", assignments: [], semanticEdges: [], recommendations: [], triageDecisions: [] })),
-        stderr: stream(""), exited: Promise.resolve(0), kill() {},
-      } as never),
-    });
-    const input = JSON.parse(prompt.split("\n").at(-1)!);
-    expect(input.issues).toHaveLength(701);
-    expect(input.edges).toHaveLength(3001);
   });
 
   test("authenticates analysis with API-key mode without exposing the key to output", async () => {
     const secret = "sk-analysis-12345678901234567890";
     let env: Record<string, string> | undefined;
     const stream = (text: string) => new ReadableStream<Uint8Array>({ start(controller) { controller.enqueue(new TextEncoder().encode(text)); controller.close(); } });
-    const result = await runCodexAnalysis({ issues: [], edges: [] }, {
+    const result = await runCodexAnalysis({ issues: [normalizeLinearIssue(raw("one"))], edges: [] }, {
       apiKey: secret,
       spawn: (_command, options) => {
         env = options.env;
-        return { stdin: { write() {}, end() {} }, stdout: stream(JSON.stringify({ brief: "Analysis complete", assignments: [], semanticEdges: [], recommendations: [], triageDecisions: [] })), stderr: stream(""), exited: Promise.resolve(0), kill() {} } as never;
+        return { stdin: { write() {}, end() {} }, stdout: stream(JSON.stringify({ brief: `Analysis complete ${secret}`, assignments: [{ issueId: "one", zone: "product", topicTags: [], confidence: 1, rationale: "Work" }], semanticEdges: [], recommendations: [], triageDecisions: [{ issueId: "one", disposition: "ready", rationale: "Work", confidence: 1, evidenceIssueIds: [], nextAction: null }] })), stderr: stream(""), exited: Promise.resolve(0), kill() {} } as never;
       },
     });
     expect(env?.CODEX_API_KEY).toBe(secret);
     expect(JSON.stringify(result)).not.toContain(secret);
   });
 
-  test("keeps a Codex run alive when individual rows are malformed", () => {
+  test("normalizes known prose-case zones but rejects malformed rows", () => {
     const assignment = (issueId: string, zone: string) => ({ issueId, zone, topicTags: ["quote"], confidence: 0.8, rationale: "why" });
     const result = sanitizeAnalysis({
       assignments: [
         assignment("issue-1", "Product"),          // prose case, coerced
-        assignment("issue-2", "Quote pipeline"),    // not a real zone, becomes unsorted
         assignment("issue-3", "platform"),          // already valid
-        { issueId: "issue-4" },                     // malformed, dropped
       ],
       semanticEdges: [
         { sourceId: "issue-1", targetId: "issue-3", confidence: 0.9, rationale: "shared carrier path" },
-        { sourceId: "issue-1" },                    // malformed, dropped
       ],
       recommendations: [{ issueId: "issue-1", rank: 1, score: 90, whyNow: "now", nextAction: "do it", evidenceIssueIds: [], confidence: 0.9 }],
     });
     expect(result.assignments.map((item) => [item.issueId, item.zone])).toEqual([
-      ["issue-1", "product"], ["issue-2", "unsorted"], ["issue-3", "platform"],
+      ["issue-1", "product"], ["issue-3", "platform"],
     ]);
     expect(result.semanticEdges).toHaveLength(1);
     expect(result.recommendations).toHaveLength(1);
+    expect(() => sanitizeAnalysis({ ...result, assignments: [{ issueId: "issue-4" }] })).toThrow();
+    expect(() => sanitizeAnalysis({ ...result, assignments: [assignment("issue-2", "Quote pipeline")] })).toThrow();
   });
 
   test("assigns unsorted issues to deterministic topic zones from metadata", () => {
