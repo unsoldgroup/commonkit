@@ -17,6 +17,7 @@ import { assignRelationZones, freshness, nextUp, rankedRecommendations } from ".
 import { inferTopicAssignment, summarizeTeams } from "./normalizer.js";
 import { redactSensitiveText } from "./redaction.js";
 import { GraphStore } from "./store.js";
+import { projectMembership } from "./membership.js";
 
 export interface GraphHubOptions {
   port?: number;
@@ -196,7 +197,8 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       }
       if (url.pathname === "/api/graph" && request.method === "GET") {
         if (!current) return error("No snapshot available", 503);
-        const snapshot = url.searchParams.get("view") === "focus" ? focusSnapshot(current) : current;
+        const membership = projectMembership(current, url.searchParams.get("history") === "true");
+        const snapshot = url.searchParams.get("view") === "focus" ? focusSnapshot(membership) : membership;
         return json({ snapshot, brief: store.loadBrief(), analysis: store.latestAnalysisRun(), drain: updateDrainMetrics() });
       }
       if (url.pathname === "/api/focus-brief" && request.method === "GET") return json(store.loadBrief() ?? { text: "", updatedAt: now().toISOString(), status: "stale", source: "fallback", error: "No brief has been generated yet" });
