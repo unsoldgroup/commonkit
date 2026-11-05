@@ -63,7 +63,24 @@ export interface AnalysisInput {
 }
 
 // The provider contract and runtime validation share the same field limits.
-const outputSchema = z.toJSONSchema(codexAnalysisSchema.required(), { target: "draft-7" });
+function batchOutputSchema(batch: ReturnType<typeof prepareBatches>[number]) {
+  // Seven reference fields repeat enums: 3 primary + 4 context. Keep well
+  // below the provider's aggregate 1,000 values / 120,000 string characters.
+  // Large relationship neighborhoods keep string schemas and strict runtime
+  // membership checks, never a truncated enum or dropped context.
+  const identifier = (ids: Set<string>) => ids.size <= 100 && [...ids].every((id) => id.length <= 100)
+    ? z.enum([...ids] as [string, ...string[]]) : z.string().min(1);
+  const primary = identifier(batch.ids);
+  const reference = identifier(batch.referenceIds);
+  const shape = codexAnalysisSchema.shape;
+  return z.toJSONSchema(z.object({
+    ...shape,
+    assignments: shape.assignments.element.extend({ issueId: primary }).array(),
+    semanticEdges: shape.semanticEdges.element.extend({ sourceId: reference, targetId: reference }).array().max(1000),
+    recommendations: shape.recommendations.element.extend({ issueId: primary, evidenceIssueIds: reference.array().max(20) }).array().max(50),
+    triageDecisions: shape.triageDecisions.unwrap().element.extend({ issueId: primary, evidenceIssueIds: reference.array().max(50) }).array(),
+  }).strict().required(), { target: "draft-7" });
+}
 
 function parseCodexEvents(text: string): unknown {
   const direct = text.trim();
@@ -100,6 +117,7 @@ function analysisPrompt(payload: unknown) {
     "Assign and triage EVERY issue in issues exactly once. relatedIssues are relationship context only; do not assign or triage them.",
     `The zone must be one of: ${DEFAULT_ZONES.map((zone) => zone.id).join(", ")}.`,
     "Suggest only clearly semantic links. Never invent IDs; references must occur in issues or relatedIssues.",
+    "Copy id values exactly, never identifier values. Recommendation issueId must come from issues only. Semantic edge endpoints and all evidenceIssueIds may come from issues or relatedIssues.",
     "Write a concise brief about this batch only. It is part of a larger universe, not the complete universe.",
     JSON.stringify(payload),
   ].join("\n");
@@ -156,6 +174,7 @@ function coverageIds(ids: string[]) {
 }
 
 class CoverageError extends Error {}
+class ReferenceError extends Error {}
 
 function validateBatch(raw: unknown, batch: ReturnType<typeof prepareBatches>[number]) {
   let result: CodexAnalysis;
@@ -174,26 +193,41 @@ function validateBatch(raw: unknown, batch: ReturnType<typeof prepareBatches>[nu
   if (coverage.some((item) => item.invalid)) {
     throw new CoverageError(`Codex coverage incomplete; ${coverage.map((item) => item.diagnostic).join("; ")}`);
   }
-  const references = [
-    ...result.semanticEdges.flatMap((edge) => [edge.sourceId, edge.targetId]),
-    ...result.recommendations.flatMap((row) => row.evidenceIssueIds),
-    ...result.triageDecisions.flatMap((row) => row.evidenceIssueIds),
-  ];
-  if (references.some((id) => !batch.referenceIds.has(id)) || result.recommendations.some((row) => !batch.ids.has(row.issueId))) {
-    throw new Error("Codex returned an unknown or out-of-batch issue reference");
+  let invalidCount = 0;
+  const samples: string[] = [];
+  const check = (id: string, path: string, primary = false) => {
+    if ((primary ? batch.ids : batch.referenceIds).has(id)) return;
+    invalidCount++;
+    if (samples.length < 2) samples.push(`${path}=${coverageIds([id])} allowed=${primary ? "issues" : "issues+relatedIssues"}`);
+  };
+  result.semanticEdges.forEach((edge, index) => {
+    check(edge.sourceId, `semanticEdges[${index}].sourceId`);
+    check(edge.targetId, `semanticEdges[${index}].targetId`);
+  });
+  result.recommendations.forEach((row, index) => {
+    check(row.issueId, `recommendations[${index}].issueId`, true);
+    row.evidenceIssueIds.forEach((id, evidence) => check(id, `recommendations[${index}].evidenceIssueIds[${evidence}]`));
+  });
+  result.triageDecisions.forEach((row, index) => {
+    row.evidenceIssueIds.forEach((id, evidence) => check(id, `triageDecisions[${index}].evidenceIssueIds[${evidence}]`));
+  });
+  if (invalidCount) {
+    throw new ReferenceError(`Codex returned an unknown or out-of-batch issue reference; invalid=${invalidCount}; ${samples.join("; ")}`);
   }
   return result;
 }
 
 async function analyzeBatch(batch: ReturnType<typeof prepareBatches>[number], options: CodexRunnerOptions) {
+  const outputSchema = batchOutputSchema(batch);
   try {
     return validateBatch(await runPrompt(batch.prompt, outputSchema, options), batch);
   } catch (error) {
-    // Only a structurally valid response with wrong coverage is correctable here.
-    // Never retry transport, timeout, schema or reference failures automatically.
-    if (!(error instanceof CoverageError)) throw error;
+    // Coverage and references share this one replacement attempt. There is no
+    // recursive retry, including when the replacement fails a different check.
+    if (!(error instanceof CoverageError) && !(error instanceof ReferenceError)) throw error;
+    const correction = error instanceof CoverageError ? "Coverage" : "Reference";
     const prompt = [
-      "Coverage correction 1/1: the previous response failed validation.",
+      `${correction} correction 1/1: the previous response failed validation.`,
       error.message,
       `Return a complete replacement with exactly ${batch.ids.size} assignments and ${batch.ids.size} triageDecisions.`,
       "Use every issues[].id exactly once in each collection, never its identifier or a relatedIssues ID. Check both collections before returning.",
@@ -202,12 +236,12 @@ async function analyzeBatch(batch: ReturnType<typeof prepareBatches>[number], op
     // Keep the original context intact. A near-budget batch may not have room
     // for correction instructions; fail explicitly instead of truncating it.
     if (Buffer.byteLength(prompt) > MAX_PROMPT_BYTES) {
-      throw new Error(`Coverage correction exceeds prompt budget: ${error.message}`);
+      throw new Error(`${correction} correction exceeds prompt budget: ${error.message}`);
     }
     try {
       return validateBatch(await runPrompt(prompt, outputSchema, options), batch);
     } catch (correctionError) {
-      throw new Error(`Coverage correction 1/1 failed: ${correctionError instanceof Error ? correctionError.message : "analysis failed"}`);
+      throw new Error(`${correction} correction 1/1 failed: ${correctionError instanceof Error ? correctionError.message : "analysis failed"}`);
     }
   }
 }

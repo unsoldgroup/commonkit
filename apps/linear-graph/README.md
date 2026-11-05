@@ -67,8 +67,22 @@ issue. Coverage errors report both collections' expected/actual row counts and
 missing, duplicate and foreign ID counts. Duplicate counts mean distinct IDs
 appearing more than once. Each category includes at most two ID samples: UUIDs
 are shown directly and other strings are SHA-256 fingerprints, never arbitrary
-provider text. The provider's
-JSON schema derives from the runtime schema. Every batch brief participates in
+provider text. Reference failures identify the field and array index, total
+invalid reference count, allowed domain, and at most two UUID/fingerprint
+samples. They never include arbitrary model text.
+
+The provider's JSON schema derives from the runtime schema. Assignment,
+triage and recommendation subjects use primary-batch ID enums. Semantic edge
+endpoints and evidence IDs use primary-plus-related enums when that set has at
+most 100 IDs. Each enum also requires IDs of at most 100 characters. Larger
+sets retain string schemas plus strict runtime membership validation; context
+is never removed to fit an enum. At most 475 ID enum entries and 47,500 ID
+characters are repeated across the seven reference fields, leaving headroom
+under OpenAI's [schema limits](https://developers.openai.com/api/docs/guides/structured-outputs):
+1,000 aggregate enum values and 120,000 aggregate string characters. Each enum
+stays below the 250-entry threshold for the additional 15,000-character limit.
+The prompt explicitly distinguishes IDs from human identifiers and restricts
+recommendation subjects to primary issues. Every batch brief participates in
 bounded hierarchical synthesis. Existing limits of 1,000 semantic suggestions
 and 50 Codex recommendations apply to the combined result; these suggestion
 limits do not cap assignment or triage coverage. The published ranking remains
@@ -91,12 +105,13 @@ enrichment is also recorded on the brief. The model, provider, login, sandbox,
 action-token policy, frame feed and daily schedule are unchanged. The existing
 `LINEAR_GRAPH_CODEX_TIMEOUT_MS` (default 600,000) applies to each bounded provider
 request. A structurally valid response with missing, duplicate or foreign
-assignment/triage IDs gets at most **one correction request per batch**. It
-receives the same full payload plus the coverage diagnostic and a request for
+assignment/triage IDs, or an invalid reference, shares **one correction request
+per batch**. It receives the same full payload plus the safe diagnostic and a request for
 a complete replacement. Both collections and all references must pass the
 original validation; no rows from the invalid response are kept. Counts advance
 only after validation. A second invalid response fails enrichment without
-publishing partial results. Transport, timeout, schema, reference and synthesis
+publishing partial results, even if the second failure is a different kind.
+Transport, timeout, schema and synthesis
 failures are not retried. If correction instructions exceed the existing prompt
 budget, the batch fails explicitly without truncating its context.
 
@@ -117,6 +132,23 @@ reproduction of the original bad response. Intermittent output drift is an
 inference. Synthetic seam regressions cover each discrepancy independently;
 real-provider correction after an actual bad response and complete-universe
 success still require validation after parent review and authorized rollout.
+
+The subsequent 12:09:25–12:12:20 run
+`6c150a9a-890b-4f33-aafe-45b407d918d3` passed schema/coverage validation but
+failed reference validation in batch 1/87 after 0/2162 issues. The offending
+reference was not retained, so its exact mismatch remains unknown. The
+reference correction and bounded enum constraints address the observed failure
+class without claiming to reconstruct that response.
+
+At 12:20:29–12:23:14 UTC, a read-only replay of batch 1 from the
+12:09:58 snapshot passed with the bounded schema: 25 primary issues, six
+related endpoints, a 29,955-byte prompt, and no descriptions at the snapshot
+storage limit. The existing subscription/default model returned 25 assignments,
+25 triage decisions, nine semantic edges and five recommendations in one call.
+**No correction was exercised by this provider replay.** Synthetic regressions
+verify reference correction and mixed coverage/reference exhaustion. This is
+targeted acceptance evidence, not full-universe success; no service restart,
+production run, deployment or publication occurred during the replay.
 
 ### USG-399 rollout handoff
 
