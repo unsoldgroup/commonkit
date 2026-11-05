@@ -3,7 +3,7 @@ import fcose from "cytoscape-fcose";
 import { demoPayload, normalizePayload, type GraphEdge, type GraphNode, type GraphPayload } from "./protocol.js";
 import type { Campaign, ExecutionRun, WorkBundle } from "@commonkit/linear-graph-protocol";
 import { membershipGraph, retainSelection, deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, recommendationFor, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, uniqueTopics, visibleGraph, zoneMetrics, type Filters, type ViewMode } from "./model.js";
-import { setTextContent } from "./security.js";
+import { briefPresentation, renderBrief } from "./brief.js";
 
 cytoscape.use(fcose);
 const $ = <T extends Element>(selector: string) => document.querySelector<T>(selector)!;
@@ -153,6 +153,7 @@ async function connectCodex() {
 }
 
 function renderShell() {
+  const briefDetailsOpen = document.querySelector<HTMLDetailsElement>("#brief-details")?.open ?? false;
   reconcileSelection();
   // Shell updates (auth polling, toasts, brief status) should not detach the
   // Cytoscape event surface. Preserve the whole wrapper, not only #cy, so
@@ -167,7 +168,7 @@ function renderShell() {
   </header>
   <main class="layout">
     <aside class="rail" aria-label="Focus controls">
-      <section class="brief-card ${graphError || analysisError || ["failed", "stale"].includes(payload.brief?.status ?? "") ? "has-error" : ""}"><div class="section-kicker"><span class="status-dot"></span> TODAY'S BRIEF</div><p id="brief-copy"></p>${analysisError ? `<small class="brief-error">${esc(analysisError)}</small>` : payload.analysis?.status === "failed" ? `<small class="brief-error">${esc(payload.analysis.error ?? "The last brief run failed.")}</small>` : payload.brief?.error ? `<small class="brief-error">${esc(payload.brief.error)}</small>` : graphError ? `<small class="brief-error">${esc(graphError)}</small>` : ""}<button id="edit-brief" class="quiet-button" type="button">Edit brief <span>↗</span></button></section>
+      <section class="brief-card ${graphError || analysisError || ["failed", "stale"].includes(payload.brief?.status ?? "") ? "has-error" : ""}"><div class="section-kicker"><span class="status-dot"></span> TODAY'S BRIEF</div><div id="brief-copy"></div><small id="brief-status" class="brief-error"></small><details id="brief-details"><summary>Details</summary><p class="muted">Top recommendation from the existing ranking. The saved brief below is unchanged.</p><p id="brief-task-full"></p><p id="brief-provenance" class="muted"></p><p id="brief-analysis"></p></details>${analysisError ? `<small class="brief-error">${esc(analysisError)}</small>` : payload.analysis?.status === "failed" ? `<small class="brief-error">${esc(payload.analysis.error ?? "The last brief run failed.")}</small>` : payload.brief?.error ? `<small class="brief-error">${esc(payload.brief.error)}</small>` : graphError ? `<small class="brief-error">${esc(graphError)}</small>` : ""}<button id="edit-brief" class="quiet-button" type="button">Edit brief <span>↗</span></button></section>
       <section class="rail-section"><div class="section-heading"><h2>Recommended</h2><span class="count">${payload.recommendations.length}</span></div><div id="recommendations" class="recommendations"></div></section>
       <section class="rail-section"><div class="section-heading"><h2>Workstreams</h2><span class="count">${membership().nodes.length}</span></div><div id="zones" class="zones"></div></section>
       <section class="rail-section team-section"><div class="section-heading"><h2>Teams</h2><span class="count">${teams.length}</span></div><div id="teams" class="teams">${teams.map((team) => `<button type="button" class="team-row ${filters.teams.has(team.name) ? "active" : ""}" data-filter-kind="team" data-filter-value="${esc(team.name)}"><i style="--team:${team.color}"></i><span>${esc(team.name)}</span><b>${team.count}</b></button>`).join("") || `<p class="muted">No team metadata yet.</p>`}</div></section>
@@ -185,7 +186,8 @@ function renderShell() {
     $(".graph-wrap").replaceWith(existingGraphWrap);
     cy.resize();
   }
-  setTextContent($("#brief-copy"), briefCopy());
+  renderBrief($(".brief-card"), briefPresentation(payload, initialLoading, payload === demoPayload));
+  $("#brief-details").toggleAttribute("open", briefDetailsOpen);
   renderRecommendations(); renderZones(); renderList(); renderGraph(); renderContext();
 }
 
@@ -203,13 +205,6 @@ function renderCampaignHistory(campaign: Campaign) {
 }
 function filterChip(kind: "team" | "topic", label: string, active: boolean, color?: string, count?: number) { return `<button class="filter-chip ${active ? "active" : ""}" data-filter-kind="${kind}" data-filter-value="${esc(label)}" type="button">${color ? `<i style="--team:${color}"></i>` : ""}${esc(label)}${typeof count === "number" ? `<b>${count}</b>` : ""}</button>`; }
 function formatRelative(iso: string) { const minutes = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 60000)); return minutes < 1 ? "just now" : minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ago`; }
-function briefCopy() {
-  if (initialLoading && !payload.brief) return "Loading today’s brief…";
-  if (payload.analysis?.status === "running" || payload.brief?.status === "running") return payload.brief?.text ?? "Codex is preparing today’s brief from the current work universe…";
-  if (payload.brief?.text) return payload.brief.text;
-  if (graphError) return "The brief could not be loaded. Retry the graph refresh to recover the latest prioritization.";
-  return "No focus brief yet. Run an analysis to find the work that matters next.";
-}
 function renderRecommendations() {
   const root = $("#recommendations");
   root.innerHTML = payload.recommendations.filter((rec) => nodeById(rec.issueId)).slice(0, 5).map((rec) => { const node = nodeById(rec.issueId); if (!node) return ""; return `<button class="recommendation ${selectedId === node.id ? "selected" : ""}" type="button" data-node="${esc(node.id)}"><span class="rec-rank">${String(rec.rank).padStart(2, "0")}</span><span class="rec-copy"><strong>${esc(node.identifier)} <em>${esc(node.title)}</em></strong><small>${esc(rec.nextAction || rec.whyNow)}</small></span><span class="rec-score">${Math.round((rec.confidence ?? 0) * 100)}</span></button>`; }).join("") || `<p class="muted">No recommendations yet.</p>`;
@@ -439,7 +434,7 @@ async function runBundle(bundleId: string) {
   toast("Headless Codex execution finished; review the evidence"); renderShell();
 }
 async function analyze() { if (loading) return; loading = true; analysisError = null; renderShell(); try { const response = await authorizedFetch("/api/analysis-runs", { method: "POST", body: JSON.stringify({ reason: "manual" }) }); if (!response.ok) throw new Error(response.status === 401 ? "Analysis is not authorized. Refresh the page from the Tailscale URL and try again." : "Analysis could not start"); toast("Codex analysis started"); await waitForAnalysis(); await loadGraph(); toast("Analysis complete — the brief and Focus view are updated"); } catch (error) { analysisError = error instanceof Error ? error.message : "Analysis failed"; toast(analysisError); } finally { loading = false; renderShell(); } }
-async function editBrief() { const current = payload.brief?.text ?? ""; const text = window.prompt("Focus brief", current); if (text === null) return; try { const response = await authorizedFetch("/api/focus-brief", { method: "PUT", body: JSON.stringify({ text: text.trim() }) }); if (!response.ok) throw new Error("Could not save brief"); payload.brief = { text: text.trim(), updatedAt: new Date().toISOString() }; renderShell(); } catch { toast("Could not save brief"); } }
+async function editBrief() { const current = payload.brief?.text ?? ""; const text = window.prompt("Focus brief", current); if (text === null) return; try { const response = await authorizedFetch("/api/focus-brief", { method: "PUT", body: JSON.stringify({ text: text.trim() }) }); if (!response.ok) throw new Error("Could not save brief"); payload.brief = await response.json() as GraphPayload["brief"]; renderShell(); await loadGraph(); } catch { toast("Could not save brief"); } }
 function toggleFilter(kind: "team" | "topic", value: string) { const target = kind === "team" ? filters.teams : filters.topics; if (target.has(value)) target.delete(value); else target.add(value); renderShell(); }
 
 document.addEventListener("click", (event) => { const target = event.target as Element; const button = target.closest<HTMLButtonElement>("button"); if (!button) return; if (button.dataset.cyAction) { runGraphAction(button.dataset.cyAction); return; } if (button.id === "codex-menu-button") { codexMenuOpen = !codexMenuOpen; const panel = $("#codex-menu-panel") as HTMLElement; panel.hidden = !codexMenuOpen; button.setAttribute("aria-expanded", String(codexMenuOpen)); return; } if (button.id === "codex-connect") { codexMenuOpen = true; void connectCodex(); return; } if (button.dataset.campaign) { void createCampaign(); return; } if (button.dataset.campaignId) { const saved = campaigns.find((campaign) => campaign.id === button.dataset.campaignId); if (saved) { campaignProposal = saved; renderShell(); } return; } if (button.dataset.approveBundle) { void approveBundle(button.dataset.approveBundle); return; } if (button.dataset.approveResolution) { void approveResolution(button.dataset.approveResolution); return; } if (button.dataset.runBundle) { void runBundle(button.dataset.runBundle); return; } if (button.dataset.view) { view = button.dataset.view as ViewMode; void loadGraph(); return; } if (button.dataset.node) { const mouse = event as MouseEvent; selectNode(button.dataset.node, Boolean(mouse.metaKey || mouse.ctrlKey || mouse.shiftKey)); return; } if (button.dataset.filterKind) { toggleFilter(button.dataset.filterKind as "team" | "topic", button.dataset.filterValue!); return; } if (button.id === "analyze" || button.id === "analyze-empty") { void analyze(); return; } if (button.id === "edit-brief") { void editBrief(); return; } if (button.id === "filters") { const panel = $("#filter-panel") as HTMLElement; panel.hidden = !panel.hidden; button.setAttribute("aria-expanded", String(!panel.hidden)); return; } if (button.id === "clear-filters" || button.id === "clear-empty") { filters.teams.clear(); filters.topics.clear(); filters.query = ""; renderShell(); return; } if (button.id === "show-completed-empty") { filters.showCompleted = true; void loadGraph(); return; } if (button.id === "show-universe-empty") { view = "universe"; void loadGraph(); return; } if (button.id === "shortcuts") { toggleShortcuts(); return; } if (button.id === "close-shortcuts") { toggleShortcuts(false); return; } if (button.id === "close-context") { clearSelection(); } });
