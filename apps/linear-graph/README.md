@@ -54,6 +54,16 @@ Frame producer/dashboard rollout is separate and documented in its companion PR.
 
 ## Local development
 
+### Concise daily brief (USG-402)
+
+Today's brief displays the first open recommendation in the server's existing
+deterministic order: task, why now, and next action. It uses at most 14 words per
+field, with character limits for long or unbroken text. The task opens its graph
+context. Native Details retains the complete recommendation and saved analysis,
+including manual text and source/timestamps. Editing still edits the original
+focus brief; the automatic display summary never replaces it. Empty rankings
+show an explicit empty state. No enrichment run is needed for this presentation.
+
 ```sh
 pnpm install
 pnpm --filter @commonkit/linear-graph-protocol test
