@@ -92,6 +92,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         if (stopping) break;
         const hash = themeInputHash(node.title);
         if (store.getTheme(node.id, hash)) continue;
+        if ((store.themeRetryAfter(node.id, hash) ?? 0) > now().getTime()) continue;
         try {
           const result = await classifyTheme(node.title, options.themes!);
           store.saveTheme(node.id, hash, result.theme, result.suggested, result.confidence);
@@ -99,6 +100,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         } catch {
           // Skip a single bad issue; stop repeated outages before making thousands of calls.
           failures++;
+          store.deferTheme(node.id, hash, now().getTime() + 60 * 60_000);
           if (++consecutiveFailures >= 3) break;
         }
       }

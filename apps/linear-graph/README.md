@@ -16,7 +16,10 @@ Assignments are separate from snapshots and keyed by issue ID and a hash of
 the redacted title and taxonomy version. The hub resumes missing assignments
 after restart or snapshot update, one request at a time, and retries failures
 after 15 minutes without disrupting Codex. Completed issues are not classified.
-Failures retain existing assignments; three consecutive failures stop the pass.
+Failures retain existing assignments; failed issue/title pairs are deferred for
+one hour in persistent storage. Three consecutive failures stop the pass, so an
+outage costs at most three requests per pass. The next pass skips deferred pairs
+and can process later tickets. Changing a title bypasses its old deferral.
 The graph distinguishes awaiting grouping
 from low-confidence `Unclear` results, showing the suggested theme and model
 confidence for review. The 0.5 threshold is provisional, not a measured accuracy

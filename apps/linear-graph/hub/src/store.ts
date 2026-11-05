@@ -24,6 +24,7 @@ export class GraphStore {
       CREATE TABLE IF NOT EXISTS triage_decisions (issue_id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS campaigns (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS theme_assignments (issue_id TEXT PRIMARY KEY, input_hash TEXT NOT NULL, theme TEXT NOT NULL, suggested TEXT NOT NULL, confidence REAL NOT NULL);
+      CREATE TABLE IF NOT EXISTS theme_failures (issue_id TEXT PRIMARY KEY, input_hash TEXT NOT NULL, retry_after INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS drain_metrics (id INTEGER PRIMARY KEY CHECK (id = 1), payload TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS execution_runs (id TEXT PRIMARY KEY, payload TEXT NOT NULL);`);
     this.closeInterruptedRuns();
@@ -65,7 +66,19 @@ export class GraphStore {
   }
 
   saveTheme(issueId: string, inputHash: string, theme: string, suggested: string, confidence: number) {
-    this.db.query("INSERT OR REPLACE INTO theme_assignments(issue_id,input_hash,theme,suggested,confidence) VALUES(?,?,?,?,?)").run(issueId, inputHash, theme, suggested, confidence);
+    this.db.transaction(() => {
+      this.db.query("INSERT OR REPLACE INTO theme_assignments(issue_id,input_hash,theme,suggested,confidence) VALUES(?,?,?,?,?)").run(issueId, inputHash, theme, suggested, confidence);
+      this.db.query("DELETE FROM theme_failures WHERE issue_id=?").run(issueId);
+    })();
+  }
+
+  themeRetryAfter(issueId: string, inputHash: string): number | null {
+    const row = this.db.query("SELECT retry_after FROM theme_failures WHERE issue_id=? AND input_hash=?").get(issueId, inputHash) as { retry_after: number } | null;
+    return row?.retry_after ?? null;
+  }
+
+  deferTheme(issueId: string, inputHash: string, retryAfter: number) {
+    this.db.query("INSERT OR REPLACE INTO theme_failures(issue_id,input_hash,retry_after) VALUES(?,?,?)").run(issueId, inputHash, retryAfter);
   }
 
   loadSnapshot(): GraphSnapshot | null {
