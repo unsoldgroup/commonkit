@@ -93,3 +93,28 @@ test("sends bounded title only through the gateway with logging disabled", async
   expect((request!.headers as Record<string, string>)["cf-aig-skip-log"]).toBe("true");
   await expect(classifyTheme("x", { gatewayUrl: "https://evil.example/v1/account/default/workers-ai/@cf/cloudflare/clef", token: "test" })).rejects.toThrow();
 });
+
+test("fresh work is not starved by more permanent failures than fit in the deferral window", async () => {
+  const store = new GraphStore(":memory:");
+  const nodes = Array.from({ length: 14 }, (_, i) => normalizeLinearIssue({ id: String(i), identifier: `USG-${i}`, title: `Issue ${i}`, url: `https://linear.app/x/USG-${i}`, team: { id: "t", key: "USG", name: "Unsold" }, state: { id: "s", name: "Todo", type: "unstarted" }, createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }));
+  const date = "2026-01-01T00:00:00.000Z";
+  store.saveSnapshot({ generatedAt: date, syncedAt: date, stale: false, nodes, edges: [], teams: [], zones: [...DEFAULT_ZONES], recommendations: [], latestAnalysisRunId: null });
+  const config = { gatewayUrl: "https://gateway.ai.cloudflare.com/v1/account/default/workers-ai/@cf/cloudflare/clef", token: "test" };
+  try {
+    for (let pass = 0; pass < 4; pass++) {
+      let calls = 0, done!: () => void;
+      const completed = new Promise<void>((resolve) => { done = resolve; });
+      const hub = startGraphHub({ actionToken: "test", port: 0, store, now: () => new Date(Date.parse(date) + pass * 15 * 60_000), themes: { ...config, fetch: (async () => { if (++calls === 3) done(); return new Response("bad", { status: 500 }); }) as unknown as typeof fetch } });
+      await completed;
+      await hub.stop();
+      expect(calls).toBe(3);
+    }
+    let calls = 0, found!: () => void;
+    const completed = new Promise<void>((resolve) => { found = resolve; });
+    const hub = startGraphHub({ actionToken: "test", port: 0, store, now: () => new Date(Date.parse(date) + 60 * 60_000), themes: { ...config, fetch: (async (_url: RequestInfo | URL, init?: RequestInit) => { calls++; const state = JSON.parse(init!.body as string).state; if (state === "Issue 13") { found(); return Response.json(answer("checkout", 0.9)); } return new Response("bad", { status: 500 }); }) as unknown as typeof fetch } });
+    await completed;
+    await hub.stop();
+    expect(calls).toBe(2);
+    expect(store.getTheme(nodes[13]!.id, themeInputHash(nodes[13]!.title))?.theme).toBe("checkout");
+  } finally { store.close(); }
+});

@@ -19,7 +19,8 @@ after 15 minutes without disrupting Codex. Completed issues are not classified.
 Failures retain existing assignments; failed issue/title pairs are deferred for
 one hour in persistent storage. Three consecutive failures stop the pass, so an
 outage costs at most three requests per pass. The next pass skips deferred pairs
-and can process later tickets. Changing a title bypasses its old deferral.
+and prioritizes never-attempted work over retries, including after restart, so
+expired deferrals cannot starve later tickets. Changing a title bypasses its old deferral.
 The graph distinguishes awaiting grouping
 from low-confidence `Unclear` results, showing the suggested theme and model
 confidence for review. The 0.5 threshold is provisional, not a measured accuracy

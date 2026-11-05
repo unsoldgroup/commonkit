@@ -84,15 +84,17 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
   let stopping = false;
   const runThemes = () => {
     if (!options.themes || !current || themeJob || stopping) return;
-    const nodes = current.nodes.filter((n) => !["completed", "canceled"].includes(n.status.type));
+    const nodes = current.nodes.filter((n) => !["completed", "canceled"].includes(n.status.type)).map((node) => {
+      const hash = themeInputHash(node.title);
+      return { node, hash, retryAfter: store.themeRetryAfter(node.id, hash) };
+    }).sort((a, b) => Number(a.retryAfter !== null) - Number(b.retryAfter !== null));
     themeJob = (async () => {
       let failures = 0;
       let consecutiveFailures = 0;
-      for (const node of nodes) {
+      for (const { node, hash, retryAfter } of nodes) {
         if (stopping) break;
-        const hash = themeInputHash(node.title);
         if (store.getTheme(node.id, hash)) continue;
-        if ((store.themeRetryAfter(node.id, hash) ?? 0) > now().getTime()) continue;
+        if ((retryAfter ?? 0) > now().getTime()) continue;
         try {
           const result = await classifyTheme(node.title, options.themes!);
           store.saveTheme(node.id, hash, result.theme, result.suggested, result.confidence);

@@ -3,6 +3,9 @@ import type { GraphEdge, GraphNode, GraphSnapshot, TeamMetadata, TopicZone, Focu
 export type ViewMode = "focus" | "universe";
 export type GraphLayoutName = "fcose" | "grid";
 export type Filters = { query: string; teams: Set<string>; topics: Set<string>; showSemantic: boolean; showCompleted: boolean; theme?: string };
+export function clearFilters(filters: Filters) {
+  filters.teams.clear(); filters.topics.clear(); filters.query = ""; filters.theme = undefined;
+}
 export type SelectionViewportAction = "fit" | "preserve";
 export type TeamSummary = { id?: string; key?: string; name: string; count: number; activeCount?: number; completedCount?: number; canceledCount?: number; color: string };
 export type ZoneMetric = TopicZone & { issueCount: number; activeCount: number; completedCount: number; canceledCount: number; weightedWorkload: number };
@@ -128,6 +131,6 @@ export function emptyStateKind(snapshot: GraphSnapshot, recommendations: FocusRe
   if (!filters.showCompleted && snapshot.nodes.every((node) => ["completed", "canceled"].includes(node.statusType ?? ""))) return "completed-only";
   if (view === "focus" && !recommendations.length) return "no-recommendations";
   const graph = visibleGraph(snapshot, recommendations, filters, view);
-  if (!graph.nodes.length && (filters.query.trim() || filters.teams.size || filters.topics.size || !filters.showCompleted)) return "filtered";
+  if (!graph.nodes.length && (filters.query.trim() || filters.teams.size || filters.topics.size || filters.theme || !filters.showCompleted)) return "filtered";
   return "empty";
 }

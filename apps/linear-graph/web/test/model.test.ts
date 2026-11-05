@@ -1,10 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { membershipGraph, retainSelection, uniqueTopics, deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, matchesNode, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
+import { clearFilters, membershipGraph, retainSelection, uniqueTopics, deterministicGridColumns, edgeLabel, emptyStateKind, graphLayoutName, graphRenderKey, issueNeighbors, matchesNode, selectionViewportAction, statusShape, teamColor, teamSummaries, topicColor, topicCounts, visibleGraph, zoneMetrics, type Filters } from "../src/model.js";
 import { demoPayload } from "../src/protocol.js";
 
 const base: Filters = { query: "", teams: new Set(), topics: new Set(), showSemantic: true, showCompleted: false };
 
 describe("linear graph view model", () => {
+  test("clearing filters removes a theme and restores the graph, including in history", () => {
+    const filters: Filters = { ...base, showCompleted: true, theme: "nonexistent", query: "", teams: new Set(), topics: new Set() };
+    expect(emptyStateKind(demoPayload.snapshot, demoPayload.recommendations, filters, "universe")).toBe("filtered");
+    clearFilters(filters);
+    expect(filters.theme).toBeUndefined();
+    expect(visibleGraph(demoPayload.snapshot, demoPayload.recommendations, filters, "universe").nodes.length).toBeGreaterThan(0);
+    expect(filters.showCompleted).toBe(true);
+  });
   test("focus view keeps recommendations and one-hop context", () => {
     const graph = visibleGraph(demoPayload.snapshot, demoPayload.recommendations, base, "focus");
     expect(graph.nodes.map((node) => node.identifier)).toContain("CK-142");
