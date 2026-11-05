@@ -26,14 +26,15 @@ export function themeInputHash(title: string) {
   return createHash("sha256").update(THEME_VERSION).update("\0").update(themeInput(title)).digest("hex");
 }
 
-export function parseTheme(value: unknown): { theme: Theme; confidence: number } {
+export function parseTheme(value: unknown): { theme: Theme; suggested: Exclude<Theme, "unclear">; confidence: number } {
   const result = value as { success?: boolean; result?: { answers?: { theme?: { choice?: unknown; confidence?: unknown } } } };
   const answer = result?.result?.answers?.theme;
   if (!result?.success || typeof answer?.choice !== "string" || !Object.hasOwn(THEMES, answer.choice) || typeof answer.confidence !== "number" || !Number.isFinite(answer.confidence) || answer.confidence < 0 || answer.confidence > 1) throw new Error("Invalid Clef theme response");
-  return { theme: answer.confidence < 0.5 ? "unclear" : answer.choice as Theme, confidence: answer.confidence };
+  const suggested = answer.choice as Exclude<Theme, "unclear">;
+  return { theme: answer.confidence < 0.5 ? "unclear" : suggested, suggested, confidence: answer.confidence };
 }
 
-export async function classifyTheme(title: string, config: { gatewayUrl: string; token: string; gatewayToken?: string; fetch?: typeof fetch }): Promise<{ theme: Theme; confidence: number }> {
+export async function classifyTheme(title: string, config: { gatewayUrl: string; token: string; gatewayToken?: string; fetch?: typeof fetch }): Promise<{ theme: Theme; suggested: Exclude<Theme, "unclear">; confidence: number }> {
   const url = new URL(config.gatewayUrl);
   if (url.protocol !== "https:" || url.hostname !== "gateway.ai.cloudflare.com" || !/^\/v1\/[^/]+\/[^/]+\/workers-ai\/@cf\/cloudflare\/clef$/.test(url.pathname) || url.search || url.hash || url.username || url.password) throw new Error("Invalid Clef gateway URL");
   const response = await (config.fetch ?? fetch)(url, {

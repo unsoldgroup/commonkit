@@ -18,9 +18,18 @@ after restart or snapshot update, one request at a time, and retries failures
 after 15 minutes without disrupting Codex. Completed issues are not classified.
 Failures retain existing assignments; three consecutive failures stop the pass.
 The graph distinguishes awaiting grouping
-from low-confidence `Unclear` results; the 0.5 threshold is provisional, not
-a measured accuracy guarantee. Theme selection filters the graph and edges.
+from low-confidence `Unclear` results, showing the suggested theme and model
+confidence for review. The 0.5 threshold is provisional, not a measured accuracy
+guarantee. Theme selection filters the graph and edges.
 Use Refresh to see progress. A changed title invalidates its prior assignment.
+
+A fixed sample of 21 open tickets across five teams was labeled by title before
+testing. With the title-only input and threshold 0.5, 6 were assigned and all
+six matched the reviewer label; 15 were unclear. The sample is small, labels are
+subjective, and this does not establish production accuracy or broad coverage.
+Adding team and project context did not increase the number above threshold, so
+the implementation continues to send titles only. Review the low-confidence
+suggestions before treating them as reliable.
 
 The graph is a private, read-only focus dashboard for Linear issues. It groups issues into
 stable topical zones, renders parent and relationship edges, and adds only high-confidence

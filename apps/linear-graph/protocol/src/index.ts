@@ -52,6 +52,8 @@ export const issueSchema = z.object({
   zone: zoneIdSchema,
   topicTags: z.array(z.string().min(1)).max(12),
   theme: z.string().min(1).max(80).optional(),
+  themeSuggestion: z.string().min(1).max(80).optional(),
+  themeConfidence: z.number().min(0).max(1).optional(),
 }).strict();
 export type Issue = z.infer<typeof issueSchema>;
 

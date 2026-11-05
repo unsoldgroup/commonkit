@@ -9,7 +9,7 @@ const answer = (choice: string, confidence: number) => ({ success: true, result:
 
 test("validates the Clef response and leaves uncertain work unclear", () => {
   expect(parseTheme(answer("checkout", 0.8)).theme).toBe("checkout");
-  expect(parseTheme(answer("checkout", 0.2)).theme).toBe("unclear");
+  expect(parseTheme(answer("checkout", 0.2))).toEqual({ theme: "unclear", suggested: "checkout", confidence: 0.2 });
   expect(() => parseTheme(answer("toString", 0.9))).toThrow();
   expect(() => parseTheme(answer("checkout", 2))).toThrow();
   expect(themeInputHash("one")).not.toBe(themeInputHash("two"));
@@ -28,6 +28,7 @@ test("hub persists classifications without changing the snapshot and invalidates
     // Stop waits for the job to commit before closing.
     await hub.stop();
     expect(store.getTheme(node.id, themeInputHash(node.title))?.theme).toBe("checkout");
+    expect(store.getTheme(node.id, themeInputHash(node.title))?.suggested).toBe("checkout");
     expect(store.getTheme(node.id, themeInputHash("Changed title"))).toBeNull();
     expect(store.loadSnapshot()!.nodes[0]!.theme).toBeUndefined();
   } finally { store.close(); }

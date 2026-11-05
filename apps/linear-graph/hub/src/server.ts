@@ -94,7 +94,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         if (store.getTheme(node.id, hash)) continue;
         try {
           const result = await classifyTheme(node.title, options.themes!);
-          store.saveTheme(node.id, hash, result.theme, result.confidence);
+          store.saveTheme(node.id, hash, result.theme, result.suggested, result.confidence);
           consecutiveFailures = 0;
         } catch {
           // Skip a single bad issue; stop repeated outages before making thousands of calls.
@@ -230,7 +230,7 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
         if (!current) return error("No snapshot available", 503);
         const membership = projectMembership(current, url.searchParams.get("history") === "true");
         const selected = url.searchParams.get("view") === "focus" ? focusSnapshot(membership) : membership;
-        const snapshot = { ...selected, nodes: selected.nodes.map((node) => ({ ...node, theme: store.getTheme(node.id, themeInputHash(node.title))?.theme ?? "pending" })) };
+        const snapshot = { ...selected, nodes: selected.nodes.map((node) => { const assignment = store.getTheme(node.id, themeInputHash(node.title)); return { ...node, theme: assignment?.theme ?? "pending", ...(assignment ? { themeSuggestion: assignment.suggested, themeConfidence: assignment.confidence } : {}) }; }) };
         return json({ snapshot, brief: store.loadBrief(), analysis: store.latestAnalysisRun(), drain: updateDrainMetrics(), themes: { enabled: Boolean(options.themes), running: Boolean(themeJob), error: themeError } });
       }
       if (url.pathname === "/api/focus-brief" && request.method === "GET") return json(store.loadBrief() ?? { text: "", updatedAt: now().toISOString(), status: "stale", source: "fallback", error: "No brief has been generated yet" });
