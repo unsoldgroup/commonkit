@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { runCodexAnalysis, type CodexRunnerOptions } from "../src/codex.js";
+import { MAX_PROMPT_BYTES, runCodexAnalysis, type CodexRunnerOptions } from "../src/codex.js";
 import { normalizeLinearIssue } from "../src/normalizer.js";
 import { startGraphHub } from "../src/server.js";
 import { GraphStore } from "../src/store.js";
@@ -70,6 +70,124 @@ test("rejects malformed, incomplete, duplicate, and foreign analysis instead of 
   }
 });
 
+test("coverage errors identify both collections and safe missing, duplicate and foreign IDs", async () => {
+  const first = "11111111-1111-4111-8111-111111111111";
+  const second = "22222222-2222-4222-8222-222222222222";
+  const foreign = "33333333-3333-4333-8333-333333333333";
+  let message = "";
+  try {
+    await runCodexAnalysis({ issues: [issue(first), issue(second)], edges: [] }, fakeCodex((input) => {
+      const out = answer(input);
+      out.assignments = [out.assignments![0]!, out.assignments![0]!, { ...out.assignments![0]!, issueId: foreign }];
+      out.triageDecisions = [{ ...out.triageDecisions![0]!, issueId: "private@example.com" }];
+      return out;
+    }));
+  } catch (error) { message = (error as Error).message; }
+  expect(message).toContain(`assignments: expected=2 actual=3 missing=1 [${second}] duplicate=1 [${first}] foreign=1 [${foreign}]`);
+  expect(message).toContain(`triageDecisions: expected=2 actual=1 missing=2 [${first},${second}] duplicate=0 [] foreign=1 [sha256:`);
+  expect(message).not.toContain("private@example.com");
+});
+
+test("one correction recovers each coverage mismatch without dropping descriptions or relationship context", async () => {
+  for (const collection of ["assignments", "triageDecisions"] as const) {
+    for (const kind of ["missing", "duplicate", "foreign"] as const) {
+      const issues = Array.from({ length: 26 }, (_, i) => issue(String(i).padStart(2, "0"), "Full context ".repeat(500)));
+      const edges = [{ sourceId: "00", targetId: "25", kind: "blocks", source: "linear" }];
+      const progress: EnrichmentProgress[] = [];
+      let calls = 0;
+      let original: unknown;
+      const result = await runCodexAnalysis({ issues, edges, focusBrief: "Manual focus" }, fakeCodex((input, prompt) => {
+        if (!input.issues) return answer(input);
+        calls++;
+        const out = answer(input);
+        if (calls === 1) {
+          original = input;
+          if (kind === "missing") out[collection]!.pop();
+          if (kind === "duplicate") out[collection]!.push(out[collection]![0]! as never);
+          if (kind === "foreign") out[collection]![0]!.issueId = "25";
+        }
+        if (calls === 2) {
+          expect(input).toEqual(original);
+          expect(prompt).toContain("Coverage correction 1/1");
+          expect(prompt).toContain(collection);
+          expect(prompt).toContain(`${kind}=1`);
+          expect(Buffer.byteLength(prompt)).toBeLessThanOrEqual(256_000);
+          expect(progress.at(-1)).toMatchObject({ status: "running", analyzedIssues: 0, completedBatches: 0 });
+        }
+        return out;
+      }), (value) => progress.push(value));
+      expect(calls).toBe(3); // first batch, its correction, second batch
+      expect(result.assignments).toHaveLength(26);
+      expect(result.triageDecisions).toHaveLength(26);
+      expect(progress.at(-1)).toMatchObject({ status: "completed", analyzedIssues: 26, completedBatches: 2, totalBatches: 2 });
+    }
+  }
+});
+
+test("a second coverage failure exhausts correction and retains only previously validated progress", async () => {
+  let calls = 0;
+  const progress: EnrichmentProgress[] = [];
+  await expect(runCodexAnalysis({ issues: Array.from({ length: 26 }, (_, i) => issue(String(i))), edges: [] }, fakeCodex((input) => {
+    calls++;
+    const out = answer(input);
+    if (calls >= 2) out.triageDecisions = [];
+    return out;
+  }), (value) => progress.push(value))).rejects.toThrow(/Batch 2\/2 failed after 25\/26 issues: Coverage correction 1\/1 failed: Codex coverage incomplete;.*triageDecisions: expected=1 actual=0 missing=1/);
+  expect(calls).toBe(3);
+  expect(progress.at(-1)).toMatchObject({ status: "failed", analyzedIssues: 25, completedBatches: 1, totalBatches: 2 });
+});
+
+test("schema and reference failures do not spend a coverage correction", async () => {
+  for (const kind of ["schema", "reference"]) {
+    let calls = 0;
+    await expect(runCodexAnalysis({ issues: [issue("1")], edges: [] }, fakeCodex((input) => {
+      calls++;
+      const out = answer(input);
+      if (kind === "schema") return { bad: true };
+      out.triageDecisions![0]!.evidenceIssueIds = ["unknown"];
+      return out;
+    }))).rejects.toThrow();
+    expect(calls).toBe(1);
+  }
+});
+
+test("a malformed correction stops without a third request", async () => {
+  let calls = 0;
+  await expect(runCodexAnalysis({ issues: [issue("1")], edges: [] }, fakeCodex((input) => {
+    calls++;
+    return calls === 1 ? { ...answer(input), assignments: [] } : { invalid: true };
+  }))).rejects.toThrow("Coverage correction 1/1 failed: Codex output failed schema validation");
+  expect(calls).toBe(2);
+});
+
+test("transport failures are not retried as coverage failures", async () => {
+  let calls = 0;
+  const base = fakeCodex();
+  await expect(runCodexAnalysis({ issues: [issue("1")], edges: [] }, {
+    spawn(command, options) {
+      calls++;
+      return { ...base.spawn!(command, options), exited: Promise.resolve(1) } as never;
+    },
+  })).rejects.toThrow("Codex exited with 1");
+  expect(calls).toBe(1);
+});
+
+test("correction overhead cannot exceed the prompt budget or truncate context", async () => {
+  let bytes = 0;
+  await runCodexAnalysis({ issues: [issue("1", "")], edges: [] }, fakeCodex((input, prompt) => {
+    bytes = Buffer.byteLength(prompt); return answer(input);
+  }));
+  // Empty descriptions serialize as null; replacing null with a quoted ASCII
+  // string costs two fewer overhead bytes.
+  let calls = 0;
+  await expect(runCodexAnalysis({ issues: [issue("1", "x".repeat(MAX_PROMPT_BYTES - bytes + 2))], edges: [] }, fakeCodex((input, prompt) => {
+    calls++;
+    expect(Buffer.byteLength(prompt)).toBe(MAX_PROMPT_BYTES);
+    return { ...answer(input), assignments: [] };
+  }))).rejects.toThrow("Coverage correction exceeds prompt budget: Codex coverage incomplete");
+  expect(calls).toBe(1);
+});
+
 test("oversized single issues fail explicitly before spawning, never silently truncate", async () => {
   let calls = 0;
   await expect(runCodexAnalysis({ issues: [issue("large", "x".repeat(1_100_000))], edges: [] }, fakeCodex((input) => {
@@ -128,12 +246,14 @@ test("a later batch failure records partial coverage without publishing partial 
   });
   const hub = startGraphHub({ actionToken: "test", port: 0, store,
     linear: { async fetchIssues() { return { nodes: rows, pageInfo: { hasNextPage: false } }; } },
-    codex: fakeCodex((input) => { calls++; return calls === 2 ? { bad: true } : answer(input); }),
+    codex: fakeCodex((input) => { calls++; return calls >= 2 ? { ...answer(input), triageDecisions: [] } : answer(input); }),
   });
   try {
     const run = await hub.runAnalysis();
     expect(run).toMatchObject({ status: "completed", enrichment: { status: "failed", totalIssues: 26, analyzedIssues: 25, completedBatches: 1 } });
     expect(run.error).toContain("Batch 2/2 failed after 25/26 issues");
+    expect(calls).toBe(3);
+    expect(run.error).toContain("Coverage correction 1/1 failed");
     expect(store.loadTriageDecisions()).toEqual([]);
     expect(store.loadSnapshot()!.nodes).toHaveLength(26);
     expect(store.loadBrief()).toMatchObject({ source: "fallback", status: "failed", snapshotAt: store.loadSnapshot()!.syncedAt });
