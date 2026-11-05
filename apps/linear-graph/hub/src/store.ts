@@ -34,6 +34,9 @@ export class GraphStore {
    * 1,670 such rows from a crash loop). Idempotent: completed and failed rows are untouched.
    */
   closeInterruptedRuns(): number {
+    this.db.query(`UPDATE analysis_runs SET payload = json_set(payload, '$.enrichment.status', 'failed')
+      WHERE json_extract(payload, '$.status') = 'running'
+        AND json_extract(payload, '$.enrichment') IS NOT NULL`).run();
     return this.db.query(`UPDATE analysis_runs SET payload = json_set(payload, '$.status', 'failed',
         '$.completedAt', coalesce(json_extract(payload, '$.completedAt'), json_extract(payload, '$.startedAt')),
         '$.error', 'Interrupted: the hub exited before this run finished')

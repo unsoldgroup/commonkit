@@ -137,6 +137,16 @@ export const codexAnalysisSchema = z.object({
 }).strict();
 export type CodexAnalysis = z.infer<typeof codexAnalysisSchema>;
 
+export const enrichmentProgressSchema = z.object({
+  status: z.enum(["running", "completed", "failed"]),
+  phase: z.enum(["planning", "analyzing", "summarizing"]),
+  totalIssues: z.number().int().nonnegative(),
+  analyzedIssues: z.number().int().nonnegative(),
+  totalBatches: z.number().int().nonnegative(),
+  completedBatches: z.number().int().nonnegative(),
+}).strict();
+export type EnrichmentProgress = z.infer<typeof enrichmentProgressSchema>;
+
 export const analysisRunSchema = z.object({
   id,
   startedAt: date,
@@ -145,6 +155,7 @@ export const analysisRunSchema = z.object({
   issueCount: z.number().int().nonnegative(),
   error: z.string().max(1000).nullable(),
   inputHash: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+  enrichment: enrichmentProgressSchema.optional(),
 }).strict();
 export type AnalysisRun = z.infer<typeof analysisRunSchema>;
 

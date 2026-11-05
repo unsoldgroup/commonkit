@@ -50,6 +50,77 @@ On open, the store marks any analysis run still `running` as failed ("Interrupte
 cut off by a hub exit. A restart within an hour of the last attempt does not re-sync Linear, and
 Linear rate limits (429, or 400 `RATELIMITED`) back off and retry.
 
+### Bounded daily analysis (USG-399)
+
+Codex reviews every active issue in sequential batches of at most 25 issues and
+256,000 UTF-8 prompt bytes, including JSON escaping and instructions. Descriptions
+are redacted but not truncated. Each batch receives all incident active-issue
+relations and description-free metadata for endpoints outside that batch. New
+semantic suggestions are therefore limited to issues visible in that batch;
+this is not an exhaustive search of every possible pair across the universe.
+No issue is selected or excluded based on a top-N cutoff. An individual issue
+plus its relationship context that cannot fit fails planning explicitly, before
+any provider call. It must be resolved before claiming complete enrichment.
+
+Each batch must return exactly one valid assignment and triage decision per
+issue. Unknown IDs, duplicate/missing coverage, malformed rows and schema errors
+fail the enrichment; invalid rows are never silently discarded. The provider's
+JSON schema derives from the runtime schema. Every batch brief participates in
+bounded hierarchical synthesis. Existing limits of 1,000 semantic suggestions
+and 50 Codex recommendations apply to the combined result; these suggestion
+limits do not cap assignment or triage coverage. The published ranking remains
+the deterministic Linear ranking, with only the manual brief supplying pins.
+
+`lastRun.enrichment` on `/api/freshness` and `enrichment` on
+`/api/analysis-runs/latest` report status (`running`, `completed`, `failed`), phase
+(`planning`, `analyzing`, `summarizing`), `totalIssues`, `analyzedIssues`,
+`totalBatches` and `completedBatches`. Analyzed counts describe validated batches,
+not published partial results. No new enrichment is published until all batches
+and synthesis succeed. The outer run can be `completed` because Linear synced
+while enrichment is `failed`; its error explains the failure. Interrupted runs
+retain their counts and become failed on restart. Old records without coverage
+remain readable, but do not prove complete enrichment.
+
+Fallback briefs regenerate their active count and snapshot date on every sync.
+A retained Codex brief keeps its original generation/snapshot date and becomes
+stale when enrichment fails. Manual brief text remains untouched. Failed
+enrichment is also recorded on the brief. The model, provider, login, sandbox,
+action-token policy, frame feed and daily schedule are unchanged. The existing
+`LINEAR_GRAPH_CODEX_TIMEOUT_MS` (default 600,000) applies to each bounded provider
+request; batches run serially with no automatic retries. Large universes take
+multiple calls and may take substantially longer than one request.
+
+### USG-399 rollout handoff
+
+No production rollout or Linear closure is part of this patch. Once separately
+authorized:
+
+1. Integrate the reviewed USG-399 patch into the deployment's tracked upstream.
+   `/root/commonkit` currently uses `linear-graph-deploy` tracking `origin/main`.
+   Preserve unrelated `.agents/` work; do not run the updater against uncommitted
+   implementation files. It resets to upstream and will not deploy a local-only
+   commit.
+2. Run `pnpm run test:linear-graph` and `pnpm run typecheck:linear-graph` on the VPS.
+   Run `bash /root/commonkit/apps/linear-graph/deploy/update-vps.sh` only after
+   authorization and integration. Its protocol/web build and health probe are
+   required; the hub runs TypeScript directly. No credential or model changes
+   are needed. Old analysis-run JSON needs no database migration. New run records
+   add `enrichment`; an older hub's strict schema cannot read that property.
+   Prefer fix-forward recovery. A code rollback needs a compatible reader or an
+   explicitly planned database restore/projection, not a blind service restart.
+3. Check `/health`, then allow the daily run or explicitly authorize one normal
+   authenticated `POST /api/analysis-runs`. Do not bypass the existing action
+   authorization. Inspect `/api/freshness` until the run finishes.
+4. Require fresh `syncedAt`, null run error, `enrichment.status=completed`,
+   `analyzedIssues=totalIssues` and `completedBatches=totalBatches`. For a generated
+   brief, `/api/focus-brief` must be ready with the new `snapshotAt`; a manual
+   brief remains manual. A healthy HTTP response alone does not prove analysis.
+5. If planning, a batch, validation or synthesis fails, leave the issue open and
+   record its phase/counts/error. The fresh Linear graph remains usable. Do not
+   declare success, drop remaining issues, change provider/auth, or raise limits
+   to conceal the failure. Live provider acceptance and runtime are rollout
+   verification, not covered by the mocked regression suite.
+
 ## VPS deployment
 
 On the VPS, install Bun, pnpm, Caddy, and acme.sh first. Then run the installer with secrets
