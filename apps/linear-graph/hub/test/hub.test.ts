@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { applyCodexAnalysis, focusSnapshot } from "../src/analysis.js";
 import { parseCodexEvents, runCodexAnalysis, sanitizeAnalysis } from "../src/codex.js";
 import { inferTopicAssignment, normalizeLinearEdges, normalizeLinearIssue, summarizeTeams } from "../src/normalizer.js";
-import { renderFocusHtml } from "../src/focusView.js";
+import { buildFocusModel, renderFocusHtml } from "../src/focusView.js";
 import type { Epic, EpicChild } from "../src/linear.js";
 import { startGraphHub, trustedNonDestructiveMutation } from "../src/server.js";
 
@@ -243,6 +243,24 @@ describe("linear graph hub", () => {
     const failed = await fetch(`${hub.url}/focus/EXP-1`);
     expect(failed.status).toBe(502);
     expect(await failed.text()).toContain("Linear request failed");
+
+    const model = buildFocusModel(epic, null, now);
+    expect(model.dayLabel).toBe("Mon 9 Nov 2026 · day 1 of 5");
+    expect(model.refreshedAt).toBe("11:40");
+    expect(model.today.map((item) => item.code)).toEqual(["A1", "G"]);
+    expect(model.today[0]).toMatchObject({ identifier: "EXP-5311", due: "2026-11-09", weekday: "Mon", done: 2, total: 4, percent: 50, status: "unstarted", pills: [{ label: "Mon", tone: "wait" }] });
+    expect(model.ops[0].pills).toEqual([{ label: "Wed", tone: "wait" }, { label: "shadow", tone: "shadow" }]);
+    expect(model.eng.map((item) => item.identifier)).toEqual(["EXP-5318", "EXP-5399"]);
+    expect(model.tiles.map((tile) => tile.value)).toEqual([null, null, null]);
+    expect(model.tiles[0].detail).toBe("awaiting events");
+    expect(model.decisionOwed).toEqual({ code: "A1", title: "Send policy core", identifier: "EXP-5311" });
+    const api = await fetch(`${hub.url}/api/focus/EXP-5310`);
+    expect(api.status).toBe(200);
+    expect(api.headers.get("Content-Type")).toContain("application/json");
+    expect(await api.json()).toEqual(JSON.parse(JSON.stringify(model)));
+    expect(calls).toBe(3); // shares the HTML route's 300 s cache (404 and 502 were the other two calls)
+    expect((await fetch(`${hub.url}/api/focus/EXP-404`)).status).toBe(404);
+    expect((await fetch(`${hub.url}/api/focus/EXP-1`)).status).toBe(502);
   });
 
 });
