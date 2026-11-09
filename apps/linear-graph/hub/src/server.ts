@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { z } from "zod";
 import {
@@ -11,6 +11,7 @@ import { applyCodexAnalysis, focusSnapshot } from "./analysis.js";
 import { createCodexAuthManager, type CodexAuthOptions } from "./codex-auth.js";
 import { runCodexAnalysis, type CodexRunnerOptions } from "./codex.js";
 import { computeDrainMetrics, proposeCampaign } from "./drain.js";
+import { renderFocusHtml, type FocusMetrics } from "./focusView.js";
 import { executeApprovedBundle, type ExecutionRunnerOptions } from "./execution.js";
 import { syncLinear, type LinearSource } from "./linear.js";
 import { assignRelationZones, freshness, nextUp, rankedRecommendations } from "./nextup.js";
@@ -54,6 +55,18 @@ export function trustedNonDestructiveMutation(request: Request, pathname: string
   // proxy marker, so accept the exact same-origin browser request as the
   // equivalent trusted path. Approvals and execution remain token-gated.
   return request.headers.get("Origin") === "https://graph.unsold.cloud" || request.headers.get("Sec-Fetch-Site") === "same-origin";
+}
+
+const focusMetricsSchema = z.object({
+  generatedAt: z.string(),
+  tiles: z.array(z.object({ key: z.string(), label: z.string(), value: z.string(), detail: z.string() })),
+});
+const FOCUS_CACHE_MS = 300_000;
+
+/** metrics.json sits beside graph.sqlite; absent or malformed means "awaiting events". */
+function readFocusMetrics(dataPath: string | undefined): FocusMetrics | null {
+  if (!dataPath || dataPath === ":memory:") return null;
+  try { return focusMetricsSchema.parse(JSON.parse(readFileSync(join(dirname(dataPath), "metrics.json"), "utf8"))); } catch { return null; }
 }
 
 function parseBody<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
@@ -212,6 +225,25 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
     return analysisInFlight;
   };
 
+  const focusCache = new Map<string, { at: number; html: string }>();
+  const renderFocus = async (ref: string, pageUrl: string): Promise<Response> => {
+    const cached = focusCache.get(ref);
+    const html = (body: string, status = 200) => new Response(body, { status, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
+    if (cached && now().getTime() - cached.at < FOCUS_CACHE_MS) return html(cached.html);
+    const text = (body: string, status: number) => new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8" } });
+    if (!options.linear?.fetchEpic) return text("Linear source is not configured", 503);
+    try {
+      const epic = await options.linear.fetchEpic(ref);
+      if (!epic) return text(`Unknown issue ${ref}`, 404);
+      const body = renderFocusHtml(epic, readFocusMetrics(options.dataPath), now(), pageUrl);
+      focusCache.set(ref, { at: now().getTime(), html: body });
+      return html(body);
+    } catch (caught) {
+      console.error("Linear graph focus view failed", caught);
+      return text(`Linear request failed: ${redactSensitiveText(caught instanceof Error ? caught.message : "unknown error").slice(0, 300)}`, 502);
+    }
+  };
+
   const server = Bun.serve({
     hostname: options.hostname ?? "127.0.0.1", port: options.port ?? 8790,
     async fetch(request) {
@@ -253,6 +285,8 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       }
       const campaignMatch = /^\/api\/campaigns\/([^/]+)$/.exec(url.pathname);
       if (campaignMatch && request.method === "GET") return json(store.loadCampaign(campaignMatch[1]) ?? { error: "Campaign not found" }, store.loadCampaign(campaignMatch[1]) ? 200 : 404);
+      const focusMatch = /^\/focus\/([A-Z]+-\d+)$/.exec(url.pathname);
+      if (focusMatch && request.method === "GET") return renderFocus(focusMatch[1], `${url.host}${url.pathname}${url.search}`);
       if (request.method === "GET") {
         const relativePath = url.pathname === "/" ? "index.html" : url.pathname.replace(/^\/+/, "");
         const root = resolve(webDistPath);
