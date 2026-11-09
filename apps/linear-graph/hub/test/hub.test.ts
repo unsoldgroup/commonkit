@@ -2,6 +2,8 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { applyCodexAnalysis, focusSnapshot } from "../src/analysis.js";
 import { parseCodexEvents, runCodexAnalysis, sanitizeAnalysis } from "../src/codex.js";
 import { inferTopicAssignment, normalizeLinearEdges, normalizeLinearIssue, summarizeTeams } from "../src/normalizer.js";
+import { renderFocusHtml } from "../src/focusView.js";
+import type { Epic, EpicChild } from "../src/linear.js";
 import { startGraphHub, trustedNonDestructiveMutation } from "../src/server.js";
 
 const raw = (id: string, title = "Graph issue") => ({
@@ -187,6 +189,60 @@ describe("linear graph hub", () => {
     expect(snapshot.nodes.map((node) => node.id)).toEqual([first.id, second.id]);
     expect(focus.nodes.map((node) => node.id)).toEqual([first.id]);
     expect(focus.teams[0].issueCount).toBe(focus.nodes.length);
+  });
+
+  test("renders the /focus TV view: today band, columns, checklist percentages, escaping, 404 and 502", async () => {
+    const child = (identifier: string, title: string, dueDate: string, type: string, bodies: string[], labels: string[] = []): EpicChild => ({
+      identifier, title, url: `https://linear.app/x/${identifier}`, dueDate, priority: 2, state: { name: type, type },
+      labels: { nodes: labels.map((name) => ({ name })) }, comments: { nodes: bodies.map((body) => ({ body, createdAt: "2026-11-09T08:00:00.000Z" })) },
+    });
+    const epic: Epic = { identifier: "EXP-5310", title: "Autonomy week <script>", description: null, url: "https://linear.app/x/EXP-5310", children: { nodes: [
+      child("EXP-5311", "[Autonomy] A1. Send policy core", "2026-11-09", "unstarted", ["- [x] brief\n- [ ] council\n- [ ] go", "- [x] draft"]),
+      child("EXP-5317", "[Autonomy] G. CI self-healing", "2026-11-09", "started", ["- [x] a\n- [ ] b\n- [ ] c\n- [ ] d"]),
+      child("EXP-5316", "[Autonomy] F. Follow-up agent <b>", "2026-11-11", "unstarted", [], ["shadow"]),
+      child("EXP-5318", "[Autonomy] H. Backlog drain", "2026-11-10", "unstarted", []),
+      child("EXP-5399", "[Autonomy] C. Labelled eng", "2026-11-12", "completed", [], ["eng"]),
+    ] } };
+    const now = new Date("2026-11-09T10:40:00.000Z"); // Mon 11:40 Europe/Madrid
+    const html = renderFocusHtml(epic, null, now);
+    expect(html).toContain("Mon 9 Nov 2026 · day 1 of 5 · refreshed 11:40");
+    expect(html).not.toContain("<script>");
+    expect(html).toContain("Autonomy week &#60;script&#62;");
+    expect(html).toContain("Follow-up agent &#60;b&#62;");
+    expect(html).toContain("awaiting events");
+    const [, today, rest] = /<div class="today">(.*?)<\/div>\n<div class="grid">(.*?)<div class="foot">/s.exec(html) ?? [];
+    expect(today).toContain("Send policy core");
+    expect(today).toContain("50%"); // 2 of 4 across two comments
+    expect(today).toContain("CI self-healing");
+    expect(today).toContain("25%");
+    expect(today).toContain("in progress");
+    expect(today).not.toContain("Backlog drain");
+    const [ops, eng] = rest.split('<div class="col"><h2>Eng');
+    expect(ops).toContain("Follow-up agent");
+    expect(ops).toContain('class="st shadow"');
+    expect(eng).toContain("Backlog drain");
+    expect(eng).toContain("Labelled eng"); // label beats the letter
+    expect(eng).toContain("100%"); // completed with no checklist
+    expect(html).toContain("Decision owed: <b>A1 Send policy core (EXP-5311)</b>");
+    const withMetrics = renderFocusHtml(epic, { generatedAt: now.toISOString(), tiles: [{ key: "prs_without_al", label: "PRs merged without Al", value: "41%", detail: "7 of 17" }] }, now);
+    expect(withMetrics).toContain(">41%<");
+    expect(withMetrics.match(/awaiting events/g)?.length).toBe(2);
+
+    let calls = 0;
+    hub = startGraphHub({ actionToken: "secret", port: 0, now: () => now, linear: {
+      async fetchIssues() { return { nodes: [] }; },
+      async fetchEpic(ref) { calls += 1; if (ref === "EXP-1") throw new Error("Linear request failed (500)"); return ref === "EXP-5310" ? epic : null; },
+    } });
+    const page = await fetch(`${hub.url}/focus/EXP-5310?tv=1`);
+    expect(page.status).toBe(200);
+    expect(page.headers.get("Content-Type")).toContain("text/html");
+    expect(await page.text()).toContain("Send policy core");
+    await fetch(`${hub.url}/focus/EXP-5310`);
+    expect(calls).toBe(1); // cached for 300 s
+    expect((await fetch(`${hub.url}/focus/EXP-404`)).status).toBe(404);
+    const failed = await fetch(`${hub.url}/focus/EXP-1`);
+    expect(failed.status).toBe(502);
+    expect(await failed.text()).toContain("Linear request failed");
   });
 
 });
