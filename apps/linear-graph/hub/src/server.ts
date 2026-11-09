@@ -11,7 +11,7 @@ import { applyCodexAnalysis, focusSnapshot } from "./analysis.js";
 import { createCodexAuthManager, type CodexAuthOptions } from "./codex-auth.js";
 import { runCodexAnalysis, type CodexRunnerOptions } from "./codex.js";
 import { computeDrainMetrics, proposeCampaign } from "./drain.js";
-import { renderFocusHtml, type FocusMetrics } from "./focusView.js";
+import { buildFocusModel, renderFocusModelHtml, type FocusMetrics, type FocusModel } from "./focusView.js";
 import { executeApprovedBundle, type ExecutionRunnerOptions } from "./execution.js";
 import { syncLinear, type LinearSource } from "./linear.js";
 import { assignRelationZones, freshness, nextUp, rankedRecommendations } from "./nextup.js";
@@ -225,24 +225,25 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
     return analysisInFlight;
   };
 
-  const focusCache = new Map<string, { at: number; html: string }>();
-  const renderFocus = async (ref: string, pageUrl: string): Promise<Response> => {
+  // One cached model per epic feeds both the TV HTML (/focus/:ref) and the frame JSON (/api/focus/:ref).
+  const focusCache = new Map<string, { at: number; model: FocusModel }>();
+  const renderFocus = async (ref: string, render: (model: FocusModel) => Response): Promise<Response> => {
     const cached = focusCache.get(ref);
-    const html = (body: string, status = 200) => new Response(body, { status, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
-    if (cached && now().getTime() - cached.at < FOCUS_CACHE_MS) return html(cached.html);
+    if (cached && now().getTime() - cached.at < FOCUS_CACHE_MS) return render(cached.model);
     const text = (body: string, status: number) => new Response(body, { status, headers: { "Content-Type": "text/plain; charset=utf-8" } });
     if (!options.linear?.fetchEpic) return text("Linear source is not configured", 503);
     try {
       const epic = await options.linear.fetchEpic(ref);
       if (!epic) return text(`Unknown issue ${ref}`, 404);
-      const body = renderFocusHtml(epic, readFocusMetrics(options.dataPath), now(), pageUrl);
-      focusCache.set(ref, { at: now().getTime(), html: body });
-      return html(body);
+      const model = buildFocusModel(epic, readFocusMetrics(options.dataPath), now());
+      focusCache.set(ref, { at: now().getTime(), model });
+      return render(model);
     } catch (caught) {
       console.error("Linear graph focus view failed", caught);
       return text(`Linear request failed: ${redactSensitiveText(caught instanceof Error ? caught.message : "unknown error").slice(0, 300)}`, 502);
     }
   };
+  const focusHtml = (pageUrl: string) => (model: FocusModel) => new Response(renderFocusModelHtml(model, pageUrl), { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } });
 
   const server = Bun.serve({
     hostname: options.hostname ?? "127.0.0.1", port: options.port ?? 8790,
@@ -286,7 +287,9 @@ export function startGraphHub(options: GraphHubOptions): GraphHub {
       const campaignMatch = /^\/api\/campaigns\/([^/]+)$/.exec(url.pathname);
       if (campaignMatch && request.method === "GET") return json(store.loadCampaign(campaignMatch[1]) ?? { error: "Campaign not found" }, store.loadCampaign(campaignMatch[1]) ? 200 : 404);
       const focusMatch = /^\/focus\/([A-Z]+-\d+)$/.exec(url.pathname);
-      if (focusMatch && request.method === "GET") return renderFocus(focusMatch[1], `${url.host}${url.pathname}${url.search}`);
+      if (focusMatch && request.method === "GET") return renderFocus(focusMatch[1], focusHtml(`${url.host}${url.pathname}${url.search}`));
+      const focusApiMatch = /^\/api\/focus\/([A-Z]+-\d+)$/.exec(url.pathname);
+      if (focusApiMatch && request.method === "GET") return renderFocus(focusApiMatch[1], (model) => json(model));
       if (request.method === "GET") {
         const relativePath = url.pathname === "/" ? "index.html" : url.pathname.replace(/^\/+/, "");
         const root = resolve(webDistPath);
