@@ -76,11 +76,13 @@ pnpm --dir "$REPO_DIR" --filter @commonkit/linear-graph-web build
 
 export CF_Token
 "$ACME_SH" --issue --dns dns_cf --keylength ec-256 -d "$DOMAIN"
-CERT_STAGE="$(mktemp -d)"; trap 'rm -rf -- "$CERT_STAGE"' EXIT
-"$ACME_SH" --install-cert -d "$DOMAIN" --ecc --key-file "$CERT_STAGE/key.pem" --fullchain-file "$CERT_STAGE/fullchain.pem"
+# acme.sh persists these paths (Le_RealKeyPath/Le_RealFullChainPath) and rewrites them on every renewal,
+# so they must be permanent: a temp dir silently breaks renewals (graph.unsold.cloud expired 2026-11-05).
 sudo install -d -m 0750 -o root -g caddy "$CERT_DIR" /etc/caddy/Caddyfile.d
-sudo install -m 0640 -o root -g caddy "$CERT_STAGE/key.pem" "$CERT_DIR/key.pem"
-sudo install -m 0644 -o root -g caddy "$CERT_STAGE/fullchain.pem" "$CERT_DIR/fullchain.pem"
+ACME_RUN=(); [[ $EUID -eq 0 ]] || ACME_RUN=(sudo -E)
+"${ACME_RUN[@]}" "$ACME_SH" --install-cert -d "$DOMAIN" --ecc --key-file "$CERT_DIR/key.pem" --fullchain-file "$CERT_DIR/fullchain.pem" --reloadcmd "systemctl reload caddy"
+sudo chown root:caddy "$CERT_DIR/key.pem" "$CERT_DIR/fullchain.pem"
+sudo chmod 0640 "$CERT_DIR/key.pem"; sudo chmod 0644 "$CERT_DIR/fullchain.pem"
 sed -e "s|@@DOMAIN@@|$DOMAIN|g" -e "s|@@HUB_PORT@@|$HUB_PORT|g" -e "s|@@TAILSCALE_IP@@|$TAILSCALE_IP|g" "$TEMPLATE_DIR/linear-graph.caddy" | sudo tee "$CADDY_FILE" >/dev/null
 sudo caddy validate --config /etc/caddy/Caddyfile
 systemctl --user daemon-reload
