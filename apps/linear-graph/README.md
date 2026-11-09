@@ -262,6 +262,8 @@ CF_Token='…' LINEAR_GRAPH_TAILSCALE_IP='<tailnet-ip>' \
   bash apps/linear-graph/deploy/install-vps.sh
 ```
 
+Renewals: acme.sh's cron re-installs into /etc/caddy/certs/linear-graph and reloads Caddy; verify with `openssl s_client -connect graph.unsold.cloud:443 </dev/null | openssl x509 -noout -enddate`.
+
 The installer writes a mode-600 environment file, a user systemd service, and a Caddy site
 restricted to Tailscale source addresses. Create a DNS-only `graph.unsold.cloud` A record for that address,
 then verify from a tailnet device:
