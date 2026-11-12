@@ -56,6 +56,18 @@ test("rtest sends pnpm arguments as NUL-delimited stdin instead of shell text", 
   );
 });
 
+test("rtest hands off to ck run when the CommonKit plugin is installed", async () => {
+  const harness = await localHarness();
+  await executable(join(harness.bin, "ck"), `#!/bin/sh\nprintf '%s\\0' "$@" > '${harness.calls}.ck'\n`);
+  const env = { ...process.env, PATH: `${harness.bin}:/usr/bin:/bin`, RTEST_VPS: "developer@build.example.test" };
+  assert.equal(spawnSync(rtest, ["pnpm", "exec", "vitest", "run", "a b.test.ts"], { encoding: "utf8", env }).status, 0);
+  assert.deepEqual((await readFile(`${harness.calls}.ck`)).toString().split("\0").filter(Boolean),
+    ["run", "--job", "auto", "--", "pnpm", "exec", "vitest", "run", "a b.test.ts"]);
+  assert.equal(spawnSync(rtest, [], { encoding: "utf8", env }).status, 0);
+  assert.deepEqual((await readFile(`${harness.calls}.ck`)).toString().split("\0").filter(Boolean),
+    ["run", "--job", "auto", "--", "pnpm", "test"]);
+});
+
 test("rtest defaults to pnpm test and rejects non-pnpm commands", async () => {
   const harness = await localHarness();
   const base = {

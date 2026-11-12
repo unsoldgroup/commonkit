@@ -14,7 +14,7 @@ try {
 
 const input = payload.tool_input ?? payload.toolInput ?? {};
 const command = input.command ?? input.cmd;
-if (typeof command !== "string" || /(^|\s)rtest(?:\s|$)/.test(command)) {
+if (typeof command !== "string" || /(^|\s)(rtest|ck\s+run)(?:\s|$)/.test(command)) {
   process.exit(0);
 }
 
@@ -88,6 +88,6 @@ function invokesVitestScript(text) {
 const scannable = stripProse(command);
 
 if (directVitest.test(scannable) || invokesVitestScript(scannable)) {
-  process.stderr.write(`Local Vitest is disabled to protect Mac memory. Use: rtest ${command}\n`);
+  process.stderr.write(`Local Vitest is disabled to protect Mac memory. Use: ck run -- ${command} (or rtest ${command})\n`);
   process.exit(2);
 }

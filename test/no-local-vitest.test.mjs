@@ -46,6 +46,7 @@ test("allows rtest, non-Vitest tests, and search commands", async () => {
   await writeFile(join(cwd, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }));
 
   assert.equal(invoke("rtest pnpm exec vitest run test/example.test.ts", cwd).status, 0);
+  assert.equal(invoke("ck run -- pnpm exec vitest related --run src/a.ts", cwd).status, 0);
   assert.equal(invoke("pnpm test", cwd).status, 0);
   assert.equal(invoke("rg -n 'vitest' package.json", cwd).status, 0);
 });

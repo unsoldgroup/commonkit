@@ -2,6 +2,14 @@
 # rtest — sync the current worktree and run a pnpm command on Hostinger.
 set -euo pipefail
 
+# USG-452: when the CommonKit plugin's `ck` is installed, route through `ck run`,
+# which picks the backend (broker, rcargo or GitHub) and never waits for capacity.
+# Without it, or with RTEST_LEGACY=1, the direct path below runs as before.
+if [[ -z ${RTEST_LEGACY:-} ]] && command -v ck >/dev/null 2>&1; then
+  (( $# )) || set -- pnpm test
+  exec ck run --job auto -- "$@"
+fi
+
 vps=${RTEST_VPS:?Set RTEST_VPS to user@host}
 key=${RTEST_SSH_KEY:-$HOME/.ssh/id_ed25519}
 worker=${RTEST_WORKER:-/root/bin/commonkit-rtest-worker}
